@@ -9,7 +9,7 @@ artifacts this script parses. The timeline builder is a pure parser -- it
 reads only from the triage collection and never queries the local system.
 Both tools are available as separate repos for independent use.
 
-  Companion project: https://github.com/<your-org>/win11-triage-collector
+  Companion project: https://github.com/Jumbalicious79/win11-triage-collector
 
 
 ## Setup
@@ -35,8 +35,8 @@ Required directory structure:
 
 To set up:
 
-  git clone https://github.com/<your-org>/win11-triage-collector
-  git clone https://github.com/<your-org>/win11-timeline-builder
+  git clone https://github.com/Jumbalicious79/win11-triage-collector
+  git clone https://github.com/Jumbalicious79/win11-timeline-builder
 
 Or download both repos and extract them into the same parent folder. The parent
 folder can be anywhere -- your desktop, a USB drive, a network share, etc.
@@ -122,18 +122,30 @@ builder's tools\volatility3\ (see Optional Tools sections in each README).
     6. Generates a color-coded Excel file (rows colored by EventType)
     7. Asks how you want to view: Excel (colored), Timeline Explorer, Both, None
 
-  You can also pass a path directly:
+  You can also pass a path directly, optionally followed by a comma-separated
+  keyword list (both in quotes):
 
   Run-TimelineBuilder.bat "path\to\triage\collection"
   Run-TimelineBuilder.bat "path\to\collection" "mimikatz,psexec"
+
+  The launcher asks for Administrator rights (UAC) and restarts itself
+  elevated with the same arguments. Paths with spaces, apostrophes, & or !
+  are fine, and a relative path is turned into a full path first (the
+  elevated window starts in C:\Windows\System32).
 
 ### PowerShell (Admin)
 
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -Browse
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection"
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -StartDate "2025-01-15" -EndDate "2025-01-20"
-  powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -Sources "EventLogs","Prefetch","Registry"
-  powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -Keywords "mimikatz","psexec","powershell -enc"
+  powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -Sources "EventLogs,Prefetch,Registry"
+  powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -Keywords "mimikatz,psexec,powershell -enc"
+  powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -MaxUsnEntries 200000
+
+  With -File, PowerShell passes a list such as "a","b" or a,b to the script as
+  one string ("a,b"). The script splits -Sources and -Keywords on commas
+  itself, so both forms work. From a PowerShell prompt (.\timeline-builder.ps1)
+  normal arrays (-Keywords "a","b") work as well.
 
 
 ## Parameters
@@ -145,14 +157,23 @@ builder's tools\volatility3\ (see Optional Tools sections in each README).
   -OutputFile     Output CSV path. Defaults to reports\timeline_<timestamp>\timeline.csv
   -StartDate      Only include events after this date (UTC).
   -EndDate        Only include events before this date (UTC).
-  -Sources        Array of parsers to run. Defaults to all 14 (Memory excluded).
+  -Sources        Parsers to run, as an array or a comma-separated string.
+                  Defaults to all 14 (Memory excluded).
                   Valid: EventLogs, Prefetch, RecentFiles, Registry, FileSystem,
                   Browser, ScheduledTasks, Services, Network, USB, Persistence,
                   UsnJournal, Amcache, PowerShellHistory, Memory
                   Note: Memory is opt-in. Requires Volatility 3 in tools\ and
                   a memory dump in the collection. Adds 5-30 minutes.
-  -Keywords       Array of strings to flag in the timeline. Adds a Flagged
-                  column (TRUE/FALSE) for quick filtering.
+  -Keywords       Strings to flag in the timeline, as an array or a
+                  comma-separated string ("mimikatz,psexec"). Spaces around
+                  each keyword are trimmed and empty items ignored. Matching is
+                  case-insensitive against Description, Details, User and
+                  Source. Adds a Flagged column (TRUE/FALSE) for quick
+                  filtering. A keyword cannot itself contain a comma.
+  -MaxUsnEntries  Maximum number of USN journal rows to keep. The NEWEST rows
+                  are kept (older ones are dropped first). Default 0 =
+                  unlimited. The USN journal is usually the largest source;
+                  see "Known Limitations" for the Excel row limit.
 
 
 ## Auto-Downloaded Dependencies
@@ -172,6 +193,9 @@ installed as PowerShell modules -- no manual installation needed.
   Used for parsing browser history databases (Chrome, Edge, Firefox).
   Downloaded from: https://www.sqlite.org/download.html
   Cached in: tools\sqlite3\sqlite3.exe
+  Lookup order: sqlite3.exe on the PATH, then tools\, then a download of
+  the x64 build (sqlite.org has no ARM64 tools build; x64 runs under
+  emulation on ARM64 Windows).
 
 ### Timeline Explorer (Eric Zimmerman)
   Used for viewing and analyzing the timeline CSV output. Downloaded only
@@ -213,22 +237,74 @@ Both timeline.csv and timeline.xlsx contain the same columns:
   Source        Which artifact produced the entry (e.g., Security.evtx, Prefetch)
   EventType     Category: Execution, FileAccess, Logon, NetworkConnection,
                 PersistenceChange, AccountChange, ProcessCreation, ServiceChange,
-                ScheduledTaskChange, USBDevice
+                ScheduledTaskChange, USBDevice, Installation, SecurityAlert,
+                Snapshot (see below)
   Description   Human-readable summary of what happened
-  User          Associated user account, if known
+  User          Account the artifact belongs to, if known (see below)
   Details       Additional context (command line, file path, IP, etc.)
   Artifact      Parser that produced the entry
-  RawPath       Original file path of the artifact
+  RawPath       Path of the collected artifact file
   Flagged       (Only when -Keywords used) TRUE if any keyword matched
+
+  Rows are sorted by Timestamp; rows with the same time stay in the order the
+  parsers produced them.
+
+### Where the times come from
+
+  Every Timestamp is taken from the artifact data itself, never from when
+  the files were copied, extracted or parsed:
+  - Prefetch: run times stored inside the .pf file
+  - LNK files: the original file times recorded in the collection manifest
+    (collected file times are not used)
+  - Registry entries (TypedPaths, RunMRU, RecentDocs, run keys, services,
+    ...): the registry key's last-write time
+  - BAM: bam_entries.csv, or the collected SYSTEM hive
+  - Browser history: visit times, which the browsers store in UTC
+  - USN journal and setupapi logs: these are local-time text. They are
+    converted to UTC with the time zones the collector recorded in
+    collection_info.json (the collector host's zone for fsutil USN output,
+    the examined system's zone for setupapi). Collections from older
+    collector versions have no collection_info.json; the time zone is then
+    read from collection_log.txt.
+
+### Snapshot rows
+
+  Some artifacts describe the state of the system when it was collected, not
+  an event: the service and driver list, DNS and ARP cache, current TCP
+  connections, shares, Wi-Fi profiles, loaded DLLs, and scheduled tasks,
+  services or run keys that have no usable time of their own. These rows
+  have EventType "Snapshot" and the collection time as their Timestamp. They
+  are colored light gray in Excel. Filter them out (EventType <> Snapshot)
+  to see only real events.
+
+### User column
+
+  The user is taken from the collection's own folder layout: Registry\<user>\,
+  UserActivity\<user>\, Browser\<user>\ or a Users\<user>\ folder inside the
+  collection. It is never taken from the analysis machine's path (for
+  example the %TEMP% folder a browse-mode zip is extracted to). Rows that do
+  not belong to a specific profile have an empty User.
+
+### Duplicates
+
+  A row is removed as a duplicate only if Timestamp, Source, EventType,
+  Description, User and Details are all identical (case-sensitive); the
+  first copy is kept. The count is shown in the summary.
 
 ### CSV vs Excel differences
 
-  The CSV file contains the complete, unmodified data from all parsers. Use it
-  when you need full-fidelity data for SIEM import, scripted analysis, or when
-  any cell value exceeds 32,767 characters.
+  The CSV file contains the complete data from all parsers. Use it when you
+  need full-fidelity data for SIEM import, scripted analysis, or when any cell
+  value exceeds 32,767 characters.
 
-  The Excel file (.xlsx) is color-coded by EventType for visual analysis. Two
-  differences from the CSV:
+  Both files keep all text as found, including accented and non-Latin
+  characters (e.g. Japanese file names), symbols such as the euro sign and
+  emoji. Only characters that an .xlsx file cannot store are removed from
+  both: control characters other than tab/CR/LF, U+FFFE/U+FFFF and broken
+  (unpaired) UTF-16 surrogates. The CSV is UTF-8.
+
+  The Excel file (.xlsx) is color-coded by EventType for visual analysis.
+  Differences from the CSV:
 
   1. Strings over 32,767 characters are truncated with a [TRUNCATED] marker.
      This is Excel's hard cell limit. The full data is always in the CSV.
@@ -238,6 +314,11 @@ Both timeline.csv and timeline.xlsx contain the same columns:
      when opening the file. Click Yes -- this is a known ImportExcel/EPPlus
      library issue with XML formatting. The data and color-coding are intact.
      This does not indicate data loss or corruption.
+
+  3. An Excel worksheet holds at most 1,048,575 data rows. If the timeline is
+     larger (usually because of a very large USN journal), the .xlsx is not
+     generated and a warning is logged; use the CSV, or narrow the run with
+     -StartDate, -EndDate, -Sources or -MaxUsnEntries.
 
 
 ## What Each Parser Extracts (15 Parsers)
@@ -253,16 +334,28 @@ Parses .evtx files using Get-WinEvent. Targets high-value forensic events:
   - Sysmon (if present): Process creation (1), network (3), image loads (7),
     file creation (11), registry changes (13)
   - Task Scheduler: Task registered (106), updated (140), deleted (141)
+  - TerminalServices (RDP) logs: remote logons, session connect, disconnect
+    and reconnect, with user and source address
+  - Windows Defender Operational: malware detections and actions, and
+    security-control changes such as real-time protection disabled or an
+    exclusion added (EventType SecurityAlert)
+  - BITS Client: background transfer jobs and the URLs they download from
 
 ### 2. Prefetch
-Extracts execution evidence from .pf file metadata:
-  - Executable name parsed from filename
-  - First execution time (file creation) and last execution time (file modified)
+Extracts execution evidence from the .pf files:
+  - Executable name, run count and the last run times stored inside the
+    .pf file (up to 8 on Windows 8 and later)
+  - The times of the copied .pf file are not used (they are only the time
+    the collector copied it)
 
 ### 3. Recent Files (LNK)
-Parses Windows shortcut files using COM Shell objects:
-  - Target file path, creation and modification times
-  - Associated user, command arguments, working directory
+Parses Windows shortcut files from the collection's RecentFiles folders:
+  - Target file path, arguments, working directory
+  - Times: the shortcut's original created/modified times from the
+    collection manifest
+  - User from the collection folder (UserActivity\<user>\RecentFiles)
+  - Only the collection is read. If it has no .lnk files there are no LNK
+    rows; the analysis machine's own Recent folder is never used.
 
 ### 4. Registry
 Parses registry hives for user activity:
@@ -271,21 +364,40 @@ Parses registry hives for user activity:
   - RunMRU: Run dialog command history
   - UserAssist: ROT13-decoded program execution counts and last run times
   - RecentDocs: Recently opened documents
-  - BAM/DAM: Background/Desktop Activity Moderator execution timestamps
+  - BAM/DAM: Background/Desktop Activity Moderator last execution times,
+    from bam_entries.csv (current collector) or the collected SYSTEM hive
+  - AppCompatCache (ShimCache): programs recorded by the compatibility
+    cache, from the collected SYSTEM hive / appcompat_cache.reg
+  - ShellBags: folders the user browsed in Explorer, from UsrClass.dat
+    (BagMRU), timed with each key's last-write time
+  - Per-user Run / RunOnce values from each NTUSER.DAT
+MRU-style entries (TypedPaths, RunMRU, RecentDocs) are timed with the
+registry key's last-write time, which is when the most recent entry was
+added -- older entries in the same key happened before that time.
 Parses offline hives from the triage collection (NTUSER.DAT via reg load).
 
 ### 5. Browser History
 Parses Chromium (Chrome, Edge, Brave, Opera, Opera GX, Vivaldi) and Firefox
 SQLite databases using auto-downloaded sqlite3.exe -- no DLLs needed:
-  - URL, page title, visit timestamp, visit count
+  - URL, page title, visit timestamp (stored by the browser in UTC and kept
+    as UTC), visit count
+  - User from the collection folder (Browser\<user>\)
 
 ### 6. Scheduled Tasks
-Parses scheduled_tasks.csv from triage collection:
-  - Task name, path, state, last run time, actions, user context
+Parses scheduled_tasks.csv from the triage collection (live collections):
+  - Task name, path, state, author, run-as user, actions (the command) and
+    triggers
+  - Registration and last run times; tasks with no usable time are
+    Snapshot rows
+Mounted-image collections have no scheduled_tasks.csv; the task XML files
+the collector copies from Windows\System32\Tasks are parsed instead
+(registration date, author, command).
 
 ### 7. Services
 Parses services.csv from triage collection:
-  - Service name, binary path, start type, state, service account
+  - Service name, binary path, start mode, state, service account
+  - Timed with the service registry key's last-write time when the
+    collector recorded it (KeyLastWriteUtc); otherwise a Snapshot row
 
 ### 8. File System
 Parses file listing CSVs from triage collection. Capped at 50,000 entries.
@@ -294,11 +406,16 @@ Parses file listing CSVs from triage collection. Capped at 50,000 entries.
 Parses $UsnJrnl_$J.txt exported by the triage collector:
   - File create, modify, delete, rename, security change events
   - Filters out noisy "Close" and "Basic info change | Close" entries
-  - Capped at 100,000 entries to manage timeline size
+  - Keeps every row by default; with -MaxUsnEntries N only the NEWEST N
+    rows are kept, so the most recent activity before collection is always
+    included
+  - The export has local-time text; it is converted to UTC with the
+    collector's recorded time zone (see "Where the times come from")
   - Typically the highest-volume source with fine-grained file activity
 
 ### 10. Network
-Parses network artifacts from triage collection:
+Parses network artifacts from triage collection (Snapshot rows -- state at
+collection time):
   - TCP connections (tcp_connections.csv) with process info
   - DNS cache entries (dns_cache.txt)
   - ARP cache (arp_cache.txt)
@@ -307,31 +424,46 @@ Parses network artifacts from triage collection:
 
 ### 11. USB
 Parses USB device history:
+  - USB storage devices from usb_storage_devices.csv: first install,
+    install, last arrival (connected) and last removal times per device
+  - All SetupAPI device install logs (setupapi.dev.log and the rotated
+    setupapi.dev.<date>.log files): first-install times, converted from the
+    examined system's local time to UTC
   - USB devices and storage devices (usb_devices.txt, usb_storage_devices.txt)
   - Mounted devices (mounted_devices.txt)
-  - SetupAPI device install log with timestamps (setupapi.dev.log)
 
 ### 12. Persistence
 Parses persistence mechanisms from triage collection:
-  - Run keys (run_keys.txt) - registry autostart entries
+  - Run keys (run_keys.csv) - HKLM and every user's Run/RunOnce values,
+    timed with the key's last-write time
+  - Startup folders (startup_folders.csv) - all-users and per-user Startup
+    folder items with their created/modified times
   - Startup entries (startup_entries.csv) - startup folder items
-  - Drivers (drivers.csv) - kernel and filesystem drivers
+  - Drivers (drivers.csv) - kernel and filesystem drivers (key last-write
+    time, otherwise Snapshot)
   - WMI subscriptions (wmi_subscriptions.csv) - event consumers
-  - Suspicious loaded DLLs (loaded_dlls_suspicious.txt)
+  - Suspicious loaded DLLs (loaded_dlls_suspicious.txt) - Snapshot
+Older collections only have run_keys.txt / startup_folders.txt; their
+entries have no times and appear as Snapshot rows.
 
 ### 13. Amcache
 Parses Amcache.hve registry hive for program installation/execution history:
-  - InventoryApplicationFile: executables with paths, publishers, hashes
+  - InventoryApplicationFile: executables with paths, publishers, SHA1
+    hashes (EventType Execution)
   - InventoryApplication: installed applications with versions
-  - If the hive is dirty/corrupt (common with live collection), Amcache
-    parsing is skipped for that collection with a warning
+    (EventType Installation)
+  - Times are each entry's registry key last-write time (when Windows
+    recorded or last updated the entry). The PE compile time (LinkDate) is
+    shown in Details only -- it is often meaningless (e.g. year 2105).
+  - The collector copies the hive's transaction logs (.LOG1/.LOG2) so the
+    hive can be loaded. If the hive is still dirty/corrupt, Amcache parsing
+    is skipped for that collection with a warning
 
 ### 14. PowerShell History
-Parses command history and execution artifacts:
-  - ConsoleHost_history.txt: PSReadLine command history per user
-  - bam_entries.txt: BAM execution data exported as text
-  - appcompat_cache.reg: ShimCache registry export (noted as collected;
-    full parsing requires Eric Zimmerman's RECmd)
+Parses command history:
+  - ConsoleHost_history.txt: PSReadLine command history per user. The file
+    stores no per-command times; all commands get the time of the history
+    file's last write (when the last command was added)
 
 ### 15. Memory Dump (opt-in, requires Volatility 3)
 Analyzes raw memory dumps captured by the triage collector using Volatility 3.
@@ -384,6 +516,11 @@ differences" above for details.
     ScheduledTaskChange     Yellow      -- task scheduler changes
     USBDevice               Purple      -- USB device connections
     Installation            Light Blue  -- application installs
+    SecurityAlert           Bright red  -- AV detections, security tampering
+                                           (Defender disabled, exclusion added);
+                                           text in bold
+    Snapshot                Light gray  -- state at collection time, not an
+                                           event (see "Snapshot rows")
 
   The Excel file includes AutoFilter on all columns and a frozen header row.
   Use column filters to narrow by EventType, Source, User, or date range.
@@ -426,6 +563,8 @@ Timeline Explorer at the same time.
   PowerShell:
     $timeline = Import-Csv ".\reports\timeline_<timestamp>\timeline.csv"
     $timeline | Where-Object { $_.EventType -eq "Logon" }
+    $timeline | Where-Object { $_.EventType -eq "SecurityAlert" }
+    $timeline | Where-Object { $_.EventType -ne "Snapshot" }
     $timeline | Where-Object { $_.User -match "admin" }
     $timeline | Where-Object { $_.Flagged -eq "TRUE" }
 
@@ -433,7 +572,7 @@ Timeline Explorer at the same time.
 ## Investigation Workflow
 
   1. COLLECT artifacts with triage-collector on the target system
-     Companion: https://github.com/<your-org>/win11-triage-collector
+     Companion: https://github.com/Jumbalicious79/win11-triage-collector
 
   2. BUILD the timeline
      Double-click Run-TimelineBuilder.bat, pick a collection
@@ -448,9 +587,11 @@ Timeline Explorer at the same time.
      Both: side by side for maximum flexibility
 
   5. TRIAGE in your chosen viewer
+     Filter EventType to SecurityAlert for AV detections and tampering
      Filter Flagged column to TRUE for keyword hits
      Sort by Timestamp for chronological review
-     Group by EventType for category analysis
+     Group by EventType for category analysis (hide Snapshot rows to see
+     only real events)
 
   6. INVESTIGATE
      Pivot on timestamps: what else happened +/- 5 minutes?
@@ -468,19 +609,41 @@ Timeline Explorer at the same time.
 
   - "No file system data found" -- The triage collector does not produce a
     file_listing.csv. File system data comes from the USN Journal parser
-    instead (up to 100,000 entries). This warning is normal.
+    instead. This warning is normal.
 
-  - "Could not load Amcache hive (dirty/corrupt)" -- The Amcache.hve was
-    collected from a live system and its transaction logs (.LOG1/.LOG2) could
-    not be collected (locked). Without the logs, the dirty hive cannot be
-    loaded. Amcache parsing is skipped. This is a known triage collector
-    limitation on live systems.
+  - USN journal size -- All USN rows are kept by default. On a very busy
+    system the timeline can exceed Excel's row limit (see above); use
+    -MaxUsnEntries N to keep only the newest N rows. The log says how many
+    older rows were dropped.
 
-  - "No scheduled task data found" / "No service data found" -- These appear
-    when parsing a mounted image collection that does not include
-    scheduled_tasks.csv or services.csv (because those require live WMI
-    queries). The triage collector collects task XML files instead for
-    mounted images, but the timeline builder does not yet parse XML tasks.
+  - "Could not load Amcache hive: ..." -- Usually a dirty hive: it needs its
+    transaction logs (Amcache.hve.LOG1/.LOG2). Older versions of the triage
+    collector dropped these hidden files by mistake, so collections made
+    with them often hit this warning and Amcache parsing is skipped.
+    Re-collect with the current collector to get the logs.
+
+  - "No service data found" -- Appears for mounted-image collections, which
+    have no services.csv (it needs live queries). Scheduled tasks of mounted
+    images are parsed from the collected task XML files instead.
+
+  - Collections from older collector versions -- Still supported, with less
+    precise times: no collection_info.json (the time zone and collection
+    time are read from collection_log.txt), no original file times in the
+    manifest, no bam_entries.csv / run_keys.csv / startup_folders.csv /
+    usb_storage_devices.csv (BAM is read from the SYSTEM hive; run keys and
+    startup items become Snapshot rows), and only setupapi.dev.log is
+    collected (it may be missing if Windows rotated it).
+
+  - Snapshot rows -- Services, drivers, network state, DLLs and items with
+    no recorded time are shown at the collection time with EventType
+    Snapshot. Their Timestamp is when the state was observed, not when it
+    was created.
+
+  - Local-time sources -- USN and setupapi times are local-time text. Times
+    inside the hour that repeats when daylight saving time ends cannot be
+    told apart and may be off by one hour.
+
+  - Excel row limit -- Timelines over 1,048,575 rows are written to CSV only.
 
   - Excel "Repaired Records" or recovery prompt -- Known ImportExcel/EPPlus
     library issue. Click Yes to proceed. Data and color-coding are intact.
@@ -499,13 +662,13 @@ Timeline Explorer at the same time.
   Setup            | Zero dependencies (pure PS)    | Requires Python + plaso
   Speed            | Fast (1-2 minutes)             | Slow (hours for full parse)
   Event logs       | Targeted high-value event IDs  | All event IDs
-  Prefetch         | File metadata (names, times)   | Full binary parsing
+  Prefetch         | Name, run count, run times     | Full binary parsing
   Registry         | Key artifacts (MRU, BAM, etc.) | Hundreds of plugins
   Browser          | URL history (auto sqlite3)     | Full history + cache
   USN Journal      | Parsed from text export        | Full $UsnJrnl binary parse
   $MFT             | Not supported                  | Full $MFT parsing
-  Shellbags        | Not supported                  | Full shellbag parsing
-  Output formats   | CSV + color-coded XLSX          | CSV, JSON, XLSX, and more
+  Shellbags        | Folder names + key times       | Full shellbag parsing
+  Output formats   | CSV + color-coded XLSX         | CSV, JSON, XLSX, and more
   Parsers          | 15 parsers (14 + memory opt-in) | 100+ parsers
 
   When to use this: Quick triage, initial timeline, no-install environments,
@@ -609,13 +772,17 @@ parsing is skipped, and the timeline CSV can be opened manually.
 
 ## Windows Built-In Tools Used
 
-  reg.exe              Loads offline registry hives (NTUSER.DAT, Amcache.hve)
-                       via "reg load" for parsing UserAssist, TypedPaths,
-                       RunMRU, RecentDocs, and Amcache entries. Unloads after.
+  reg.exe              Loads offline registry hives (NTUSER.DAT, SYSTEM,
+                       Amcache.hve) via "reg load" for parsing UserAssist,
+                       TypedPaths, RunMRU, RecentDocs, BAM, ShimCache and
+                       Amcache entries, including key last-write times.
+                       Unloads after.
 
   Get-WinEvent         Parses .evtx event log files with XPath filtering.
                        Used for targeted extraction of high-value Security,
-                       System, PowerShell, Sysmon, and Task Scheduler events.
+                       System, PowerShell, Sysmon, Task Scheduler,
+                       TerminalServices (RDP), Windows Defender and BITS
+                       events.
 
   WScript.Shell COM    Reads LNK shortcut files to extract target paths,
                        arguments, and working directories for Recent Files.
