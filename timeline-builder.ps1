@@ -2799,8 +2799,658 @@ function Parse-Services {
 # ----------------------------------------------------------
 # 8. File System Parser
 # ----------------------------------------------------------
+# Raw $MFT copied by newer collectors (FileSystem\$MFT), parsed in C# for
+# speed (TimelineNtfs.MftParser). FILE record header: update sequence array
+# offset 0x04 and count 0x06 (the last 2 bytes of every stride of record size /
+# (count - 1) must equal the array's first value and are restored from it),
+# sequence number 0x10, first attribute 0x14, flags 0x16 (0x01 in use, 0x02
+# directory), bytes allocated 0x1C (record size, from the first record), base
+# record reference 0x20 (non-zero = extension record; its attributes belong to
+# the base record). Attributes: 0x10 $STANDARD_INFORMATION (Created, Modified,
+# MFT changed, Accessed FILETIMEs), 0x30 $FILE_NAME (parent reference = 6-byte
+# record + 2-byte sequence at 0, the same 4 times at 0x08, name length 0x40,
+# namespace 0x41: 0 POSIX, 1 Win32, 2 DOS, 3 Win32+DOS, UTF-16 name 0x42; the
+# DOS 8.3 name is used only if there is no other) and the unnamed 0x80 $DATA
+# (file size). Paths are volume-relative (\Users\...), built from the parent
+# references; record 5 is the root. A missing parent, or one whose sequence
+# number does not match (record reused), gives an "<orphan>\" prefix. NTFS
+# increments the sequence number when a record is freed, so a deleted parent
+# also matches a reference one lower.
+function Initialize-MftParser {
+    if ($null -ne $script:mftParserReady) { return $script:mftParserReady }
+    $script:mftParserReady = $false
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]'TimelineNtfs.MftParser').Type) {
+            # C# 5 (Windows PowerShell 5.1 compiler): no interpolation, no "=>" members
+            Add-Type -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Text;
+
+namespace TimelineNtfs
+{
+    public sealed class MftRow
+    {
+        public DateTime Time { get; set; }
+        public string Description { get; set; }
+        public string User { get; set; }
+        public string Details { get; set; }
+    }
+
+    public sealed class MftResult
+    {
+        public MftResult() { Rows = new List<MftRow>(); }
+        public List<MftRow> Rows { get; private set; }
+        public int RecordSize { get; set; }
+        public long RecordsRead { get; set; }
+        public long InUse { get; set; }
+        public long Deleted { get; set; }
+        public long Unused { get; set; }
+        public long Extension { get; set; }
+        public long BadSignature { get; set; }
+        public long FixupMismatch { get; set; }
+        public long BadAttributes { get; set; }
+        public long ParseFailures { get { return BadSignature + FixupMismatch + BadAttributes; } }
+        public long OutsideWindow { get; set; }
+        public long KeptForTimestomp { get; set; }
+        public long OrphanPaths { get; set; }
+        public long TimestompRecords { get; set; }
+        public long TimestompRows { get; set; }
+        public bool HasReference { get; set; }
+        public bool ReferenceFromMft { get; set; }
+        public DateTime ReferenceUtc { get; set; }
+        public bool HasWindow { get; set; }
+        public DateTime WindowStartUtc { get; set; }
+    }
+
+    public sealed class MftParser
+    {
+        const uint FileSignature = 0x454C4946;   // "FILE"
+        const int RootRecord = 5;
+        const long TicksPerSecond = 10000000L;
+        const long TicksPerDay = 864000000000L;
+        const string OrphanPrefix = "<orphan>";
+        const string TimeFormat = "yyyy-MM-dd HH:mm:ss.fffffff";
+        const byte StValid = 1;
+        const byte StInUse = 2;
+        const byte StDir = 4;
+        const byte StHasSI = 8;
+        const byte StVisiting = 16;
+        static readonly long MaxFileTime = DateTime.MaxValue.ToFileTimeUtc();
+        static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
+
+        // $FILE_NAME / $DATA found in an extension record, applied to its base record
+        sealed class ExtensionPart
+        {
+            public int BaseRecord;
+            public ushort BaseSeq;
+            public string Name;
+            public int Priority;
+            public int Parent;
+            public ushort ParentSeq;
+            public long FnCreated;
+            public long Size;
+        }
+
+        readonly MftResult result = new MftResult();
+        readonly List<ExtensionPart> extensions = new List<ExtensionPart>();
+        readonly List<int> chain = new List<int>();
+        int count;
+        int recordSize;
+
+        // Per base record (index = record number)
+        byte[] state;
+        ushort[] seq;
+        long[] siCreated;
+        long[] siModified;
+        long[] siChanged;
+        long[] siAccessed;
+        long[] fnCreated;
+        long[] dataSize;
+        string[] names;
+        byte[] namePriority;
+        int[] parents;
+        ushort[] parentSeqs;
+        string[] dirPaths;
+
+        // Attributes of the record being read
+        bool curHasSI;
+        long curSiCreated;
+        long curSiModified;
+        long curSiChanged;
+        long curSiAccessed;
+        string curName;
+        int curPriority;
+        int curParent;
+        ushort curParentSeq;
+        long curFnCreated;
+        long curSize;
+
+        MftParser() { }
+
+        // referenceFileTime: collection start as a UTC FILETIME (0 = unknown, use
+        // the newest plausible $MFT time); days: window before it (0 = all times)
+        public static MftResult Parse(string path, long referenceFileTime, int days)
+        {
+            MftParser parser = new MftParser();
+            parser.ReadFile(path);
+            parser.ApplyExtensions();
+            parser.BuildRows(referenceFileTime, days);
+            return parser.result;
+        }
+
+        static int ReadFull(Stream s, byte[] buffer, int length)
+        {
+            int total = 0;
+            while (total < length)
+            {
+                int n = s.Read(buffer, total, length - total);
+                if (n <= 0) break;
+                total += n;
+            }
+            return total;
+        }
+
+        static bool IsValidTime(long fileTime)
+        {
+            return fileTime > 0 && fileTime <= MaxFileTime;
+        }
+
+        void ReadFile(string path)
+        {
+            using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 65536, FileOptions.SequentialScan))
+            {
+                byte[] head = new byte[0x30];
+                if (ReadFull(fs, head, head.Length) < head.Length || BitConverter.ToUInt32(head, 0) != FileSignature)
+                    throw new IOException("not an $MFT copy: the first record has no FILE signature");
+                recordSize = (int)BitConverter.ToUInt32(head, 0x1C);
+                if (recordSize < 256 || recordSize > 65536 || (recordSize & (recordSize - 1)) != 0)
+                    throw new IOException("unexpected MFT record size " + recordSize.ToString(Inv) + " in the first record");
+                long total = fs.Length / recordSize;
+                if (total > int.MaxValue / 2) throw new IOException("$MFT too large (" + total.ToString(Inv) + " records)");
+                count = (int)total;
+                result.RecordSize = recordSize;
+
+                state = new byte[count];
+                seq = new ushort[count];
+                siCreated = new long[count];
+                siModified = new long[count];
+                siChanged = new long[count];
+                siAccessed = new long[count];
+                fnCreated = new long[count];
+                dataSize = new long[count];
+                names = new string[count];
+                namePriority = new byte[count];
+                parents = new int[count];
+                parentSeqs = new ushort[count];
+                dirPaths = new string[count];
+
+                fs.Position = 0;
+                int perChunk = Math.Max(1, (4 * 1024 * 1024) / recordSize);
+                byte[] buffer = new byte[perChunk * recordSize];
+                int rec = 0;
+                while (rec < count)
+                {
+                    int want = Math.Min(perChunk, count - rec);
+                    int got = ReadFull(fs, buffer, want * recordSize) / recordSize;
+                    for (int i = 0; i < got; i++) ReadRecord(buffer, i * recordSize, rec + i);
+                    rec += got;
+                    if (got < want) { count = rec; break; }
+                }
+            }
+        }
+
+        // Check and undo the update sequence fixups (in place)
+        bool ApplyFixups(byte[] b, int o)
+        {
+            int usaOffset = BitConverter.ToUInt16(b, o + 0x04);
+            int usaCount = BitConverter.ToUInt16(b, o + 0x06);
+            if (usaCount < 2 || usaOffset < 0x28 || usaOffset + usaCount * 2 > recordSize) return false;
+            int stride = recordSize / (usaCount - 1);
+            if (stride < 256 || stride * (usaCount - 1) != recordSize) return false;
+            int u = o + usaOffset;
+            for (int k = 1; k < usaCount; k++)
+            {
+                int p = o + k * stride - 2;
+                if (b[p] != b[u] || b[p + 1] != b[u + 1]) return false;
+            }
+            for (int k = 1; k < usaCount; k++)
+            {
+                int p = o + k * stride - 2;
+                b[p] = b[u + 2 * k];
+                b[p + 1] = b[u + 2 * k + 1];
+            }
+            return true;
+        }
+
+        void ReadRecord(byte[] b, int o, int rec)
+        {
+            result.RecordsRead++;
+            uint signature = BitConverter.ToUInt32(b, o);
+            if (signature != FileSignature)
+            {
+                if (signature == 0) result.Unused++;
+                else result.BadSignature++;
+                return;
+            }
+            if (!ApplyFixups(b, o)) { result.FixupMismatch++; return; }
+
+            ushort sequence = BitConverter.ToUInt16(b, o + 0x10);
+            int firstAttribute = BitConverter.ToUInt16(b, o + 0x14);
+            int flags = BitConverter.ToUInt16(b, o + 0x16);
+            uint bytesInUse = BitConverter.ToUInt32(b, o + 0x18);
+            int used = bytesInUse > (uint)recordSize ? recordSize : (int)bytesInUse;
+            ulong baseReference = BitConverter.ToUInt64(b, o + 0x20);
+            long baseRecord = (long)(baseReference & 0xFFFFFFFFFFFFUL);
+
+            if (!ReadAttributes(b, o, firstAttribute, used)) result.BadAttributes++;
+
+            if (baseRecord != 0)
+            {
+                result.Extension++;
+                if (baseRecord < count && baseRecord != rec && (curName != null || curSize >= 0))
+                {
+                    ExtensionPart part = new ExtensionPart();
+                    part.BaseRecord = (int)baseRecord;
+                    part.BaseSeq = (ushort)(baseReference >> 48);
+                    part.Name = curName;
+                    part.Priority = curPriority;
+                    part.Parent = curParent;
+                    part.ParentSeq = curParentSeq;
+                    part.FnCreated = curFnCreated;
+                    part.Size = curSize;
+                    extensions.Add(part);
+                }
+                return;
+            }
+
+            byte st = StValid;
+            if ((flags & 0x01) != 0) st |= StInUse;
+            if ((flags & 0x02) != 0) st |= StDir;
+            if (curHasSI) st |= StHasSI;
+            state[rec] = st;
+            seq[rec] = sequence;
+            siCreated[rec] = curSiCreated;
+            siModified[rec] = curSiModified;
+            siChanged[rec] = curSiChanged;
+            siAccessed[rec] = curSiAccessed;
+            names[rec] = curName;
+            namePriority[rec] = (byte)curPriority;
+            parents[rec] = curParent;
+            parentSeqs[rec] = curParentSeq;
+            fnCreated[rec] = curFnCreated;
+            dataSize[rec] = curSize;
+        }
+
+        // Fills the cur* fields; false if the attribute list is damaged (what was
+        // read before the damage is kept)
+        bool ReadAttributes(byte[] b, int o, int first, int used)
+        {
+            curHasSI = false;
+            curSiCreated = 0; curSiModified = 0; curSiChanged = 0; curSiAccessed = 0;
+            curName = null; curPriority = 0; curParent = -1; curParentSeq = 0;
+            curFnCreated = 0; curSize = -1;
+
+            int a = first;
+            while (a + 4 <= used)
+            {
+                uint type = BitConverter.ToUInt32(b, o + a);
+                if (type == 0xFFFFFFFF) return true;
+                if (a + 0x18 > used) return false;
+                uint length = BitConverter.ToUInt32(b, o + a + 4);
+                if (length < 0x18 || length > (uint)(used - a)) return false;
+                int len = (int)length;
+                int nameLength = b[o + a + 9];
+                if (b[o + a + 8] == 0)
+                {
+                    // Resident: content length 0x10, content offset 0x14
+                    long contentLength = BitConverter.ToUInt32(b, o + a + 0x10);
+                    int contentOffset = BitConverter.ToUInt16(b, o + a + 0x14);
+                    if (contentOffset + contentLength > len) return false;
+                    int c = o + a + contentOffset;
+                    if (type == 0x10 && contentLength >= 0x20)
+                    {
+                        curHasSI = true;
+                        curSiCreated = BitConverter.ToInt64(b, c);
+                        curSiModified = BitConverter.ToInt64(b, c + 0x08);
+                        curSiChanged = BitConverter.ToInt64(b, c + 0x10);
+                        curSiAccessed = BitConverter.ToInt64(b, c + 0x18);
+                    }
+                    else if (type == 0x30)
+                    {
+                        if (contentLength < 0x42) return false;
+                        int chars = b[c + 0x40];
+                        if (0x42 + chars * 2 > contentLength) return false;
+                        int priority = b[c + 0x41] == 2 ? 1 : 2;
+                        if (chars > 0 && priority > curPriority)
+                        {
+                            ulong parentReference = BitConverter.ToUInt64(b, c);
+                            long parentRecord = (long)(parentReference & 0xFFFFFFFFFFFFUL);
+                            curPriority = priority;
+                            curName = Encoding.Unicode.GetString(b, c + 0x42, chars * 2);
+                            curParent = parentRecord > int.MaxValue ? -1 : (int)parentRecord;
+                            curParentSeq = (ushort)(parentReference >> 48);
+                            curFnCreated = BitConverter.ToInt64(b, c + 0x08);
+                        }
+                    }
+                    else if (type == 0x80 && nameLength == 0)
+                    {
+                        curSize = contentLength;
+                    }
+                }
+                else if (type == 0x80 && nameLength == 0)
+                {
+                    // Non-resident: the first extent (start VCN 0x10 = 0) holds the real size (0x30)
+                    if (len < 0x40) return false;
+                    if (BitConverter.ToInt64(b, o + a + 0x10) == 0) curSize = BitConverter.ToInt64(b, o + a + 0x30);
+                }
+                a += len;
+            }
+            return true;
+        }
+
+        // Sequence check; a freed record's number was incremented when it was freed
+        bool SequenceMatches(int r, ushort referenceSeq)
+        {
+            if (seq[r] == referenceSeq) return true;
+            if ((state[r] & StInUse) != 0) return false;
+            ushort next = (ushort)(referenceSeq + 1);
+            if (next == 0) next = 1;
+            return seq[r] == next;
+        }
+
+        void ApplyExtensions()
+        {
+            foreach (ExtensionPart part in extensions)
+            {
+                int r = part.BaseRecord;
+                if ((state[r] & StValid) == 0 || !SequenceMatches(r, part.BaseSeq)) continue;
+                if (part.Name != null && part.Priority > namePriority[r])
+                {
+                    names[r] = part.Name;
+                    namePriority[r] = (byte)part.Priority;
+                    parents[r] = part.Parent;
+                    parentSeqs[r] = part.ParentSeq;
+                    fnCreated[r] = part.FnCreated;
+                }
+                if (part.Size >= 0 && dataSize[r] < 0) dataSize[r] = part.Size;
+            }
+            extensions.Clear();
+        }
+
+        bool ParentOk(int r)
+        {
+            int p = parents[r];
+            if (p == RootRecord) return true;
+            if (p < 0 || p >= count || p == r) return false;
+            if ((state[p] & StValid) == 0 || names[p] == null) return false;
+            return SequenceMatches(p, parentSeqs[r]);
+        }
+
+        // Path of a folder used as a parent ("" for the root), memoised. Walks up
+        // until a known path, the root, a bad parent or a cycle, then builds down.
+        string DirPath(int d)
+        {
+            if (d == RootRecord) return "";
+            if (dirPaths[d] != null) return dirPaths[d];
+            chain.Clear();
+            string basePath;
+            int cur = d;
+            while (true)
+            {
+                if (cur == RootRecord) { basePath = ""; break; }
+                if (dirPaths[cur] != null) { basePath = dirPaths[cur]; break; }
+                if ((state[cur] & StVisiting) != 0) { basePath = OrphanPrefix; break; }
+                state[cur] |= StVisiting;
+                chain.Add(cur);
+                if (!ParentOk(cur)) { basePath = OrphanPrefix; break; }
+                cur = parents[cur];
+            }
+            for (int i = chain.Count - 1; i >= 0; i--)
+            {
+                int c = chain[i];
+                basePath = basePath + "\\" + names[c];
+                dirPaths[c] = basePath;
+                state[c] = (byte)(state[c] & ~StVisiting);
+            }
+            return basePath;
+        }
+
+        string FullPath(int r)
+        {
+            if (r == RootRecord) return "\\";
+            if (names[r] == null) return OrphanPrefix + "\\<record " + r.ToString(Inv) + ">";
+            string prefix = ParentOk(r) ? DirPath(parents[r]) : OrphanPrefix;
+            return prefix + "\\" + names[r];
+        }
+
+        static string UserFromPath(string path)
+        {
+            const string usersPrefix = "\\Users\\";
+            if (!path.StartsWith(usersPrefix, StringComparison.OrdinalIgnoreCase)) return "";
+            int end = path.IndexOf('\\', usersPrefix.Length);
+            return end > usersPrefix.Length ? path.Substring(usersPrefix.Length, end - usersPrefix.Length) : "";
+        }
+
+        // Possible timestomping: SI Created more than 1 s before FN Created, or SI
+        // Created and Modified on whole seconds while FN Created is not
+        static string TimestompReason(long created, long modified, long fnCreatedTime)
+        {
+            if (!IsValidTime(created) || !IsValidTime(fnCreatedTime)) return null;
+            string reason = null;
+            if (created < fnCreatedTime - TicksPerSecond) reason = "SI Created is more than 1 s earlier than FN Created";
+            if (created % TicksPerSecond == 0 && IsValidTime(modified) && modified % TicksPerSecond == 0 && fnCreatedTime % TicksPerSecond != 0)
+            {
+                const string wholeSeconds = "SI Created and Modified have no sub-second part but FN Created has one";
+                reason = reason == null ? wholeSeconds : reason + "; " + wholeSeconds;
+            }
+            return reason == null ? null : "possible timestomping: " + reason;
+        }
+
+        static void AppendTime(StringBuilder sb, string label, long fileTime)
+        {
+            if (!IsValidTime(fileTime)) return;
+            sb.Append(" | ").Append(label).Append('=').Append(DateTime.FromFileTimeUtc(fileTime).ToString(TimeFormat, Inv));
+        }
+
+        string Details(int r, bool createdRow, string stomp)
+        {
+            StringBuilder sb = new StringBuilder(256);
+            sb.Append("MftRecord=").Append(r.ToString(Inv)).Append(" | Seq=").Append(seq[r].ToString(Inv));
+            if ((state[r] & StDir) == 0 && dataSize[r] >= 0) sb.Append(" | Size=").Append(dataSize[r].ToString(Inv));
+            if (createdRow) AppendTime(sb, "SI.Modified", siModified[r]);
+            else AppendTime(sb, "SI.Created", siCreated[r]);
+            AppendTime(sb, "SI.MftChanged", siChanged[r]);
+            AppendTime(sb, "SI.Accessed", siAccessed[r]);
+            AppendTime(sb, "FN.Created", fnCreated[r]);
+            if (stomp != null) sb.Append(" | Timestomp=").Append(stomp);
+            return sb.ToString();
+        }
+
+        void AddRow(long fileTime, string description, string user, string details)
+        {
+            MftRow row = new MftRow();
+            row.Time = DateTime.FromFileTimeUtc(fileTime);
+            row.Description = description;
+            row.User = user;
+            row.Details = details;
+            result.Rows.Add(row);
+        }
+
+        static long Newer(long newest, long fileTime, long limit)
+        {
+            return (IsValidTime(fileTime) && fileTime <= limit && fileTime > newest) ? fileTime : newest;
+        }
+
+        void BuildRows(long referenceFileTime, int days)
+        {
+            // Counts, and the newest plausible SI time (not after tomorrow)
+            long limit = DateTime.UtcNow.AddDays(1).ToFileTimeUtc();
+            long newest = 0;
+            for (int r = 0; r < count; r++)
+            {
+                byte st = state[r];
+                if ((st & StValid) == 0) continue;
+                if ((st & StInUse) != 0) result.InUse++;
+                else if ((st & StHasSI) != 0 || names[r] != null) result.Deleted++;
+                else result.Unused++;
+                if ((st & StHasSI) == 0) continue;
+                newest = Newer(newest, siCreated[r], limit);
+                newest = Newer(newest, siModified[r], limit);
+                newest = Newer(newest, siChanged[r], limit);
+            }
+
+            long reference = referenceFileTime;
+            if (!IsValidTime(reference))
+            {
+                reference = newest;
+                result.ReferenceFromMft = newest > 0;
+            }
+            long windowStart = long.MinValue;
+            if (reference > 0)
+            {
+                result.HasReference = true;
+                result.ReferenceUtc = DateTime.FromFileTimeUtc(reference);
+                if (days > 0)
+                {
+                    windowStart = reference - days * TicksPerDay;
+                    result.HasWindow = true;
+                    result.WindowStartUtc = DateTime.FromFileTimeUtc(Math.Max(0L, windowStart));
+                }
+            }
+
+            for (int r = 0; r < count; r++)
+            {
+                byte st = state[r];
+                if ((st & StValid) == 0 || (st & StHasSI) == 0) continue;
+                long created = siCreated[r];
+                long modified = siModified[r];
+                string stomp = TimestompReason(created, modified, fnCreated[r]);
+                if (stomp != null) result.TimestompRecords++;
+                // Backdating moves SI times out of the window: keep flagged records
+                // whose FN Created time is in it
+                bool keepFlagged = stomp != null && fnCreated[r] >= windowStart;
+
+                bool createdRow = false;
+                bool modifiedRow = false;
+                if (IsValidTime(created))
+                {
+                    if (created >= windowStart) createdRow = true;
+                    else if (keepFlagged) { createdRow = true; result.KeptForTimestomp++; }
+                    else result.OutsideWindow++;
+                }
+                if (IsValidTime(modified))
+                {
+                    if (modified >= windowStart) modifiedRow = true;
+                    else if (keepFlagged) { modifiedRow = true; result.KeptForTimestomp++; }
+                    else result.OutsideWindow++;
+                }
+                if (!createdRow && !modifiedRow) continue;
+
+                string path = FullPath(r);
+                if (path.StartsWith(OrphanPrefix, StringComparison.Ordinal)) result.OrphanPaths++;
+                bool isDir = (st & StDir) != 0;
+                string noun;
+                if ((st & StInUse) == 0) noun = isDir ? "Deleted folder" : "Deleted file";
+                else noun = isDir ? "Folder" : "File";
+                string marker = stomp != null ? " [SI<FN]" : "";
+                string user = UserFromPath(path);
+                if (createdRow) AddRow(created, noun + " created: " + path + marker, user, Details(r, true, stomp));
+                if (modifiedRow) AddRow(modified, noun + " modified: " + path + marker, user, Details(r, false, stomp));
+                if (stomp != null) result.TimestompRows += (createdRow ? 1 : 0) + (modifiedRow ? 1 : 0);
+            }
+        }
+    }
+}
+'@
+        }
+        $script:mftParserReady = $true
+    }
+    catch {
+        Log-Warning "  `$MFT parser could not be compiled: $($_.Exception.Message)"
+    }
+    return $script:mftParserReady
+}
+
+# Timeline rows (Source MFT) from one $MFT copy: SI Created and SI Modified of
+# every file and folder record, for times at most -MftDays days before the
+# collection start (the newest $MFT time if that is unknown); later times are
+# kept. Records flagged [SI<FN] (possible timestomping) are also kept when
+# their FN Created time is in the window, as backdating moves SI times out of it.
+function Add-MftTimelineEntries {
+    param([System.IO.FileInfo]$File)
+    if (-not (Initialize-MftParser)) { return }
+
+    Log "  Parsing: $($File.FullName) ($([Math]::Round($File.Length / 1MB, 1)) MB)"
+    $collectionStart = (Get-CollectionInfo).CollectionStartUtc
+    $referenceFileTime = 0L
+    if ($collectionStart) { $referenceFileTime = $collectionStart.ToFileTimeUtc() }
+
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $mftResult = [TimelineNtfs.MftParser]::Parse($File.FullName, $referenceFileTime, $MftDays)
+    }
+    catch {
+        $failure = $_.Exception
+        if ($failure.InnerException) { $failure = $failure.InnerException }
+        Log-Warning "  Failed to parse `$MFT $($File.FullName): $($failure.Message)"
+        return
+    }
+    $parseSeconds = [Math]::Round($stopwatch.Elapsed.TotalSeconds, 1)
+    Log ("  Read $($mftResult.RecordsRead) record(s) of $($mftResult.RecordSize) bytes in $parseSeconds s: " +
+        "$($mftResult.InUse) in use, $($mftResult.Deleted) deleted, $($mftResult.Extension) extension, $($mftResult.Unused) unused; " +
+        "$($mftResult.ParseFailures) parse failure(s) ($($mftResult.BadSignature) bad signature, $($mftResult.FixupMismatch) fixup mismatch, " +
+        "$($mftResult.BadAttributes) damaged attribute list).")
+
+    if ($mftResult.HasWindow) {
+        $referenceText = $mftResult.ReferenceUtc.ToString("yyyy-MM-dd HH:mm:ss")
+        $anchor = "the collection start ($referenceText UTC)"
+        if ($mftResult.ReferenceFromMft) { $anchor = "the newest `$MFT time ($referenceText UTC; collection start unknown)" }
+        Log "  Window: times from $($mftResult.WindowStartUtc.ToString('yyyy-MM-dd HH:mm:ss')) UTC, $MftDays day(s) before $anchor (-MftDays 0 = all)."
+    }
+    elseif ($MftDays -gt 0) {
+        Log "  No usable `$MFT time to anchor the -MftDays window -- all times added."
+    }
+    else {
+        Log "  -MftDays 0: all `$MFT times added."
+    }
+
+    $before = $script:timelineEntries.Count
+    $rawPath = $File.FullName
+    foreach ($row in $mftResult.Rows) {
+        Add-TimelineEntry -Timestamp $row.Time -Source "MFT" -EventType "FileAccess" `
+            -Description $row.Description -User $row.User -Details $row.Details `
+            -Artifact "FileSystem" -RawPath $rawPath
+    }
+    $added = $script:timelineEntries.Count - $before
+    $summary = "  Added $added row(s); $($mftResult.OutsideWindow) time(s) outside the window skipped"
+    if ($mftResult.Rows.Count -gt $added) { $summary += "; $($mftResult.Rows.Count - $added) row(s) dropped by -StartDate/-EndDate or dated before 1980" }
+    Log "$summary."
+    if ($mftResult.TimestompRecords -gt 0) {
+        Log "  $($mftResult.TimestompRecords) record(s) flagged [SI<FN] (possible timestomping; see Details): $($mftResult.TimestompRows) row(s), $($mftResult.KeptForTimestomp) of them outside the window."
+    }
+    if ($mftResult.OrphanPaths -gt 0) {
+        Log "  $($mftResult.OrphanPaths) record(s) with rows have a missing or reused parent folder (path starts with <orphan>)."
+    }
+    Log "  `$MFT done in $([Math]::Round($stopwatch.Elapsed.TotalSeconds, 1)) s."
+}
+
 function Parse-FileSystem {
     Log "--- Parsing File System Metadata ---"
+
+    # Raw $MFT from newer collectors (FileSystem\$MFT). -Force: a copy may keep
+    # the Hidden/System attributes of the original.
+    $mftFiles = @(Get-ChildItem -Path $InputPath -Filter '$MFT' -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq '$MFT' })
+    if ($mftFiles.Count -gt 0) {
+        foreach ($mftFile in $mftFiles) {
+            Add-MftTimelineEntries -File $mftFile
+        }
+        Log "  File system parsing complete."
+        Log ""
+        return
+    }
 
     $fsParsed = $false
 
@@ -2870,13 +3520,12 @@ function Parse-FileSystem {
                 Log-Warning "  Failed to parse file listing CSV: $($_.Exception.Message)"
             }
         }
+        if (-not $fsParsed) {
+            Log-Warning "No usable times in the file listing CSV(s)."
+        }
     }
     else {
-        Log "  No file listing CSV found in collection."
-    }
-
-    if (-not $fsParsed) {
-        Log-Warning "No file system data found."
+        Log "  No `$MFT or file listing in this collection (`$MFT is collected by newer collector versions)."
     }
     Log "  File system parsing complete."
     Log ""
