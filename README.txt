@@ -186,7 +186,8 @@ themselves are never committed.
                   before the collection are added. Default 7; 0 = all. A
                   full $MFT can produce millions of rows, and one Windows
                   update alone can add hundreds of thousands. Possible
-                  timestomping is always reported (see parser #8).
+                  timestomping and Mark-of-the-Web (downloaded or
+                  extracted file) rows are always reported (see parser #8).
 
 
 ## Auto-Downloaded Dependencies
@@ -270,9 +271,11 @@ Both timeline.csv and timeline.xlsx contain the same columns:
   - LNK files: the original file times recorded in the collection manifest
     (collected file times are not used)
   - Registry entries (TypedPaths, RunMRU, RecentDocs, run keys, services,
-    ...): the registry key's last-write time
+    ...): the registry key's last-write time. Values that store a time of
+    their own use it (TaskCache, Office TrustRecords and File/Place MRU)
   - BAM: bam_entries.csv, or the collected SYSTEM hive
-  - Browser history: visit times, which the browsers store in UTC
+  - Browser history, downloads, logins, cookies, form entries and
+    permissions: times the browsers store in UTC
   - USN journal and setupapi logs: these are local-time text. They are
     converted to UTC with the time zones the collector recorded in
     collection_info.json (the collector host's zone for fsutil USN output,
@@ -286,9 +289,12 @@ Both timeline.csv and timeline.xlsx contain the same columns:
   an event: the service and driver list, DNS and ARP cache, current TCP
   connections, shares, Wi-Fi profiles, loaded DLLs, and scheduled tasks,
   services or run keys that have no usable time of their own. These rows
-  have EventType "Snapshot" and the collection time as their Timestamp. They
-  are colored light gray in Excel. Filter them out (EventType <> Snapshot)
-  to see only real events.
+  have EventType "Snapshot" and the collection time as their Timestamp. A
+  few context rows are Snapshot rows at a time of their own: a security
+  product reported ON to Security Center (event time), the Outlook
+  attachment folder and the triage collector's own Defender exclusion
+  (registry key last-write time). Snapshot rows are colored light gray in
+  Excel. Filter them out (EventType <> Snapshot) to see only real events.
 
 ### User column
 
@@ -337,21 +343,62 @@ Both timeline.csv and timeline.xlsx contain the same columns:
 ## What Each Parser Extracts (17 Parsers)
 
 ### 1. Event Logs
-Parses .evtx files using Get-WinEvent. Targets high-value forensic events:
+Parses .evtx files using Get-WinEvent. Targets high-value forensic events
+(the Source is the log file name, e.g. Security.evtx):
   - Security: Logon success/fail (4624/4625), explicit credentials (4648),
-    special privileges (4672), process creation (4688), account changes
-    (4720/4726/4732)
+    special privileges (4672), process creation (4688), account created or
+    deleted (4720/4726, with the account SID), session reconnected or
+    disconnected (4778/4779, EventType Logon, with the client name and
+    address)
+  - Security account changes (EventType AccountChange): member added to a
+    security-enabled global, local or universal group (4728/4732/4756;
+    Details Group, GroupSID, Member, MemberSID -- a local member, which the
+    event gives only by SID, is named from the other Security events),
+    password reset attempt (4724), account locked out (4740, with the
+    CallerComputer)
+  - Security log and persistence changes: audit log cleared (1102, with
+    ClearedBy) and system audit policy changed (4719, category and
+    subcategory by name), both SecurityAlert; service installed (4697,
+    PersistenceChange); scheduled task registered, updated, deleted,
+    enabled or disabled (4698/4702/4699/4700/4701, ScheduledTaskChange,
+    with Command, Arguments and RunAs from the task XML)
   - System: Service crashes (7034), state changes (7036), start type changes
-    (7040), new service installs (7045), shutdowns (1074/6008)
+    (7040, with the service name), new service installs (7045), shutdowns
+    (1074/6008), event log cleared (104, SecurityAlert, with the log name
+    and who cleared it), event log service started/stopped (6005/6006: the
+    markers of a boot and of a clean shutdown)
+  - Application: software installed or removed (MsiInstaller 1033/1034,
+    EventType Installation, with Product, Version, Manufacturer, Status and
+    the installing account as User; 11707/11724 only when there is no
+    matching 1033/1034), application crashes and hangs (Application Error
+    1000, Application Hang 1002, EventType Execution, with the faulting
+    Module and ExceptionCode), ESE database created, attached, detached or
+    moved (ESENT 325/326/327/216, FileAccess -- shows copies of ntds.dit).
+    Only these events and the security-product events below are read from
+    this log; Windows Error Reporting 1001 is not (it repeats 1000/1002)
+  - Application, security products: the state each product reports to
+    Security Center (SecurityCenter 15: the first state per product and
+    every change; 16: a failed state update). A product reported OFF,
+    SNOOZED, EXPIRED or in an unknown state is a SecurityAlert; one
+    reported ON is a Snapshot row at the event time (context). Events that
+    third-party antivirus writes to this log (Symantec / Norton, McAfee /
+    Trellix, Sophos, ESET, Trend Micro, Bitdefender, Kaspersky,
+    Malwarebytes, Webroot, CrowdStrike) are SecurityAlert rows with the
+    message text, trimmed: Critical, Error and Warning events, and
+    Information events only when their text reports a detection
   - PowerShell Operational: Script block logging (4104), module logging (4103)
   - Sysmon (if present): Process creation (1), network (3), image loads (7),
     file creation (11), registry changes (13)
   - Task Scheduler: Task registered (106), updated (140), deleted (141)
   - TerminalServices (RDP) logs: remote logons, session connect, disconnect
     and reconnect, with user and source address
-  - Windows Defender Operational: malware detections and actions, and
+  - Windows Defender Operational: malware detections and actions,
     security-control changes such as real-time protection disabled or an
-    exclusion added (EventType SecurityAlert)
+    exclusion added, malware detection history deleted (1013; the service's
+    own daily retention purge is labelled as such), and attack surface
+    reduction rules that blocked or audited an action (1121/1122, with the
+    rule name; audits are folded into one row per rule, path, process and
+    day, with Count and LastSeen) (EventType SecurityAlert)
   - BITS Client: background transfer jobs and the URLs they download from
   - Defender detections (defender_detections.csv) with the threat name and
     severity from defender_threats.csv
@@ -381,33 +428,136 @@ Parses Windows shortcut files from the collection's RecentFiles folders:
 
 
 ### 4. Registry
-Parses registry hives for user activity:
+Parses the offline hives of the triage collection (NTUSER.DAT, UsrClass.dat,
+SOFTWARE and SYSTEM via reg load) for user activity, persistence and
+security settings. Sources are named Registry-<item> (e.g. Registry-RunMRU,
+Registry-TaskCache); Details give the Key and say where the time came from.
+From each user's NTUSER.DAT:
   - TypedPaths: Explorer address bar history
   - TypedURLs: Internet Explorer typed URLs
   - RunMRU: Run dialog command history
   - UserAssist: ROT13-decoded program execution counts and last run times
   - RecentDocs: Recently opened documents
+  - Per-user Run / RunOnce values
+  - WordWheelQuery: Explorer search box terms
+  - Open/Save dialogs (Registry-OpenSaveMRU, Registry-LastVisitedMRU):
+    files picked in Open/Save dialogs and the folder each program's dialog
+    last used; paths are decoded like ShellBags
+  - Office trusted documents (Registry-TrustRecords): "Office macros
+    enabled on document" (EventType Execution) when the user enabled
+    macros, otherwise "Office editing enabled on document" (FileAccess),
+    at the time the document was trusted
+  - Office File MRU / Place MRU (Registry-OfficeMRU): recent documents and
+    folders per Office app, at the time each was last opened
+  - Outlook attachment temp folder (OutlookSecureTempFolder): one Snapshot
+    row with the folder
+  - Remote Desktop client (Registry-RDPClient, EventType
+    NetworkConnection): outbound RDP targets from the MRU list and the
+    saved servers with their user name hint
+From UsrClass.dat:
+  - ShellBags: folders the user browsed in Explorer (BagMRU), timed with
+    each key's last-write time
+From the SOFTWARE hive (EventType PersistenceChange unless noted):
+  - Image File Execution Options Debugger values (Registry-IFEO). A
+    Debugger on an accessibility program (sethc.exe, utilman.exe, osk.exe,
+    narrator.exe, magnify.exe, displayswitch.exe, atbroker.exe) is marked
+    "(accessibility program)": the Debugger then runs at the logon screen
+    as SYSTEM
+  - SilentProcessExit monitor processes and dumps on exit, described by
+    what ReportingMode makes Windows do; Details say whether it is Active
+    (that also needs IFEO GlobalFlag 0x200)
+  - Winlogon Shell, Userinit and Taskman when not the Windows default
+  - AppInit_DLLs when not empty (native and Wow6432Node), with
+    LoadAppInit_DLLs
+  - Scheduled tasks from the TaskCache (Registry-TaskCache): hidden tasks
+    and task folders -- a Tree entry without an SD value, which schtasks
+    and Task Scheduler do not list (ScheduledTaskChange); and, from
+    DynamicInfo, "Scheduled task registered" (ScheduledTaskChange) and
+    "Scheduled task last run" (Execution, with LastErrorCode) with the
+    task's Actions, for tasks that scheduled_tasks.csv or the task XML
+    files do not already put on the timeline
+  - Defender exclusions (Registry-DefenderExclusions; Paths, Extensions,
+    Processes, IpAddresses; local and Group Policy): one SecurityAlert row
+    each; local ones are "ignored by policy" when Group Policy sets
+    DisableLocalAdminMerge. The exclusion the triage collector adds for its
+    own output folder while it runs is recognised from collection_log.txt
+    and shown as a Snapshot row "(triage collector's own temporary
+    exclusion)", or as a SecurityAlert when the log says the collector
+    could not remove it
+From the SYSTEM hive:
+  - LSA Authentication, Notification (password filter) and Security
+    Packages entries that are not Windows defaults (Registry-LSA,
+    PersistenceChange)
+  - WDigest UseLogonCredential=1: clear-text passwords kept in memory
+    (Registry-WDigest, SecurityAlert)
   - BAM/DAM: Background/Desktop Activity Moderator last execution times,
     from bam_entries.csv (current collector) or the collected SYSTEM hive
   - AppCompatCache (ShimCache): programs recorded by the compatibility
     cache, from the collected SYSTEM hive / appcompat_cache.reg
-  - ShellBags: folders the user browsed in Explorer, from UsrClass.dat
-    (BagMRU), timed with each key's last-write time
-  - Per-user Run / RunOnce values from each NTUSER.DAT
-MRU-style entries (TypedPaths, RunMRU, RecentDocs) are timed with the
-registry key's last-write time, which is when the most recent entry was
-added -- older entries in the same key happened before that time.
-Parses offline hives from the triage collection (NTUSER.DAT via reg load).
+MRU-style entries (TypedPaths, RunMRU, RecentDocs, Open/Save dialogs,
+WordWheelQuery, Remote Desktop MRU) are timed with the registry key's
+last-write time, which is when the most recent entry was added -- older
+entries in the same key happened before that time. TrustRecords, Office
+MRU and TaskCache DynamicInfo store their own times, which are used. The
+settings (IFEO, Winlogon, AppInit_DLLs, Defender exclusions, LSA, WDigest,
+hidden tasks) use their key's last-write time: when the key last changed,
+so the value itself may be older.
 
 ### 5. Browser History
 Parses Chromium (Chrome, Edge, Brave, Opera, Opera GX, Vivaldi) and Firefox
-SQLite databases using auto-downloaded sqlite3.exe -- no DLLs needed:
+SQLite databases using auto-downloaded sqlite3.exe -- no DLLs needed. Each
+database is read from a temporary copy with its -wal and -journal files, so
+a copy taken while the browser was writing is read in its last committed
+state. Sources are "<Browser> <store>", for example "Edge History",
+"Chrome Downloads" or "Firefox Cookies":
   - URL, page title, visit timestamp (stored by the browser in UTC and kept
     as UTC), visit count
   - Bookmarks (Chromium Bookmarks file, Firefox moz_bookmarks): date added
   - Chromium address bar shortcuts (Shortcuts database): last used, hits
   - Chromium Top Sites (Snapshot rows; no times are stored)
+  - Downloads ("<Browser> Downloads", EventType FileAccess; the Chromium
+    History downloads table, the Firefox places.sqlite annotations): a row
+    when the download started; one when it completed, was cancelled,
+    interrupted or blocked, if that was at least a minute later; and, for
+    Chromium, one when the file was last opened from the browser. Details:
+    Path, URL (Chromium: the file's URL, the last of the redirect chain;
+    Firefox: the URL the download started from), Referrer, State (COMPLETE,
+    CANCELLED, INTERRUPTED, IN_PROGRESS, BLOCKED; Firefox's own name in
+    FirefoxState), DangerType (Chromium danger type or the Firefox
+    reputation verdict, e.g. Malware), Bytes, StartUtc, EndUtc; Chromium
+    adds OriginalURL (the first URL of the chain), TabURL, MimeType,
+    InterruptReason and SHA256
+  - Saved logins ("<Browser> Logins", "Firefox Logins"; Chromium Login
+    Data, Firefox logins.json): when a login was saved, last used (only if
+    at least a minute after it was saved), its password changed, and when
+    the user chose "never save" for a site. Details: URL, Action, Realm,
+    Username (Chromium only -- Firefox stores user names encrypted),
+    TimesUsed
+  - Cookies ("<Browser> Cookies", "Firefox Cookies"; Chromium
+    Network\Cookies or Cookies, Firefox cookies.sqlite), aggregated per
+    host: a row when the host's oldest cookie was set and one when its
+    cookies were last accessed. Details: Host, Cookies (count), Names
+    (first 200 characters), Persistent / Secure / HttpOnly counts
+  - Form entries ("<Browser> Autofill", "Firefox Form History"; Chromium
+    Web Data, Firefox formhistory.sqlite): the form field name, when an
+    entry was first saved and last used, and TimesUsed. The newest 20,000
+    entries per database are kept
+  - Search engines ("<Browser> Search Engines", Chromium Web Data): when
+    each engine was added, modified and last used, with its Keyword and URL
+    template. Kind: Prepopulated, Policy, StarterPack, AutoGenerated (from
+    a site's search form) or Custom (added or edited by the user -- or by
+    software that wrote to Web Data, a known search-hijack technique)
+  - Firefox site permissions ("Firefox Permissions", permissions.sqlite):
+    notifications, camera, microphone, location, pop-ups, add-on installs
+    and more, with the value set (ALLOW, DENY, PROMPT) and when
   - User from the collection folder (Browser\<user>\)
+Downloads are FileAccess rows (a download writes a file to disk); all other
+browser rows are NetworkConnection (Top Sites: Snapshot).
+The credential, cookie and form stores are read as metadata only: saved
+passwords, cookie values, autofill and form values, payment cards,
+addresses and Firefox's encrypted user names and passwords are never read
+(the queries never select them, and in logins.json they are blanked before
+parsing). key4.db is never opened.
 
 ### 6. Scheduled Tasks
 Parses scheduled_tasks.csv from the triage collection (live collections):
@@ -440,6 +590,28 @@ Parses the raw $MFT the collector copies (FileSystem\$MFT):
     the same way, so WinSxS, servicing, SoftwareDistribution, Installer,
     assembly, dotnet and WindowsApps are not flagged (on a test system that
     cut 10,230 hits to 180). Treat a flag as a lead, not proof.
+  - Downloads (Mark of the Web): a file saved from the internet by a
+    browser or mail client carries a Zone.Identifier stream ([ZoneTransfer]
+    ZoneId=3, HostUrl=..., ReferrerUrl=...). Its text is small and almost
+    always stored inside the MFT record, so it is read from the collected
+    $MFT, also for deleted files. Each such file gets a row
+    "Downloaded file (Mark of the Web, Internet zone): <path>" (Source MFT,
+    EventType FileAccess; "; record deleted" is added in the brackets when
+    the record is no longer in use). Details: ZoneId, HostUrl, ReferrerUrl,
+    any other key of the stream, the MFT record, size and all times.
+    Zones: 0 Local machine, 1 Local intranet, 2 Trusted sites, 3 Internet,
+    4 Restricted sites; "zone unknown" when there is no ZoneId
+  - "Extracted file (Mark of the Web, <zone>): <path>": the stream has no
+    HostUrl and a local or network path as ReferrerUrl. Explorer writes
+    this for each file it extracts from an archive with Mark of the Web;
+    ReferrerUrl is the archive, whose own row has the HostUrl
+  - These rows are at the $STANDARD_INFORMATION created time, or at the
+    $FILE_NAME created time (RowTime=FN.Created in Details) when the SI
+    time is missing, before 1980 or more than 1 s earlier (backdated, or
+    set from the archive entry on extraction). They are added whatever
+    -MftDays (-StartDate/-EndDate still apply). The file's "File created"
+    row, when in the window, gets ZoneId and HostUrl (or ReferrerUrl)
+    appended to its Details
   - Only times within -MftDays (default 7) days before the collection are
     added; flagged records are kept when their $FILE_NAME time is in range
 Older collections without a $MFT: file listing CSVs are parsed if present
@@ -692,6 +864,40 @@ Timeline Explorer at the same time.
     have no services.csv (it needs live queries). Scheduled tasks of mounted
     images are parsed from the collected task XML files instead.
 
+  - "N IFEO/SilentProcessExit key(s) could not be opened (access denied)"
+    -- A collected hive keeps the key permissions of the system it came
+    from. Keys that deny Administrators (e.g. IFEO\DefenderAgentScan.exe on
+    Windows 11) are skipped and named in the warning.
+
+  - Hidden scheduled tasks -- A task is reported as hidden when its
+    TaskCache\Tree key has no SD value, so the check relies on Windows
+    keeping SD values there. Hidden task folders are only reported when
+    other folders in the same hive have an SD value; otherwise the log says
+    "N TaskCache\Tree folder(s) without an SD value not reported".
+
+  - TaskCache times -- "Scheduled task registered" / "last run" rows from
+    Registry-TaskCache are only added for tasks that scheduled_tasks.csv or
+    the task XML files do not already cover. With -Sources Registry but not
+    ScheduledTasks they are added for every task (a few hundred Microsoft
+    tasks on a normal system).
+
+  - Mark of the Web -- Only Zone.Identifier text stored inside the MFT
+    record (resident, almost always the case) can be read. A non-resident
+    stream still gives a row, with "zone unknown" and no URL. curl.exe and
+    Invoke-WebRequest usually set no Mark of the Web, and copies through
+    FAT/exFAT drives and Unblock-File remove it.
+
+  - Third-party antivirus in the Application log -- Of the event source
+    names read, only Symantec AntiVirus, McLogEvent and Sophos Anti-Virus
+    are documented; the others are the products' names as they register
+    them, not verified against real logs. Events under any other source
+    name are not read.
+
+  - Old browser databases -- Each browser query uses the columns the
+    database has. A Chromium store too old to have the key columns (e.g. a
+    History downloads table without target_path, an autofill table without
+    date_created) is skipped with "0 row(s) added" in the log.
+
   - Collections from older collector versions -- Still supported, with less
     precise times: no collection_info.json (the time zone and collection
     time are read from collection_log.txt), no original file times in the
@@ -730,9 +936,10 @@ Timeline Explorer at the same time.
   Event logs       | Targeted high-value event IDs  | All event IDs
   Prefetch         | Name, run count, run times     | Full binary parsing
   Registry         | Key artifacts (MRU, BAM, etc.) | Hundreds of plugins
-  Browser          | URL history (auto sqlite3)     | Full history + cache
+  Browser          | History, downloads, logins,    | Full history + cache
+                   | cookies, forms (auto sqlite3)  |
   USN Journal      | Parsed from text export        | Full $UsnJrnl binary parse
-  $MFT             | SI/FN times, deleted, windowed | Full $MFT parsing
+  $MFT             | SI/FN, deleted, windowed, MotW | Full $MFT parsing
   Shellbags        | Folder names + key times       | Full shellbag parsing
   Output formats   | CSV + color-coded XLSX         | CSV, JSON, XLSX, and more
   Parsers          | 17 parsers (16 + memory opt-in) | 100+ parsers
@@ -856,20 +1063,70 @@ parsing is skipped, and the timeline CSV can be opened manually.
   After an intended change to the parser output, regenerate the expected rows
   with -UpdateExpected and review the diff before committing.
 
+  Four more scripts test the event log, browser, registry and $MFT parsers.
+  CI runs them after Test-Parsers.ps1 in both PowerShell versions (GitHub
+  Actions runners are elevated):
+
+  tests\Test-EventLogParsers.ps1 -- Part 1 feeds the Security, System,
+  Defender and Application handlers synthetic event records and checks
+  their rows and which event IDs and providers each log reads; it needs no
+  admin and always runs. Part 2 generates real events (audit policy, a
+  temporary local user and group membership, scheduled task, service and
+  classic event log), exports the logs with wevtutil, runs the builder on
+  them and checks the rows. It needs admin and runs only in GitHub Actions or with
+  -AllowSystemChanges; otherwise it is skipped. It undoes its changes, but
+  the event records stay in the Security and System logs. Only in CI does
+  it also clear the Security log (1102) and write synthetic Application
+  events.
+
+  tests\Test-BrowserParsers.ps1 -- builds synthetic Chromium and Firefox
+  databases with sqlite3.exe, runs the builder with -Sources Browser and
+  checks every row, its time and its Details. Every secret column holds a
+  canary string that must not appear in the timeline, the log or the
+  output. Needs admin like the builder (or -BuilderPath with a copy
+  without the admin check); it changes nothing on the system. If
+  sqlite3.exe is missing, the builder is run once to download it.
+
+  tests\Test-RegistryParsers.ps1 -- writes known values (IFEO, Winlogon, a
+  hidden TaskCache task, Defender exclusions, Office, Remote Desktop, ...)
+  below a temporary key HKCU\Software\TriageTimelineTest_<guid>, saves them
+  as SOFTWARE, SYSTEM and NTUSER.DAT hives with reg save, deletes the key,
+  runs the builder with -Sources Registry,ScheduledTasks and checks the
+  rows and times. Needs admin; because it writes to the registry it runs
+  only in GitHub Actions or with -AllowSystemChanges (otherwise it prints
+  SKIP).
+
+  tests\Test-MftParser.ps1 -- builds a small synthetic $MFT and checks the
+  $MFT parser's rows (Mark of the Web: downloaded, extracted, deleted,
+  timestomped and backdated files, stream encodings, extension records).
+  No admin needed: it loads the builder's functions without running the
+  script.
+
+  Run them from an elevated PowerShell; -AllowSystemChanges lets the event
+  log and registry tests change this machine:
+    powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-BrowserParsers.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-MftParser.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers.ps1 -AllowSystemChanges
+    powershell -ExecutionPolicy Bypass -File tests\Test-RegistryParsers.ps1 -AllowSystemChanges
+
 
 ## Windows Built-In Tools Used
 
-  reg.exe              Loads offline registry hives (NTUSER.DAT, SYSTEM,
-                       Amcache.hve) via "reg load" for parsing UserAssist,
-                       TypedPaths, RunMRU, RecentDocs, BAM, ShimCache and
-                       Amcache entries, including key last-write times.
-                       Unloads after.
+  reg.exe              Loads offline registry hives (NTUSER.DAT,
+                       UsrClass.dat, SOFTWARE, SYSTEM, Amcache.hve) via
+                       "reg load" for parsing UserAssist, TypedPaths,
+                       RunMRU, RecentDocs, ShellBags, Office and Remote
+                       Desktop history, IFEO / Winlogon / AppInit_DLLs, the
+                       TaskCache, Defender exclusions, LSA settings, BAM,
+                       ShimCache and Amcache entries, including key
+                       last-write times. Unloads after.
 
   Get-WinEvent         Parses .evtx event log files with XPath filtering.
                        Used for targeted extraction of high-value Security,
-                       System, PowerShell, Sysmon, Task Scheduler,
-                       TerminalServices (RDP), Windows Defender and BITS
-                       events.
+                       System, Application, PowerShell, Sysmon, Task
+                       Scheduler, TerminalServices (RDP), Windows Defender
+                       and BITS events.
 
   WScript.Shell COM    Reads LNK shortcut files to extract target paths,
                        arguments, and working directories for Recent Files.
@@ -941,6 +1198,8 @@ One-time actions (first run only):
 
 Temporary actions (all cleaned up automatically):
   - Extracts triage zip to %TEMP% (browse mode) -- deleted after processing
-  - Copies Amcache.hve to %TEMP% for reg load -- deleted after processing
+  - Copies registry hives (NTUSER.DAT, UsrClass.dat, SOFTWARE, SYSTEM,
+    Amcache.hve) to %TEMP% for reg load -- unloaded and deleted after
+    processing
   - Copies browser DBs to %TEMP% for sqlite3 -- deleted after processing
   - Downloads zip files to %TEMP% (first run) -- deleted after extraction
