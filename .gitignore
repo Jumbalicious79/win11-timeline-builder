@@ -1,8 +1,12 @@
 # Reports (generated at runtime)
 reports/
 
-# Auto-downloaded tool binaries
-tools/
+# Tools: auto-downloaded (sqlite3, Timeline Explorer) or user-provided
+# (Volatility 3) -- never committed. Only each tool folder's README.txt is
+# tracked, so a clone has the expected tools\<tool>\ layout.
+tools/**
+!tools/**/
+!tools/*/README.txt
 
 # Backups
 bak/

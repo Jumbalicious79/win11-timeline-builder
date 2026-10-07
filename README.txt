@@ -91,7 +91,8 @@ Both tools are designed to live side-by-side on a USB drive:
     win11-triage-collector\
       triage-collector.ps1
       Run-TriageCollector.bat
-      tools\                      <-- optional: winpmem.exe for memory capture
+      tools\
+        dumpit\                   <-- optional: DumpIt for memory capture
       reports\                    <-- collections save here
     win11-timeline-builder\
       timeline-builder.ps1
@@ -103,8 +104,10 @@ Both tools are designed to live side-by-side on a USB drive:
 The timeline builder auto-discovers triage collections from the sibling
 directory. sqlite3.exe and Timeline Explorer are auto-downloaded on first run
 and cached in the tools\ directory for future use. For memory capture and
-analysis, place winpmem.exe in the collector's tools\ and vol.exe in the
-builder's tools\volatility3\ (see Optional Tools sections in each README).
+analysis, extract Magnet DumpIt into the collector's tools\dumpit\ and
+Volatility 3 into the builder's tools\volatility3\. Both folders are in the
+repos with a README.txt explaining where to get the tool; the tools
+themselves are never committed.
 
 
 ## Quick Start
@@ -158,10 +161,11 @@ builder's tools\volatility3\ (see Optional Tools sections in each README).
   -StartDate      Only include events after this date (UTC).
   -EndDate        Only include events before this date (UTC).
   -Sources        Parsers to run, as an array or a comma-separated string.
-                  Defaults to all 14 (Memory excluded).
+                  Defaults to all 16 (Memory excluded).
                   Valid: EventLogs, Prefetch, RecentFiles, Registry, FileSystem,
                   Browser, ScheduledTasks, Services, Network, USB, Persistence,
-                  UsnJournal, Amcache, PowerShellHistory, Memory
+                  UsnJournal, Amcache, PowerShellHistory, SystemInfo,
+                  AntiVirus, Memory
                   Note: Memory is opt-in. Requires Volatility 3 in tools\ and
                   a memory dump in the collection. Adds 5-30 minutes.
   -Keywords       Strings to flag in the timeline, as an array or a
@@ -174,6 +178,10 @@ builder's tools\volatility3\ (see Optional Tools sections in each README).
                   are kept (older ones are dropped first). Default 0 =
                   unlimited. The USN journal is usually the largest source;
                   see "Known Limitations" for the Excel row limit.
+  -MftDays        $MFT file-system events: only times within this many days
+                  before the collection are added. Default 30; 0 = all (a
+                  full $MFT can produce millions of rows). Possible
+                  timestomping is always reported (see parser #8).
 
 
 ## Auto-Downloaded Dependencies
@@ -321,7 +329,7 @@ Both timeline.csv and timeline.xlsx contain the same columns:
      -StartDate, -EndDate, -Sources or -MaxUsnEntries.
 
 
-## What Each Parser Extracts (15 Parsers)
+## What Each Parser Extracts (17 Parsers)
 
 ### 1. Event Logs
 Parses .evtx files using Get-WinEvent. Targets high-value forensic events:
@@ -340,6 +348,11 @@ Parses .evtx files using Get-WinEvent. Targets high-value forensic events:
     security-control changes such as real-time protection disabled or an
     exclusion added (EventType SecurityAlert)
   - BITS Client: background transfer jobs and the URLs they download from
+  - Defender detections (defender_detections.csv) with the threat name and
+    severity from defender_threats.csv
+  - Defender support logs (MPLog-*.log): detections and remediations,
+    exclusion lists and exclusion/protection-setting changes
+    (EventType SecurityAlert; MPLog times are UTC)
 
 ### 2. Prefetch
 Extracts execution evidence from the .pf files:
@@ -356,6 +369,11 @@ Parses Windows shortcut files from the collection's RecentFiles folders:
   - User from the collection folder (UserActivity\<user>\RecentFiles)
   - Only the collection is read. If it has no .lnk files there are no LNK
     rows; the analysis machine's own Recent folder is never used.
+  - Jump Lists: AutomaticDestinations (DestList entries: path, last access
+    time, access count, pinned) and CustomDestinations (target paths), per
+    application -- the app name comes from the AppID (well-known IDs) or the
+    program the list starts
+
 
 ### 4. Registry
 Parses registry hives for user activity:
@@ -381,6 +399,9 @@ Parses Chromium (Chrome, Edge, Brave, Opera, Opera GX, Vivaldi) and Firefox
 SQLite databases using auto-downloaded sqlite3.exe -- no DLLs needed:
   - URL, page title, visit timestamp (stored by the browser in UTC and kept
     as UTC), visit count
+  - Bookmarks (Chromium Bookmarks file, Firefox moz_bookmarks): date added
+  - Chromium address bar shortcuts (Shortcuts database): last used, hits
+  - Chromium Top Sites (Snapshot rows; no times are stored)
   - User from the collection folder (Browser\<user>\)
 
 ### 6. Scheduled Tasks
@@ -399,8 +420,22 @@ Parses services.csv from triage collection:
   - Timed with the service registry key's last-write time when the
     collector recorded it (KeyLastWriteUtc); otherwise a Snapshot row
 
-### 8. File System
-Parses file listing CSVs from triage collection. Capped at 50,000 entries.
+### 8. File System ($MFT)
+Parses the raw $MFT the collector copies (FileSystem\$MFT):
+  - File and folder created/modified times ($STANDARD_INFORMATION), with
+    full paths rebuilt from the parent references, MFT record number, size
+    and the $FILE_NAME created time in Details
+  - Deleted files and folders (record no longer in use) are included and
+    labelled "Deleted file"; their paths may be partial (<orphan>\...)
+  - Possible timestomping is flagged with [SI<FN] in the Description when
+    the $STANDARD_INFORMATION created time is earlier than the $FILE_NAME
+    created time, or has no sub-second part while the $FILE_NAME time does.
+    Installers and Windows servicing can also cause this -- treat it as a
+    lead, not proof.
+  - Only times within -MftDays (default 30) days before the collection are
+    added; flagged records are kept when their $FILE_NAME time is in range
+Older collections without a $MFT: file listing CSVs are parsed if present
+(capped at 50,000 entries); otherwise an info line, not a warning.
 
 ### 9. USN Journal
 Parses $UsnJrnl_$J.txt exported by the triage collector:
@@ -466,9 +501,13 @@ Parses command history:
     file's last write (when the last command was added)
 
 ### 15. Memory Dump (opt-in, requires Volatility 3)
-Analyzes raw memory dumps captured by the triage collector using Volatility 3.
+Analyzes memory dumps captured by the triage collector using Volatility 3:
+the crash dump from DumpIt (<collection>_memory_dump.dmp) or a raw image
+(_memory_dump.raw), found next to the collection zip.
 Opt-in only -- not included in default Sources. Add "Memory" to -Sources to enable.
-Requires vol.exe in tools\volatility3\ (see Optional Tools section below).
+Requires vol.exe in tools\volatility3\ (see tools\volatility3\README.txt).
+Windows ARM64 dumps are detected from the dump header and skipped:
+Volatility 3 analyzes Intel x86/x64 Windows memory only (use WinDbg).
   - windows.pslist: Running processes with creation timestamps, PIDs, parent PIDs
   - windows.netscan: Network connections with protocol, addresses, ports, state
   - windows.cmdline: Full command line arguments for each process
@@ -476,6 +515,29 @@ Requires vol.exe in tools\volatility3\ (see Optional Tools section below).
 Memory artifacts use the same EventTypes as disk artifacts (ProcessCreation,
 NetworkConnection, Execution, ServiceChange) and are color-coded automatically.
 The Source column distinguishes them (Memory-Processes, Memory-Network, etc.).
+
+### 16. System Info
+Parses systeminfo.txt and the firewall rule list:
+  - "Windows installed" (Original Install Date, EventType Installation) and
+    "System booted" (System Boot Time) at their real times
+  - One Snapshot row with OS name, version, build, system type and domain
+  - Enabled inbound Allow firewall rules (Snapshot rows)
+
+### 17. Antivirus Logs (third-party)
+Parses the third-party AV logs the collector copies to AntiVirus\<vendor>\
+into SecurityAlert rows (detections, blocks, quarantines, failures; routine
+scan/update lines are skipped):
+  - Symantec / Broadcom Endpoint Protection: daily AV logs (AV\*.Log)
+  - Sophos Anti-Virus: SAV.txt
+  - McAfee VirusScan Enterprise: AccessProtectionLog.txt (blocked and
+    would-be-blocked actions)
+  - ESET: virlog.dat (binary; best effort -- the format is undocumented)
+These logs record the examined machine's local time, converted to UTC.
+Built and tested against public sample logs from the plaso project
+(Symantec, Sophos, McAfee) and a public ESET sample. Other products
+(CrowdStrike, SentinelOne, Carbon Black, Kaspersky, Malwarebytes, ...) are
+collected but not parsed: no public sample logs, and several keep their
+detections in the vendor's cloud console rather than in local logs.
 
 
 ## Viewing the Timeline
@@ -607,10 +669,6 @@ Timeline Explorer at the same time.
 
 ## Known Limitations and Expected Warnings
 
-  - "No file system data found" -- The triage collector does not produce a
-    file_listing.csv. File system data comes from the USN Journal parser
-    instead. This warning is normal.
-
   - USN journal size -- All USN rows are kept by default. On a very busy
     system the timeline can exceed Excel's row limit (see above); use
     -MaxUsnEntries N to keep only the newest N rows. The log says how many
@@ -666,16 +724,16 @@ Timeline Explorer at the same time.
   Registry         | Key artifacts (MRU, BAM, etc.) | Hundreds of plugins
   Browser          | URL history (auto sqlite3)     | Full history + cache
   USN Journal      | Parsed from text export        | Full $UsnJrnl binary parse
-  $MFT             | Not supported                  | Full $MFT parsing
+  $MFT             | SI/FN times, deleted, windowed | Full $MFT parsing
   Shellbags        | Folder names + key times       | Full shellbag parsing
   Output formats   | CSV + color-coded XLSX         | CSV, JSON, XLSX, and more
-  Parsers          | 15 parsers (14 + memory opt-in) | 100+ parsers
+  Parsers          | 17 parsers (16 + memory opt-in) | 100+ parsers
 
   When to use this: Quick triage, initial timeline, no-install environments,
   USB kit deployment, when you need results in minutes not hours.
 
   When to use plaso: Full forensic investigation, court-ready analysis, when
-  you need exhaustive artifact coverage or $MFT timeline data.
+  you need exhaustive artifact coverage.
 
 
 ## Requirements
@@ -742,19 +800,25 @@ parsing is skipped, and the timeline CSV can be opened manually.
 ## Optional Tools (User-Provided)
 
 ### Volatility 3 (Memory Analysis)
-  Purpose:    Analyzes raw memory dumps to extract running processes, network
+  Purpose:    Analyzes memory dumps to extract running processes, network
               connections, command lines, and services from RAM.
   Author:     Volatility Foundation
   Source:     https://github.com/volatilityfoundation/volatility3/releases
-  License:    Volatility Software License (open source)
-  Place at:   tools\volatility3\vol.exe
+  License:    Volatility Software License (open source); not redistributed
+              with this repo
+  Place at:   tools\volatility3\vol.exe (the folder and its README.txt are in
+              the repo; the tool is not)
   Used by:    Parser #15 (Memory Dump) -- opt-in only
 
-  Setup:
-    1. Download the latest standalone Windows release from:
+  Setup (details: tools\volatility3\README.txt):
+    1. Download the Windows executables asset of the latest release,
+       volatility3-win-exes-<version>.zip, from:
        https://github.com/volatilityfoundation/volatility3/releases
-    2. Extract vol.exe (the standalone executable)
-    3. Place it in: win11-timeline-builder\tools\volatility3\vol.exe
+    2. Extract it into win11-timeline-builder\tools\volatility3\ so that
+       tools\volatility3\vol.exe exists (x64 build; runs under emulation
+       on Windows on ARM)
+    Volatility 3 analyzes Intel x86/x64 Windows memory only; ARM64 dumps
+    are skipped with a note.
 
   The Memory parser is opt-in. Add "Memory" to -Sources to enable it.
   If vol.exe is not found, the parser logs download instructions and skips.
