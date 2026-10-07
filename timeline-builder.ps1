@@ -50,7 +50,7 @@ param(
     # collection are added (0 = all). A full $MFT can hold millions of times.
     [Parameter(Mandatory = $false)]
     [ValidateRange(0, 36500)]
-    [int]$MftDays = 30
+    [int]$MftDays = 7
 )
 
 # --- Require Administrator ---
@@ -4318,19 +4318,42 @@ namespace TimelineNtfs
             return end > usersPrefix.Length ? path.Substring(usersPrefix.Length, end - usersPrefix.Length) : "";
         }
 
-        // Possible timestomping: SI Created more than 1 s before FN Created, or SI
-        // Created and Modified on whole seconds while FN Created is not
-        static string TimestompReason(long created, long modified, long fnCreatedTime)
+        // Possible timestomping: on an executable or script, SI Created is on a
+        // whole second and more than 1 s earlier than FN Created (backdating
+        // tools set whole-second times). Windows servicing and installers lay
+        // files down the same way in WinSxS, servicing, Installer, dotnet and
+        // WindowsApps; those locations are not flagged (on a real system they
+        // were 98% of all hits without this rule).
+        const string TimestompReason = "possible timestomping: executable/script whose SI Created is on a whole second and more than 1 s earlier than FN Created";
+        static readonly string[] StompExtensions = { ".exe", ".dll", ".sys", ".ps1", ".psm1", ".bat", ".cmd", ".vbs", ".js", ".jse", ".wsf", ".hta", ".scr", ".com", ".cpl", ".msi", ".lnk" };
+        static readonly string[] StompExcludedPrefixes = {
+            "\\Windows\\WinSxS\\", "\\Windows\\servicing\\", "\\Windows\\SoftwareDistribution\\",
+            "\\Windows\\Installer\\", "\\Windows\\assembly\\", "\\Program Files\\dotnet\\",
+            "\\Program Files (x86)\\dotnet\\", "\\Program Files\\WindowsApps\\" };
+
+        static bool StompTimes(long created, long fnCreatedTime)
         {
-            if (!IsValidTime(created) || !IsValidTime(fnCreatedTime)) return null;
-            string reason = null;
-            if (created < fnCreatedTime - TicksPerSecond) reason = "SI Created is more than 1 s earlier than FN Created";
-            if (created % TicksPerSecond == 0 && IsValidTime(modified) && modified % TicksPerSecond == 0 && fnCreatedTime % TicksPerSecond != 0)
+            if (!IsValidTime(created) || !IsValidTime(fnCreatedTime)) return false;
+            return created < fnCreatedTime - TicksPerSecond && created % TicksPerSecond == 0;
+        }
+
+        static bool StompPath(string path)
+        {
+            // Extension by hand: paths can hold characters Path.GetExtension rejects
+            int dot = path.LastIndexOf('.');
+            if (dot <= path.LastIndexOf('\\')) return false;
+            string ext = path.Substring(dot);
+            bool executable = false;
+            foreach (string e in StompExtensions)
             {
-                const string wholeSeconds = "SI Created and Modified have no sub-second part but FN Created has one";
-                reason = reason == null ? wholeSeconds : reason + "; " + wholeSeconds;
+                if (string.Equals(ext, e, StringComparison.OrdinalIgnoreCase)) { executable = true; break; }
             }
-            return reason == null ? null : "possible timestomping: " + reason;
+            if (!executable) return false;
+            foreach (string prefix in StompExcludedPrefixes)
+            {
+                if (path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return false;
+            }
+            return true;
         }
 
         static void AppendTime(StringBuilder sb, string label, long fileTime)
@@ -4411,7 +4434,11 @@ namespace TimelineNtfs
                 if ((st & StValid) == 0 || (st & StHasSI) == 0) continue;
                 long created = siCreated[r];
                 long modified = siModified[r];
-                string stomp = TimestompReason(created, modified, fnCreated[r]);
+                string stomp = null;
+                if ((st & StDir) == 0 && StompTimes(created, fnCreated[r]) && StompPath(FullPath(r)))
+                {
+                    stomp = TimestompReason;
+                }
                 if (stomp != null) result.TimestompRecords++;
                 // Backdating moves SI times out of the window: keep flagged records
                 // whose FN Created time is in it

@@ -179,8 +179,9 @@ themselves are never committed.
                   unlimited. The USN journal is usually the largest source;
                   see "Known Limitations" for the Excel row limit.
   -MftDays        $MFT file-system events: only times within this many days
-                  before the collection are added. Default 30; 0 = all (a
-                  full $MFT can produce millions of rows). Possible
+                  before the collection are added. Default 7; 0 = all. A
+                  full $MFT can produce millions of rows, and one Windows
+                  update alone can add hundreds of thousands. Possible
                   timestomping is always reported (see parser #8).
 
 
@@ -427,12 +428,15 @@ Parses the raw $MFT the collector copies (FileSystem\$MFT):
     and the $FILE_NAME created time in Details
   - Deleted files and folders (record no longer in use) are included and
     labelled "Deleted file"; their paths may be partial (<orphan>\...)
-  - Possible timestomping is flagged with [SI<FN] in the Description when
-    the $STANDARD_INFORMATION created time is earlier than the $FILE_NAME
-    created time, or has no sub-second part while the $FILE_NAME time does.
-    Installers and Windows servicing can also cause this -- treat it as a
-    lead, not proof.
-  - Only times within -MftDays (default 30) days before the collection are
+  - Possible timestomping is flagged with [SI<FN] in the Description for an
+    executable or script (.exe .dll .sys .ps1 .bat .vbs .js .scr .lnk ...)
+    whose $STANDARD_INFORMATION created time is on a whole second and more
+    than 1 s earlier than its $FILE_NAME created time -- the pattern
+    backdating tools leave. Windows servicing and installers lay files down
+    the same way, so WinSxS, servicing, SoftwareDistribution, Installer,
+    assembly, dotnet and WindowsApps are not flagged (on a test system that
+    cut 10,230 hits to 180). Treat a flag as a lead, not proof.
+  - Only times within -MftDays (default 7) days before the collection are
     added; flagged records are kept when their $FILE_NAME time is in range
 Older collections without a $MFT: file listing CSVs are parsed if present
 (capped at 50,000 entries); otherwise an info line, not a warning.
