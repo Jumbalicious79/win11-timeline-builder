@@ -1526,10 +1526,11 @@ function Add-ApplicationEventEntries {
             $details["HangType"] = Get-EvtxFieldValue $f @("HangType", "param10")
         }
         elseif ($provider -eq "SecurityCenter") {
-            # %1 product, %2 state (SECURITY_PRODUCT_STATE_ON / OFF / SNOOZED / EXPIRED)
-            $type = "SecurityAlert"
+            # %1 product, %2 state (SECURITY_PRODUCT_STATE_ON / OFF / SNOOZED / EXPIRED).
+            # A product that is ON is context, not an alert.
             $product = Get-EvtxFieldValue $f @("param1")
             $state = (Get-EvtxFieldValue $f @("param2")) -replace '^SECURITY_PRODUCT_STATE_', ''
+            $type = if ($state -eq "ON") { "Snapshot" } else { "SecurityAlert" }
             if (-not $product) { continue }
             $details["Product"] = $product
             $details["State"] = $state

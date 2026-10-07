@@ -427,7 +427,7 @@ Test-Case -Name "Application: MSI, crashes, hangs, Security Center, ESENT, third
     @{ EventType = "Execution"; Description = "Application crashed: oldapp.exe (exception 0xc0000409 in oldmod.dll)"
         Details = "EventID=1000 | Application=oldapp.exe | Version=1.0.0.0 | Module=oldmod.dll | ModuleVersion=2.0.0.0 | ExceptionCode=0xc0000409 | FaultOffset=0x0000000000004321 | Path=C:\Apps\oldapp.exe | ModulePath=C:\Apps\oldmod.dll" },
     @{ EventType = "Execution"; Description = "Application hung and was closed: slowapp.exe"; Details = "EventID=1002 | Application=slowapp.exe | Version=3.1 | Path=C:\Apps\slowapp.exe | HangType=Quiesce" },
-    @{ Timestamp = "2026-01-03 10:00:00.000"; EventType = "SecurityAlert"; Description = "Security product state: Test AV ON"; Details = "EventID=15 | Product=Test AV | State=ON" },
+    @{ Timestamp = "2026-01-03 10:00:00.000"; EventType = "Snapshot"; Description = "Security product state: Test AV ON"; Details = "EventID=15 | Product=Test AV | State=ON" },
     @{ Timestamp = "2026-01-03 10:10:00.000"; EventType = "SecurityAlert"; Description = "Security product state: Test AV OFF"; Details = "EventID=15 | Product=Test AV | State=OFF | PreviousState=ON" },
     @{ EventType = "SecurityAlert"; Description = "Security Center could not update product state: Test AV SNOOZED"; Details = "EventID=16 | Product=Test AV | State=SNOOZED" },
     @{ EventType = "FileAccess"; Description = "ESE database created: C:\Temp\copy\ntds.dit"; Details = "EventID=325 | Database=C:\Temp\copy\ntds.dit | Process=TestProc | ProcessId=4321 | Instance=TestInstance" },
