@@ -50,7 +50,16 @@ param(
     # collection are added (0 = all). A full $MFT can hold millions of times.
     [Parameter(Mandatory = $false)]
     [ValidateRange(0, 36500)]
-    [int]$MftDays = 7
+    [int]$MftDays = 7,
+
+    # Viewer to open at the end without asking (for scripts and automation)
+    [Parameter(Mandatory = $false)]
+    [ValidateSet("Excel", "TimelineExplorer", "Both", "None")]
+    [string]$Viewer,
+
+    # CSV only: don't generate timeline.xlsx (ImportExcel isn't needed)
+    [Parameter(Mandatory = $false)]
+    [switch]$NoExcel
 )
 
 # --- Require Administrator ---
@@ -7346,7 +7355,11 @@ Log "--- Generating Color-Coded Excel Timeline ---"
 # Excel worksheets hold at most 1,048,576 rows (1 header + 1,048,575 data rows)
 $excelMaxDataRows = 1048575
 $skipExcel = $false
-if ($dedupedCount -gt $excelMaxDataRows) {
+if ($NoExcel) {
+    Log "  -NoExcel: skipping Excel generation (CSV only)."
+    $skipExcel = $true
+}
+elseif ($dedupedCount -gt $excelMaxDataRows) {
     Log-Warning "  Timeline has $dedupedCount entries, more than Excel's limit of $excelMaxDataRows rows."
     Log-Warning "  Skipping Excel generation -- use the CSV (or narrow with -StartDate/-EndDate, -Sources, -MaxUsnEntries)."
     $skipExcel = $true
@@ -7570,44 +7583,60 @@ Log "    CSV: $OutputFile"
 if ($xlsxGenerated) { Log "    Excel (color-coded): $xlsxFile" }
 Log ""
 
-# Build viewer menu dynamically based on what's available
-Write-Host ""
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "  How would you like to view the timeline?" -ForegroundColor Cyan
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host ""
-
-$menuOptions = @()
-
-if ($xlsxGenerated) {
-    $menuOptions += @{ Key = "1"; Label = "Excel (color-coded .xlsx)"; Action = "excel" }
-    Write-Host "  [1] Excel -- rows pre-colored by EventType, ready to analyze" -ForegroundColor Green
-    Write-Host "       (Logon=Green, Execution=Orange, Persistence=Red, Network=Blue, etc.)" -ForegroundColor DarkGray
+if ($Viewer) {
+    # -Viewer given: no menu (scripts, automation, tests)
+    $selectedAction = switch ($Viewer) {
+        "Excel"            { "excel" }
+        "TimelineExplorer" { "te" }
+        "Both"             { "both" }
+        default            { "none" }
+    }
+    if (($selectedAction -eq "excel" -or $selectedAction -eq "both") -and -not $xlsxGenerated) {
+        Log-Warning "  -Viewer ${Viewer}: no Excel file was generated, so Excel is not opened."
+        if ($selectedAction -eq "both") { $selectedAction = "te" } else { $selectedAction = "none" }
+    }
+    Log "  Viewer selection: $Viewer (-Viewer)"
 }
+else {
+    # Build viewer menu dynamically based on what's available
+    Write-Host ""
+    Write-Host "========================================" -ForegroundColor Cyan
+    Write-Host "  How would you like to view the timeline?" -ForegroundColor Cyan
+    Write-Host "========================================" -ForegroundColor Cyan
+    Write-Host ""
 
-$teOptionNum = $menuOptions.Count + 1
-$menuOptions += @{ Key = "$teOptionNum"; Label = "Timeline Explorer (Eric Zimmerman)"; Action = "te" }
-Write-Host "  [$teOptionNum] Timeline Explorer -- powerful forensic CSV viewer (no colors," -ForegroundColor White
-Write-Host "       requires manual conditional formatting setup per session)" -ForegroundColor DarkGray
+    $menuOptions = @()
 
-if ($xlsxGenerated) {
-    $bothOptionNum = $menuOptions.Count + 1
-    $menuOptions += @{ Key = "$bothOptionNum"; Label = "Both"; Action = "both" }
-    Write-Host "  [$bothOptionNum] Both -- open Excel (colored) and Timeline Explorer side by side" -ForegroundColor White
+    if ($xlsxGenerated) {
+        $menuOptions += @{ Key = "1"; Label = "Excel (color-coded .xlsx)"; Action = "excel" }
+        Write-Host "  [1] Excel -- rows pre-colored by EventType, ready to analyze" -ForegroundColor Green
+        Write-Host "       (Logon=Green, Execution=Orange, Persistence=Red, Network=Blue, etc.)" -ForegroundColor DarkGray
+    }
+
+    $teOptionNum = $menuOptions.Count + 1
+    $menuOptions += @{ Key = "$teOptionNum"; Label = "Timeline Explorer (Eric Zimmerman)"; Action = "te" }
+    Write-Host "  [$teOptionNum] Timeline Explorer -- powerful forensic CSV viewer (no colors," -ForegroundColor White
+    Write-Host "       requires manual conditional formatting setup per session)" -ForegroundColor DarkGray
+
+    if ($xlsxGenerated) {
+        $bothOptionNum = $menuOptions.Count + 1
+        $menuOptions += @{ Key = "$bothOptionNum"; Label = "Both"; Action = "both" }
+        Write-Host "  [$bothOptionNum] Both -- open Excel (colored) and Timeline Explorer side by side" -ForegroundColor White
+    }
+
+    $noneOptionNum = $menuOptions.Count + 1
+    $menuOptions += @{ Key = "$noneOptionNum"; Label = "None"; Action = "none" }
+    Write-Host "  [$noneOptionNum] None -- just save the files, don't open anything" -ForegroundColor DarkGray
+    Write-Host ""
+
+    $maxOption = $menuOptions.Count
+    do {
+        $viewerChoice = Read-Host "Select a viewer (1-$maxOption)"
+    } while (-not ($menuOptions.Key -contains $viewerChoice))
+
+    $selectedAction = ($menuOptions | Where-Object { $_.Key -eq $viewerChoice }).Action
+    Log "  Viewer selection: $($($menuOptions | Where-Object { $_.Key -eq $viewerChoice }).Label)"
 }
-
-$noneOptionNum = $menuOptions.Count + 1
-$menuOptions += @{ Key = "$noneOptionNum"; Label = "None"; Action = "none" }
-Write-Host "  [$noneOptionNum] None -- just save the files, don't open anything" -ForegroundColor DarkGray
-Write-Host ""
-
-$maxOption = $menuOptions.Count
-do {
-    $viewerChoice = Read-Host "Select a viewer (1-$maxOption)"
-} while (-not ($menuOptions.Key -contains $viewerChoice))
-
-$selectedAction = ($menuOptions | Where-Object { $_.Key -eq $viewerChoice }).Action
-Log "  Viewer selection: $($($menuOptions | Where-Object { $_.Key -eq $viewerChoice }).Label)"
 
 # --- Helper: ensure Timeline Explorer is available ---
 function Get-TimelineExplorer {

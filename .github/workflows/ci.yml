@@ -41,6 +41,25 @@ jobs:
           if ($failed) { exit 1 }
           Write-Host "All scripts parse in PowerShell $($PSVersionTable.PSVersion)"
 
+  parser-tests:
+    # Runs the builder on the fixture collection in tests\fixtures and
+    # compares the timeline with the expected rows (Windows runners are
+    # elevated, which the builder requires)
+    name: Parser tests (${{ matrix.shell }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run parser tests
+        run: ./tests/Test-Parsers.ps1
+
   analyze:
     name: PSScriptAnalyzer
     runs-on: windows-latest
