@@ -698,6 +698,247 @@ function ConvertFrom-CollectorTimeText {
     return ConvertFrom-CollectorLocalText $Text
 }
 
+# Get-MpThreat SeverityID values
+$script:DefenderSeverityNames = @{ "0" = "Unknown"; "1" = "Low"; "2" = "Moderate"; "4" = "High"; "5" = "Severe" }
+
+# Defender threat catalog written by the collector (Get-MpThreat: ThreatID,
+# ThreatName, SeverityID, CategoryID). Get-MpThreatDetection has no threat
+# name, so detections are named from here. Keys are "id:<ThreatID>" and
+# "name:<ThreatName>" (the support logs only give the name).
+function Get-DefenderThreatCatalog {
+    $catalog = @{}
+    foreach ($csv in (Find-ArtifactFiles -BasePath $InputPath -FileNames @("defender_threats.csv"))) {
+        try {
+            # A collection without threats holds only a text placeholder line
+            foreach ($row in (Import-Csv -Path $csv.FullName -ErrorAction Stop)) {
+                $id = Get-ArtifactRowValue $row @("ThreatID")
+                $name = Get-ArtifactRowValue $row @("ThreatName")
+                if (-not $id -and -not $name) { continue }
+                $severityId = Get-ArtifactRowValue $row @("SeverityID")
+                $severity = $severityId
+                if ($script:DefenderSeverityNames.ContainsKey($severityId)) { $severity = "$($script:DefenderSeverityNames[$severityId]) ($severityId)" }
+                $entry = [PSCustomObject]@{ Name = $name; Severity = $severity; CategoryID = Get-ArtifactRowValue $row @("CategoryID") }
+                if ($id) { $catalog["id:$id"] = $entry }
+                if ($name) { $catalog["name:$name"] = $entry }
+            }
+        }
+        catch { Log-Warning "  Could not read Defender threat catalog $($csv.Name): $($_.Exception.Message)" }
+    }
+    return $catalog
+}
+
+# "MP_THREAT_ACTION_QUARANTINE" -> "Quarantine", "MPSOURCE_REALTIME" -> "Realtime"
+function ConvertTo-DefenderLogName {
+    param([string]$Token)
+    $words = ($Token -replace '^(MP_THREAT_ACTION_|MPSOURCE_)', '' -replace '_', ' ').ToLowerInvariant()
+    return [System.Globalization.CultureInfo]::InvariantCulture.TextInfo.ToTitleCase($words)
+}
+
+# Path of a support-log resource or SDN query, without volume or drive, in
+# lower case ("file:C:\x" and "\Device\HarddiskVolume4\x" both give "\x")
+function Get-DefenderLogPathKey {
+    param([string]$Path)
+    return (($Path -replace '^file:', '') -replace '^\\Device\\HarddiskVolume\d+|^[A-Za-z]:', '').ToLowerInvariant()
+}
+
+# Exclusion lists of one "RTP Perf Log" block (Process / Path / Ext / Temp
+# Exclusions) compared with the block before; differences become rows at
+# the block's time. The first block in the logs only lists what was already
+# in effect. Returns the number of rows added.
+function Compare-DefenderExclusionListing {
+    param([hashtable]$State, [System.Collections.Specialized.OrderedDictionary]$Items, $Time, [System.IO.FileInfo]$File, [string]$User, [int]$Line)
+    if ($null -eq $Time) { return 0 }
+    $added = 0
+    $previous = $State.Exclusions
+    $previousText = if ($State.ExclusionListTime) { $State.ExclusionListTime.ToString("yyyy-MM-dd HH:mm:ss") + " UTC" } else { "" }
+    $changes = @()
+    foreach ($key in $Items.Keys) {
+        if ($null -ne $previous -and $previous.Contains($key)) { continue }
+        $what = if ($null -eq $previous) { "in effect" } else { "added" }
+        $changes += , @($what, $key)
+    }
+    if ($null -ne $previous) {
+        foreach ($key in $previous.Keys) {
+            if (-not $Items.Contains($key)) { $changes += , @("removed", $key) }
+        }
+    }
+    foreach ($change in $changes) {
+        $parts = $change[1] -split "`t", 2
+        $when = switch ($change[0]) {
+            "in effect" { "Listed at the first RTP perf log in the support logs (added earlier)" }
+            "added"     { "Not listed at $previousText, listed at this time" }
+            "removed"   { "Listed at $previousText, not listed at this time" }
+        }
+        Add-TimelineEntry -Timestamp $Time -Source $File.Name -EventType "SecurityAlert" `
+            -Description "Defender exclusion $($change[0]) ($($parts[0])): $($parts[1])" `
+            -User $User `
+            -Details (Format-ArtifactDetails ([ordered]@{ Type = $parts[0]; Exclusion = $parts[1]; When = $when; Line = $Line })) `
+            -Artifact "AntiVirus" -RawPath $File.FullName
+        $added++
+    }
+    $State.Exclusions = $Items
+    $State.ExclusionListTime = $Time
+    return $added
+}
+
+# Defender support log (MPLog-*.log / MPDetection-*.log, UTF-16). Line times
+# are UTC with or without a trailing "Z": in the real logs every session
+# header "Current time: ... UTC" equals the time of the next line, also after
+# the platform update that dropped the "Z". As a safeguard, a header that
+# differs from the next line by 10+ minutes sets an offset for lines without
+# "Z". Rows (SecurityAlert) come only from:
+#   DETECTIONEVENT / DETECTION           threat detected (SHA-256 from the SDN query)
+#   DETECTION_CLEANEVENT                 remediation (quarantine, remove, ...)
+#   Path exclusion changed, new size     exclusion list changed (size differs)
+#   RTP Perf Log exclusion lists         exclusion added / removed
+#   RTPPlugin state ... RTPStatus:x->0   real-time protection off (and back on)
+#   [TP] State change (not at startup)   Tamper Protection state changed
+# $State carries exclusion state and seen detections from file to file.
+# Returns the number of rows added.
+function Read-DefenderSupportLog {
+    param([System.IO.FileInfo]$File, [hashtable]$State, [hashtable]$Catalog)
+    $added = 0
+    $user = Get-CollectionUser $File.FullName
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    $utcStyles = [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal
+    $formats = [string[]]@("yyyy-MM-dd'T'HH:mm:ss.FFFFFFF", "yyyy-MM-dd'T'HH:mm:ss")
+    $offset = [TimeSpan]::Zero
+    $headerUtc = $null
+    $lastUtc = $null
+    $perf = $null
+    $lineNo = 0
+    foreach ($line in [System.IO.File]::ReadLines($File.FullName)) {
+        $lineNo++
+        if ($line -notmatch '^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?)(Z?) (.*)$') {
+            # Untimed lines: session headers and RTP perf log blocks
+            if ($line -match '^Current time: (\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2})[.\d]* UTC') {
+                $headerUtc = [datetime]::ParseExact($Matches[1], "MM/dd/yyyy HH:mm:ss", $invariant, $utcStyles)
+            }
+            elseif ($line -match '^\*+RTP Perf Log\*+\s*$') {
+                $perf = @{ Time = $lastUtc; Line = $lineNo; Items = [ordered]@{}; Current = $null }
+            }
+            elseif ($perf -and $line.Contains("END RTP Perf Log")) {
+                $added += Compare-DefenderExclusionListing -State $State -Items $perf.Items -Time $perf.Time -File $File -User $user -Line $perf.Line
+                $perf = $null
+            }
+            elseif ($perf) {
+                if ($line -match '^(Process|Path|Ext|Temp) Exclusions:\s*$') { $perf.Current = $Matches[1] }
+                elseif ($perf.Current -and $line -match '^\s+(\S.*?)\s*$') { $perf.Items["$($perf.Current)`t$($Matches[1])"] = $true }
+                else { $perf.Current = $null }
+            }
+            continue
+        }
+        $stamp = $Matches[1]
+        $hasZ = $Matches[2] -eq "Z"
+        $msg = $Matches[3]
+        $t = [datetime]::MinValue
+        if (-not [datetime]::TryParseExact($stamp, $formats, $invariant, $utcStyles, [ref]$t)) { continue }
+        if ($null -ne $headerUtc) {
+            $offset = [TimeSpan]::Zero
+            $diff = $headerUtc - $t
+            if (-not $hasZ -and [Math]::Abs($diff.TotalMinutes) -ge 10) {
+                $offset = [TimeSpan]::FromMinutes([Math]::Round($diff.TotalMinutes / 15) * 15)
+                Log-Warning "    $($File.Name) line $($lineNo): times without 'Z' differ from the UTC header -- applying an offset of $($offset.TotalMinutes) minute(s)"
+            }
+            $headerUtc = $null
+        }
+        if (-not $hasZ) { $t = $t + $offset }
+        $lastUtc = $t
+        if ($perf) {
+            $added += Compare-DefenderExclusionListing -State $State -Items $perf.Items -Time $perf.Time -File $File -User $user -Line $perf.Line
+            $perf = $null
+        }
+
+        $desc = $null
+        $details = $null
+        if ($msg.StartsWith("DETECTION")) {
+            $source = ""; $action = ""; $result = ""
+            if ($msg -match '^DETECTIONEVENT\s+(\S+)\s+(\S+)\s+(.*?);?\s*$') {
+                $source = $Matches[1]; $threat = $Matches[2]; $resource = $Matches[3]
+                $desc = "Defender detection (support log): $threat"
+            }
+            elseif ($msg -match '^DETECTION_CLEANEVENT\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.*?);?\s*$') {
+                $source = $Matches[1]; $action = ConvertTo-DefenderLogName $Matches[2]; $result = $Matches[3]; $threat = $Matches[4]; $resource = $Matches[5]
+                $desc = "Defender remediation (support log): $threat ($action)"
+            }
+            elseif ($msg -match '^DETECTION\s+(\S+)\s+(.*?);?\s*$') {
+                $threat = $Matches[1]; $resource = $Matches[2]
+                $desc = "Defender detection (support log): $threat"
+            }
+            else { continue }
+            # MPLog and MPDetection can record the same detection
+            $seenKey = "$desc`t$($t.Ticks)`t$resource"
+            if ($State.Seen.ContainsKey($seenKey)) { continue }
+            $State.Seen[$seenKey] = $true
+            $known = $Catalog["name:$threat"]
+            $pathKey = Get-DefenderLogPathKey (($resource -split ';')[0])
+            $details = [ordered]@{
+                Resource        = $resource
+                DetectionSource = $(if ($source) { ConvertTo-DefenderLogName $source } else { "" })
+                Action          = $action
+                Result          = $result
+                Severity        = $(if ($known) { $known.Severity } else { "" })
+                SHA256          = $State.Sha[$pathKey]
+            }
+        }
+        elseif ($msg.StartsWith("SDN:Issuing SDN query for ")) {
+            # File hashes sent to the cloud just before a detection
+            if ($msg -match '^SDN:Issuing SDN query for (.+?) \(.*sha2=([0-9A-Fa-f]{64})') {
+                $State.Sha[(Get-DefenderLogPathKey $Matches[1])] = $Matches[2]
+            }
+            continue
+        }
+        elseif ($msg.Contains("Path exclusion changed, new size in bytes:")) {
+            if ($msg -notmatch 'new size in bytes: (\d+)') { continue }
+            $size = [long]$Matches[1]
+            $before = $State.ExclusionSize
+            $State.ExclusionSize = $size
+            if ($null -eq $before -or $before -eq $size) { continue }
+            $change = if ($size -gt $before) { "grew" } else { "shrank" }
+            $desc = "Defender path exclusion list changed (support log): $before -> $size bytes"
+            $details = [ordered]@{ Change = "list $change (exclusion $(if ($size -gt $before) { 'added' } else { 'removed' }) or changed)" }
+        }
+        elseif ($msg.Contains("RTPStatus:")) {
+            if ($msg -notmatch 'RTPStatus:(\d+)->(\d+)') { continue }
+            $from = [int]$Matches[1]
+            $to = [int]$Matches[2]
+            if ($to -eq 0 -and $from -ne 0) {
+                $desc = "Defender real-time protection turned off (support log)"
+                $State.RtpOff = $true
+            }
+            elseif ($to -ne 0 -and $State.RtpOff) {
+                $desc = "Defender real-time protection turned back on (support log)"
+                $State.RtpOff = $false
+            }
+            else { continue }
+            $details = [ordered]@{ State = ($msg -replace '^.*?follow:\s*', '') }
+        }
+        elseif ($msg.StartsWith("[TP] State change.")) {
+            # Every service start logs OldState 0 -> current state; only a
+            # change from a known state is an event
+            if ($msg -notmatch 'NewState: (0x[0-9A-Fa-f]+|\d+), OldState: (0x[0-9A-Fa-f]+|\d+)') { continue }
+            $newState = $Matches[1]
+            $oldState = $Matches[2]
+            $newValue = if ($newState -like "0x*") { [Convert]::ToInt32($newState.Substring(2), 16) } else { [int]$newState }
+            $oldValue = if ($oldState -like "0x*") { [Convert]::ToInt32($oldState.Substring(2), 16) } else { [int]$oldState }
+            if ($oldValue -eq 0 -or $newValue -eq $oldValue) { continue }
+            $desc = "Defender Tamper Protection state changed (support log): $oldState -> $newState"
+            $details = [ordered]@{ Source = $(if ($msg -match 'Source: ([^,]+)') { $Matches[1] } else { "" }) }
+        }
+        else { continue }
+
+        $details["Line"] = $lineNo
+        Add-TimelineEntry -Timestamp $t -Source $File.Name -EventType "SecurityAlert" `
+            -Description $desc -User $user -Details (Format-ArtifactDetails $details) `
+            -Artifact "AntiVirus" -RawPath $File.FullName
+        $added++
+    }
+    if ($perf) {
+        $added += Compare-DefenderExclusionListing -State $State -Items $perf.Items -Time $perf.Time -File $File -User $user -Line $perf.Line
+    }
+    return $added
+}
+
 function Parse-EventLogs {
     Log "--- Parsing Event Logs ---"
     $evtxFiles = Find-ArtifactFiles -BasePath $InputPath -Extensions @(".evtx")
@@ -1203,27 +1444,35 @@ function Parse-EventLogs {
     $threatStatusNames = @{ "0" = "Unknown"; "1" = "Detected"; "2" = "Cleaned"; "3" = "Quarantined"; "4" = "Removed";
         "5" = "Allowed"; "6" = "Blocked"; "102" = "QuarantineFailed"; "103" = "RemoveFailed"; "104" = "AllowFailed";
         "105" = "Abandoned"; "107" = "BlockedFailed" }
+    # Get-MpThreatDetection has no threat name: it comes from the Get-MpThreat catalog
+    $threatCatalog = Get-DefenderThreatCatalog
     $detectionCsvs = Find-ArtifactFiles -BasePath $InputPath -FileNames @("defender_detections.csv")
     foreach ($csv in $detectionCsvs) {
         Log "  Parsing: $($csv.Name)"
         try {
             # A collection without detections holds only a text placeholder line
-            $detections = @(Import-Csv -Path $csv.FullName -ErrorAction Stop | Where-Object { $_.PSObject.Properties["ThreatName"] })
+            $detections = @(Import-Csv -Path $csv.FullName -ErrorAction Stop | Where-Object { $_.PSObject.Properties["ThreatName"] -or $_.PSObject.Properties["ThreatID"] })
             if ($detections.Count -eq 0) {
                 Log "    No Defender detections recorded."
                 continue
             }
             $entriesBefore = $script:timelineEntries.Count
             foreach ($det in $detections) {
+                $threatId = Get-ArtifactRowValue $det @("ThreatID")
+                $known = $threatCatalog["id:$threatId"]
                 $threat = Get-ArtifactRowValue $det @("ThreatName")
+                if (-not $threat -and $known) { $threat = $known.Name }
+                if (-not $threat) { $threat = "ThreatID $threatId" }
                 $statusId = Get-ArtifactRowValue $det @("ThreatStatusID")
                 $status = if ($threatStatusNames.ContainsKey($statusId)) { $threatStatusNames[$statusId] } else { $statusId }
                 $details = Format-ArtifactDetails ([ordered]@{
                     Resources   = Get-ArtifactRowValue $det @("Resources")
                     Process     = Get-ArtifactRowValue $det @("ProcessName")
                     Status      = $status
+                    Severity    = $(if ($known) { $known.Severity } else { "" })
+                    CategoryID  = $(if ($known) { $known.CategoryID } else { "" })
                     DetectionID = Get-ArtifactRowValue $det @("DetectionID")
-                    ThreatID    = Get-ArtifactRowValue $det @("ThreatID")
+                    ThreatID    = $threatId
                 })
                 $detUser = Get-ArtifactRowValue $det @("DomainUser")
                 $times = [ordered]@{
@@ -1253,6 +1502,24 @@ function Parse-EventLogs {
         }
         catch {
             Log-Warning "  Failed to parse Defender detections: $($_.Exception.Message)"
+        }
+    }
+
+    # Defender support logs (ProgramData\Microsoft\Windows Defender\Support),
+    # MPLog files first (in time order) so detections they share with
+    # MPDetection keep the file hash. MPDeviceControl / MPScanSkip logs hold no
+    # detection or configuration lines and are not read.
+    $supportLogs = @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("MPLog-*.log") | Sort-Object Name) +
+        @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("MPDetection-*.log") | Sort-Object Name)
+    $supportState = @{ Seen = @{}; Sha = @{}; ExclusionSize = $null; Exclusions = $null; ExclusionListTime = $null; RtpOff = $false }
+    foreach ($supportLog in $supportLogs) {
+        Log "  Parsing: $($supportLog.Name)"
+        try {
+            $added = Read-DefenderSupportLog -File $supportLog -State $supportState -Catalog $threatCatalog
+            Log "    Added $added timeline entries"
+        }
+        catch {
+            Log-Warning "  Failed to parse Defender support log $($supportLog.Name): $($_.Exception.Message)"
         }
     }
 
@@ -1511,23 +1778,675 @@ function Read-LnkHeader {
     }
 }
 
-function Parse-RecentFiles {
-    Log "--- Parsing Recent Files (LNK Shortcuts) ---"
+# Jump lists are read by a small C# helper (compiled once per session):
+#   TimelineJumpList.Reader.ReadAutomatic(path): an AutomaticDestinations
+#     file is an OLE compound file (MS-CFB). Its DestList stream lists the
+#     entries; each entry's shell link is the stream named by its entry
+#     number in hex, parsed as well.
+#   TimelineJumpList.Reader.ReadCustom(path): a CustomDestinations file holds
+#     shell links back to back; each is found by its header and CLSID.
+# DestList: 32-byte header (version, entry count, pinned count, ...). Entry:
+# hostname 0x48, entry number 0x58, then
+#   version 1 (Win7/8):  FILETIME 0x60, pin 0x68, path length 0x6C, path 0x6E
+#   versions 2-4 (Win10): FILETIME 0x60, pin 0x68, access count 0x70,
+#                         path length 0x7C, path 0x7E
+#   version 6 (Win11 24H2, the test collection): the same fields 4 bytes
+#                         later (FILETIME 0x64 ... path length 0x80, path 0x82)
+# From version 2 on the path is followed by the size of a property store
+# that comes before the next entry. Pin status -1 = not pinned, else the
+# pin position (0-based). Path lengths are in UTF-16 characters.
+function Initialize-JumpListReader {
+    if ($null -ne $script:jumpListReaderReady) { return $script:jumpListReaderReady }
+    $script:jumpListReaderReady = $false
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]'TimelineJumpList.Reader').Type) {
+            Add-Type -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
 
-    # Only the collection's own .lnk files -- never the analysis machine's Recent folders
-    $lnkFiles = Find-ArtifactFiles -BasePath $InputPath -Extensions @(".lnk")
-
-    if ($lnkFiles.Count -eq 0) {
-        Log-Warning "No .lnk files found in the collection. Skipping recent files parsing."
-        return
+namespace TimelineJumpList
+{
+    // One shell link (MS-SHLLINK): header times, target and string data
+    public class LnkData
+    {
+        public int Offset;
+        public int Length;
+        public uint Flags;
+        public long CreatedFileTime;
+        public long AccessedFileTime;
+        public long ModifiedFileTime;
+        public uint TargetSize;
+        public string LocalPath;
+        public string NetworkPath;
+        public string EnvTarget;
+        public string Name;
+        public string RelativePath;
+        public string WorkingDir;
+        public string Arguments;
+        public string MachineId;
+        public string Error;
+        public List<byte[]> IdListItems = new List<byte[]>();
     }
 
-    Log "Found $($lnkFiles.Count) LNK file(s)"
+    // One DestList entry of an AutomaticDestinations jump list
+    public class DestListEntry
+    {
+        public int EntryNumber;
+        public string Path;
+        public long LastAccessFileTime;
+        public int AccessCount;
+        public int PinStatus;
+        public string Hostname;
+        public LnkData Lnk;
+    }
+
+    public class AutomaticDestinations
+    {
+        public int Version;
+        public int DeclaredEntries;
+        public int PinnedEntries;
+        public List<DestListEntry> Entries = new List<DestListEntry>();
+    }
+
+    public static class Reader
+    {
+        static readonly byte[] LinkClsid = { 0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 };
+        static readonly long MinFileTime = new DateTime(1980, 1, 1, 0, 0, 0, DateTimeKind.Utc).ToFileTimeUtc();
+        static readonly long MaxFileTime = new DateTime(2200, 1, 1, 0, 0, 0, DateTimeKind.Utc).ToFileTimeUtc();
+
+        public static AutomaticDestinations ReadAutomatic(string path)
+        {
+            CompoundFile cf = new CompoundFile(File.ReadAllBytes(path));
+            AutomaticDestinations result = new AutomaticDestinations();
+            byte[] d = cf.GetStream("DestList");
+            if (d == null || d.Length < 32) { return result; }
+            result.Version = BitConverter.ToInt32(d, 0);
+            result.DeclaredEntries = BitConverter.ToInt32(d, 4);
+            result.PinnedEntries = BitConverter.ToInt32(d, 8);
+            // Layout 0 = version 1, 1 = versions 2-4, 2 = version 6; for an
+            // unknown version the first layout the first entry fits
+            int[] order = result.Version <= 1 ? new int[] { 0, 1, 2 } : (result.Version <= 4 ? new int[] { 1, 2, 0 } : new int[] { 2, 1, 0 });
+            int layout = order[0];
+            foreach (int candidate in order)
+            {
+                if (EntryFits(d, 32, candidate)) { layout = candidate; break; }
+            }
+            int shift = layout == 2 ? 4 : 0;
+            int lenOff = layout == 0 ? 0x6C : 0x7C + shift;
+            int off = 32;
+            while (off + lenOff + 2 <= d.Length && result.Entries.Count < result.DeclaredEntries && result.Entries.Count < 100000)
+            {
+                DestListEntry e = new DestListEntry();
+                e.Hostname = AnsiZ(d, off + 0x48, off + 0x58);
+                e.EntryNumber = BitConverter.ToInt32(d, off + 0x58);
+                e.LastAccessFileTime = BitConverter.ToInt64(d, off + 0x60 + shift);
+                e.PinStatus = BitConverter.ToInt32(d, off + 0x68 + shift);
+                e.AccessCount = layout == 0 ? -1 : BitConverter.ToInt32(d, off + 0x70 + shift);
+                int chars = BitConverter.ToUInt16(d, off + lenOff);
+                int pathOff = off + lenOff + 2;
+                if (pathOff + chars * 2 > d.Length) { break; }
+                e.Path = Encoding.Unicode.GetString(d, pathOff, chars * 2);
+                off = pathOff + chars * 2;
+                if (layout != 0 && off + 4 <= d.Length)
+                {
+                    // Size of the property store that follows (0 if none)
+                    int extra = BitConverter.ToInt32(d, off);
+                    off += 4;
+                    if (extra > d.Length - off) { off = d.Length; }
+                    else if (extra > 0) { off += extra; }
+                }
+                byte[] lnk = cf.GetStream(e.EntryNumber.ToString("x"));
+                if (lnk != null) { e.Lnk = ParseLnk(lnk, 0, lnk.Length); }
+                result.Entries.Add(e);
+            }
+            return result;
+        }
+
+        // True if an entry at off fits the layout: last-access time zero or
+        // 1980-2200 and a printable path that ends inside the stream
+        static bool EntryFits(byte[] d, int off, int layout)
+        {
+            int shift = layout == 2 ? 4 : 0;
+            int lenOff = layout == 0 ? 0x6C : 0x7C + shift;
+            if (off + lenOff + 4 > d.Length) { return false; }
+            long ft = BitConverter.ToInt64(d, off + 0x60 + shift);
+            if (ft != 0 && (ft < MinFileTime || ft > MaxFileTime)) { return false; }
+            int chars = BitConverter.ToUInt16(d, off + lenOff);
+            int pathOff = off + lenOff + 2;
+            if (chars == 0 || pathOff + chars * 2 > d.Length) { return false; }
+            return BitConverter.ToUInt16(d, pathOff) >= 0x20;
+        }
+
+        public static List<LnkData> ReadCustom(string path)
+        {
+            byte[] b = File.ReadAllBytes(path);
+            List<LnkData> list = new List<LnkData>();
+            int i = 0;
+            while (i + 0x4C <= b.Length)
+            {
+                int hit = FindLinkHeader(b, i);
+                if (hit < 0) { break; }
+                LnkData l = ParseLnk(b, hit, b.Length);
+                if (l == null) { i = hit + 4; continue; }
+                list.Add(l);
+                i = hit + Math.Max(l.Length, 0x4C);
+            }
+            return list;
+        }
+
+        static int FindLinkHeader(byte[] b, int start)
+        {
+            for (int i = start; i + 20 <= b.Length; i++)
+            {
+                if (b[i] != 0x4C || b[i + 1] != 0 || b[i + 2] != 0 || b[i + 3] != 0) { continue; }
+                bool match = true;
+                for (int k = 0; k < 16; k++) { if (b[i + 4 + k] != LinkClsid[k]) { match = false; break; } }
+                if (match) { return i; }
+            }
+            return -1;
+        }
+
+        // Shell link at b[off..end): null if there is no valid header. A
+        // damaged link keeps what was read before the damage (Error is set).
+        public static LnkData ParseLnk(byte[] b, int off, int end)
+        {
+            if (b == null || off < 0 || end > b.Length || off + 0x4C > end) { return null; }
+            if (BitConverter.ToUInt32(b, off) != 0x4C) { return null; }
+            for (int k = 0; k < 16; k++) { if (b[off + 4 + k] != LinkClsid[k]) { return null; } }
+            LnkData l = new LnkData();
+            l.Offset = off;
+            l.Flags = BitConverter.ToUInt32(b, off + 0x14);
+            l.CreatedFileTime = BitConverter.ToInt64(b, off + 0x1C);
+            l.AccessedFileTime = BitConverter.ToInt64(b, off + 0x24);
+            l.ModifiedFileTime = BitConverter.ToInt64(b, off + 0x2C);
+            l.TargetSize = BitConverter.ToUInt32(b, off + 0x34);
+            int p = off + 0x4C;
+            try
+            {
+                // LinkTargetIDList: shell items, resolved by the caller if needed
+                if ((l.Flags & 0x1) != 0)
+                {
+                    int idEnd = p + 2 + BitConverter.ToUInt16(b, p);
+                    int q = p + 2;
+                    while (q + 2 <= idEnd)
+                    {
+                        int itemSize = BitConverter.ToUInt16(b, q);
+                        if (itemSize < 3 || q + itemSize > idEnd) { break; }
+                        byte[] item = new byte[itemSize];
+                        Array.Copy(b, q, item, 0, itemSize);
+                        l.IdListItems.Add(item);
+                        q += itemSize;
+                    }
+                    p = idEnd;
+                }
+                // LinkInfo: local base path + common path suffix, or network share
+                if ((l.Flags & 0x2) != 0)
+                {
+                    int li = p;
+                    int liSize = BitConverter.ToInt32(b, li);
+                    int liEnd = Math.Min(li + liSize, end);
+                    int liHeader = BitConverter.ToInt32(b, li + 4);
+                    uint liFlags = BitConverter.ToUInt32(b, li + 8);
+                    int localOff = BitConverter.ToInt32(b, li + 16);
+                    int netOff = BitConverter.ToInt32(b, li + 20);
+                    int suffixOff = BitConverter.ToInt32(b, li + 24);
+                    string suffix = null;
+                    if (liHeader >= 0x24)
+                    {
+                        int localUni = BitConverter.ToInt32(b, li + 28);
+                        int suffixUni = BitConverter.ToInt32(b, li + 32);
+                        if ((liFlags & 1) != 0 && localUni > 0) { l.LocalPath = Utf16Z(b, li + localUni, liEnd); }
+                        if (suffixUni > 0) { suffix = Utf16Z(b, li + suffixUni, liEnd); }
+                    }
+                    if ((liFlags & 1) != 0 && string.IsNullOrEmpty(l.LocalPath) && localOff > 0) { l.LocalPath = AnsiZ(b, li + localOff, liEnd); }
+                    if (string.IsNullOrEmpty(suffix) && suffixOff > 0) { suffix = AnsiZ(b, li + suffixOff, liEnd); }
+                    if ((liFlags & 2) != 0 && netOff > 0)
+                    {
+                        int cn = li + netOff;
+                        int netNameOff = BitConverter.ToInt32(b, cn + 8);
+                        string net = null;
+                        if (netNameOff > 0x14)
+                        {
+                            int netUni = BitConverter.ToInt32(b, cn + 0x14);
+                            if (netUni > 0) { net = Utf16Z(b, cn + netUni, liEnd); }
+                        }
+                        if (string.IsNullOrEmpty(net) && netNameOff > 0) { net = AnsiZ(b, cn + netNameOff, liEnd); }
+                        if (!string.IsNullOrEmpty(net))
+                        {
+                            l.NetworkPath = string.IsNullOrEmpty(suffix) ? net : net.TrimEnd('\\') + "\\" + suffix;
+                        }
+                    }
+                    if (!string.IsNullOrEmpty(l.LocalPath) && !string.IsNullOrEmpty(suffix)) { l.LocalPath = l.LocalPath + suffix; }
+                    p = li + liSize;
+                }
+                // StringData: name, relative path, working dir, arguments, icon
+                bool unicode = (l.Flags & 0x80) != 0;
+                uint[] stringFlags = { 0x4, 0x8, 0x10, 0x20, 0x40 };
+                string[] values = new string[5];
+                for (int k = 0; k < 5; k++)
+                {
+                    if ((l.Flags & stringFlags[k]) == 0) { continue; }
+                    int count = BitConverter.ToUInt16(b, p);
+                    p += 2;
+                    int bytes = unicode ? count * 2 : count;
+                    if (p + bytes > end) { throw new InvalidDataException("string data past the end"); }
+                    values[k] = unicode ? Encoding.Unicode.GetString(b, p, bytes) : Encoding.Default.GetString(b, p, bytes);
+                    p += bytes;
+                }
+                l.Name = values[0];
+                l.RelativePath = values[1];
+                l.WorkingDir = values[2];
+                l.Arguments = values[3];
+                // ExtraData blocks up to the terminal block (size < 4)
+                while (p + 4 <= end)
+                {
+                    int size = BitConverter.ToInt32(b, p);
+                    if (size < 4) { p += 4; break; }
+                    if (size < 8 || size > end - p) { throw new InvalidDataException("extra data block past the end"); }
+                    uint sig = BitConverter.ToUInt32(b, p + 4);
+                    if (sig == 0xA0000003 && size >= 0x60) { l.MachineId = AnsiZ(b, p + 16, p + 32); }
+                    else if (sig == 0xA0000001 && size >= 0x314)
+                    {
+                        l.EnvTarget = Utf16Z(b, p + 268, p + 788);
+                        if (string.IsNullOrEmpty(l.EnvTarget)) { l.EnvTarget = AnsiZ(b, p + 8, p + 268); }
+                    }
+                    p += size;
+                }
+            }
+            catch (Exception ex)
+            {
+                l.Error = ex.Message;
+            }
+            l.Length = Math.Min(Math.Max(p, off + 0x4C), end) - off;
+            return l;
+        }
+
+        static string Utf16Z(byte[] b, int start, int limit)
+        {
+            limit = Math.Min(limit, b.Length);
+            if (start < 0 || start >= limit) { return null; }
+            int e = start;
+            while (e + 1 < limit && (b[e] != 0 || b[e + 1] != 0)) { e += 2; }
+            return Encoding.Unicode.GetString(b, start, Math.Min(e, limit) - start);
+        }
+
+        static string AnsiZ(byte[] b, int start, int limit)
+        {
+            limit = Math.Min(limit, b.Length);
+            if (start < 0 || start >= limit) { return null; }
+            int e = start;
+            while (e < limit && b[e] != 0) { e++; }
+            return Encoding.Default.GetString(b, start, e - start);
+        }
+    }
+
+    // Minimal OLE compound file (MS-CFB) reader: FAT and DIFAT, directory,
+    // mini stream; enough to read the streams of a jump list
+    internal class CompoundFile
+    {
+        class DirEntry
+        {
+            public string Name;
+            public int Type;
+            public uint Start;
+            public long Size;
+        }
+
+        readonly byte[] data;
+        readonly int sectorSize;
+        readonly int miniSectorSize;
+        readonly uint miniCutoff;
+        readonly uint[] fat;
+        readonly uint[] miniFat;
+        readonly byte[] miniStream;
+        readonly List<DirEntry> entries = new List<DirEntry>();
+
+        public CompoundFile(byte[] bytes)
+        {
+            data = bytes;
+            if (bytes.Length < 512 || BitConverter.ToUInt64(bytes, 0) != 0xE11AB1A1E011CFD0UL) { throw new InvalidDataException("not an OLE compound file"); }
+            int sectorShift = BitConverter.ToUInt16(bytes, 0x1E);
+            if (sectorShift != 9 && sectorShift != 12) { throw new InvalidDataException("unsupported sector size"); }
+            sectorSize = 1 << sectorShift;
+            miniSectorSize = 1 << BitConverter.ToUInt16(bytes, 0x20);
+            int fatCount = BitConverter.ToInt32(bytes, 0x2C);
+            uint firstDir = BitConverter.ToUInt32(bytes, 0x30);
+            miniCutoff = BitConverter.ToUInt32(bytes, 0x38);
+            uint firstMiniFat = BitConverter.ToUInt32(bytes, 0x3C);
+            uint difat = BitConverter.ToUInt32(bytes, 0x44);
+            int perSector = sectorSize / 4;
+
+            // FAT sector numbers: 109 in the header, the rest in DIFAT sectors
+            List<uint> fatSectors = new List<uint>();
+            for (int i = 0; i < 109 && fatSectors.Count < fatCount; i++)
+            {
+                uint s = BitConverter.ToUInt32(bytes, 0x4C + i * 4);
+                if (s < 0xFFFFFFFA) { fatSectors.Add(s); }
+            }
+            int guard = 0;
+            while (difat < 0xFFFFFFFA && fatSectors.Count < fatCount && guard++ < 65536)
+            {
+                long doff = SectorOffset(difat);
+                if (doff + sectorSize > data.Length) { break; }
+                for (int i = 0; i < perSector - 1 && fatSectors.Count < fatCount; i++)
+                {
+                    uint s = BitConverter.ToUInt32(data, (int)doff + i * 4);
+                    if (s < 0xFFFFFFFA) { fatSectors.Add(s); }
+                }
+                difat = BitConverter.ToUInt32(data, (int)doff + (perSector - 1) * 4);
+            }
+            fat = new uint[fatSectors.Count * perSector];
+            for (int f = 0; f < fatSectors.Count; f++)
+            {
+                long foff = SectorOffset(fatSectors[f]);
+                for (int i = 0; i < perSector; i++)
+                {
+                    long pos = foff + i * 4;
+                    fat[f * perSector + i] = pos + 4 <= data.Length ? BitConverter.ToUInt32(data, (int)pos) : 0xFFFFFFFF;
+                }
+            }
+
+            byte[] dir = ReadChain(firstDir, long.MaxValue);
+            for (int p = 0; p + 128 <= dir.Length; p += 128)
+            {
+                DirEntry e = new DirEntry();
+                int nameBytes = Math.Min((int)BitConverter.ToUInt16(dir, p + 0x40), 64);
+                e.Name = nameBytes >= 2 ? Encoding.Unicode.GetString(dir, p, nameBytes - 2) : "";
+                e.Type = dir[p + 0x42];
+                e.Start = BitConverter.ToUInt32(dir, p + 0x74);
+                // Version 3 files (512-byte sectors) only use the low 32 bits
+                e.Size = sectorSize == 512 ? (long)BitConverter.ToUInt32(dir, p + 0x78) : (long)BitConverter.ToUInt64(dir, p + 0x78);
+                entries.Add(e);
+            }
+            miniStream = (entries.Count > 0 && entries[0].Type == 5) ? ReadChain(entries[0].Start, entries[0].Size) : new byte[0];
+            byte[] mf = ReadChain(firstMiniFat, long.MaxValue);
+            miniFat = new uint[mf.Length / 4];
+            for (int i = 0; i < miniFat.Length; i++) { miniFat[i] = BitConverter.ToUInt32(mf, i * 4); }
+        }
+
+        long SectorOffset(uint sector)
+        {
+            return ((long)sector + 1) * sectorSize;
+        }
+
+        // Sectors of a FAT chain (stops at the end of the chain or the file,
+        // and after as many sectors as the FAT has, so a loop cannot hang)
+        byte[] ReadChain(uint start, long size)
+        {
+            MemoryStream ms = new MemoryStream();
+            uint s = start;
+            int guard = 0;
+            while (s < 0xFFFFFFFA && s < fat.Length && guard++ <= fat.Length && ms.Length < size)
+            {
+                long off = SectorOffset(s);
+                if (off >= data.Length) { break; }
+                ms.Write(data, (int)off, (int)Math.Min(sectorSize, data.Length - off));
+                s = fat[s];
+            }
+            return Truncate(ms.ToArray(), size);
+        }
+
+        byte[] ReadMiniChain(uint start, long size)
+        {
+            MemoryStream ms = new MemoryStream();
+            uint s = start;
+            int guard = 0;
+            while (s < 0xFFFFFFFA && s < miniFat.Length && guard++ <= miniFat.Length && ms.Length < size)
+            {
+                long off = (long)s * miniSectorSize;
+                if (off >= miniStream.Length) { break; }
+                ms.Write(miniStream, (int)off, (int)Math.Min(miniSectorSize, miniStream.Length - off));
+                s = miniFat[s];
+            }
+            return Truncate(ms.ToArray(), size);
+        }
+
+        static byte[] Truncate(byte[] b, long size)
+        {
+            if (size >= 0 && size < b.Length) { Array.Resize(ref b, (int)size); }
+            return b;
+        }
+
+        // Contents of the named stream, or null if there is none
+        public byte[] GetStream(string name)
+        {
+            foreach (DirEntry e in entries)
+            {
+                if (e.Type != 2 || !string.Equals(e.Name, name, StringComparison.OrdinalIgnoreCase)) { continue; }
+                return e.Size < miniCutoff ? ReadMiniChain(e.Start, e.Size) : ReadChain(e.Start, e.Size);
+            }
+            return null;
+        }
+    }
+}
+'@
+        }
+        $script:jumpListReaderReady = $true
+    }
+    catch {
+        Log-Warning "  Jump list reader unavailable ($($_.Exception.Message)) -- jump lists skipped."
+    }
+    return $script:jumpListReaderReady
+}
+
+# Well-known jump list AppIDs (the file name: a CRC-64 of the program's path
+# or AppUserModelID). Other AppIDs are named after the one program their
+# CustomDestinations links start, else shown as the AppID.
+$script:JumpListAppIds = @{
+    "1b4dd67f29cb1962" = "Windows Explorer"
+    "f01b4d95cf55d32a" = "Windows Explorer"
+    "5f7b5f1e01b83767" = "Quick Access"
+    "7e4dca80246863e3" = "Control Panel"
+    "9b9cdc69c1c24e2b" = "Notepad (64-bit)"
+    "918e0ecb43d17e23" = "Notepad (32-bit)"
+    "12dc1ea8e34b5a6"  = "Paint"
+    "469e4a7982cea4d4" = "WordPad"
+    "1bc392b8e104a00e" = "Remote Desktop Connection"
+    "590aee7bdd69b59b" = "Windows PowerShell"
+    "16f2f0042ddbe0e8" = "Windows Terminal"
+    "28c8b86deab549a1" = "Internet Explorer"
+    "ccba5a5986c77e43" = "Microsoft Edge"
+    "5d696d521de238c3" = "Google Chrome"
+    "6824f4a902c78fbd" = "Mozilla Firefox"
+    "b8ab77100df80ab2" = "Microsoft Excel"
+    "a52b0784bd667468" = "Photos"
+}
+
+# FILETIME -> UTC [datetime], or $null when zero or out of range
+function ConvertFrom-JumpListFileTime {
+    param([long]$FileTime)
+    if ($FileTime -le 0 -or $FileTime -gt [datetime]::MaxValue.ToFileTimeUtc()) { return $null }
+    return [datetime]::FromFileTimeUtc($FileTime)
+}
+
+# Target of a jump list shell link: LinkInfo path, environment-variable
+# target, else (unless -PathOnly) the path built from its shell items, else
+# its name
+function Get-JumpListLinkTarget {
+    param($Link, [switch]$PathOnly)
+    if (-not $Link) { return "" }
+    foreach ($candidate in @($Link.LocalPath, $Link.NetworkPath, $Link.EnvTarget)) {
+        if ($candidate) { return [string]$candidate }
+    }
+    if ($PathOnly) { return "" }
+    $path = ""
+    foreach ($item in $Link.IdListItems) {
+        $shellItem = Get-ShellItemName ([byte[]]$item)
+        if ($shellItem.IsVolume -or -not $path) { $path = $shellItem.Name }
+        else { $path = $path.TrimEnd('\') + '\' + $shellItem.Name }
+    }
+    if ($path) { return $path }
+    return [string]$Link.Name
+}
+
+# Adds a shell link's arguments, target times and size (from the link
+# header) and the machine it was made on to a Details dictionary
+function Add-JumpListLinkDetails {
+    param([System.Collections.Specialized.OrderedDictionary]$Details, $Link)
+    if (-not $Link) { return }
+    $Details["Arguments"] = $Link.Arguments
+    foreach ($pair in @(@("TargetCreatedUtc", $Link.CreatedFileTime), @("TargetModifiedUtc", $Link.ModifiedFileTime), @("TargetAccessedUtc", $Link.AccessedFileTime))) {
+        $time = ConvertFrom-JumpListFileTime $pair[1]
+        if ($time) { $Details[$pair[0]] = $time.ToString("yyyy-MM-dd HH:mm:ss") }
+    }
+    if ($Link.TargetSize -gt 0) { $Details["TargetSize"] = $Link.TargetSize }
+    $Details["MachineID"] = $Link.MachineId
+    $Details["LinkError"] = $Link.Error
+}
+
+# Jump list rows for every user in the collection: one per DestList entry
+# (at its last-access time) and one per CustomDestinations link (at the
+# list file's last-write time: custom links carry no use time). Returns the
+# number of rows added.
+function Read-JumpLists {
+    $autoFiles = @(Find-ArtifactFiles -BasePath $InputPath -Extensions @(".automaticDestinations-ms"))
+    $customFiles = @(Find-ArtifactFiles -BasePath $InputPath -Extensions @(".customDestinations-ms"))
+    if ($autoFiles.Count + $customFiles.Count -eq 0) {
+        Log "  No jump lists found in the collection."
+        return 0
+    }
+    Log "  Found $($autoFiles.Count) AutomaticDestinations and $($customFiles.Count) CustomDestinations jump list(s)"
+    if (-not (Initialize-JumpListReader)) { return 0 }
+
+    $added = 0
+    $noTime = 0
+    $failed = 0
+    # CustomDestinations first: the program their links start names the AppID
+    $customLists = @()
+    $appHints = @{}
+    foreach ($file in $customFiles) {
+        try {
+            $links = @([TimelineJumpList.Reader]::ReadCustom($file.FullName))
+            $customLists += , @($file, $links)
+            $programs = @($links | ForEach-Object { [string]$_.LocalPath } | Where-Object { $_ -match '\.exe$' } |
+                ForEach-Object { Split-Path $_ -Leaf } | Sort-Object -Unique)
+            if ($programs.Count -eq 1) { $appHints[$file.BaseName] = $programs[0] }
+        }
+        catch {
+            $failed++
+            Log-Warning "  Could not read jump list $($file.FullName): $($_.Exception.Message)"
+        }
+    }
+    $appNameOf = {
+        param([string]$AppId)
+        if ($script:JumpListAppIds.ContainsKey($AppId)) { return $script:JumpListAppIds[$AppId] }
+        if ($appHints.ContainsKey($AppId)) { return $appHints[$AppId] }
+        return $AppId
+    }
+
+    # Time for rows without their own: the list file's original last-write
+    # time from the manifest, else the collected copy's
+    $listFileTime = {
+        param([System.IO.FileInfo]$File)
+        $src = Get-SourceFileTimes $File.FullName
+        if ($src -and $src.Modified) { return @($src.Modified, "jump list file last modified (original)") }
+        return @($File.LastWriteTimeUtc, "jump list file last modified (collected copy)")
+    }
+
+    foreach ($pair in $customLists) {
+        $file = $pair[0]
+        try {
+            $appId = $file.BaseName.ToLowerInvariant()
+            $app = & $appNameOf $appId
+            $user = Get-CollectionUser $file.FullName
+            $fileTime = & $listFileTime $file
+            $n = 0
+            foreach ($link in $pair[1]) {
+                $n++
+                $target = Get-JumpListLinkTarget $link
+                if (-not $target) { continue }
+                $label = $target
+                if ($link.Arguments) { $label = "$target $($link.Arguments)" }
+                $details = [ordered]@{ AppID = $appId; EntryNumber = $n; List = "CustomDestinations"; Name = $link.Name }
+                Add-JumpListLinkDetails $details $link
+                $details["TimeSource"] = $fileTime[1]
+                Add-TimelineEntry -Timestamp $fileTime[0] -Source "JumpLists" -EventType "FileAccess" `
+                    -Description "Jump list ($app): $label" `
+                    -User $user -Details (Format-ArtifactDetails $details) `
+                    -Artifact "RecentFiles" -RawPath $file.FullName
+                $added++
+            }
+        }
+        catch {
+            $failed++
+            Log-Warning "  Could not read jump list $($file.FullName): $($_.Exception.Message)"
+        }
+    }
+
+    foreach ($file in $autoFiles) {
+        try {
+            $list = [TimelineJumpList.Reader]::ReadAutomatic($file.FullName)
+            $appId = $file.BaseName.ToLowerInvariant()
+            $app = & $appNameOf $appId
+            $user = Get-CollectionUser $file.FullName
+            $fileTime = $null
+            foreach ($entry in $list.Entries) {
+                # Known folders are listed as "knownfolder:{GUID}"; the link has the path
+                $path = [string]$entry.Path
+                $target = Get-JumpListLinkTarget $entry.Lnk -PathOnly
+                if (-not $path -or $path -like "knownfolder:*") {
+                    if (-not $target) { $target = Get-JumpListLinkTarget $entry.Lnk }
+                    if ($target) { $path = $target }
+                }
+                if (-not $path) { continue }
+                $ts = ConvertFrom-JumpListFileTime $entry.LastAccessFileTime
+                $timeSource = "DestList last access"
+                if (-not $ts) {
+                    if (-not $fileTime) { $fileTime = & $listFileTime $file }
+                    $ts = $fileTime[0]
+                    $timeSource = "entry has no access time; $($fileTime[1])"
+                    $noTime++
+                }
+                $details = [ordered]@{
+                    AccessCount  = $(if ($entry.AccessCount -ge 0) { $entry.AccessCount } else { "" })
+                    Pinned       = $(if ($entry.PinStatus -ge 0) { "Yes (position $($entry.PinStatus + 1))" } else { "No" })
+                    AppID        = $appId
+                    EntryNumber  = $entry.EntryNumber
+                    List         = "AutomaticDestinations (DestList version $($list.Version))"
+                    DestListPath = $(if ($path -ne $entry.Path) { $entry.Path } else { "" })
+                    LinkTarget   = $(if ($target -and $target -ne $path) { $target } else { "" })
+                    Hostname     = $entry.Hostname
+                }
+                Add-JumpListLinkDetails $details $entry.Lnk
+                $details["TimeSource"] = $timeSource
+                Add-TimelineEntry -Timestamp $ts -Source "JumpLists" -EventType "FileAccess" `
+                    -Description "Jump list ($app): $path" `
+                    -User $user -Details (Format-ArtifactDetails $details) `
+                    -Artifact "RecentFiles" -RawPath $file.FullName
+                $added++
+            }
+        }
+        catch {
+            $failed++
+            Log-Warning "  Could not read jump list $($file.FullName): $($_.Exception.Message)"
+        }
+    }
+
+    Log "  Jump lists: $added row(s)$(if ($noTime -gt 0) { " ($noTime DestList entr(ies) without an access time use the list file's time)" })$(if ($failed -gt 0) { "; $failed file(s) could not be read" })."
+    return $added
+}
+
+function Parse-RecentFiles {
+    Log "--- Parsing Recent Files (LNK Shortcuts, Jump Lists) ---"
+
+    # Only the collection's own .lnk files -- never the analysis machine's Recent folders
+    $lnkFiles = @(Find-ArtifactFiles -BasePath $InputPath -Extensions @(".lnk"))
+
+    if ($lnkFiles.Count -eq 0) {
+        Log-Warning "No .lnk files found in the collection."
+    }
+    else {
+        Log "Found $($lnkFiles.Count) LNK file(s)"
+    }
 
     # WScript.Shell resolves the target path; the rows are still written without it
     $shell = $null
-    try { $shell = New-Object -ComObject WScript.Shell -ErrorAction Stop }
-    catch { Log-Warning "  WScript.Shell unavailable ($($_.Exception.Message)) -- LNK target paths will be blank." }
+    if ($lnkFiles.Count -gt 0) {
+        try { $shell = New-Object -ComObject WScript.Shell -ErrorAction Stop }
+        catch { Log-Warning "  WScript.Shell unavailable ($($_.Exception.Message)) -- LNK target paths will be blank." }
+    }
 
     $fromSource = 0
     $fromCopy = 0
@@ -1610,7 +2529,11 @@ function Parse-RecentFiles {
     }
 
     if ($shell) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($shell) | Out-Null }
-    Log "  LNK times: $fromSource file(s) with original file times, $fromCopy with the collected copy's last-write time only."
+    if ($lnkFiles.Count -gt 0) {
+        Log "  LNK times: $fromSource file(s) with original file times, $fromCopy with the collected copy's last-write time only."
+    }
+
+    $null = Read-JumpLists
     Log "  Recent files parsing complete."
     Log ""
 }
@@ -2470,6 +3393,61 @@ function Add-BrowserVisitRows {
     return $count
 }
 
+# Chromium time (microseconds since 1601-01-01 UTC, as text or a number)
+# -> UTC [datetime], or $null when zero or out of range
+function ConvertFrom-ChromiumTime {
+    param($Value)
+    $us = 0L
+    if (-not [long]::TryParse([string]$Value, [ref]$us) -or $us -le 0 -or $us -gt [datetime]::MaxValue.ToFileTimeUtc() / 10) { return $null }
+    return [datetime]::FromFileTimeUtc($us * 10)
+}
+
+# Chromium "Bookmarks" file (JSON) of one profile: a row per bookmark at its
+# date_added. Returns the number of rows added.
+function Add-ChromiumBookmarkRows {
+    param([System.IO.FileInfo]$File)
+    $json = Get-Content -LiteralPath $File.FullName -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
+    if (-not $json -or -not $json.PSObject.Properties["roots"]) { return 0 }
+    $browserName = Get-ChromiumBrowserName $File.FullName
+    $user = Get-CollectionUser $File.FullName
+    $profileName = Get-BrowserProfileName $File.FullName
+    $count = 0
+    # Depth-first walk; each stack item is @(node, folder path)
+    $stack = New-Object System.Collections.Stack
+    foreach ($root in $json.roots.PSObject.Properties) {
+        if ($root.Value -and $root.Value.PSObject.Properties["type"]) { $stack.Push(@($root.Value, [string]$root.Value.name)) }
+    }
+    while ($stack.Count -gt 0) {
+        $item = $stack.Pop()
+        $node = $item[0]
+        if ($node.type -eq "url") {
+            $addedTime = ConvertFrom-ChromiumTime $node.date_added
+            if (-not $addedTime) { continue }
+            $lastUsed = ConvertFrom-ChromiumTime $node.date_last_used
+            $desc = if ($node.name) { "Bookmark added: $($node.name) ($($node.url))" } else { "Bookmark added: $($node.url)" }
+            Add-TimelineEntry -Timestamp $addedTime -Source "$browserName Bookmarks" -EventType "NetworkConnection" `
+                -Description $desc `
+                -User $user `
+                -Details (Format-ArtifactDetails ([ordered]@{
+                    URL         = $node.url
+                    Folder      = $item[1]
+                    LastUsedUtc = $(if ($lastUsed) { $lastUsed.ToString("yyyy-MM-dd HH:mm:ss") } else { "" })
+                    Profile     = $profileName
+                })) `
+                -Artifact "Browser" -RawPath $File.FullName
+            $count++
+            continue
+        }
+        if (-not $node.PSObject.Properties["children"]) { continue }
+        foreach ($child in @($node.children)) {
+            if ($null -eq $child) { continue }
+            $folder = if ($child.type -eq "folder") { "$($item[1])/$($child.name)" } else { $item[1] }
+            $stack.Push(@($child, $folder))
+        }
+    }
+    return $count
+}
+
 function Parse-BrowserHistory {
     Log "--- Parsing Browser History ---"
 
@@ -2489,9 +3467,35 @@ function Parse-BrowserHistory {
         if ($f.Name -eq "places.sqlite") { $firefoxHistoryPaths += $f }
     }
 
-    $totalBrowserFiles = $chromeHistoryPaths.Count + $firefoxHistoryPaths.Count
-    if ($totalBrowserFiles -eq 0) {
+    # Other Chromium profile files: Shortcuts and Top Sites (SQLite), Bookmarks (JSON)
+    $chromeShortcutPaths = @()
+    $chromeTopSitesPaths = @()
+    foreach ($f in (Find-ArtifactFiles -BasePath $InputPath -FileNames @("Shortcuts", "Top Sites"))) {
+        if ($f.PSIsContainer) { continue }
+        if (-not (Test-FileSignature -Path $f.FullName -Signature "SQLite format 3")) { continue }
+        if ($f.Name -eq "Shortcuts") { $chromeShortcutPaths += $f } else { $chromeTopSitesPaths += $f }
+    }
+    $bookmarkFiles = @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("Bookmarks") | Where-Object { -not $_.PSIsContainer })
+
+    $totalBrowserFiles = $chromeHistoryPaths.Count + $firefoxHistoryPaths.Count + $chromeShortcutPaths.Count + $chromeTopSitesPaths.Count
+    if ($totalBrowserFiles + $bookmarkFiles.Count -eq 0) {
         Log-Warning "No browser history databases found. Skipping."
+        Log ""
+        return
+    }
+
+    # Chromium bookmarks (JSON, no sqlite3 needed): date_added = microseconds since 1601 UTC
+    foreach ($bm in $bookmarkFiles) {
+        Log "  Parsing: $(Get-ChromiumBrowserName $bm.FullName) Bookmarks ($(Get-CollectionUser $bm.FullName))"
+        try {
+            $added = Add-ChromiumBookmarkRows -File $bm
+            Log "    $added bookmark(s) added."
+            if ($added -gt 0) { $browserParsed = $true }
+        }
+        catch { Log-Warning "    Could not read bookmarks $($bm.FullName): $($_.Exception.Message)" }
+    }
+    if ($totalBrowserFiles -eq 0) {
+        Log "  Browser history parsing complete."
         Log ""
         return
     }
@@ -2543,6 +3547,86 @@ function Parse-BrowserHistory {
             -TypeNames $script:FirefoxVisitTypes -RawPath $placesDb.FullName -MaxVisits $maxVisits
         Log "    $added visit(s) added."
         if ($added -gt 0) { $browserParsed = $true }
+
+        # Bookmarks (moz_bookmarks type 1) joined to moz_places; dateAdded and
+        # lastModified = microseconds since 1970 UTC; "place:" URLs are saved queries
+        $query = "SELECT replace(replace(coalesce(b.title, p.title, ''), char(13), ' '), char(10), ' '), p.url, " +
+                 "strftime('%Y-%m-%d %H:%M:%f', b.dateAdded / 1000000.0, 'unixepoch'), " +
+                 "strftime('%Y-%m-%d %H:%M:%f', b.lastModified / 1000000.0, 'unixepoch'), " +
+                 "replace(replace(coalesce(f.title, ''), char(13), ' '), char(10), ' ') " +
+                 "FROM moz_bookmarks b JOIN moz_places p ON p.id = b.fk LEFT JOIN moz_bookmarks f ON f.id = b.parent " +
+                 "WHERE b.type = 1 AND b.dateAdded > 0 AND p.url NOT LIKE 'place:%' ORDER BY b.dateAdded;"
+        $rows = @(Invoke-Sqlite3Query -Sqlite3Exe $sqlite3Exe -DbPath $placesDb.FullName -Query $query)
+        $bookmarks = 0
+        foreach ($r in ($rows | ConvertFrom-Csv -Header "Title", "Url", "Added", "Modified", "Folder")) {
+            $ts = ConvertFrom-UtcText $r.Added
+            if ($null -eq $ts) { continue }
+            $desc = if ($r.Title) { "Bookmark added: $($r.Title) ($($r.Url))" } else { "Bookmark added: $($r.Url)" }
+            Add-TimelineEntry -Timestamp $ts -Source "Firefox Bookmarks" -EventType "NetworkConnection" `
+                -Description $desc `
+                -User $user `
+                -Details (Format-ArtifactDetails ([ordered]@{ URL = $r.Url; Folder = $r.Folder; LastModifiedUtc = ($r.Modified -replace '\.\d+$', ''); Profile = $profileName })) `
+                -Artifact "Browser" -RawPath $placesDb.FullName
+            $bookmarks++
+        }
+        Log "    $bookmarks bookmark(s) added."
+        if ($bookmarks -gt 0) { $browserParsed = $true }
+    }
+
+    # Chromium Shortcuts (omni_box_shortcuts): text typed in the address bar
+    # and the suggestion it was completed to; last_access_time = microseconds
+    # since 1601 UTC
+    foreach ($db in $chromeShortcutPaths) {
+        $browserName = Get-ChromiumBrowserName $db.FullName
+        $user = Get-CollectionUser $db.FullName
+        $profileName = Get-BrowserProfileName $db.FullName
+        Log "  Parsing: $browserName Shortcuts ($user)"
+        $query = "SELECT replace(replace(text, char(13), ' '), char(10), ' '), url, " +
+                 "strftime('%Y-%m-%d %H:%M:%f', last_access_time / 1000000.0 - 11644473600, 'unixepoch'), number_of_hits, " +
+                 "replace(replace(contents, char(13), ' '), char(10), ' '), replace(replace(description, char(13), ' '), char(10), ' ') " +
+                 "FROM omni_box_shortcuts WHERE last_access_time > 0 ORDER BY last_access_time;"
+        $rows = @(Invoke-Sqlite3Query -Sqlite3Exe $sqlite3Exe -DbPath $db.FullName -Query $query)
+        $shortcuts = 0
+        foreach ($r in ($rows | ConvertFrom-Csv -Header "Text", "Url", "LastAccess", "Hits", "Contents", "Title")) {
+            $ts = ConvertFrom-UtcText $r.LastAccess
+            if ($null -eq $ts) { continue }
+            Add-TimelineEntry -Timestamp $ts -Source "$browserName Shortcuts" -EventType "NetworkConnection" `
+                -Description "Address bar shortcut used: $($r.Text) -> $($r.Url)" `
+                -User $user `
+                -Details (Format-ArtifactDetails ([ordered]@{ Hits = $r.Hits; Suggestion = $r.Contents; Title = $r.Title; URL = $r.Url; Profile = $profileName })) `
+                -Artifact "Browser" -RawPath $db.FullName
+            $shortcuts++
+        }
+        Log "    $shortcuts shortcut(s) added."
+        if ($shortcuts -gt 0) { $browserParsed = $true }
+    }
+
+    # Chromium Top Sites: the most visited sites shown on the new tab page.
+    # No times -- Snapshot rows at collection time.
+    foreach ($db in $chromeTopSitesPaths) {
+        $browserName = Get-ChromiumBrowserName $db.FullName
+        $user = Get-CollectionUser $db.FullName
+        $profileName = Get-BrowserProfileName $db.FullName
+        Log "  Parsing: $browserName Top Sites ($user)"
+        $snapshotTs = Get-SnapshotTimeUtc -File $db
+        if (-not $snapshotTs) { Log-Warning "    Collection time unknown -- top sites skipped."; continue }
+        $query = "SELECT url, url_rank, replace(replace(title, char(13), ' '), char(10), ' ') FROM top_sites ORDER BY url_rank;"
+        $rows = @(Invoke-Sqlite3Query -Sqlite3Exe $sqlite3Exe -DbPath $db.FullName -Query $query)
+        $sites = 0
+        foreach ($r in ($rows | ConvertFrom-Csv -Header "Url", "Rank", "Title")) {
+            if (-not $r.Url) { continue }
+            $rank = 0
+            $rankText = if ([int]::TryParse([string]$r.Rank, [ref]$rank)) { $rank + 1 } else { $r.Rank }
+            $desc = if ($r.Title) { "Browser top site: $($r.Title) ($($r.Url))" } else { "Browser top site: $($r.Url)" }
+            Add-TimelineEntry -Timestamp $snapshotTs -Source "$browserName Top Sites" -EventType "Snapshot" `
+                -Description $desc `
+                -User $user `
+                -Details (Format-ArtifactDetails ([ordered]@{ Rank = $rankText; URL = $r.Url; Profile = $profileName })) `
+                -Artifact "Browser" -RawPath $db.FullName
+            $sites++
+        }
+        Log "    $sites top site(s) added (snapshot)."
+        if ($sites -gt 0) { $browserParsed = $true }
     }
 
     if (-not $browserParsed) {
@@ -5348,8 +6432,143 @@ function Parse-Memory {
 # ----------------------------------------------------------
 # 16. System Info Parser
 # ----------------------------------------------------------
+# "Name:   value" lines of systeminfo output (English) as a hashtable; the
+# indented lines of lists (processors, hotfixes, NICs) are left out, and a
+# name seen twice keeps its first value
+function ConvertFrom-SystemInfoText {
+    param([string[]]$Lines)
+    $values = @{}
+    foreach ($line in $Lines) {
+        if ($line -match '^(\S[^:]*?):\s+(\S.*?)\s*$' -and -not $values.ContainsKey($Matches[1])) { $values[$Matches[1]] = $Matches[2] }
+    }
+    return $values
+}
+
 function Parse-SystemInfo {
     Log "--- Parsing System Info ---"
+
+    # systeminfo.txt (live collections only). Install and boot times are local
+    # time of the collector host in its culture (e.g. "9/18/2025, 2:25:51 PM").
+    $infoFiles = @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("systeminfo.txt"))
+    if ($infoFiles.Count -eq 0) { Log-Warning "No systeminfo.txt found in the collection." }
+    foreach ($file in $infoFiles) {
+        Log "  Parsing: $($file.FullName)"
+        try {
+            $values = ConvertFrom-SystemInfoText -Lines (Get-Content -Path $file.FullName -ErrorAction Stop)
+            if (-not $values["OS Name"]) {
+                Log-Warning "    No 'OS Name' line found (systeminfo output in another language?) -- skipped."
+                continue
+            }
+            $user = Get-CollectionUser $file.FullName
+            $osVersion = [string]$values["OS Version"]
+            $version = if ($osVersion -match '^(\d+(?:\.\d+)+)') { $Matches[1] } else { $osVersion }
+            $build = if ($osVersion -match 'Build (\d+)') { $Matches[1] } else { "" }
+            $osDetails = [ordered]@{ Host = $values["Host Name"]; OS = $values["OS Name"]; Version = $version; Build = $build }
+            $rows = 0
+
+            foreach ($spec in @(@("Original Install Date", "Installation", "Windows installed"), @("System Boot Time", "ServiceChange", "System booted"))) {
+                $text = $values[$spec[0]]
+                if (-not $text) { continue }
+                $utc = ConvertFrom-CollectorLocalText $text
+                if (-not $utc) {
+                    Log-Warning "    Could not parse $($spec[0]): '$text'"
+                    continue
+                }
+                $details = [ordered]@{}
+                foreach ($k in $osDetails.Keys) { $details[$k] = $osDetails[$k] }
+                $details["LocalTime"] = "$text (collector time zone $((Get-CollectionInfo).CollectorTimeZone.Id))"
+                Add-TimelineEntry -Timestamp $utc -Source "SystemInfo" -EventType $spec[1] `
+                    -Description $spec[2] `
+                    -User $user -Details (Format-ArtifactDetails $details) `
+                    -Artifact "SystemInfo" -RawPath $file.FullName
+                $rows++
+            }
+
+            # The system as collected
+            $snapshotTs = Get-SnapshotTimeUtc -File $file
+            if ($snapshotTs) {
+                $desc = "System: $($values['OS Name'])"
+                if ($version) { $desc += " $version" }
+                if ($build) { $desc += " build $build" }
+                if ($values["System Type"]) { $desc += " ($($values['System Type']))" }
+                if ($values["Domain"]) { $desc += ", domain $($values['Domain'])" }
+                $details = [ordered]@{}
+                foreach ($k in $osDetails.Keys) { $details[$k] = $osDetails[$k] }
+                $details["SystemType"] = $values["System Type"]
+                $details["Domain"] = $values["Domain"]
+                $details["Configuration"] = $values["OS Configuration"]
+                $details["Model"] = (@($values["System Manufacturer"], $values["System Model"]) | Where-Object { $_ }) -join " "
+                $details["TimeZone"] = $values["Time Zone"]
+                Add-TimelineEntry -Timestamp $snapshotTs -Source "SystemInfo" -EventType "Snapshot" `
+                    -Description $desc `
+                    -User $user -Details (Format-ArtifactDetails $details) `
+                    -Artifact "SystemInfo" -RawPath $file.FullName
+                $rows++
+            }
+            Log "    Added $rows timeline entries"
+        }
+        catch { Log-Warning "  Failed to parse $($file.Name): $($_.Exception.Message)" }
+    }
+
+    # Enabled firewall rules (Get-NetFirewallRule -Enabled True | Format-Table
+    # DisplayName, Direction, Action, Profile). Only inbound allow rules --
+    # what lets other hosts connect in -- become Snapshot rows.
+    $fwFiles = @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("firewall_rules.txt"))
+    foreach ($file in $fwFiles) {
+        Log "  Parsing: $($file.FullName)"
+        try {
+            $snapshotTs = Get-SnapshotTimeUtc -File $file
+            $rules = @(ConvertFrom-FormatTableText -Lines (Get-Content -Path $file.FullName -ErrorAction Stop))
+            if ($rules.Count -eq 0) {
+                Log "    No firewall rule table found."
+                continue
+            }
+            if (-not $rules[0].PSObject.Properties["Direction"] -or -not $rules[0].PSObject.Properties["Action"]) {
+                # Format-Table drops columns that do not fit the console width
+                Log-Warning "    $($rules.Count) rule(s) listed without Direction/Action columns (the table was too wide when collected) -- inbound allow rules cannot be identified; none added."
+                continue
+            }
+            if (-not $snapshotTs) {
+                Log-Warning "    Collection time unknown -- firewall rules skipped."
+                continue
+            }
+            # A long name wrapped by -Wrap continues on lines whose other
+            # columns are empty: join those to the rule above
+            $merged = New-Object System.Collections.Generic.List[object]
+            foreach ($rule in $rules) {
+                $name = Get-ArtifactRowValue $rule @("DisplayName", "Name")
+                if ($merged.Count -gt 0 -and -not (Get-ArtifactRowValue $rule @("Direction")) -and -not (Get-ArtifactRowValue $rule @("Action"))) {
+                    $merged[$merged.Count - 1].Name += " $name"
+                    continue
+                }
+                $merged.Add([PSCustomObject]@{
+                    Name      = $name
+                    Direction = Get-ArtifactRowValue $rule @("Direction")
+                    Action    = Get-ArtifactRowValue $rule @("Action")
+                    Enabled   = Get-ArtifactRowValue $rule @("Enabled")
+                    Profile   = Get-ArtifactRowValue $rule @("Profile")
+                })
+            }
+            $user = Get-CollectionUser $file.FullName
+            $added = 0
+            foreach ($rule in $merged) {
+                # Enum names, or the numbers (Inbound = 1, Allow = 2)
+                if (@("Inbound", "1") -notcontains $rule.Direction -or @("Allow", "2") -notcontains $rule.Action) { continue }
+                if ($rule.Enabled -and @("True", "1") -notcontains $rule.Enabled) { continue }
+                $name = $rule.Name.Trim()
+                if (-not $name) { continue }
+                Add-TimelineEntry -Timestamp $snapshotTs -Source "Firewall" -EventType "Snapshot" `
+                    -Description "Firewall rule (enabled, inbound allow): $name" `
+                    -User $user `
+                    -Details (Format-ArtifactDetails ([ordered]@{ Direction = "Inbound"; Action = "Allow"; Profile = $rule.Profile })) `
+                    -Artifact "SystemInfo" -RawPath $file.FullName
+                $added++
+            }
+            Log "    $added inbound allow rule(s) of $($merged.Count) enabled rule(s) (snapshot)"
+        }
+        catch { Log-Warning "  Failed to parse $($file.Name): $($_.Exception.Message)" }
+    }
+
     Log "  System info parsing complete."
     Log ""
 }
@@ -6007,20 +7226,41 @@ if ($entryCount -eq 0) {
 
 # Deduplicate: an entry is a duplicate only if Timestamp, Source, EventType,
 # Description, User and Details are all identical (case-sensitive). The first
-# occurrence is kept. A HashSet keeps this fast on very large timelines.
+# occurrence is kept and, when there were more, "Occurrences=N" is appended to
+# its Details once all keys are built (so the count is never part of a key).
+# A dictionary of key -> position of the kept row keeps this fast on very
+# large timelines; only rows that have duplicates are touched afterwards.
 Log "  Deduplicating..."
-$dedupKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+$dedupPositions = [System.Collections.Generic.Dictionary[string, int]]::new($entryCount, [System.StringComparer]::Ordinal)
 $deduped = [System.Collections.Generic.List[object]]::new($entryCount)
+# Extra occurrences per kept position, and the positions that have any
+$extraCount = New-Object int[] $entryCount
+$withDuplicates = [System.Collections.Generic.List[int]]::new()
 foreach ($entry in $script:timelineEntries) {
     # NUL separator: cannot occur in the values (removed by Add-TimelineEntry)
     $dedupKey = [string]$entry.Timestamp + "`0" + $entry.Source + "`0" + $entry.EventType + "`0" +
         $entry.Description + "`0" + $entry.User + "`0" + $entry.Details
-    if ($dedupKeys.Add($dedupKey)) { $deduped.Add($entry) }
+    if ($dedupPositions.ContainsKey($dedupKey)) {
+        $firstPosition = $dedupPositions[$dedupKey]
+        if ($extraCount[$firstPosition] -eq 0) { $withDuplicates.Add($firstPosition) }
+        $extraCount[$firstPosition]++
+    }
+    else {
+        $dedupPositions[$dedupKey] = $deduped.Count
+        $deduped.Add($entry)
+    }
 }
-$dedupKeys = $null
+$dedupPositions = $null
+foreach ($firstPosition in $withDuplicates) {
+    $kept = $deduped[$firstPosition]
+    $occurrenceText = "Occurrences=$($extraCount[$firstPosition] + 1)"
+    $kept.Details = if ($kept.Details) { "$($kept.Details) | $occurrenceText" } else { $occurrenceText }
+}
+$extraCount = $null
 $dedupedCount = $deduped.Count
 $removedCount = $entryCount - $dedupedCount
-Log "  Removed $removedCount duplicate(s). Unique entries: $dedupedCount"
+Log "  Removed $removedCount duplicate(s) ($($withDuplicates.Count) row(s) now carry Occurrences=N). Unique entries: $dedupedCount"
+$withDuplicates = $null
 
 # Sort chronologically. Timestamps are fixed-width "yyyy-MM-dd HH:mm:ss.fff"
 # text, so an ordinal sort is chronological. The original position is appended
