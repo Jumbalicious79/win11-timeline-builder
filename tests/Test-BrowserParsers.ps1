@@ -9,7 +9,9 @@
 # and its Details. Every secret column (saved passwords, cookie values,
 # autofill and form values, payment cards, addresses, Firefox encrypted
 # logins) holds a canary string that must appear nowhere in the
-# timeline or the builder log.
+# timeline, the builder log or its output -- also not from a logins.json
+# cut off inside an encrypted password. A Cookies database copied
+# mid-transaction must be read through its journal.
 #
 # Needs Administrator rights, like the builder itself (GitHub Actions
 # Windows runners are elevated). For a local run without them, pass
@@ -99,6 +101,29 @@ function New-TestDatabase {
     $ErrorActionPreference = "Continue"
     $output = $Sql | & $script:sqlite3 -bail $Path 2>&1
     if ($LASTEXITCODE -ne 0) { throw "sqlite3 could not create $Path : $output" }
+}
+
+# Creates a database from $Sql, then copies it and its rollback journal to
+# $Path and "$Path-journal" while a transaction ($Transaction) is open: with
+# a 1-page cache the change spills into the database file, so the copy is
+# half-written, like one read from disk mid-write. Only the journal brings
+# it back to its committed state.
+function New-TestHotJournalDatabase {
+    param([string]$Path, [string]$Sql, [string]$Transaction)
+    $work = Join-Path $workDir ("hot-" + [guid]::NewGuid().ToString("N") + ".db")
+    New-TestDatabase -Path $work -Sql $Sql
+    New-Item -ItemType Directory -Path (Split-Path $Path -Parent) -Force | Out-Null
+    # .system runs a command while the transaction is open; \\ in "..." is one \
+    $copy = '.system copy /y "{0}" "{1}"'
+    $commands = @("PRAGMA cache_size = 1;", "BEGIN;", $Transaction,
+        ($copy -f $work.Replace('\', '\\'), $Path.Replace('\', '\\')),
+        ($copy -f "$work-journal".Replace('\', '\\'), "$Path-journal".Replace('\', '\\')),
+        "ROLLBACK;") -join "`n"
+    $ErrorActionPreference = "Continue"
+    $output = $commands | & $script:sqlite3 -bail $work 2>&1
+    if (-not (Test-Path -LiteralPath $Path) -or -not (Test-Path -LiteralPath "$Path-journal")) {
+        throw "sqlite3 could not copy $work during a transaction: $output"
+    }
 }
 
 # Writes an ASCII text file (no BOM)
@@ -192,11 +217,15 @@ INSERT INTO downloads_url_chains VALUES (1, 0, 'https://old.example.com/old.zip'
 "@
 
     # Chromium Login Data (current schema): a saved login (created, used,
-    # password changed) and a "never save" entry
+    # password changed), a "never save" entry, and a login never used after
+    # it was saved (Chromium sets date_last_used at the form submit, seconds
+    # before the user clicks Save, which sets date_created: no "used" row)
     $created1 = ConvertTo-StoredTime "2026-02-01 08:00:00.000" Chromium
     $used1 = ConvertTo-StoredTime "2026-03-01 09:00:00.000" Chromium
     $changed1 = ConvertTo-StoredTime "2026-02-15 12:00:00.000" Chromium
     $created2 = ConvertTo-StoredTime "2026-02-02 08:00:00.000" Chromium
+    $submitted3 = ConvertTo-StoredTime "2026-02-20 10:00:00.000" Chromium
+    $created3 = ConvertTo-StoredTime "2026-02-20 10:00:07.000" Chromium
     New-TestDatabase -Path (Join-Path $userDir "Chrome\Default\Login Data") -Sql @"
 CREATE TABLE meta(key LONGVARCHAR NOT NULL UNIQUE PRIMARY KEY, value LONGVARCHAR);
 INSERT INTO meta VALUES ('version', '43');
@@ -206,6 +235,8 @@ INSERT INTO logins (origin_url, action_url, username_element, username_value, pa
   VALUES ('https://mail.example.com/', 'https://mail.example.com/login', 'email', 'alice@example.com', 'pass', CAST('$canary-password-1' AS BLOB), '', 'https://mail.example.com/', $created1, 0, 0, 0, 7, X'', '', '', '', 0, 0, X'', $used1, X'', $changed1, $used1);
 INSERT INTO logins (origin_url, action_url, username_element, username_value, password_element, password_value, submit_element, signon_realm, date_created, blacklisted_by_user, scheme, password_type, times_used, form_data, display_name, icon_url, federation_url, skip_zero_click, generation_upload_status, possible_username_pairs, date_last_used, moving_blocked_for, date_password_modified, date_last_filled)
   VALUES ('https://bank.example.org/', '', '', '', '', CAST('$canary-password-2' AS BLOB), '', 'https://bank.example.org/', $created2, 1, 0, 0, 0, X'', '', '', '', 0, 0, X'', 0, X'', $created2, 0);
+INSERT INTO logins (origin_url, action_url, username_element, username_value, password_element, password_value, submit_element, signon_realm, date_created, blacklisted_by_user, scheme, password_type, times_used, form_data, display_name, icon_url, federation_url, skip_zero_click, generation_upload_status, possible_username_pairs, date_last_used, moving_blocked_for, date_password_modified, date_last_filled)
+  VALUES ('https://shop.example.net/', 'https://shop.example.net/signin', 'user', 'bob', 'pw', CAST('$canary-password-3' AS BLOB), '', 'https://shop.example.net/', $created3, 0, 0, 0, 1, X'', '', '', '', 0, 0, X'', $submitted3, X'', $submitted3, 0);
 INSERT INTO password_notes (parent_id, key, value, date_created, confidential) VALUES (1, 'note', CAST('$canary-note' AS BLOB), $created1, 1);
 "@
 
@@ -233,10 +264,21 @@ INSERT INTO meta VALUES ('version', '9');
 CREATE TABLE cookies (creation_utc INTEGER NOT NULL UNIQUE PRIMARY KEY,host_key TEXT NOT NULL,name TEXT NOT NULL,value TEXT NOT NULL,path TEXT NOT NULL,expires_utc INTEGER NOT NULL,secure INTEGER NOT NULL,httponly INTEGER NOT NULL,last_access_utc INTEGER NOT NULL, has_expires INTEGER NOT NULL DEFAULT 1, persistent INTEGER NOT NULL DEFAULT 1,priority INTEGER NOT NULL DEFAULT 1,encrypted_value BLOB DEFAULT '',firstpartyonly INTEGER NOT NULL DEFAULT 0);
 INSERT INTO cookies VALUES ($(ConvertTo-StoredTime "2025-12-01 00:00:00.000" Chromium), '.legacy.example', 'old', '$canary-value', '/', 0, 1, 0, $(ConvertTo-StoredTime "2025-12-05 00:00:00.000" Chromium), 0, 1, 1, CAST('$canary-encrypted' AS BLOB), 0);
 "@
+    # Network\Cookies copied mid-transaction with its Cookies-journal (the
+    # collector collects it): 400 committed cookies on journal.example; the
+    # open transaction deletes half and moves the rest to another host
+    $journalCreated = ConvertTo-StoredTime "2026-01-20 00:00:00.000" Chromium
+    $journalAccessed = ConvertTo-StoredTime "2026-02-21 00:00:00.000" Chromium
+    New-TestHotJournalDatabase -Path (Join-Path $userDir "Vivaldi\Default\Network\Cookies") -Sql ($cookieSql + "`n" +
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 400) INSERT INTO cookies SELECT $journalCreated + i, 'journal.example', '', 'c' || i, " +
+        "'$canary-' || hex(randomblob(200)), CAST('$canary-encrypted' AS BLOB), '/', 0, 1, 1, $journalAccessed + i, 1, 1, 1, 0, 2, 443, $journalCreated + i, 0, 0 FROM n;") `
+        -Transaction "DELETE FROM cookies WHERE rowid % 2 = 0; UPDATE cookies SET host_key = 'uncommitted.example', value = '$canary-' || hex(randomblob(300));"
 
     # Chromium Web Data: autofill (times in seconds since 1970), search
-    # engines (prepopulated, custom, auto-generated) and the payment card and
-    # address tables, which must never be read
+    # engines (prepopulated, custom, auto-generated -- used when it was added,
+    # so no "last used" row -- and a custom one whose name starts with '#',
+    # which ConvertFrom-Csv would take for a comment line) and the payment
+    # card and address tables, which must never be read
     $engineColumns = "id, short_name, keyword, favicon_url, url, safe_for_autoreplace, originating_url, date_created, usage_count, input_encodings, suggest_url, prepopulate_id, created_by_policy, last_modified, sync_guid, alternate_urls, image_url, search_url_post_params, suggest_url_post_params, image_url_post_params, new_tab_url, last_visited, created_from_play_api, is_active, starter_pack_id, enforced_by_policy, featured_by_policy, url_hash"
     New-TestDatabase -Path (Join-Path $userDir "Chrome\Default\Web Data") -Sql @"
 CREATE TABLE meta(key LONGVARCHAR NOT NULL UNIQUE PRIMARY KEY, value LONGVARCHAR);
@@ -250,7 +292,8 @@ INSERT INTO autofill VALUES ('email', '$canary-email', lower('$canary-email'), $
 INSERT INTO autofill VALUES ('q', '$canary-search', lower('$canary-search'), $(ConvertTo-StoredTime "2026-02-04 06:00:00.000" UnixSeconds), $(ConvertTo-StoredTime "2026-02-04 06:00:00.000" UnixSeconds), 1);
 INSERT INTO keywords ($engineColumns) VALUES (2, 'Google', 'google.com', 'https://www.google.com/favicon.ico', 'https://www.google.com/search?q={searchTerms}', 1, '', 0, 0, 'UTF-8', '', 1, 0, 0, 'guid-google', '[]', '', '', '', '', '', $(ConvertTo-StoredTime "2026-03-01 09:30:00.000" Chromium), 0, 1, 0, 0, 0, NULL);
 INSERT INTO keywords ($engineColumns) VALUES (5, 'Evil Search', 'evil', '', 'https://search.evil.example/?q={searchTerms}', 0, '', $(ConvertTo-StoredTime "2026-02-10 03:00:00.000" Chromium), 0, '', '', 0, 0, $(ConvertTo-StoredTime "2026-02-11 03:00:00.000" Chromium), 'guid-evil', '[]', '', '', '', '', '', 0, 0, 1, 0, 0, 0, NULL);
-INSERT INTO keywords ($engineColumns) VALUES (6, 'Shop', 'shop.example', '', 'https://shop.example/search?q={searchTerms}', 1, 'https://shop.example/opensearch.xml', $(ConvertTo-StoredTime "2026-02-12 00:00:00.000" Chromium), 0, '', '', 0, 0, $(ConvertTo-StoredTime "2026-02-12 00:00:00.000" Chromium), 'guid-shop', '[]', '', '', '', '', '', 0, 0, 1, 0, 0, 0, NULL);
+INSERT INTO keywords ($engineColumns) VALUES (6, 'Shop', 'shop.example', '', 'https://shop.example/search?q={searchTerms}', 1, 'https://shop.example/opensearch.xml', $(ConvertTo-StoredTime "2026-02-12 00:00:00.000" Chromium), 0, '', '', 0, 0, $(ConvertTo-StoredTime "2026-02-12 00:00:00.000" Chromium), 'guid-shop', '[]', '', '', '', '', '', $(ConvertTo-StoredTime "2026-02-12 00:00:00.000" Chromium), 0, 1, 0, 0, 0, NULL);
+INSERT INTO keywords ($engineColumns) VALUES (7, '#hijack', 'h', '', 'https://hijack.example/?q={searchTerms}', 0, '', $(ConvertTo-StoredTime "2026-02-13 00:00:00.000" Chromium), 0, '', '', 0, 0, $(ConvertTo-StoredTime "2026-02-13 00:00:00.000" Chromium), 'guid-hijack', '[]', '', '', '', '', '', 0, 0, 1, 0, 0, 0, NULL);
 INSERT INTO credit_cards VALUES ('card-1', '$canary-name', 12, 2030, CAST('$canary-card' AS BLOB), 0, '', 1, 0, '', '$canary-nickname');
 INSERT INTO addresses VALUES ('address-1', 1, 0, 0, 'en', '', 0, 0, 0);
 INSERT INTO address_type_tokens VALUES ('address-1', 3, '$canary-address', 0, NULL);
@@ -258,8 +301,9 @@ INSERT INTO address_type_tokens VALUES ('address-1', 3, '$canary-address', 0, NU
 
     # Firefox profile
     $ffDir = Join-Path $userDir "Firefox\abcd1234.default-release"
-    # places.sqlite: one visit and two downloads (completed after 5 minutes;
-    # blocked by the reputation check after 1 s)
+    # places.sqlite: one visit and two downloads: one completed after 5
+    # minutes, whose download visit (type 7) comes from a page visit (the
+    # referrer), and one blocked by the reputation check after 1 s
     New-TestDatabase -Path (Join-Path $ffDir "places.sqlite") -Sql @"
 CREATE TABLE moz_places ( id INTEGER PRIMARY KEY, url LONGVARCHAR, title LONGVARCHAR, rev_host LONGVARCHAR, visit_count INTEGER DEFAULT 0, hidden INTEGER DEFAULT 0 NOT NULL, typed INTEGER DEFAULT 0 NOT NULL, frecency INTEGER DEFAULT -1 NOT NULL, last_visit_date INTEGER, guid TEXT, foreign_count INTEGER DEFAULT 0 NOT NULL, url_hash INTEGER DEFAULT 0 NOT NULL, description TEXT, preview_image_url TEXT, site_name TEXT, origin_id INTEGER REFERENCES moz_origins(id), recalc_frecency INTEGER NOT NULL DEFAULT 0, alt_frecency INTEGER, recalc_alt_frecency INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE moz_historyvisits (id INTEGER PRIMARY KEY, from_visit INTEGER, place_id INTEGER, visit_date INTEGER, visit_type INTEGER, session INTEGER, source INTEGER DEFAULT 0 NOT NULL, triggeringPlaceId INTEGER);
@@ -269,7 +313,10 @@ CREATE TABLE moz_annos (id INTEGER PRIMARY KEY, place_id INTEGER NOT NULL, anno_
 INSERT INTO moz_places (id, url, title, rev_host, visit_count, typed, frecency, last_visit_date, guid) VALUES (1, 'https://www.mozilla.org/', 'Mozilla', 'gro.allizom.www.', 1, 1, 100, $(ConvertTo-StoredTime "2026-03-02 12:00:00.000" PRTime), 'placeguid001');
 INSERT INTO moz_places (id, url, title, rev_host, visit_count, frecency, guid) VALUES (2, 'https://files.example.org/tool.zip', 'tool.zip', 'gro.elpmaxe.selif.', 0, 0, 'placeguid002');
 INSERT INTO moz_places (id, url, title, rev_host, visit_count, frecency, guid) VALUES (3, 'https://bad.example/payload.exe', 'payload.exe', 'elpmaxe.dab.', 0, 0, 'placeguid003');
+INSERT INTO moz_places (id, url, title, rev_host, visit_count, frecency, guid) VALUES (4, 'https://files.example.org/tools.html', 'Tools', 'gro.elpmaxe.selif.', 1, 100, 'placeguid004');
 INSERT INTO moz_historyvisits (id, from_visit, place_id, visit_date, visit_type, session, source) VALUES (1, 0, 1, $(ConvertTo-StoredTime "2026-03-02 12:00:00.000" PRTime), 2, 0, 0);
+INSERT INTO moz_historyvisits (id, from_visit, place_id, visit_date, visit_type, session, source) VALUES (2, 0, 4, $(ConvertTo-StoredTime "2026-03-02 12:09:30.000" PRTime), 1, 0, 0);
+INSERT INTO moz_historyvisits (id, from_visit, place_id, visit_date, visit_type, session, source) VALUES (3, 2, 2, $(ConvertTo-StoredTime "2026-03-02 12:10:00.000" PRTime), 7, 0, 0);
 INSERT INTO moz_anno_attributes VALUES (1, 'downloads/destinationFileURI');
 INSERT INTO moz_anno_attributes VALUES (2, 'downloads/metaData');
 INSERT INTO moz_annos VALUES (1, 2, 1, 'file:///C:/Users/alice/Downloads/tool%20v2.zip', 0, 4, 3, $(ConvertTo-StoredTime "2026-03-02 12:10:00.000" PRTime), $(ConvertTo-StoredTime "2026-03-02 12:10:00.000" PRTime));
@@ -294,14 +341,26 @@ CREATE TABLE moz_perms ( id INTEGER PRIMARY KEY,origin TEXT,type TEXT,permission
 INSERT INTO moz_perms VALUES (1, 'https://push.example.com', 'desktop-notification', 1, 0, 0, $(ConvertTo-StoredTime "2026-02-25 16:00:00.000" UnixMs));
 INSERT INTO moz_perms VALUES (2, 'https://cam.example.com', 'camera', 2, 2, $(ConvertTo-StoredTime "2026-03-25 16:00:00.000" UnixMs), $(ConvertTo-StoredTime "2026-02-26 16:00:00.000" UnixMs));
 "@
-    # logins.json: times in milliseconds; the password was never changed
+    # logins.json: times in milliseconds; the first password was never
+    # changed; the second login was never used after it was saved (Firefox
+    # sets all three times when a login is saved: only a "created" row)
     $loginCreated = ConvertTo-StoredTime "2026-01-20 10:00:00.000" UnixMs
     $loginUsed = ConvertTo-StoredTime "2026-03-02 13:00:00.000" UnixMs
-    New-TestTextFile -Path (Join-Path $ffDir "logins.json") -Text ('{"nextId":2,"logins":[{"id":1,"hostname":"https://forum.example.com","httpRealm":null,' +
+    $loginSaved = ConvertTo-StoredTime "2026-03-02 10:00:00.000" UnixMs
+    New-TestTextFile -Path (Join-Path $ffDir "logins.json") -Text ('{"nextId":3,"logins":[{"id":1,"hostname":"https://forum.example.com","httpRealm":null,' +
         '"formSubmitURL":"https://forum.example.com/login","usernameField":"user","passwordField":"pass",' +
         '"encryptedUsername":"' + $canary + '-username","encryptedPassword":"' + $canary + '-password",' +
         '"guid":"{11111111-2222-3333-4444-555555555555}","encType":1,"timeCreated":' + $loginCreated + ',"timeLastUsed":' + $loginUsed +
-        ',"timePasswordChanged":' + $loginCreated + ',"timesUsed":5}],"potentiallyVulnerablePasswords":[],"dismissedBreachAlertsByLoginGUID":{},"version":3}')
+        ',"timePasswordChanged":' + $loginCreated + ',"timesUsed":5},' +
+        '{"id":2,"hostname":"https://new.example.com","httpRealm":null,"formSubmitURL":"https://new.example.com/","usernameField":"email","passwordField":"pw",' +
+        '"encryptedUsername":"' + $canary + '-username-2","encryptedPassword":"' + $canary + '-password-2",' +
+        '"guid":"{22222222-3333-4444-5555-666666666666}","encType":1,"timeCreated":' + $loginSaved + ',"timeLastUsed":' + $loginSaved +
+        ',"timePasswordChanged":' + $loginSaved + ',"timesUsed":1}],"potentiallyVulnerablePasswords":[],"dismissedBreachAlertsByLoginGUID":{},"version":3}')
+    # A second profile with a logins.json cut off inside an encrypted
+    # password (a damaged or partial copy): reported, never quoted
+    New-TestTextFile -Path (Join-Path $userDir "Firefox\trunc5678.default\logins.json") -Text ('{"nextId":2,"logins":[{"id":1,"hostname":"https://cut.example.com",' +
+        '"httpRealm":null,"formSubmitURL":"","usernameField":"u","passwordField":"p","encryptedUsername":"' + $canary + '-username-3",' +
+        '"encryptedPassword":"MEIEEPgAAAAAAAAAAAAAAAAAAAEwFAYIKoZIhvcNAwcE' + $canary + '-password-3')
     # key4.db (the Firefox key store) is collected but must never be read
     New-TestTextFile -Path (Join-Path $ffDir "key4.db") -Text "$canary-key4"
 
@@ -331,8 +390,10 @@ INSERT INTO moz_perms VALUES (2, 'https://cam.example.com', 'camera', 2, 2, $(Co
         "FirstSetUtc=2026-01-10 00:00:00", "LastAccessUtc=2026-03-01 10:00:00", "LatestExpiryUtc=2027-01-10 00:00:00", "Profile=Default")
     $evilEngine = @("Name=Evil Search", "Keyword=evil", "URL=https://search.evil.example/?q={searchTerms}", "Kind=Custom", "CreatedUtc=2026-02-10 03:00:00", "ModifiedUtc=2026-02-11 03:00:00")
     $toolLabel = "C:\Users\alice\Downloads\tool v2.zip (https://files.example.org/tool.zip)"
-    $toolDetails = @("Path=C:\Users\alice\Downloads\tool v2.zip", "URL=https://files.example.org/tool.zip", "State=FINISHED", "Bytes=2048",
-        "StartUtc=2026-03-02 12:10:00", "EndUtc=2026-03-02 12:15:00", "Profile=abcd1234.default-release")
+    $toolDetails = @("Path=C:\Users\alice\Downloads\tool v2.zip", "URL=https://files.example.org/tool.zip", "Referrer=https://files.example.org/tools.html",
+        "State=COMPLETE", "FirefoxState=FINISHED", "Bytes=2048", "StartUtc=2026-03-02 12:10:00", "EndUtc=2026-03-02 12:15:00", "Profile=abcd1234.default-release")
+    $journalCookies = @("Host=journal.example", "Cookies=400", "Persistent=400", "Secure=400", "HttpOnly=400", "FirstSetUtc=2026-01-20 00:00:00",
+        "LastAccessUtc=2026-02-21 00:00:00", "Profile=Default")
     $mozillaCookies = @("Host=.mozilla.org", "Cookies=2", "Names=a, b", "Secure=1", "HttpOnly=1", "FirstSetUtc=2026-02-05 00:00:00", "LastAccessUtc=2026-03-02 12:00:00")
     $forumLogin = @("URL=https://forum.example.com", "Action=https://forum.example.com/login", "UsernameField=user", "TimesUsed=5",
         "CreatedUtc=2026-01-20 10:00:00", "LastUsedUtc=2026-03-02 13:00:00", "Profile=abcd1234.default-release")
@@ -353,10 +414,12 @@ INSERT INTO moz_perms VALUES (2, 'https://cam.example.com', 'camera', 2, 2, $(Co
             Lacks = @("TabURL=", "MimeType=", "TotalBytes=", "SHA256=", "LastOpenedUtc=") }
         # Chromium saved logins
         @{ Time = "2026-02-01 08:00:00.000"; Source = "Chrome Logins"; Type = "NetworkConnection"; Text = "Saved login created: $mailLogin"; Has = $mailDetails; Lacks = @("NeverSave=") }
-        @{ Time = "2026-03-01 09:00:00.000"; Source = "Chrome Logins"; Type = "NetworkConnection"; Text = "Saved login used: $mailLogin"; Has = $mailDetails }
+        @{ Time = "2026-03-01 09:00:00.000"; Source = "Chrome Logins"; Type = "NetworkConnection"; Text = "Saved login last used: $mailLogin"; Has = $mailDetails }
         @{ Time = "2026-02-15 12:00:00.000"; Source = "Chrome Logins"; Type = "NetworkConnection"; Text = "Saved password changed: $mailLogin"; Has = $mailDetails }
         @{ Time = "2026-02-02 08:00:00.000"; Source = "Chrome Logins"; Type = "NetworkConnection"; Text = "Saved login declined: https://bank.example.org/ (never save for this site)"
             Has = @("URL=https://bank.example.org/", "NeverSave=Yes", "CreatedUtc=2026-02-02 08:00:00"); Lacks = @("Username=") }
+        @{ Time = "2026-02-20 10:00:07.000"; Source = "Chrome Logins"; Type = "NetworkConnection"; Text = "Saved login created: https://shop.example.net/ (user: bob)"
+            Has = @("Username=bob", "TimesUsed=1", "CreatedUtc=2026-02-20 10:00:07", "LastUsedUtc=2026-02-20 10:00:00", "PasswordChangedUtc=2026-02-20 10:00:00") }
         # Chromium cookies, per host
         @{ Time = "2026-01-10 00:00:00.000"; Source = "Chrome Cookies"; Type = "NetworkConnection"; Text = "Cookies first set: .example.com (2 cookies)"; Has = $exampleCookies }
         @{ Time = "2026-03-01 10:00:00.000"; Source = "Chrome Cookies"; Type = "NetworkConnection"; Text = "Cookies last accessed: .example.com (2 cookies)"; Has = $exampleCookies }
@@ -366,22 +429,30 @@ INSERT INTO moz_perms VALUES (2, 'https://cam.example.com', 'camera', 2, 2, $(Co
             Has = @("Names=old", "Persistent=1", "Secure=1", "HttpOnly=0", "Profile=Default") }
         @{ Time = "2025-12-05 00:00:00.000"; Source = "Edge Cookies"; Type = "NetworkConnection"; Text = "Cookies last accessed: .legacy.example (1 cookie)" }
         @{ Time = "2026-01-05 00:00:00.000"; Source = "Opera Cookies"; Type = "NetworkConnection"; Text = "Cookies first set: .opera.example (1 cookie)"; Lacks = @("Profile=") }
+        # Copied mid-transaction: read in its committed state through the journal
+        @{ Time = "2026-01-20 00:00:00.000"; Source = "Vivaldi Cookies"; Type = "NetworkConnection"; Text = "Cookies first set: journal.example (400 cookies)"; Has = $journalCookies }
+        @{ Time = "2026-02-21 00:00:00.000"; Source = "Vivaldi Cookies"; Type = "NetworkConnection"; Text = "Cookies last accessed: journal.example (400 cookies)"; Has = $journalCookies }
         # Chromium autofill and search engines
         @{ Time = "2026-02-03 07:00:00.000"; Source = "Chrome Autofill"; Type = "NetworkConnection"; Text = "Form entry saved: field email"
             Has = @("Field=email", "TimesUsed=3", "FirstUsedUtc=2026-02-03 07:00:00", "LastUsedUtc=2026-02-28 07:00:00", "Profile=Default") }
         @{ Time = "2026-02-28 07:00:00.000"; Source = "Chrome Autofill"; Type = "NetworkConnection"; Text = "Form entry last used: field email" }
         @{ Time = "2026-02-04 06:00:00.000"; Source = "Chrome Autofill"; Type = "NetworkConnection"; Text = "Form entry saved: field q"; Has = @("TimesUsed=1") }
-        @{ Time = "2026-03-01 09:30:00.000"; Source = "Chrome Search Engines"; Type = "NetworkConnection"; Text = "Search engine used: Google (https://www.google.com/search?q={searchTerms})"
+        @{ Time = "2026-03-01 09:30:00.000"; Source = "Chrome Search Engines"; Type = "NetworkConnection"; Text = "Search engine last used: Google (https://www.google.com/search?q={searchTerms})"
             Has = @("Kind=Prepopulated", "Keyword=google.com", "LastUsedUtc=2026-03-01 09:30:00"); Lacks = @("CreatedUtc=") }
         @{ Time = "2026-02-10 03:00:00.000"; Source = "Chrome Search Engines"; Type = "NetworkConnection"; Text = "Search engine added: Evil Search (https://search.evil.example/?q={searchTerms})"; Has = $evilEngine }
         @{ Time = "2026-02-11 03:00:00.000"; Source = "Chrome Search Engines"; Type = "NetworkConnection"; Text = "Search engine modified: Evil Search (https://search.evil.example/?q={searchTerms})"; Has = $evilEngine }
         @{ Time = "2026-02-12 00:00:00.000"; Source = "Chrome Search Engines"; Type = "NetworkConnection"; Text = "Search engine added: Shop (https://shop.example/search?q={searchTerms})"
-            Has = @("Kind=AutoGenerated", "OriginatingURL=https://shop.example/opensearch.xml") }
+            Has = @("Kind=AutoGenerated", "OriginatingURL=https://shop.example/opensearch.xml", "LastUsedUtc=2026-02-12 00:00:00") }
+        @{ Time = "2026-02-13 00:00:00.000"; Source = "Chrome Search Engines"; Type = "NetworkConnection"; Text = "Search engine added: #hijack (https://hijack.example/?q={searchTerms})"
+            Has = @("Name=#hijack", "Keyword=h", "Kind=Custom") }
         # Firefox downloads
         @{ Time = "2026-03-02 12:10:00.000"; Source = "Firefox Downloads"; Type = "FileAccess"; Text = "Download started: $toolLabel"; Has = $toolDetails }
         @{ Time = "2026-03-02 12:15:00.000"; Source = "Firefox Downloads"; Type = "FileAccess"; Text = "Download completed: $toolLabel"; Has = $toolDetails }
         @{ Time = "2026-03-02 12:20:00.000"; Source = "Firefox Downloads"; Type = "FileAccess"; Text = "Download started: C:\Users\alice\Downloads\payload.exe (https://bad.example/payload.exe)"
-            Has = @("State=DIRTY", "DangerType=Malware", "EndUtc=2026-03-02 12:20:01"); Lacks = @("Bytes=") }
+            Has = @("State=BLOCKED", "FirefoxState=DIRTY", "DangerType=Malware", "EndUtc=2026-03-02 12:20:01"); Lacks = @("Bytes=", "Referrer=") }
+        # The referrer page visit and the download visit
+        @{ Time = "2026-03-02 12:09:30.000"; Source = "Firefox History"; Type = "NetworkConnection"; Text = "Browser visit: Tools" }
+        @{ Time = "2026-03-02 12:10:00.000"; Source = "Firefox History"; Type = "NetworkConnection"; Text = "Browser visit: tool.zip"; Has = @("Transition=DOWNLOAD") }
         # Firefox cookies, form history, permissions and saved logins
         @{ Time = "2026-02-05 00:00:00.000"; Source = "Firefox Cookies"; Type = "NetworkConnection"; Text = "Cookies first set: .mozilla.org (2 cookies)"; Has = $mozillaCookies; Lacks = @("Persistent=") }
         @{ Time = "2026-03-02 12:00:00.000"; Source = "Firefox Cookies"; Type = "NetworkConnection"; Text = "Cookies last accessed: .mozilla.org (2 cookies)"; Has = $mozillaCookies }
@@ -393,7 +464,9 @@ INSERT INTO moz_perms VALUES (2, 'https://cam.example.com', 'camera', 2, 2, $(Co
         @{ Time = "2026-02-26 16:00:00.000"; Source = "Firefox Permissions"; Type = "NetworkConnection"; Text = "Site permission set: https://cam.example.com camera=DENY"
             Has = @("Permission=DENY", "Expiry=TIME", "ExpiresUtc=2026-03-25 16:00:00") }
         @{ Time = "2026-01-20 10:00:00.000"; Source = "Firefox Logins"; Type = "NetworkConnection"; Text = "Saved login created: https://forum.example.com"; Has = $forumLogin; Lacks = @("Username=") }
-        @{ Time = "2026-03-02 13:00:00.000"; Source = "Firefox Logins"; Type = "NetworkConnection"; Text = "Saved login used: https://forum.example.com"; Has = $forumLogin }
+        @{ Time = "2026-03-02 13:00:00.000"; Source = "Firefox Logins"; Type = "NetworkConnection"; Text = "Saved login last used: https://forum.example.com"; Has = $forumLogin }
+        @{ Time = "2026-03-02 10:00:00.000"; Source = "Firefox Logins"; Type = "NetworkConnection"; Text = "Saved login created: https://new.example.com"
+            Has = @("UsernameField=email", "TimesUsed=1", "CreatedUtc=2026-03-02 10:00:00", "LastUsedUtc=2026-03-02 10:00:00", "PasswordChangedUtc=2026-03-02 10:00:00") }
     )
 
     # --- Checks ---
@@ -428,6 +501,10 @@ INSERT INTO moz_perms VALUES (2, 'https://cam.example.com', 'camera', 2, 2, $(Co
     $logText = ($logFiles | ForEach-Object { [System.IO.File]::ReadAllText($_.FullName) }) -join "`n"
     Write-TestResult -Succeeded ($logFiles.Count -gt 0 -and $logText.IndexOf($canary, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) -Message "no secret value (canary) in the builder log"
     Write-TestResult -Succeeded ((($builderOutput -join "`n").IndexOf($canary, [System.StringComparison]::OrdinalIgnoreCase)) -lt 0) -Message "no secret value (canary) in the builder output"
+    # The cut-off logins.json is reported (the canary checks above show its
+    # encrypted values are not)
+    $damaged = @($builderOutput | Where-Object { $_ -like "*Could not read saved logins*trunc5678.default*not valid JSON*" })
+    Write-TestResult -Succeeded ($damaged.Count -gt 0) -Message "the cut-off logins.json is reported as not valid JSON"
 
     if ($script:failures -gt 0) {
         Write-Host "FAIL: $($script:failures) check(s) failed" -ForegroundColor Red

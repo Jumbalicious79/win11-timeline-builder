@@ -3282,16 +3282,20 @@ function Find-Sqlite3Exe {
 }
 
 # Run a query with sqlite3 against a temp copy of the database (plus its -wal
-# file, so recent history not yet checkpointed is included). Returns the CSV
-# output lines, decoded as UTF-8.
+# file, so recent history not yet checkpointed is included, and its rollback
+# -journal, so a copy taken mid-transaction is rolled back to its last
+# committed state instead of being read half-written). Returns the CSV output
+# lines, decoded as UTF-8.
 function Invoke-Sqlite3Query {
     param([string]$Sqlite3Exe, [string]$DbPath, [string]$Query)
     $tempDb = Join-Path $env:TEMP "timeline_browser_$(Get-Random).db"
     $prevEncoding = $null
     try {
         Copy-Item -LiteralPath $DbPath -Destination $tempDb -Force -ErrorAction Stop
-        if (Test-Path -LiteralPath "$DbPath-wal") {
-            Copy-Item -LiteralPath "$DbPath-wal" -Destination "$tempDb-wal" -Force -ErrorAction SilentlyContinue
+        foreach ($companion in @("-wal", "-journal")) {
+            if (Test-Path -LiteralPath "$DbPath$companion") {
+                Copy-Item -LiteralPath "$DbPath$companion" -Destination "$tempDb$companion" -Force -ErrorAction SilentlyContinue
+            }
         }
         # sqlite3 writes UTF-8; without this, titles are decoded with the OEM code page
         try { $prevEncoding = [Console]::OutputEncoding; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 }
@@ -3466,16 +3470,23 @@ function Add-ChromiumBookmarkRows {
 # Column names of the given tables in a SQLite database: hashtable of table
 # name -> string[] (tables that do not exist are left out). The queries are
 # built from the columns present, as they differ between browser versions.
+# Plain PRAGMA table_info works with any sqlite3 version (pragma_table_info()
+# needs 3.16, and an older sqlite3 on PATH is used first); a row with cid -1
+# names the table whose columns follow.
 function Get-Sqlite3TableColumns {
     param([string]$Sqlite3Exe, [string]$DbPath, [string[]]$Tables)
-    $names = ($Tables | ForEach-Object { "'" + $_.Replace("'", "''") + "'" }) -join ", "
-    $query = "SELECT m.name, p.name FROM sqlite_master m JOIN pragma_table_info(m.name) p " +
-             "WHERE m.type = 'table' AND m.name IN ($names) ORDER BY m.name, p.cid;"
+    $query = ($Tables | ForEach-Object {
+        "SELECT -1, '" + $_.Replace("'", "''") + "'; PRAGMA table_info(""" + $_.Replace('"', '""') + """);"
+    }) -join " "
     $columns = @{}
+    $table = ""
     $rows = @(Invoke-Sqlite3Query -Sqlite3Exe $Sqlite3Exe -DbPath $DbPath -Query $query)
-    foreach ($r in ($rows | ConvertFrom-Csv -Header "Table", "Column")) {
-        if (-not $columns.ContainsKey($r.Table)) { $columns[$r.Table] = @() }
-        $columns[$r.Table] += $r.Column
+    # table_info rows: cid, name, type, notnull, dflt_value, pk
+    foreach ($r in ($rows | ConvertFrom-Csv -Header "Cid", "Name")) {
+        if ($r.Cid -eq "-1") { $table = $r.Name; continue }
+        if (-not $table) { continue }
+        if (-not $columns.ContainsKey($table)) { $columns[$table] = @() }
+        $columns[$table] += $r.Name
     }
     return $columns
 }
@@ -3534,13 +3545,18 @@ $script:ChromiumInterruptReasons = @{
     "35" = "SERVER_CERT_PROBLEM"; "36" = "SERVER_FORBIDDEN"; "37" = "SERVER_UNREACHABLE"; "38" = "SERVER_CONTENT_LENGTH_MISMATCH"
     "39" = "SERVER_CROSS_ORIGIN_REDIRECT"; "40" = "USER_CANCELED"; "41" = "USER_SHUTDOWN"; "50" = "CRASH"; "51" = "LOCAL_DOWNLOAD_BLOCKED"
 }
-# Firefox downloads/metaData state (DownloadHistory.sys.mjs)
+# Firefox downloads/metaData state (DownloadHistory.sys.mjs), and the
+# Chromium state name used for it in Details (State=; the Firefox name is
+# kept in FirefoxState=). Paused = stopped with partial data, which Chromium
+# stores as interrupted. BLOCKED: blocked by parental controls, the
+# reputation check (DIRTY) or content analysis.
 $script:FirefoxDownloadStates = @{ "1" = "FINISHED"; "2" = "FAILED"; "3" = "CANCELED"; "4" = "PAUSED"; "6" = "BLOCKED_PARENTAL"; "8" = "DIRTY"; "9" = "BLOCKED_CONTENT_ANALYSIS" }
-# Verb of the row at a download's end time, by state (no row for other states)
-$script:DownloadEndVerbs = @{
-    COMPLETE = "completed"; FINISHED = "completed"; CANCELLED = "cancelled"; CANCELED = "cancelled"; INTERRUPTED = "interrupted"
-    FAILED = "failed"; BLOCKED_PARENTAL = "blocked"; DIRTY = "blocked"; BLOCKED_CONTENT_ANALYSIS = "blocked"
+$script:FirefoxDownloadStateNames = @{
+    FINISHED = "COMPLETE"; FAILED = "INTERRUPTED"; CANCELED = "CANCELLED"; PAUSED = "INTERRUPTED"
+    BLOCKED_PARENTAL = "BLOCKED"; DIRTY = "BLOCKED"; BLOCKED_CONTENT_ANALYSIS = "BLOCKED"
 }
+# Verb of the row at a download's end time, by state (no row for other states)
+$script:DownloadEndVerbs = @{ COMPLETE = "completed"; CANCELLED = "cancelled"; INTERRUPTED = "interrupted"; BLOCKED = "blocked" }
 # Firefox moz_perms.permission and expireType (nsIPermissionManager)
 $script:FirefoxPermissionValues = @{ "0" = "UNKNOWN"; "1" = "ALLOW"; "2" = "DENY"; "3" = "PROMPT"; "8" = "ALLOW_SESSION" }
 $script:FirefoxPermissionExpiry = @{ "0" = "NEVER"; "1" = "SESSION"; "2" = "TIME"; "3" = "POLICY" }
@@ -3645,19 +3661,24 @@ function Add-ChromiumDownloadRows {
 # Firefox downloads (places.sqlite): the downloads/destinationFileURI
 # annotation on the download's URL (added when the download starts; PRTime)
 # and the downloads/metaData JSON (state, endTime in milliseconds, fileSize,
-# reputationCheckVerdict). Returns the number of rows added.
+# reputationCheckVerdict). Firefox keeps the URL the download started from
+# (before any redirect); the referrer is the page of the download visit's
+# from_visit (visit_type 7 = DOWNLOAD). Returns the number of rows added.
 function Add-FirefoxDownloadRows {
     param([string]$Sqlite3Exe, [System.IO.FileInfo]$File)
     $query = "SELECT replace(replace(p.url, char(13), ' '), char(10), ' '), replace(replace(d.content, char(13), ' '), char(10), ' '), d.dateAdded, " +
              "coalesce((SELECT replace(replace(m.content, char(13), ' '), char(10), ' ') FROM moz_annos m " +
-             "JOIN moz_anno_attributes ma ON ma.id = m.anno_attribute_id WHERE m.place_id = d.place_id AND ma.name = 'downloads/metaData' LIMIT 1), '') " +
+             "JOIN moz_anno_attributes ma ON ma.id = m.anno_attribute_id WHERE m.place_id = d.place_id AND ma.name = 'downloads/metaData' LIMIT 1), ''), " +
+             "coalesce((SELECT replace(replace(rp.url, char(13), ' '), char(10), ' ') FROM moz_historyvisits v " +
+             "JOIN moz_historyvisits rv ON rv.id = v.from_visit JOIN moz_places rp ON rp.id = rv.place_id " +
+             "WHERE v.place_id = d.place_id AND v.visit_type = 7 ORDER BY v.visit_date DESC LIMIT 1), '') " +
              "FROM moz_annos d JOIN moz_anno_attributes a ON a.id = d.anno_attribute_id JOIN moz_places p ON p.id = d.place_id " +
              "WHERE a.name = 'downloads/destinationFileURI' ORDER BY d.dateAdded;"
     $rows = @(Invoke-Sqlite3Query -Sqlite3Exe $Sqlite3Exe -DbPath $File.FullName -Query $query)
     $user = Get-CollectionUser $File.FullName
     $profileName = Get-BrowserProfileName $File.FullName
     $count = 0
-    foreach ($r in ($rows | ConvertFrom-Csv -Header "Url", "FileUri", "Added", "MetaData")) {
+    foreach ($r in ($rows | ConvertFrom-Csv -Header "Url", "FileUri", "Added", "MetaData", "Referrer")) {
         $path = $r.FileUri
         try {
             $uri = New-Object System.Uri($r.FileUri)
@@ -3671,21 +3692,25 @@ function Add-FirefoxDownloadRows {
         }
         $start = ConvertFrom-UnixTime $r.Added -Unit Microseconds
         $end = $null
-        $state = ""
+        $firefoxState = ""
         if ($meta) {
             $end = ConvertFrom-UnixTime $meta.endTime -Unit Milliseconds
-            if ($null -ne $meta.state) { $state = Get-AntiVirusCodeName -Names $script:FirefoxDownloadStates -Code $meta.state }
+            if ($null -ne $meta.state) { $firefoxState = Get-AntiVirusCodeName -Names $script:FirefoxDownloadStates -Code $meta.state }
         }
+        $state = $script:FirefoxDownloadStateNames[$firefoxState]
+        if (-not $state) { $state = $firefoxState }
         $details = [ordered]@{
-            Path       = $path
-            URL        = $r.Url
-            State      = $state
-            DangerType = $(if ($meta) { $meta.reputationCheckVerdict } else { "" })
-            Bytes      = $(if ($meta) { $meta.fileSize } else { "" })
-            StartUtc   = Format-UtcDetailTime $start
-            EndUtc     = Format-UtcDetailTime $end
-            Deleted    = $(if ($meta -and $meta.deleted -eq $true) { "Yes" } else { "" })
-            Profile    = $profileName
+            Path         = $path
+            URL          = $r.Url
+            Referrer     = $r.Referrer
+            State        = $state
+            FirefoxState = $firefoxState
+            DangerType   = $(if ($meta) { $meta.reputationCheckVerdict } else { "" })
+            Bytes        = $(if ($meta) { $meta.fileSize } else { "" })
+            StartUtc     = Format-UtcDetailTime $start
+            EndUtc       = Format-UtcDetailTime $end
+            Deleted      = $(if ($meta -and $meta.deleted -eq $true) { "Yes" } else { "" })
+            Profile      = $profileName
         }
         $count += Add-BrowserDownloadRows -Source "Firefox Downloads" -User $user -RawPath $File.FullName -Path $path -Url $r.Url `
             -StartTime $start -EndTime $end -OpenedTime $null -State $state -Details $details
@@ -3693,10 +3718,13 @@ function Add-FirefoxDownloadRows {
     return $count
 }
 
-# Rows for one saved login: created, last used, and password changed
-# (-Changed, when later than created); a "never save" entry gets one row when
-# it was added. -AccountName is the site user name, if known. Returns the
-# number of rows added.
+# Rows for one saved login: created; last used, when at least a minute after
+# created (both browsers set the last-used time when a login is saved --
+# Chromium at the form submit, seconds before the user clicks Save -- so an
+# earlier or equal time is not a use and is only in Details); and password
+# changed (-Changed, when later than created). A "never save" entry gets one
+# row when it was added. -AccountName is the site user name, if known.
+# Returns the number of rows added.
 function Add-BrowserLoginRows {
     param(
         [string]$Source,
@@ -3715,7 +3743,10 @@ function Add-BrowserLoginRows {
         $rows = @(, @($Created, "Saved login declined: $Url (never save for this site)"))
     }
     else {
-        $rows = @(@($Created, "Saved login created: $label"), @($LastUsed, "Saved login used: $label"))
+        $rows = @(, @($Created, "Saved login created: $label"))
+        if ($LastUsed -and (-not $Created -or ($LastUsed - $Created).TotalSeconds -ge 60)) {
+            $rows += , @($LastUsed, "Saved login last used: $label")
+        }
         if ($Changed -and (-not $Created -or ($Changed - $Created).TotalSeconds -ge 1)) {
             $rows += , @($Changed, "Saved password changed: $label")
         }
@@ -3773,12 +3804,16 @@ function Add-ChromiumLoginRows {
 
 # Firefox logins.json: saved logins per site. Times are milliseconds since
 # 1970 UTC. User names and passwords are stored encrypted; they are blanked
-# in the text before it is parsed, so they are never read.
+# in the text before it is parsed, so they are never read -- also when the
+# file ends inside one (a partial copy). The JSON parser's error is not
+# passed on: in Windows PowerShell it quotes the text it could not parse.
 function Add-FirefoxLoginRows {
     param([System.IO.FileInfo]$File)
     $text = Get-Content -LiteralPath $File.FullName -Raw -Encoding UTF8 -ErrorAction Stop
-    $text = $text -replace '"(encryptedUsername|encryptedPassword)"\s*:\s*"[^"]*"', '"$1":""'
-    $json = $text | ConvertFrom-Json
+    $text = $text -replace '"(encryptedUsername|encryptedPassword)"\s*:\s*"(?:[^"\\]|\\.?)*(?:"|$)', '"$1":""'
+    if ([string]::IsNullOrWhiteSpace($text)) { return 0 }
+    try { $json = $text | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw "not valid JSON (damaged or incomplete file)" }
     if (-not $json -or -not $json.PSObject.Properties["logins"]) { return 0 }
     $user = Get-CollectionUser $File.FullName
     $profileName = Get-BrowserProfileName $File.FullName
@@ -3992,24 +4027,27 @@ function Add-FirefoxFormHistoryRows {
 }
 
 # Chromium "Web Data" keywords table: the search engines the browser knows,
-# with when each was added, modified and last used (Chromium times). An
-# engine added or changed outside the browser's own sources is a known
-# hijack. Kind: Prepopulated (built in), Policy, StarterPack (@bookmarks,
-# ...), AutoGenerated (from a site's search form) or Custom (added or edited
-# by the user -- or by software writing to Web Data). Returns the row count.
+# with when each was added, modified and last used (the last two when later
+# than added; Chromium times). An engine added or changed outside the
+# browser's own sources is a known hijack. Kind: Prepopulated (built in),
+# Policy, StarterPack (@bookmarks, ...), AutoGenerated (from a site's search
+# form) or Custom (added or edited by the user -- or by software writing to
+# Web Data). Returns the row count.
 function Add-ChromiumSearchEngineRows {
     param([string]$Sqlite3Exe, [System.IO.FileInfo]$File)
     $c = (Get-Sqlite3TableColumns -Sqlite3Exe $Sqlite3Exe -DbPath $File.FullName -Tables @("keywords"))["keywords"]
     if (-not $c -or $c -notcontains "url" -or $c -notcontains "date_created") { return 0 }
     $text = @(Get-SqliteColumnSql -Columns $c -Names @("short_name", "keyword", "url", "originating_url"))
     $numbers = @(Get-SqliteColumnSql -Columns $c -Number -Names @("date_created", "last_modified", "last_visited", "prepopulate_id", "safe_for_autoreplace", "created_by_policy", "starter_pack_id", "usage_count"))
-    $query = "SELECT " + (($text + $numbers) -join ", ") + " FROM keywords ORDER BY date_created;"
+    # Numbers first: a site picks the name of an engine made from its search
+    # form, and ConvertFrom-Csv drops a line that starts with '#' (a comment)
+    $query = "SELECT " + (($numbers + $text) -join ", ") + " FROM keywords ORDER BY date_created;"
     $rows = @(Invoke-Sqlite3Query -Sqlite3Exe $Sqlite3Exe -DbPath $File.FullName -Query $query)
 
     $source = "$(Get-ChromiumBrowserName $File.FullName) Search Engines"
     $user = Get-CollectionUser $File.FullName
     $profileName = Get-BrowserProfileName $File.FullName
-    $header = @("Name", "Keyword", "Url", "OriginatingUrl", "Created", "Modified", "LastUsed", "Prepopulated", "AutoReplace", "Policy", "StarterPack", "UsageCount")
+    $header = @("Created", "Modified", "LastUsed", "Prepopulated", "AutoReplace", "Policy", "StarterPack", "UsageCount", "Name", "Keyword", "Url", "OriginatingUrl")
     $count = 0
     foreach ($r in ($rows | ConvertFrom-Csv -Header $header)) {
         $created = ConvertFrom-ChromiumTime $r.Created
@@ -4037,7 +4075,9 @@ function Add-ChromiumSearchEngineRows {
         if ($modified -and (-not $created -or ($modified - $created).TotalSeconds -ge 1)) {
             $rowList += , @($modified, "Search engine modified: $label")
         }
-        $rowList += , @($lastUsed, "Search engine used: $label")
+        if ($lastUsed -and (-not $created -or ($lastUsed - $created).TotalSeconds -ge 1)) {
+            $rowList += , @($lastUsed, "Search engine last used: $label")
+        }
         foreach ($row in $rowList) {
             if ($null -eq $row[0]) { continue }
             Add-TimelineEntry -Timestamp $row[0] -Source $source -EventType "NetworkConnection" `
