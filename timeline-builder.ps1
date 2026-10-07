@@ -651,19 +651,47 @@ function Format-ArtifactDetails {
     return ($parts -join " | ")
 }
 
-# Events with the given IDs from an .evtx file (nothing if there are none)
+# Events with the given IDs from an .evtx file (nothing if there are none),
+# optionally only those of the given providers (with no -Ids: any ID of
+# them). The event log's XPath takes at most about 22 terms per query, so
+# longer ID and provider lists are read in groups. A file that cannot be read
+# is reported once: the remaining groups are skipped, and so are later calls
+# that pass the same -State hashtable (its Failed key is set).
 function Get-EvtxEventsById {
-    param([string]$Path, [int[]]$Ids, [string]$Label)
-    $xpath = "*[System[(" + (($Ids | ForEach-Object { "EventID=$_" }) -join " or ") + ")]]"
-    try {
-        return @(Get-WinEvent -Path $Path -FilterXPath $xpath -ErrorAction Stop)
+    param([string]$Path, [int[]]$Ids, [string]$Label, [string[]]$Providers, [hashtable]$State)
+    if ($State -and $State["Failed"]) { return @() }
+    $idSize = if ($Providers) { 15 } else { 20 }
+    $providerSize = if ($Ids) { 5 } else { 20 }
+    $idTerms = @()
+    for ($i = 0; $i -lt $Ids.Count; $i += $idSize) {
+        $group = $Ids[$i..([Math]::Min($i + $idSize, $Ids.Count) - 1)]
+        $idTerms += "(" + (($group | ForEach-Object { "EventID=$_" }) -join " or ") + ")"
     }
-    catch {
-        if ($_.FullyQualifiedErrorId -notlike "NoMatchingEventsFound*" -and $_.Exception.Message -notmatch "No events were found") {
-            Log-Warning "    Error reading $Label events from $(Split-Path $Path -Leaf) : $($_.Exception.Message)"
+    if ($idTerms.Count -eq 0) { $idTerms = @("") }
+    $providerTerms = @()
+    for ($i = 0; $i -lt $Providers.Count; $i += $providerSize) {
+        $group = $Providers[$i..([Math]::Min($i + $providerSize, $Providers.Count) - 1)]
+        $providerTerms += "Provider[" + (($group | ForEach-Object { "@Name='$_'" }) -join " or ") + "]"
+    }
+    if ($providerTerms.Count -eq 0) { $providerTerms = @("") }
+
+    $events = New-Object System.Collections.Generic.List[object]
+    foreach ($idTerm in $idTerms) {
+        foreach ($providerTerm in $providerTerms) {
+            $xpath = "*[System[" + ((@($providerTerm, $idTerm) | Where-Object { $_ }) -join " and ") + "]]"
+            try {
+                foreach ($record in (Get-WinEvent -Path $Path -FilterXPath $xpath -ErrorAction Stop)) { $events.Add($record) }
+            }
+            catch {
+                if ($_.FullyQualifiedErrorId -notlike "NoMatchingEventsFound*" -and $_.Exception.Message -notmatch "No events were found") {
+                    Log-Warning "    Error reading $Label events from $(Split-Path $Path -Leaf) : $($_.Exception.Message)"
+                    if ($State) { $State["Failed"] = $true }
+                    return $events.ToArray()
+                }
+            }
         }
-        return @()
     }
+    return $events.ToArray()
 }
 
 # Fields of an event record as a hashtable: EventData <Data Name="..."> values
@@ -948,6 +976,629 @@ function Read-DefenderSupportLog {
     return $added
 }
 
+# Names for the %%NNNN references in event 4719 (system audit policy changed),
+# as msobjs.dll gives them in English. Categories are %%8272-%%8280; the
+# subcategories of category n (0-8) are %%(12288 + 256 * n) and up.
+$script:AuditCategoryNames = @("System", "Logon/Logoff", "Object Access", "Privilege Use", "Detailed Tracking", "Policy Change", "Account Management", "DS Access", "Account Logon")
+$script:AuditSubcategoryNames = @(
+    @("Security State Change", "Security System Extension", "System Integrity", "IPsec Driver", "Other System Events"),
+    @("Logon", "Logoff", "Account Lockout", "IPsec Main Mode", "Special Logon", "IPsec Quick Mode", "IPsec Extended Mode", "Other Logon/Logoff Events", "Network Policy Server", "User / Device Claims", "Group Membership", "Access Rights"),
+    @("File System", "Registry", "Kernel Object", "SAM", "Other Object Access Events", "Certification Services", "Application Generated", "Handle Manipulation", "File Share", "Filtering Platform Packet Drop", "Filtering Platform Connection", "Detailed File Share", "Removable Storage", "Central Policy Staging"),
+    @("Sensitive Privilege Use", "Non Sensitive Privilege Use", "Other Privilege Use Events"),
+    @("Process Creation", "Process Termination", "DPAPI Activity", "RPC Events", "Plug and Play Events", "Token Right Adjusted Events"),
+    @("Audit Policy Change", "Authentication Policy Change", "Authorization Policy Change", "MPSSVC Rule-Level Policy Change", "Filtering Platform Policy Change", "Other Policy Change Events"),
+    @("User Account Management", "Computer Account Management", "Security Group Management", "Distribution Group Management", "Application Group Management", "Other Account Management Events"),
+    @("Directory Service Access", "Directory Service Changes", "Directory Service Replication", "Detailed Directory Service Replication"),
+    @("Credential Validation", "Kerberos Service Ticket Operations", "Other Account Logon Events", "Kerberos Authentication Service")
+)
+$script:AuditChangeNames = @{ 8448 = "Success removed"; 8449 = "Success added"; 8450 = "Failure removed"; 8451 = "Failure added" }
+
+# Service type and start type codes of event 4697 (as in the 7040 text)
+$script:ServiceTypeNames = @{ 1 = "kernel driver"; 2 = "file system driver"; 8 = "recognizer driver"; 16 = "own process"; 32 = "share process"; 272 = "interactive own process"; 288 = "interactive share process" }
+$script:ServiceStartTypeNames = @{ 0 = "boot start"; 1 = "system start"; 2 = "auto start"; 3 = "demand start"; 4 = "disabled" }
+
+# Attack surface reduction rule GUIDs (Defender 1121/1122 "ID") -> rule names,
+# from Microsoft's ASR rules reference
+$script:AsrRuleNames = @{
+    "56a863a9-875e-4185-98a7-b882c64b5ce5" = "Block abuse of exploited vulnerable signed drivers"
+    "9e6c4e1f-7d60-472f-ba1a-a39ef669e4b2" = "Block credential stealing from the Windows local security authority subsystem"
+    "e6db77e5-3df2-4cf1-b95a-636979351e5b" = "Block persistence through WMI event subscription"
+    "7674ba52-37eb-4a4f-a9a1-f0f9a1619a2c" = "Block Adobe Reader from creating child processes"
+    "d4f940ab-401b-4efc-aadc-ad5f3c50688a" = "Block all Office applications from creating child processes"
+    "be9ba2d9-53ea-4cdc-84e5-9b1eeee46550" = "Block executable content from email client and webmail"
+    "01443614-cd74-433a-b99e-2ecdc07bfc25" = "Block executable files from running unless they meet a prevalence, age, or trusted list criterion"
+    "5beb7efe-fd9a-4556-801d-275e5ffc04cc" = "Block execution of potentially obfuscated scripts"
+    "d3e037e1-3eb8-44c8-a917-57927947596d" = "Block JavaScript or VBScript from launching downloaded executable content"
+    "3b576869-a4ec-4529-8536-b80a7769e899" = "Block Office applications from creating executable content"
+    "75668c1f-73b5-4cf0-bb93-3ecf5cb7cc84" = "Block Office applications from injecting code into other processes"
+    "26190899-1602-49e8-8b27-eb1d0a1ce869" = "Block Office communication application from creating child processes"
+    "d1e49aac-8f56-4280-b9ba-993a6d77406c" = "Block process creations originating from PSExec and WMI commands"
+    "33ddedf1-c6e0-47cb-833e-de6133960387" = "Block rebooting machine in Safe Mode"
+    "b2b3f03d-6a65-4f7b-a9c7-1c7ef74a9ba4" = "Block untrusted and unsigned processes that run from USB"
+    "c0033c00-d16d-4114-a5a0-dc9b3a7d2ceb" = "Block use of copied or impersonated system tools"
+    "a8f5898e-1dc8-49a9-9878-85004b8a61e6" = "Block Webshell creation for Servers"
+    "92e97fa1-2edf-4476-bdd6-9dd0b4dddc7b" = "Block Win32 API calls from Office macros"
+    "c1db55ab-c21a-4637-bb3f-a12568109d35" = "Use advanced protection against ransomware"
+}
+
+# Event sources that third-party antivirus products write to the Application
+# log (exact names: the event log's XPath has no wildcards). Symantec
+# AntiVirus, McLogEvent and Sophos Anti-Virus are documented sources; the
+# others are the products' names as they register them. A name that is not
+# in the log costs nothing.
+$script:ThirdPartyAvProviders = @(
+    "Symantec AntiVirus", "Symantec Endpoint Protection", "Symantec Endpoint Protection Client", "Norton AntiVirus", "Norton Security",
+    "McLogEvent", "McAfee Endpoint Security", "Trellix Endpoint Security",
+    "Sophos Anti-Virus", "Sophos Endpoint Defense",
+    "ESET", "ESET Security",
+    "Trend Micro OfficeScan", "OfficeScan NT", "Trend Micro Apex One", "Deep Security Agent",
+    "Bitdefender", "Bitdefender Endpoint Security Tools",
+    "Kaspersky Endpoint Security", "Kaspersky Security",
+    "Malwarebytes", "MBAMService",
+    "Webroot", "WRSVC",
+    "CrowdStrike", "CSFalconService"
+)
+
+# "DOMAIN\name" from an event's domain and account fields; empty and "-"
+# parts are left out
+function Join-EvtxAccountName {
+    param([string]$Domain, [string]$Name)
+    return ((@($Domain, $Name) | ForEach-Object { "$_".Trim() } | Where-Object { $_ -and $_ -ne "-" }) -join "\")
+}
+
+# First non-empty value among the named event fields, trimmed ("-" counts as
+# empty). Lets a parser list a field's name and its param<n> position, for
+# records that store the same fields unnamed (older Windows, ReportEvent).
+function Get-EvtxFieldValue {
+    param([hashtable]$Fields, [string[]]$Names)
+    foreach ($n in $Names) {
+        $v = "$($Fields[$n])".Trim()
+        if ($v -and $v -ne "-") { return $v }
+    }
+    return ""
+}
+
+# "0x10" -> "0x10 (own process)" from a code -> name table; other text as is
+function Format-EvtxCodeText {
+    param([string]$Text, [hashtable]$Names)
+    $t = "$Text".Trim()
+    $value = 0
+    if ($t -match '^0x([0-9A-Fa-f]{1,8})$') {
+        if (-not [int]::TryParse($Matches[1], [System.Globalization.NumberStyles]::HexNumber, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$value)) { return $t }
+    }
+    elseif (-not [int]::TryParse($t, [ref]$value)) { return $t }
+    if ($Names.ContainsKey($value)) { return "$t ($($Names[$value]))" }
+    return $t
+}
+
+# "%%8274" or "%%8448, %%8450" from event 4719 -> "Object Access" or
+# "Success removed, Failure removed"; unknown references are kept as they are
+function ConvertFrom-AuditPolicyText {
+    param([string]$Text)
+    $names = @()
+    foreach ($part in ($Text -split ',')) {
+        $name = $part.Trim()
+        if (-not $name) { continue }
+        # At most 9 digits, so that a malformed reference cannot overflow [int]
+        if ($name -match '^%%(\d{1,9})$') {
+            $n = [int]$Matches[1]
+            if ($n -ge 8272 -and $n -le 8280) { $name = $script:AuditCategoryNames[$n - 8272] }
+            elseif ($script:AuditChangeNames.ContainsKey($n)) { $name = $script:AuditChangeNames[$n] }
+            elseif ($n -ge 12288) {
+                $category = [int][Math]::Floor(($n - 12288) / 256)
+                $index = ($n - 12288) % 256
+                if ($category -lt $script:AuditSubcategoryNames.Count -and $index -lt $script:AuditSubcategoryNames[$category].Count) {
+                    $name = $script:AuditSubcategoryNames[$category][$index]
+                }
+            }
+        }
+        $names += $name
+    }
+    return ($names -join ", ")
+}
+
+# Action and run-as account of the task XML in events 4698-4702 (TaskContent /
+# TaskContentNew). A single Exec action gives Command and Arguments; anything
+# else gives Actions, one "<command> <arguments>" or "ComHandler <ClassId>"
+# per action joined with "; " (as in the task XML rows), so that arguments
+# always stay with their command. Empty if there is no readable XML.
+function Get-TaskContentSummary {
+    param([string]$TaskXml)
+    $summary = [ordered]@{}
+    if (-not $TaskXml -or -not $TaskXml.Trim()) { return $summary }
+    $doc = New-Object System.Xml.XmlDocument
+    try { $doc.LoadXml($TaskXml.Trim()) }
+    catch {
+        Write-Verbose "Task XML in a scheduled task event is not readable: $($_.Exception.Message)"
+        return $summary
+    }
+    $taskNode = $doc.DocumentElement
+    $actions = @()
+    $exec = $null
+    foreach ($node in $taskNode.SelectNodes("*[local-name()='Actions']/*")) {
+        if ($node.LocalName -eq "Exec") {
+            $exec = $node
+            $actions += ((Get-TaskXmlText $node "Command") + " " + (Get-TaskXmlText $node "Arguments")).Trim()
+        }
+        elseif ($node.LocalName -eq "ComHandler") {
+            $actions += "ComHandler " + (Get-TaskXmlText $node "ClassId")
+        }
+    }
+    if ($actions.Count -eq 1 -and $null -ne $exec) {
+        $summary["Command"] = Get-TaskXmlText $exec "Command"
+        $summary["Arguments"] = Get-TaskXmlText $exec "Arguments"
+    }
+    else {
+        $summary["Actions"] = (@($actions | Where-Object { $_ }) -join "; ")
+    }
+    $runAs = Get-TaskXmlText $taskNode "Principals/Principal/UserId"
+    if (-not $runAs) { $runAs = Get-TaskXmlText $taskNode "Principals/Principal/GroupId" }
+    $summary["RunAs"] = $runAs
+    return $summary
+}
+
+# SID -> @{ Name = "DOMAIN\name"; EventId = <id> } from the Security events
+# that carry both: the target of 4720 / 4724 / 4726 (account created, reset,
+# deleted), the account of 4624 logons and the subject of these and 4648.
+# Names the member of a group add (4728 / 4732 / 4756), which gives only the
+# SID of a local account. Account management events win over logons.
+function Get-SecuritySidNames {
+    param([object[]]$Records)
+    $names = @{}
+    foreach ($record in @($Records | Where-Object { $_.Id -in @(4720, 4724, 4726, 4624, 4648) })) {
+        $f = Get-EvtxEventFields $record
+        $id = [int]$record.Id
+        # @(SID, name, rank): lower rank wins
+        $accounts = @(, @($f["SubjectUserSid"], (Join-EvtxAccountName $f["SubjectDomainName"] $f["SubjectUserName"]), 2))
+        if ($id -in @(4720, 4724, 4726)) { $accounts += , @($f["TargetSid"], (Join-EvtxAccountName $f["TargetDomainName"] $f["TargetUserName"]), 1) }
+        elseif ($id -eq 4624) { $accounts += , @($f["TargetUserSid"], (Join-EvtxAccountName $f["TargetDomainName"] $f["TargetUserName"]), 2) }
+        foreach ($account in $accounts) {
+            $sid = "$($account[0])".Trim()
+            if ($sid -notmatch '^S-1-' -or $sid -eq "S-1-0-0" -or -not $account[1]) { continue }
+            $known = $names[$sid]
+            if ($null -eq $known -or $account[2] -lt $known.Rank) {
+                $names[$sid] = @{ Name = $account[1]; EventId = $id; Rank = $account[2] }
+            }
+        }
+    }
+    return $names
+}
+
+# "4624 x805, 4672 x786": events per ID (and provider, with -ByProvider) for the log
+function Format-EvtxEventCounts {
+    param([object[]]$Records, [switch]$ByProvider)
+    $groups = @($Records | Group-Object { if ($ByProvider) { "$($_.ProviderName) $($_.Id)" } else { "$($_.Id)" } } | Sort-Object Name)
+    return (($groups | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ", ")
+}
+
+# Security.evtx events other than logons and process creation (field names
+# from the Microsoft-Windows-Security-Auditing templates; 1102 is written by
+# Microsoft-Windows-Eventlog as UserData):
+#   1102                 audit log cleared                        SecurityAlert
+#   4719                 system audit policy changed              SecurityAlert
+#   4697                 service installed                        PersistenceChange
+#   4698-4702            scheduled task registered/deleted/enabled/
+#                        disabled/updated (+ action from the XML) ScheduledTaskChange
+#   4728/4732/4756       member added to a global/local/universal
+#                        security group                           AccountChange
+#   4724 / 4740          password reset attempt / account locked  AccountChange
+#   4778 / 4779          session reconnected / disconnected       Logon
+# $SidNames (Get-SecuritySidNames) names a group member given only by SID.
+function Add-SecurityEventEntry {
+    param($Record, [string]$FileName, [string]$FilePath, [hashtable]$SidNames)
+    $f = Get-EvtxEventFields $Record
+    $id = [int]$Record.Id
+    $subject = Join-EvtxAccountName $f["SubjectDomainName"] $f["SubjectUserName"]
+    $user = $subject
+    $type = "AccountChange"
+    $desc = $null
+    $details = [ordered]@{ EventID = $id }
+    switch ($id) {
+        1102 {
+            $type = "SecurityAlert"
+            $desc = "Security audit log cleared"
+            $details["ClearedBy"] = $subject
+            $details["SubjectSID"] = $f["SubjectUserSid"]
+            $details["LogonID"] = $f["SubjectLogonId"]
+            $details["ClientProcessId"] = $f["ClientProcessId"]
+        }
+        4719 {
+            $type = "SecurityAlert"
+            $category = ConvertFrom-AuditPolicyText $f["CategoryId"]
+            $subcategory = ConvertFrom-AuditPolicyText $f["SubcategoryId"]
+            $changes = ConvertFrom-AuditPolicyText $f["AuditPolicyChanges"]
+            $desc = "System audit policy changed: $category\$subcategory ($changes)"
+            $details["Category"] = $category
+            $details["Subcategory"] = $subcategory
+            $details["SubcategoryGuid"] = $f["SubcategoryGuid"]
+            $details["Changes"] = $changes
+        }
+        4697 {
+            $type = "PersistenceChange"
+            $desc = "New service installed: $($f['ServiceName'])"
+            $details["ServiceName"] = $f["ServiceName"]
+            # ServiceFileName, under the key System 7045 rows use
+            $details["ImagePath"] = $f["ServiceFileName"]
+            $details["ServiceType"] = Format-EvtxCodeText $f["ServiceType"] $script:ServiceTypeNames
+            $details["StartType"] = Format-EvtxCodeText $f["ServiceStartType"] $script:ServiceStartTypeNames
+            $details["Account"] = $f["ServiceAccount"]
+            $details["ClientProcessId"] = $f["ClientProcessId"]
+        }
+        { $_ -in @(4698, 4699, 4700, 4701, 4702) } {
+            $type = "ScheduledTaskChange"
+            # Same verbs as the TaskScheduler 106 / 140 / 141 rows
+            $what = @{ 4698 = "registered"; 4699 = "deleted"; 4700 = "enabled"; 4701 = "disabled"; 4702 = "updated" }[$id]
+            $desc = "Scheduled task ${what}: $($f['TaskName'])"
+            $details["TaskName"] = $f["TaskName"]
+            $taskXml = Get-EvtxFieldValue $f @("TaskContentNew", "TaskContent")
+            $task = Get-TaskContentSummary $taskXml
+            foreach ($key in $task.Keys) { $details[$key] = $task[$key] }
+            $details["ClientProcessId"] = $f["ClientProcessId"]
+        }
+        { $_ -in @(4728, 4732, 4756) } {
+            $scope = @{ 4728 = "global"; 4732 = "local"; 4756 = "universal" }[$id]
+            # MemberName is a domain account's DN, and "-" for a local account:
+            # then the name comes from another event with the same SID
+            $member = Get-EvtxFieldValue $f @("MemberName")
+            $memberSid = Get-EvtxFieldValue $f @("MemberSid")
+            $memberFrom = ""
+            if (-not $member -and $memberSid -and $SidNames -and $SidNames.ContainsKey($memberSid)) {
+                $member = $SidNames[$memberSid].Name
+                $memberFrom = "event $($SidNames[$memberSid].EventId)"
+            }
+            $desc = "Member added to security-enabled $scope group: $($f['TargetUserName'])"
+            $shown = if ($member) { $member } else { $memberSid }
+            if ($shown) { $desc += " (member $shown)" }
+            $details["Group"] = Join-EvtxAccountName $f["TargetDomainName"] $f["TargetUserName"]
+            $details["GroupSID"] = $f["TargetSid"]
+            $details["Member"] = $member
+            $details["MemberSID"] = $memberSid
+            $details["MemberNameFrom"] = $memberFrom
+        }
+        4724 {
+            $target = Join-EvtxAccountName $f["TargetDomainName"] $f["TargetUserName"]
+            $desc = "Password reset attempted for account: $target"
+            $details["Account"] = $target
+            $details["AccountSID"] = $f["TargetSid"]
+        }
+        4740 {
+            # TargetDomainName holds the caller computer name in this event; the
+            # subject is the machine (or DC) that reports it, so User is the
+            # locked-out account
+            $desc = "User account locked out: $($f['TargetUserName'])"
+            $user = Get-EvtxFieldValue $f @("TargetUserName", "TargetSid")
+            $details["Account"] = $f["TargetUserName"]
+            $details["AccountSID"] = $f["TargetSid"]
+            $details["CallerComputer"] = $f["TargetDomainName"]
+            $details["ReportedBy"] = $subject
+        }
+        { $_ -in @(4778, 4779) } {
+            $type = "Logon"
+            $user = Join-EvtxAccountName $f["AccountDomain"] $f["AccountName"]
+            $clientName = Get-EvtxFieldValue $f @("ClientName")
+            $clientAddress = Get-EvtxFieldValue $f @("ClientAddress")
+            $client = (@($clientName, $clientAddress) | Where-Object { $_ }) -join ", "
+            $desc = if ($id -eq 4778) { "Session reconnected to window station" } else { "Session disconnected from window station" }
+            if ($client) { $desc += " (client $client)" }
+            $details["Account"] = $user
+            $details["ClientName"] = $clientName
+            $details["ClientAddress"] = $clientAddress
+            $details["SessionName"] = $f["SessionName"]
+            $details["LogonID"] = $f["LogonID"]
+        }
+    }
+    if (-not $desc) { return }
+    Add-TimelineEntry -Timestamp $Record.TimeCreated -Source $FileName -EventType $type `
+        -Description $desc -User $user -Details (Format-ArtifactDetails $details) `
+        -Artifact "EventLogs" -RawPath $FilePath
+}
+
+# System.evtx: event log cleared (104, Microsoft-Windows-Eventlog; SecurityAlert)
+# and the event log service started / stopped (6005 / 6006, EventLog), the
+# markers of a boot and of a clean shutdown (ServiceChange)
+function Add-SystemEventEntry {
+    param($Record, [string]$FileName, [string]$FilePath)
+    $id = [int]$Record.Id
+    if ($id -eq 104 -and $Record.ProviderName -eq "Microsoft-Windows-Eventlog") {
+        $f = Get-EvtxEventFields $Record
+        $by = Join-EvtxAccountName $f["SubjectDomainName"] $f["SubjectUserName"]
+        Add-TimelineEntry -Timestamp $Record.TimeCreated -Source $FileName -EventType "SecurityAlert" `
+            -Description "Event log cleared: $($f['Channel'])" -User $by `
+            -Details (Format-ArtifactDetails ([ordered]@{ EventID = $id; Channel = $f["Channel"]; ClearedBy = $by; BackupPath = $f["BackupPath"]; ClientProcessId = $f["ClientProcessId"] })) `
+            -Artifact "EventLogs" -RawPath $FilePath
+    }
+    elseif ($id -in @(6005, 6006) -and $Record.ProviderName -eq "EventLog") {
+        $desc = if ($id -eq 6005) { "Event log service started (system startup)" } else { "Event log service stopped (clean shutdown)" }
+        Add-TimelineEntry -Timestamp $Record.TimeCreated -Source $FileName -EventType "ServiceChange" `
+            -Description $desc -Details (Format-ArtifactDetails ([ordered]@{ EventID = $id })) `
+            -Artifact "EventLogs" -RawPath $FilePath
+    }
+}
+
+# Defender Operational: malware history deleted (1013) and attack surface
+# reduction rule blocked / audited (1121 / 1122), all SecurityAlert. $Fields
+# are the record's Get-EvtxEventFields (read here if not given). $Count and
+# $LastSeen describe a row that stands for several 1122 events (see
+# Add-DefenderAsrAuditEntries).
+function Add-DefenderEventEntry {
+    param($Record, [hashtable]$Fields, [string]$FileName, [string]$FilePath, [int]$Count = 1, $LastSeen = $null)
+    $f = $Fields
+    if ($null -eq $f) { $f = Get-EvtxEventFields $Record }
+    $id = [int]$Record.Id
+    if ($id -eq 1013) {
+        # Timestamp: history older than this was removed (UTC). The service
+        # itself purges old items every day as SYSTEM (ScanPurgeItemsAfterDelay,
+        # 15 days by default), so its cutoff lies whole days before the event;
+        # a deletion by a user removes the history up to about now.
+        $by = Join-EvtxAccountName $f["Domain"] $f["User"]
+        $cutoff = ConvertFrom-UtcText $f["Timestamp"]
+        $retention = $f["SID"] -eq "S-1-5-18" -and $null -ne $cutoff -and ($Record.TimeCreated.ToUniversalTime() - $cutoff).TotalHours -ge 23
+        if ($retention) {
+            $desc = "Defender malware detection history purged by retention (items before $($f['Timestamp']))"
+        }
+        else {
+            $desc = "Defender malware detection history deleted"
+            if ($by) { $desc += " by $by" }
+        }
+        Add-TimelineEntry -Timestamp $Record.TimeCreated -Source $FileName -EventType "SecurityAlert" `
+            -Description $desc -User $by `
+            -Details (Format-ArtifactDetails ([ordered]@{ EventID = $id; Trigger = $(if ($retention) { "Retention" } else { "User" }); DeletedBefore = $f["Timestamp"]; DeletedBy = $by; SID = $f["SID"] })) `
+            -Artifact "EventLogs" -RawPath $FilePath
+    }
+    elseif ($id -in @(1121, 1122)) {
+        $ruleId = "$($f['ID'])".Trim().Trim('{', '}')
+        $rule = $script:AsrRuleNames[$ruleId.ToLowerInvariant()]
+        if (-not $rule) { $rule = $ruleId }
+        $what = if ($id -eq 1121) { "blocked" } else { "audited" }
+        $details = [ordered]@{
+            EventID           = $id
+            RuleID            = $ruleId
+            Path              = $f["Path"]
+            Process           = $f["Process Name"]
+            TargetCommandline = $f["Target Commandline"]
+            ParentCommandline = $f["Parent Commandline"]
+            InvolvedFile      = $f["Involved File"]
+        }
+        if ($Count -gt 1) {
+            $details["Count"] = $Count
+            $details["LastSeen"] = ([datetime]$LastSeen).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture)
+        }
+        Add-TimelineEntry -Timestamp $Record.TimeCreated -Source $FileName -EventType "SecurityAlert" `
+            -Description "Defender attack surface reduction rule ${what}: $rule" -User $f["User"] `
+            -Details (Format-ArtifactDetails $details) `
+            -Artifact "EventLogs" -RawPath $FilePath
+    }
+}
+
+# Defender 1122 (attack surface reduction rule audited), folded per rule, path,
+# process and UTC day: audit mode can log large numbers of benign events
+# (Microsoft says so of the LSASS rule). One row at the first event of each
+# group, with Count and LastSeen when it stands for more than one. $Items are
+# @{ Record; Fields } pairs. Blocks (1121) are not folded.
+function Add-DefenderAsrAuditEntries {
+    param([object[]]$Items, [string]$FileName, [string]$FilePath)
+    $groups = [ordered]@{}
+    foreach ($item in @($Items | Sort-Object { $_.Record.TimeCreated.ToUniversalTime() }, { $_.Record.RecordId })) {
+        $f = $item.Fields
+        $key = (@("$($f['ID'])".Trim().Trim('{', '}'), "$($f['Path'])", "$($f['Process Name'])",
+            $item.Record.TimeCreated.ToUniversalTime().ToString("yyyy-MM-dd", [System.Globalization.CultureInfo]::InvariantCulture)) -join "`t").ToLowerInvariant()
+        if (-not $groups.Contains($key)) { $groups[$key] = New-Object System.Collections.Generic.List[object] }
+        $groups[$key].Add($item)
+    }
+    foreach ($key in $groups.Keys) {
+        $group = $groups[$key]
+        Add-DefenderEventEntry -Record $group[0].Record -Fields $group[0].Fields -FileName $FileName -FilePath $FilePath `
+            -Count $group.Count -LastSeen $group[$group.Count - 1].Record.TimeCreated
+    }
+    $folded = @($Items).Count - $groups.Count
+    if ($folded -gt 0) {
+        Log "    Folded $folded attack surface reduction audit event(s) (1122) into $($groups.Count) row(s)"
+    }
+}
+
+# Application.evtx. Message layouts were checked against the providers'
+# message files (msimsg.dll, wer.dll, wersvc.dll, wscsvc.dll, esent.dll):
+#   MsiInstaller 1033/1034    installed / removed: product, version,
+#                             manufacturer, status              Installation
+#   MsiInstaller 11707/11724  only when there is no 1033/1034 for the
+#                             same product within a minute      Installation
+#   Application Error 1000    crash: app, version, faulting
+#                             module, exception code, path      Execution
+#   Application Hang 1002     hang: app, version, path          Execution
+#   SecurityCenter 15         security product state (ON, OFF, SNOOZED,
+#                             EXPIRED): the first per product
+#                             and each change                   SecurityAlert
+#   SecurityCenter 16         a state update that failed        SecurityAlert
+#   ESENT 216, 325-327        database location changed /
+#                             created / attached / detached
+#                             (shows copies of ntds.dit)        FileAccess
+#   $script:ThirdPartyAvProviders, any ID: the message text,
+#                             trimmed; Critical, Error and Warning
+#                             events, and Information events
+#                             whose text reports a detection    SecurityAlert
+# Windows Error Reporting 1001 is not read: its application crashes and hangs
+# repeat 1000 / 1002, and the rest (LiveKernelEvent, Store and update
+# failures) is routine and can number in the hundreds.
+function Add-ApplicationEventEntries {
+    param([object[]]$Records, [string]$FileName, [string]$FilePath)
+    $items = @($Records | Sort-Object TimeCreated, RecordId | ForEach-Object { [PSCustomObject]@{ Record = $_; Fields = Get-EvtxEventFields $_ } })
+    $msiStatusNames = @{ "0" = "success"; "3010" = "success, restart required"; "1641" = "success, restart started"; "1602" = "cancelled by the user"; "1603" = "fatal error" }
+    $levelNames = @{ 1 = "Critical"; 2 = "Error"; 3 = "Warning"; 4 = "Information" }
+    # Antivirus Information events are mostly routine (definitions loaded, scan
+    # started or finished, update done); keep those that name a threat and
+    # what happened to it ("Virus Found", "Security Risk Found", "... Trojan
+    # ... deleted")
+    $avDetectionPattern = '\b(virus|threat|malware|trojan|worm|ransomware|spyware|infected|infection|security risk)\b.*\b(found|detected|quarantined|blocked|cleaned|removed|deleted)\b'
+    $eseActions = @{ 325 = "created"; 326 = "attached"; 327 = "detached" }
+
+    # Product name -> times of its 1033 (installed) / 1034 (removed) events
+    $msiTimes = @{}
+    foreach ($item in $items) {
+        if ($item.Record.ProviderName -eq "MsiInstaller" -and $item.Record.Id -in @(1033, 1034)) {
+            $key = "$($item.Record.Id)`t" + (Get-EvtxFieldValue $item.Fields @("param1"))
+            if (-not $msiTimes.ContainsKey($key)) { $msiTimes[$key] = @() }
+            $msiTimes[$key] += $item.Record.TimeCreated
+        }
+    }
+
+    $productStates = @{}
+    $rowCounts = [ordered]@{}
+    $skipped = [ordered]@{}
+    foreach ($item in $items) {
+        $r = $item.Record
+        $f = $item.Fields
+        $provider = $r.ProviderName
+        $id = [int]$r.Id
+        $type = $null
+        $desc = $null
+        $user = ""
+        $details = [ordered]@{ EventID = $id }
+
+        if ($provider -eq "MsiInstaller") {
+            $type = "Installation"
+            if ($id -in @(1033, 1034)) {
+                # %1 product, %2 version, %3 language, %4 status, %5 manufacturer
+                $product = Get-EvtxFieldValue $f @("param1")
+                $version = Get-EvtxFieldValue $f @("param2")
+                $status = Get-EvtxFieldValue $f @("param4")
+                $ok = @("0", "3010", "1641") -contains $status
+                $what = if ($id -eq 1033) { $(if ($ok) { "Software installed" } else { "Software installation failed" }) } else { $(if ($ok) { "Software removed" } else { "Software removal failed" }) }
+                $desc = "${what}: $product $version".TrimEnd()
+                if (-not $ok -and $status) { $desc += " (status $status)" }
+                $details["Product"] = $product
+                $details["Version"] = $version
+                $details["Manufacturer"] = Get-EvtxFieldValue $f @("param5")
+                $details["Status"] = $(if ($msiStatusNames.ContainsKey($status)) { "$status ($($msiStatusNames[$status]))" } else { $status })
+            }
+            else {
+                # "Product: <name> -- Installation completed successfully."
+                $message = Get-EvtxFieldValue $f @("param1")
+                $product = if ($message -match '^\S+:\s*(.+?)\s+--\s') { $Matches[1] } else { "" }
+                $pair = if ($id -eq 11707) { 1033 } else { 1034 }
+                $twin = @($msiTimes["$pair`t$product"] | Where-Object { $null -ne $_ -and [Math]::Abs(($_ - $r.TimeCreated).TotalSeconds) -le 60 })
+                if ($product -and $twin.Count -gt 0) {
+                    $skipped["MsiInstaller $id (same install as $pair)"] = 1 + [int]$skipped["MsiInstaller $id (same install as $pair)"]
+                    continue
+                }
+                $what = if ($id -eq 11707) { "Software installed" } else { "Software removed" }
+                $desc = if ($product) { "${what}: $product" } else { "${what}: $message" }
+                $details["Product"] = $product
+                $details["Message"] = $message
+            }
+            # The product code is the start of the binary data, as ASCII text
+            if ($r.ToXml() -match '<Binary>((?:[0-9A-Fa-f]{2}){38})') {
+                $hex = $Matches[1]
+                $code = -join (0..37 | ForEach-Object { [char][Convert]::ToByte($hex.Substring($_ * 2, 2), 16) })
+                if ($code -match '^\{[0-9A-Fa-f-]{36}\}$') { $details["ProductCode"] = $code }
+            }
+            # The account that ran the install (SYSTEM for most updates)
+            $user = Resolve-BamUser -Sid "$($r.UserId)" -SidNames @{}
+            $details["UserSID"] = "$($r.UserId)"
+        }
+        elseif ($provider -eq "Application Error") {
+            # Named fields; %1-%15 in the same order in older unnamed records
+            $type = "Execution"
+            $app = Get-EvtxFieldValue $f @("AppName", "param1")
+            $module = Get-EvtxFieldValue $f @("ModuleName", "param4")
+            $code = Get-EvtxFieldValue $f @("ExceptionCode", "param7")
+            if ($code -and $code -notmatch '^0x') { $code = "0x$code" }
+            $offset = Get-EvtxFieldValue $f @("FaultingOffset", "param8")
+            if ($offset -and $offset -notmatch '^0x') { $offset = "0x$offset" }
+            $desc = "Application crashed: $app (exception $code in $module)"
+            $details["Application"] = $app
+            $details["Version"] = Get-EvtxFieldValue $f @("AppVersion", "param2")
+            $details["Module"] = $module
+            $details["ModuleVersion"] = Get-EvtxFieldValue $f @("ModuleVersion", "param5")
+            $details["ExceptionCode"] = $code
+            $details["FaultOffset"] = $offset
+            $details["Path"] = Get-EvtxFieldValue $f @("AppPath", "param11")
+            $details["ModulePath"] = Get-EvtxFieldValue $f @("ModulePath", "param12")
+        }
+        elseif ($provider -eq "Application Hang") {
+            # %1 app, %2 version, %3 process ID, %6 path, %10 hang type
+            $type = "Execution"
+            $app = Get-EvtxFieldValue $f @("AppName", "param1")
+            $desc = "Application hung and was closed: $app"
+            $details["Application"] = $app
+            $details["Version"] = Get-EvtxFieldValue $f @("AppVersion", "param2")
+            $details["Path"] = Get-EvtxFieldValue $f @("ExeFileName", "param6")
+            $details["HangType"] = Get-EvtxFieldValue $f @("HangType", "param10")
+        }
+        elseif ($provider -eq "SecurityCenter") {
+            # %1 product, %2 state (SECURITY_PRODUCT_STATE_ON / OFF / SNOOZED / EXPIRED)
+            $type = "SecurityAlert"
+            $product = Get-EvtxFieldValue $f @("param1")
+            $state = (Get-EvtxFieldValue $f @("param2")) -replace '^SECURITY_PRODUCT_STATE_', ''
+            if (-not $product) { continue }
+            $details["Product"] = $product
+            $details["State"] = $state
+            if ($id -eq 15) {
+                # Each start of the service reports every product again
+                $previous = $productStates[$product]
+                if ($previous -eq $state) {
+                    $skipped["SecurityCenter 15 (state unchanged)"] = 1 + [int]$skipped["SecurityCenter 15 (state unchanged)"]
+                    continue
+                }
+                $productStates[$product] = $state
+                $desc = "Security product state: $product $state"
+                $details["PreviousState"] = $previous
+            }
+            else {
+                $desc = "Security Center could not update product state: $product $state"
+            }
+        }
+        elseif ($provider -eq "ESENT") {
+            # %1 process, %2 "PID,...", %3 instance; 216: %4 old and %5 new
+            # location; 325-327: %4 database ID, %5 database path
+            $type = "FileAccess"
+            if ($id -eq 216) {
+                $desc = "ESE database location changed: $(Get-EvtxFieldValue $f @('param4')) -> $(Get-EvtxFieldValue $f @('param5'))"
+                $details["OldPath"] = Get-EvtxFieldValue $f @("param4")
+                $details["NewPath"] = Get-EvtxFieldValue $f @("param5")
+            }
+            else {
+                $desc = "ESE database $($eseActions[$id]): $(Get-EvtxFieldValue $f @('param5'))"
+                $details["Database"] = Get-EvtxFieldValue $f @("param5")
+            }
+            $details["Process"] = Get-EvtxFieldValue $f @("param1")
+            $details["ProcessId"] = ((Get-EvtxFieldValue $f @("param2")) -split ',')[0]
+            $details["Instance"] = (Get-EvtxFieldValue $f @("param3")) -replace '\s*:\s*$', ''
+        }
+        elseif ($script:ThirdPartyAvProviders -contains $provider) {
+            # The vendor's message text when its message file is on this
+            # machine, else the event's values
+            $type = "SecurityAlert"
+            $text = "$($r.Message)"
+            if (-not $text.Trim()) {
+                $text = (@($r.Properties | ForEach-Object { "$($_.Value)".Trim() } | Where-Object { $_ -and $_ -ne "(NULL)" }) -join " | ")
+            }
+            $text = ($text -replace '\s+', ' ').Trim()
+            if ([int]$r.Level -notin @(1, 2, 3) -and $text -notmatch $avDetectionPattern) {
+                $skipped["antivirus Information events that report no detection"] = 1 + [int]$skipped["antivirus Information events that report no detection"]
+                continue
+            }
+            $short = if ($text.Length -gt 200) { $text.Substring(0, 200) + "..." } else { $text }
+            $desc = "Antivirus event ($provider $id): $short"
+            $details["Provider"] = $provider
+            $details["Level"] = $(if ($levelNames.ContainsKey([int]$r.Level)) { $levelNames[[int]$r.Level] } else { "$($r.Level)" })
+            $details["Message"] = $(if ($text.Length -gt 1000) { $text.Substring(0, 1000) + "..." } else { $text })
+            $details["UserSID"] = "$($r.UserId)"
+        }
+        if (-not $desc) { continue }
+
+        Add-TimelineEntry -Timestamp $r.TimeCreated -Source $FileName -EventType $type `
+            -Description $desc -User $user -Details (Format-ArtifactDetails $details) `
+            -Artifact "EventLogs" -RawPath $FilePath
+        $rowCounts["$provider $id"] = 1 + [int]$rowCounts["$provider $id"]
+    }
+    if ($rowCounts.Count -gt 0) {
+        Log "    Rows by event: $((@($rowCounts.Keys | ForEach-Object { "$_ x$($rowCounts[$_])" })) -join ', ')"
+    }
+    foreach ($reason in $skipped.Keys) {
+        Log "    Skipped $($skipped[$reason]) event(s): $reason"
+    }
+}
+
 function Parse-EventLogs {
     Log "--- Parsing Event Logs ---"
     $evtxFiles = Find-ArtifactFiles -BasePath $InputPath -Extensions @(".evtx")
@@ -976,19 +1627,15 @@ function Parse-EventLogs {
             # Determine which events to look for based on the log name
             $events = @()
 
-            # Security log events
+            # Security log events (the IDs after 4726 are handled by Add-SecurityEventEntry)
             if ($logName -eq "Security") {
-                $targetIds = @(4624, 4625, 4648, 4672, 4688, 4720, 4726, 4732)
-                try {
-                    $events = Get-WinEvent -Path $filePath -FilterXPath (
-                        "*[System[(" + (($targetIds | ForEach-Object { "EventID=$_" }) -join " or ") + ")]]"
-                    ) -ErrorAction Stop
-                }
-                catch [Exception] {
-                    if ($_.Exception.Message -notmatch "No events were found") {
-                        Log-Warning "    Error reading Security events from $fileName : $($_.Exception.Message)"
-                    }
-                }
+                $targetIds = @(4624, 4625, 4648, 4672, 4688, 4720, 4726,
+                    1102, 4697, 4698, 4699, 4700, 4701, 4702, 4719, 4724, 4728, 4732, 4740, 4756, 4778, 4779)
+                $events = @(Get-EvtxEventsById -Path $filePath -Ids $targetIds -Label "Security")
+                if ($events.Count -gt 0) { Log "    Events read: $(Format-EvtxEventCounts $events)" }
+                # Group adds give a local member's SID only: name it from the other events
+                $sidNames = @{}
+                if (@($events | Where-Object { $_.Id -in @(4728, 4732, 4756) }).Count -gt 0) { $sidNames = Get-SecuritySidNames -Records $events }
 
                 foreach ($evt in $events) {
                     $xmlData = [xml]$evt.ToXml()
@@ -1052,40 +1699,28 @@ function Parse-EventLogs {
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "AccountChange" `
                                 -Description "User account created: $($eventData['TargetUserName'])" `
                                 -User "$($eventData['SubjectDomainName'])\$($eventData['SubjectUserName'])" `
-                                -Details "NewAccount=$($eventData['TargetDomainName'])\$($eventData['TargetUserName'])" `
+                                -Details (Format-ArtifactDetails ([ordered]@{ NewAccount = "$($eventData['TargetDomainName'])\$($eventData['TargetUserName'])"; AccountSID = $eventData['TargetSid'] })) `
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
                         4726 {
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "AccountChange" `
                                 -Description "User account deleted: $($eventData['TargetUserName'])" `
                                 -User "$($eventData['SubjectDomainName'])\$($eventData['SubjectUserName'])" `
-                                -Details "DeletedAccount=$($eventData['TargetDomainName'])\$($eventData['TargetUserName'])" `
+                                -Details (Format-ArtifactDetails ([ordered]@{ DeletedAccount = "$($eventData['TargetDomainName'])\$($eventData['TargetUserName'])"; AccountSID = $eventData['TargetSid'] })) `
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
-                        4732 {
-                            Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "AccountChange" `
-                                -Description "Member added to security-enabled local group" `
-                                -User "$($eventData['SubjectDomainName'])\$($eventData['SubjectUserName'])" `
-                                -Details "MemberSID=$($eventData['MemberSid']) Group=$($eventData['TargetUserName'])" `
-                                -Artifact "EventLogs" -RawPath $filePath
+                        default {
+                            Add-SecurityEventEntry -Record $evt -FileName $fileName -FilePath $filePath -SidNames $sidNames
                         }
                     }
                 }
             }
 
-            # System log events
+            # System log events (104, 6005 and 6006 are handled by Add-SystemEventEntry)
             if ($logName -eq "System") {
-                $targetIds = @(7034, 7036, 7040, 7045, 1074, 6008)
-                try {
-                    $events = Get-WinEvent -Path $filePath -FilterXPath (
-                        "*[System[(" + (($targetIds | ForEach-Object { "EventID=$_" }) -join " or ") + ")]]"
-                    ) -ErrorAction Stop
-                }
-                catch [Exception] {
-                    if ($_.Exception.Message -notmatch "No events were found") {
-                        Log-Warning "    Error reading System events from $fileName : $($_.Exception.Message)"
-                    }
-                }
+                $targetIds = @(7034, 7036, 7040, 7045, 1074, 6008, 104, 6005, 6006)
+                $events = @(Get-EvtxEventsById -Path $filePath -Ids $targetIds -Label "System")
+                if ($events.Count -gt 0) { Log "    Events read: $(Format-EvtxEventCounts $events)" }
 
                 foreach ($evt in $events) {
                     $xmlData = [xml]$evt.ToXml()
@@ -1110,16 +1745,17 @@ function Parse-EventLogs {
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
                         7040 {
+                            # param1 display name, param2/param3 old/new start type, param4 service (key) name
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "ServiceChange" `
                                 -Description "Service start type changed: $($eventData['param1'])" `
-                                -Details "OldType=$($eventData['param2']) NewType=$($eventData['param3'])" `
+                                -Details (Format-ArtifactDetails ([ordered]@{ Service = $eventData['param4']; OldType = $eventData['param2']; NewType = $eventData['param3'] })) `
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
                         7045 {
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "PersistenceChange" `
                                 -Description "New service installed: $($eventData['ServiceName'])" `
                                 -User $eventData['AccountName'] `
-                                -Details "ImagePath=$($eventData['ImagePath']) StartType=$($eventData['StartType'])" `
+                                -Details (Format-ArtifactDetails ([ordered]@{ ImagePath = $eventData['ImagePath']; StartType = $eventData['StartType'] })) `
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
                         1074 {
@@ -1133,6 +1769,9 @@ function Parse-EventLogs {
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "ServiceChange" `
                                 -Description "Unexpected shutdown detected" `
                                 -Artifact "EventLogs" -RawPath $filePath
+                        }
+                        default {
+                            Add-SystemEventEntry -Record $evt -FileName $fileName -FilePath $filePath
                         }
                     }
                 }
@@ -1336,12 +1975,18 @@ function Parse-EventLogs {
 
             # Windows Defender Operational log: detections and protection tampering
             if ($logName -eq "Microsoft-Windows-Windows Defender/Operational") {
-                $events = @(Get-EvtxEventsById -Path $filePath -Ids @(1006, 1007, 1008, 1116, 1117, 1118, 1119, 5001, 5007, 5010, 5012, 5013) -Label "Defender")
+                $events = @(Get-EvtxEventsById -Path $filePath -Ids @(1006, 1007, 1008, 1116, 1117, 1118, 1119, 5001, 5007, 5010, 5012, 5013, 1013, 1121, 1122) -Label "Defender")
+                if ($events.Count -gt 0) { Log "    Events read: $(Format-EvtxEventCounts $events)" }
                 $routineConfig = 0
+                $asrAudits = New-Object System.Collections.Generic.List[object]
                 foreach ($evt in $events) {
                     $f = Get-EvtxEventFields $evt
                     $id = $evt.Id
-                    if ($id -eq 5007) {
+                    if ($id -eq 1122) {
+                        # Attack surface reduction audits are folded after the loop
+                        $asrAudits.Add([PSCustomObject]@{ Record = $evt; Fields = $f })
+                    }
+                    elseif ($id -eq 5007) {
                         $old = ("$($f['Old Value'])".Trim()) -replace '\s+', ' '
                         $new = ("$($f['New Value'])".Trim()) -replace '\s+', ' '
                         if ("$old $new" -notmatch $defenderTamperPattern) { $routineConfig++; continue }
@@ -1378,6 +2023,10 @@ function Parse-EventLogs {
                             -Details (Format-ArtifactDetails ([ordered]@{ EventID = $id; Setting = $f["Value"] })) `
                             -Artifact "EventLogs" -RawPath $filePath
                     }
+                    elseif ($id -in @(1013, 1121)) {
+                        # Malware history deleted, attack surface reduction rule blocked
+                        Add-DefenderEventEntry -Record $evt -Fields $f -FileName $fileName -FilePath $filePath
+                    }
                     else {
                         # Detections (1006/1116), actions taken (1007/1117) and failures (1008/1118/1119)
                         $threat = $f["Threat Name"]
@@ -1406,6 +2055,9 @@ function Parse-EventLogs {
                             })) `
                             -Artifact "EventLogs" -RawPath $filePath
                     }
+                }
+                if ($asrAudits.Count -gt 0) {
+                    Add-DefenderAsrAuditEntries -Items $asrAudits.ToArray() -FileName $fileName -FilePath $filePath
                 }
                 if ($routineConfig -gt 0) {
                     Log "    Skipped $routineConfig routine Defender configuration change(s) (event 5007)"
@@ -1436,6 +2088,28 @@ function Parse-EventLogs {
                             -Artifact "EventLogs" -RawPath $filePath
                     }
                 }
+            }
+
+            # Application log: installs, crashes, Security Center, ESE databases
+            # and third-party antivirus (see Add-ApplicationEventEntries). The
+            # log is large, so only these providers and IDs are read.
+            if ($logName -eq "Application") {
+                $queries = @(
+                    @{ Label = "MsiInstaller"; Providers = @("MsiInstaller"); Ids = @(1033, 1034, 11707, 11724) },
+                    @{ Label = "Application Error"; Providers = @("Application Error"); Ids = @(1000) },
+                    @{ Label = "Application Hang"; Providers = @("Application Hang"); Ids = @(1002) },
+                    @{ Label = "SecurityCenter"; Providers = @("SecurityCenter"); Ids = @(15, 16) },
+                    @{ Label = "ESENT"; Providers = @("ESENT"); Ids = @(216, 325, 326, 327) },
+                    @{ Label = "antivirus"; Providers = $script:ThirdPartyAvProviders; Ids = @() }
+                )
+                $events = @()
+                # A damaged file is reported once, not once per query
+                $readState = @{ Failed = $false }
+                foreach ($query in $queries) {
+                    $events += @(Get-EvtxEventsById -Path $filePath -Ids $query.Ids -Providers $query.Providers -Label $query.Label -State $readState)
+                }
+                if ($events.Count -gt 0) { Log "    Events read: $(Format-EvtxEventCounts $events -ByProvider)" }
+                Add-ApplicationEventEntries -Records $events -FileName $fileName -FilePath $filePath
             }
 
         }
