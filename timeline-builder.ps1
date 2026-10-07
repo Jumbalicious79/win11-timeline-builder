@@ -29,7 +29,7 @@ param(
     # is how powershell.exe -File passes -Sources A,B; it is split after binding.
     [Parameter(Mandatory = $false)]
     [ValidateScript({
-        $validSources = @("EventLogs", "Prefetch", "RecentFiles", "Registry", "FileSystem", "Browser", "ScheduledTasks", "Services", "Network", "USB", "Persistence", "UsnJournal", "Amcache", "PowerShellHistory", "SystemInfo", "Memory")
+        $validSources = @("EventLogs", "Prefetch", "RecentFiles", "Registry", "FileSystem", "Browser", "ScheduledTasks", "Services", "Network", "USB", "Persistence", "UsnJournal", "Amcache", "PowerShellHistory", "SystemInfo", "AntiVirus", "Memory")
         foreach ($name in ("$_" -split ',')) {
             if ($name.Trim() -and $validSources -notcontains $name.Trim()) {
                 throw "Unknown source '$($name.Trim())'. Valid sources: $($validSources -join ', ')"
@@ -37,7 +37,7 @@ param(
         }
         $true
     })]
-    [string[]]$Sources = @("EventLogs", "Prefetch", "RecentFiles", "Registry", "FileSystem", "Browser", "ScheduledTasks", "Services", "Network", "USB", "Persistence", "UsnJournal", "Amcache", "PowerShellHistory", "SystemInfo"),
+    [string[]]$Sources = @("EventLogs", "Prefetch", "RecentFiles", "Registry", "FileSystem", "Browser", "ScheduledTasks", "Services", "Network", "USB", "Persistence", "UsnJournal", "Amcache", "PowerShellHistory", "SystemInfo", "AntiVirus"),
 
     [Parameter(Mandatory = $false)]
     [string[]]$Keywords,
@@ -5354,6 +5354,546 @@ function Parse-SystemInfo {
     Log ""
 }
 
+# ----------------------------------------------------------
+# 17. Antivirus Log Parser
+# ----------------------------------------------------------
+# Third-party antivirus logs that the collector copies to AntiVirus\<vendor>\
+# (file names kept, folders flattened):
+#   Symantec_SEP\    Symantec AntiVirus / SEP risk and scan logs (Logs\AV\MMDDYYYY.Log)
+#   Sophos\          Sophos Anti-Virus for Windows SAV.txt
+#   McAfee_Trellix\  McAfee VirusScan Enterprise AccessProtectionLog.txt
+#   ESET\            virlog.dat ("Detected threats" log; binary, best effort)
+# Detections, blocks, remediation results and protection failures become
+# SecurityAlert rows. Routine records (scan started/finished, definitions
+# loaded, engine version) are counted and skipped: they are frequent, have no
+# EventType of their own and add little to an investigation -- the log is
+# still named in RawPath. Other files and vendor folders are skipped
+# (Write-Verbose). Defender is covered by Parse-EventLogs.
+
+# Lines of a text log. A byte order mark decides the encoding; without one,
+# UTF-16LE is recognized by its zero high bytes, then strict UTF-8 is tried,
+# and anything else is read in the ANSI code page.
+function Read-AntiVirusTextLines {
+    param([string]$Path)
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $start = 0
+    $encoding = $null
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { $encoding = [System.Text.Encoding]::UTF8; $start = 3 }
+    elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) { $encoding = [System.Text.Encoding]::Unicode; $start = 2 }
+    elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) { $encoding = [System.Text.Encoding]::BigEndianUnicode; $start = 2 }
+    elseif ($bytes.Length -ge 4 -and $bytes[0] -ne 0 -and $bytes[1] -eq 0 -and $bytes[2] -ne 0 -and $bytes[3] -eq 0) { $encoding = [System.Text.Encoding]::Unicode }
+
+    if ($encoding) {
+        $text = $encoding.GetString($bytes, $start, $bytes.Length - $start)
+    }
+    else {
+        try { $text = (New-Object System.Text.UTF8Encoding($false, $true)).GetString($bytes) }
+        catch {
+            Write-Verbose "$Path is not UTF-8, reading it as ANSI: $($_.Exception.Message)"
+            $text = [System.Text.Encoding]::Default.GetString($bytes)
+        }
+    }
+    return ,($text -split '\r?\n')
+}
+
+# Name for a numeric code from a lookup table; the code itself if unknown
+function Get-AntiVirusCodeName {
+    param([hashtable]$Names, [string]$Code)
+    $c = "$Code".Trim()
+    if ($Names.ContainsKey($c)) { return $Names[$c] }
+    return $c
+}
+
+# Fields of one comma-separated line: "..." quotes a field, "" inside quotes
+# is a literal quote. Splitting on the quotes first keeps this linear.
+function Split-AntiVirusCsvLine {
+    param([string]$Line)
+    $fields = New-Object System.Collections.Generic.List[string]
+    $current = New-Object System.Text.StringBuilder
+    $parts = $Line.Split([char]'"')
+    for ($i = 0; $i -lt $parts.Length; $i++) {
+        if ($i % 2 -eq 1) {
+            # Odd parts are inside quotes
+            [void]$current.Append($parts[$i])
+            continue
+        }
+        if ($parts[$i] -eq "") {
+            # Nothing between two quoted parts: an escaped quote ("")
+            if ($i -gt 0 -and $i -lt $parts.Length - 1) { [void]$current.Append('"') }
+            continue
+        }
+        $pieces = $parts[$i].Split([char]',')
+        [void]$current.Append($pieces[0])
+        for ($j = 1; $j -lt $pieces.Length; $j++) {
+            $fields.Add($current.ToString())
+            [void]$current.Clear()
+            [void]$current.Append($pieces[$j])
+        }
+    }
+    $fields.Add($current.ToString())
+    return ,$fields.ToArray()
+}
+
+# Symantec log time: six hex octets = years since 1970, month (0-11), day,
+# hour, minute, second, e.g. 2A0A1E0A2F1D = 2012-11-30 10:47:29. It is the
+# examined machine's local time (plaso reads it the same way; in the public
+# sample the Unix-time scan ID of a scan fits a local time of UTC-7).
+# Returns Kind=Unspecified or $null.
+function ConvertFrom-SymantecHexTime {
+    param([string]$Hex)
+    if ($Hex -notmatch '^[0-9A-Fa-f]{12}$') { return $null }
+    $o = @(foreach ($i in 0..5) { [Convert]::ToInt32($Hex.Substring($i * 2, 2), 16) })
+    try { return New-Object DateTime (1970 + $o[0]), ($o[1] + 1), $o[2], $o[3], $o[4], $o[5] }
+    catch {
+        Write-Verbose "Invalid Symantec log time '$Hex': $($_.Exception.Message)"
+        return $null
+    }
+}
+
+# Symantec AntiVirus / SEP AV log (one comma-separated record per line).
+# Fields used (0-based): 0 time, 1 event, 2 category, 3 logger, 4 computer,
+# 5 user, 6 threat, 7 file, 8 first action, 9 second action, 10 action taken,
+# 13 message. Code meanings from the SEPparser "Log Line Info" wiki page.
+function Read-SymantecAvLog {
+    param([System.IO.FileInfo]$File, [string[]]$Lines, [System.TimeZoneInfo]$TimeZone)
+
+    # Events kept as SecurityAlert ("NAME|description"): detections and their
+    # remediation, Tamper Protection, and protection that failed or was turned
+    # off. Any other event is kept too if it names a threat or has category 1
+    # (Infection); everything else (scans, definition loads, service start/stop,
+    # licensing, client check-ins) is routine.
+    $alertEvents = @{
+        5  = "INFECTION|threat detected"
+        11 = "TRAP|Auto-Protect not fully operational"
+        17 = "TOO_MANY_VIRUSES|too many threats found"
+        22 = "RTS_LOAD_ERROR|Auto-Protect failed to load"
+        40 = "BAD_DEFS_UNPROTECTED|bad definitions, client unprotected"
+        42 = "RTS_ERROR|Auto-Protect error"
+        45 = "SECURITY_SYMPROTECT_POLICYVIOLATION|Tamper Protection blocked access"
+        46 = "ANOMALY_START|threat remediation started"
+        47 = "DETECTION_ACTION_TAKEN|action taken on threat"
+        48 = "REMEDIATION_ACTION_PENDING|remediation pending"
+        49 = "REMEDIATION_ACTION_FAILED|remediation failed"
+        50 = "REMEDIATION_ACTION_SUCCESSFUL|remediation succeeded"
+        51 = "ANOMALY_FINISH|threat remediation finished"
+        72 = "INTERESTING_PROCESS_DETECTED_START|suspicious process detected"
+        73 = "LOAD_ERROR_BASH|SONAR failed to load"
+        74 = "LOAD_ERROR_BASH_DEFINITIONS|SONAR definitions failed to load"
+        75 = "INTERESTING_PROCESS_DETECTED_FINISH|suspicious process detection finished"
+        77 = "HEUR_THREAT_NOW_KNOWN|heuristic detection now identified"
+        78 = "DISABLE_BASH|SONAR disabled"
+        80 = "DEFS_LOAD_FAILED|definitions failed to load"
+        86 = "ELAM_LOAD_FAILED|ELAM driver failed to load"
+        89 = "ELAM_DISABLE|ELAM disabled"
+        90 = "ELAM_BAD|ELAM detected a bad driver"
+        91 = "ELAM_BAD_REPORTED_AS_UNKNOWN|ELAM bad driver reported as unknown"
+        92 = "DISABLE_SYMPROTECT|Tamper Protection disabled"
+    }
+    $categoryNames = @{ "1" = "Infection"; "2" = "Summary"; "3" = "Pattern"; "4" = "Security" }
+    $loggerNames = @{ "0" = "Scheduled scan"; "1" = "Manual scan"; "2" = "Auto-Protect"; "3" = "Integrity Shield";
+        "6" = "Console"; "7" = "VPDOWN"; "8" = "System"; "9" = "Startup scan"; "10" = "Idle scan"; "11" = "DefWatch";
+        "12" = "Licensing"; "13" = "Manual quarantine"; "14" = "Tamper Protection"; "15" = "Reboot processing";
+        "16" = "SONAR"; "17" = "ELAM"; "18" = "Power Eraser"; "19" = "EOC scan" }
+    # 0 = no action
+    $actionNames = @{ "0" = ""; "1" = "Quarantine"; "2" = "Rename"; "3" = "Delete"; "4" = "Leave alone"; "5" = "Clean";
+        "6" = "Remove macros"; "7" = "Save file as"; "8" = "Sent to backend"; "9" = "Restore from quarantine";
+        "10" = "Rename back"; "11" = "Undo action"; "12" = "Error"; "13" = "Backup to quarantine";
+        "14" = "Pending analysis"; "15" = "Partially fixed"; "16" = "Terminate process required";
+        "17" = "Exclude from scanning"; "18" = "Reboot processing"; "19" = "Clean by deletion"; "20" = "Access denied";
+        "21" = "Terminate process only"; "22" = "No repair"; "23" = "Fail"; "24" = "Run Power Eraser";
+        "25" = "No repair (Power Eraser)" }
+
+    $added = 0
+    $routine = 0
+    $unreadable = 0
+    foreach ($line in $Lines) {
+        if ($line -notmatch '^[0-9A-Fa-f]{12},') { continue }
+        $f = Split-AntiVirusCsvLine $line
+        $code = 0
+        if ($f.Count -lt 14 -or -not [int]::TryParse($f[1], [ref]$code)) { $unreadable++; continue }
+        $virus = $f[6].Trim()
+        $path = $f[7].Trim()
+        if (-not $alertEvents.ContainsKey($code) -and $f[2].Trim() -ne "1" -and -not $virus) { $routine++; continue }
+        $local = ConvertFrom-SymantecHexTime $f[0]
+        if ($null -eq $local) { $unreadable++; continue }
+
+        $names = @("", "event $code")
+        if ($alertEvents.ContainsKey($code)) { $names = $alertEvents[$code] -split '\|' }
+        $actionTaken = Get-AntiVirusCodeName $actionNames $f[10]
+        $message = $f[13].Trim()
+        $subject = (@($virus, $path) | Where-Object { $_ }) -join " in "
+        if (-not $subject) { $subject = $message }
+        $desc = "Symantec $($names[1])"
+        if ($subject) { $desc += ": $subject" }
+        if ($actionTaken) { $desc += " ($actionTaken)" }
+
+        Add-TimelineEntry -Timestamp (Convert-LocalToUtc -Local $local -TimeZone $TimeZone) -Source "AV-Symantec" -EventType "SecurityAlert" `
+            -Description $desc `
+            -User $f[5].Trim() `
+            -Details (Format-ArtifactDetails ([ordered]@{
+                Event        = "$code $($names[0])".Trim()
+                Category     = Get-AntiVirusCodeName $categoryNames $f[2]
+                Logger       = Get-AntiVirusCodeName $loggerNames $f[3]
+                Threat       = $virus
+                File         = $path
+                ActionTaken  = $actionTaken
+                FirstAction  = Get-AntiVirusCodeName $actionNames $f[8]
+                SecondAction = Get-AntiVirusCodeName $actionNames $f[9]
+                Computer     = $f[4]
+                Message      = $message
+                LogTime      = $local.ToString("yyyy-MM-dd HH:mm:ss") + " (target local time)"
+            })) `
+            -Artifact "AntiVirus" -RawPath $File.FullName
+        $added++
+    }
+    $note = "$routine routine record(s) skipped"
+    if ($unreadable -gt 0) { $note += ", $unreadable unreadable line(s)" }
+    Log "    Added $added timeline entries ($note)"
+}
+
+# Sophos Anti-Virus SAV.txt: "yyyyMMdd HHmmss <message>" per line, usually
+# UTF-16LE. Times are the examined machine's local time (as plaso assumes;
+# Sophos does not document the time zone). Messages are English text, so
+# known detection/remediation sentences are matched, then alert keywords.
+function Read-SophosSavLog {
+    param([System.IO.FileInfo]$File, [string[]]$Lines, [System.TimeZoneInfo]$TimeZone)
+    $alertPattern = '(?i)virus/spyware|adware|\bPUA\b|suspicious (?:file|behaviou?r)|malicious|quarantined|infected file|(?:was|been) blocked|could not be (?:cleaned|deleted|removed|quarantined)|clean(?:ing|up) (?:failed|impossible)|could not (?:be )?scan|\bHIPS\b'
+    $added = 0
+    $routine = 0
+    foreach ($line in $Lines) {
+        if ($line -notmatch '^\s*(\d{8}\s\d{6})\s+(.+?)\s*$') { continue }
+        $logTime = $Matches[1] -replace '\s', ' '
+        $message = $Matches[2]
+        $local = [datetime]::MinValue
+        if (-not [datetime]::TryParseExact($logTime, "yyyyMMdd HHmmss", [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$local)) { continue }
+
+        if ($message -match '^File "(.+)" belongs to (.+?) ''(.+)''\.?$') {
+            $desc = "Sophos threat detected: $($Matches[3]) in $($Matches[1])"
+            $info = [ordered]@{ Threat = $Matches[3]; ThreatType = $Matches[2]; File = $Matches[1] }
+        }
+        elseif ($message -match '^(.+?) ''(.+?)'' detected in ''(.+)''(?:\.\s*(.*))?$') {
+            $desc = "Sophos threat detected: $($Matches[2]) in $($Matches[3])"
+            if ($Matches[4]) { $desc += " ($($Matches[4].Trim().TrimEnd('.')))" }
+            $info = [ordered]@{ Threat = $Matches[2]; ThreatType = $Matches[1]; File = $Matches[3]; Result = $Matches[4] }
+        }
+        elseif ($message -match '^Infected file "(.+)" moved (?:in|to) "(.+)"\.?$') {
+            $desc = "Sophos moved infected file to quarantine: $($Matches[1])"
+            $info = [ordered]@{ File = $Matches[1]; MovedTo = $Matches[2] }
+        }
+        elseif ($message -match '^The file "(.+)" (?:was|has been) (cleaned|deleted|removed|quarantined)\.?$') {
+            $desc = "Sophos $($Matches[2]) file: $($Matches[1])"
+            $info = [ordered]@{ File = $Matches[1]; Action = $Matches[2] }
+        }
+        elseif ($message -match '^The (.+?) ''(.+)'' (?:was|has been) (cleaned|deleted|removed|quarantined)\.?$') {
+            $desc = "Sophos $($Matches[3]) threat: $($Matches[2])"
+            $info = [ordered]@{ Threat = $Matches[2]; ThreatType = $Matches[1]; Action = $Matches[3] }
+        }
+        elseif ($message -match '"(.+)" returned a SAV error (.+?)\.?$') {
+            # The file could not be scanned (e.g. "File is crypted")
+            $desc = "Sophos could not scan file: $($Matches[1])"
+            $info = [ordered]@{ File = $Matches[1]; Error = $Matches[2] }
+        }
+        elseif ($message -match 'sent for Sophos Live Protection: File: ''(.+)'' Checksum: ''(.+)''') {
+            $desc = "Sophos sent file sample to Live Protection: $($Matches[1])"
+            $info = [ordered]@{ File = $Matches[1]; Checksum = $Matches[2] }
+        }
+        elseif ($message -match $alertPattern) {
+            $desc = "Sophos: $message"
+            $info = [ordered]@{}
+        }
+        else {
+            $routine++
+            continue
+        }
+        $info["LogTime"] = $local.ToString("yyyy-MM-dd HH:mm:ss") + " (target local time)"
+        # Keyword match only: keep the whole message
+        if ($info.Count -eq 1) { $info["Message"] = $message }
+
+        Add-TimelineEntry -Timestamp (Convert-LocalToUtc -Local $local -TimeZone $TimeZone) -Source "AV-Sophos" -EventType "SecurityAlert" `
+            -Description $desc `
+            -Details (Format-ArtifactDetails $info) `
+            -Artifact "AntiVirus" -RawPath $File.FullName
+        $added++
+    }
+    Log "    Added $added timeline entries ($routine routine record(s) skipped)"
+}
+
+# McAfee writes date and time in the examined machine's regional format
+# (en-US "9/27/2013" and "2:42:26 PM"). Day-first is decided per file by the
+# caller. Returns Kind=Unspecified or $null.
+function ConvertFrom-McAfeeLogTime {
+    param([string]$Date, [string]$Time, [bool]$DayFirst)
+    if ($Date -notmatch '^\s*(\d{1,4})[./-](\d{1,2})[./-](\d{1,4})\s*$') { return $null }
+    $part1 = $Matches[1]
+    $part2 = [int]$Matches[2]
+    $part3 = [int]$Matches[3]
+    if ($part1.Length -eq 4) { $year = [int]$part1; $month = $part2; $day = $part3 }
+    elseif ($DayFirst) { $year = $part3; $month = $part2; $day = [int]$part1 }
+    else { $year = $part3; $month = [int]$part1; $day = $part2 }
+    if ($year -lt 100) { $year += 2000 }
+
+    if ($Time -notmatch '^\s*(\d{1,2}):(\d{2}):(\d{2})\s*([AaPp])?\.?(?:[Mm]\.?)?\s*$') { return $null }
+    $hour = [int]$Matches[1]
+    $minute = [int]$Matches[2]
+    $second = [int]$Matches[3]
+    if ($Matches[4]) {
+        if ($hour -eq 12) { $hour = 0 }
+        if ("Pp".Contains($Matches[4])) { $hour += 12 }
+    }
+    try { return New-Object DateTime $year, $month, $day, $hour, $minute, $second }
+    catch {
+        Write-Verbose "Invalid McAfee log time '$Date $Time': $($_.Exception.Message)"
+        return $null
+    }
+}
+
+# McAfee VirusScan Enterprise AccessProtectionLog.txt, tab-separated, local
+# time of the examined machine (as plaso reads it):
+#   date, time, status, user, process, target, rule, action
+# Port blocking lines have no user/action: date, time, status, process, rule,
+# destination. "Would be blocked ... (rule is currently not enforced)" lines
+# are report-only rule hits and are kept, marked as not enforced.
+function Read-McAfeeAccessProtectionLog {
+    param([System.IO.FileInfo]$File, [string[]]$Lines, [System.TimeZoneInfo]$TimeZone)
+    $rows = @(foreach ($line in $Lines) {
+        $cols = $line.Split([char]"`t")
+        if ($cols.Count -ge 6 -and $cols[0] -match '^\s*\d{1,4}[./-]\d{1,2}[./-]\d{1,4}\s*$') { ,$cols }
+    })
+    # Day-first dates: "." separators (27.09.2013) or a first number over 12
+    $dayFirst = $false
+    foreach ($cols in $rows) {
+        if ($cols[0] -match '^\s*(\d{1,2})([./-])\d{1,2}[./-]\d{2,4}\s*$' -and ($Matches[2] -eq '.' -or [int]$Matches[1] -gt 12)) {
+            $dayFirst = $true
+            break
+        }
+    }
+
+    $added = 0
+    $unreadable = 0
+    foreach ($cols in $rows) {
+        $local = ConvertFrom-McAfeeLogTime -Date $cols[0] -Time $cols[1] -DayFirst $dayFirst
+        if ($null -eq $local) { $unreadable++; continue }
+        $status = $cols[2].Trim()
+        if ($cols.Count -ge 8) {
+            $user = $cols[3].Trim()
+            $process = $cols[4].Trim()
+            $target = $cols[5].Trim()
+            $rule = $cols[6].Trim()
+            $action = ($cols[7] -replace '^\s*Action blocked\s*:\s*', '').Trim()
+        }
+        else {
+            $user = ""
+            if ($cols.Count -ge 7) { $user = $cols[3].Trim() }
+            $process = $cols[$cols.Count - 3].Trim()
+            $rule = $cols[$cols.Count - 2].Trim()
+            $target = $cols[$cols.Count - 1].Trim()
+            $action = ""
+        }
+
+        $kind = "Access Protection"
+        if ($status -match 'port blocking') { $kind = "port blocking" }
+        if ($status -match '^Would be blocked') { $what = "$kind would have blocked (rule not enforced)" }
+        elseif ($status -match '^Blocked') { $what = "$kind blocked" }
+        else { $what = "$kind ($status)" }
+        $desc = "McAfee ${what}: $process -> $target"
+        if ($action) { $desc += " ($action)" }
+
+        Add-TimelineEntry -Timestamp (Convert-LocalToUtc -Local $local -TimeZone $TimeZone) -Source "AV-McAfee" -EventType "SecurityAlert" `
+            -Description $desc `
+            -User $user `
+            -Details (Format-ArtifactDetails ([ordered]@{
+                Rule    = $rule
+                Action  = $action
+                Process = $process
+                Target  = $target
+                Status  = $status
+                LogTime = $local.ToString("yyyy-MM-dd HH:mm:ss") + " (target local time)"
+            })) `
+            -Artifact "AntiVirus" -RawPath $File.FullName
+        $added++
+    }
+    $note = ""
+    if ($unreadable -gt 0) { $note = " ($unreadable line(s) with unreadable date/time skipped)" }
+    Log "    Added $added timeline entries$note"
+}
+
+# Fields of an ESET log record payload as a hashtable (field id -> value).
+# Each field is uint16 id, uint16 type, then a value by type:
+#   0x4E 'N' uint32 byte count + UTF-16LE text    0x45 'E' 4-byte number
+#   0x42 'B' uint32 byte count + bytes (as hex)   0x46 'F' 8-byte number
+#   0x41 'A' assumed like 'B' (only seen empty)   0x43 'C' 1-byte number
+# An unknown type ends the record: its size, and so the rest, is unknown.
+function Read-EsetRecordFields {
+    param([byte[]]$Bytes, [int]$Start, [int]$End)
+    $fields = @{}
+    $p = $Start
+    while ($p + 4 -le $End) {
+        $id = [int][BitConverter]::ToUInt16($Bytes, $p)
+        $type = [int][BitConverter]::ToUInt16($Bytes, $p + 2)
+        $p += 4
+        if ($type -eq 0x45 -and $p + 4 -le $End) { $value = [BitConverter]::ToUInt32($Bytes, $p); $p += 4 }
+        elseif ($type -eq 0x46 -and $p + 8 -le $End) { $value = [BitConverter]::ToInt64($Bytes, $p); $p += 8 }
+        elseif ($type -eq 0x43 -and $p + 1 -le $End) { $value = $Bytes[$p]; $p += 1 }
+        elseif (@(0x4E, 0x42, 0x41) -contains $type -and $p + 4 -le $End) {
+            $length = [BitConverter]::ToInt32($Bytes, $p)
+            $p += 4
+            if ($length -lt 0 -or $p + $length -gt $End) { break }
+            if ($type -eq 0x4E) { $value = [System.Text.Encoding]::Unicode.GetString($Bytes, $p, $length).TrimEnd([char]0) }
+            elseif ($length -gt 0) { $value = [BitConverter]::ToString($Bytes, $p, $length).Replace("-", "") }
+            else { $value = "" }
+            $p += $length
+        }
+        else { break }
+        $fields[$id] = $value
+    }
+    return $fields
+}
+
+# ESET virlog.dat ("Detected threats" log). BEST EFFORT: ESET does not
+# document this binary format. The layout below was worked out from one
+# public sample (ESET NOD32 / Smart Security, 2017) and other versions may
+# differ; records that do not fit are skipped. Little-endian throughout.
+#   file:    56-byte header (signature, sizes, record count, FILETIMEs)
+#   record:  signature DC CF 8B 63 | uint32 record size | uint32 size of the
+#            rest of the header (36) | 4 bytes ? | uint32 record number |
+#            FILETIME detection time | 16 bytes ? | uint32 payload size,
+#            then the payload (see Read-EsetRecordFields)
+#   fields:  0x0BBE detected object, 0x1D4D threat name, 0x03EE user,
+#            0x0BC4 process, 0x139E SHA1 of the object (matches the EICAR
+#            file in the sample), 0x139D a second 20-byte hash (meaning
+#            unknown), 0x139F first-seen time (Unix seconds), 0x2717
+#            detection engine version. Action and scanner are not decoded.
+# FILETIMEs are UTC (the Windows convention; in the sample the detection
+# times also fall a few minutes after the Unix-epoch first-seen time).
+function Read-EsetVirlog {
+    param([System.IO.FileInfo]$File)
+    $bytes = [System.IO.File]::ReadAllBytes($File.FullName)
+    # One char per byte, to find record signatures with String.IndexOf
+    $latin1 = [System.Text.Encoding]::GetEncoding(28591)
+    $view = $latin1.GetString($bytes)
+    $signature = $latin1.GetString([byte[]](0xDC, 0xCF, 0x8B, 0x63))
+    $unixEpoch = New-Object DateTime 1970, 1, 1, 0, 0, 0, ([System.DateTimeKind]::Utc)
+
+    $added = 0
+    $unreadable = 0
+    $pos = $view.IndexOf($signature, [System.StringComparison]::Ordinal)
+    while ($pos -ge 0 -and $pos + 48 -le $bytes.Length) {
+        $recordSize = [BitConverter]::ToInt32($bytes, $pos + 4)
+        $headerRest = [BitConverter]::ToInt32($bytes, $pos + 8)
+        $payloadStart = $pos + 12 + $headerRest
+        if ($recordSize -lt 48 -or $headerRest -lt 16 -or $pos + $recordSize -gt $bytes.Length -or $payloadStart -gt $pos + $recordSize) {
+            # Signature bytes inside other data -- keep looking
+            $pos = $view.IndexOf($signature, $pos + 1, [System.StringComparison]::Ordinal)
+            continue
+        }
+        $recordNumber = [BitConverter]::ToUInt32($bytes, $pos + 16)
+        $fileTime = [BitConverter]::ToInt64($bytes, $pos + 20)
+        $fields = Read-EsetRecordFields -Bytes $bytes -Start $payloadStart -End ($pos + $recordSize)
+        $threat = "$($fields[0x1D4D])"
+        $object = "$($fields[0x0BBE])"
+
+        $detected = $null
+        if ($fileTime -gt 0 -and $fileTime -lt 2650467743999999999) { $detected = [DateTime]::FromFileTimeUtc($fileTime) }
+        if ($null -eq $detected -or (-not $threat -and -not $object)) {
+            $unreadable++
+        }
+        else {
+            $firstSeen = ""
+            $unixTime = $fields[0x139F]
+            if ($unixTime -is [long] -and $unixTime -gt 0 -and $unixTime -lt 4102444800) {
+                $firstSeen = $unixEpoch.AddSeconds($unixTime).ToString("yyyy-MM-dd HH:mm:ss")
+            }
+            $desc = "ESET threat detected: $threat"
+            if (-not $threat) { $desc = "ESET threat detected" }
+            if ($object) { $desc += " in $object" }
+            Add-TimelineEntry -Timestamp $detected -Source "AV-ESET" -EventType "SecurityAlert" `
+                -Description $desc `
+                -User "$($fields[0x03EE])" `
+                -Details (Format-ArtifactDetails ([ordered]@{
+                    Threat       = $threat
+                    Object       = $object
+                    Process      = $fields[0x0BC4]
+                    SHA1         = $fields[0x139E]
+                    OtherHash    = $fields[0x139D]
+                    FirstSeenUtc = $firstSeen
+                    Engine       = $fields[0x2717]
+                    Record       = $recordNumber
+                })) `
+                -Artifact "AntiVirus" -RawPath $File.FullName
+            $added++
+        }
+        $pos = $view.IndexOf($signature, $pos + $recordSize, [System.StringComparison]::Ordinal)
+    }
+
+    if ($added -eq 0 -and $bytes.Length -gt 256) {
+        Log-Warning "    No readable detection records in $($File.Name) ($($bytes.Length) bytes) -- this ESET version's log format may differ"
+    }
+    else {
+        $note = ""
+        if ($unreadable -gt 0) { $note = " ($unreadable record(s) without time or threat skipped)" }
+        Log "    Added $added timeline entries$note (best-effort parse of ESET's binary log)"
+    }
+}
+
+function Parse-AntiVirus {
+    Log "--- Parsing Antivirus Logs ---"
+
+    $timeZone = (Get-CollectionInfo).TargetTimeZone
+    $symantecPattern = '^[0-9A-Fa-f]{12},\d+,\d+,\d+,'
+    $sophosPattern = '^\s*\d{8}\s\d{6}\s'
+    $mcafeePattern = '^\s*\d{1,4}[./-]\d{1,2}[./-]\d{1,4}\t[^\t]*\t\s*(?:Would be blocked|Blocked) by (?:Access Protection|port blocking) rule'
+
+    $vendorDirs = @(Get-ChildItem -Path $InputPath -Directory -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $_.Parent -and $_.Parent.Name -eq "AntiVirus" } | Sort-Object FullName)
+    $parsedFiles = 0
+    foreach ($dir in $vendorDirs) {
+        $vendor = $dir.Name
+        if (@("Symantec_SEP", "Sophos", "McAfee_Trellix", "ESET") -notcontains $vendor) {
+            Write-Verbose "No antivirus log parser for $($dir.FullName)"
+            continue
+        }
+        foreach ($file in @(Get-ChildItem -Path $dir.FullName -File -Recurse -ErrorAction SilentlyContinue | Sort-Object Name)) {
+            try {
+                # Recognize the log by folder, file name and first lines
+                $lines = @()
+                if (@(".log", ".txt") -contains $file.Extension) { $lines = Read-AntiVirusTextLines $file.FullName }
+                $head = @($lines | Where-Object { $_.Trim() } | Select-Object -First 20)
+                $kind = ""
+                if ($vendor -eq "Symantec_SEP") {
+                    if ($file.Extension -eq ".log" -and $head.Count -gt 0 -and $head[0] -match $symantecPattern) { $kind = "Symantec" }
+                }
+                elseif ($vendor -eq "Sophos") {
+                    if ($file.Name -like "sav*.txt" -and $head.Count -gt 0 -and $head[0] -match $sophosPattern) { $kind = "Sophos" }
+                }
+                elseif ($vendor -eq "McAfee_Trellix") {
+                    if ($file.Name -like "AccessProtectionLog*.txt" -or @($head | Where-Object { $_ -match $mcafeePattern }).Count -gt 0) { $kind = "McAfee" }
+                }
+                elseif ($vendor -eq "ESET") {
+                    if ($file.Name -like "virlog*.dat") { $kind = "ESET" }
+                }
+                if (-not $kind) {
+                    Write-Verbose "Skipping $($file.FullName): not a supported $vendor log"
+                    continue
+                }
+
+                Log "  Parsing: $($file.FullName)"
+                if ($kind -eq "Symantec") { Read-SymantecAvLog -File $file -Lines $lines -TimeZone $timeZone }
+                elseif ($kind -eq "Sophos") { Read-SophosSavLog -File $file -Lines $lines -TimeZone $timeZone }
+                elseif ($kind -eq "McAfee") { Read-McAfeeAccessProtectionLog -File $file -Lines $lines -TimeZone $timeZone }
+                else { Read-EsetVirlog -File $file }
+                $parsedFiles++
+            }
+            catch {
+                Log-Warning "  Failed to parse $($file.FullName): $($_.Exception.Message)"
+            }
+        }
+    }
+
+    if ($parsedFiles -eq 0) { Log "  No supported third-party antivirus logs (Symantec, Sophos, McAfee, ESET) in the collection." }
+    Log "  Antivirus log parsing complete."
+    Log ""
+}
+
 # =============================================================
 # Auto-detect memory dump and prompt for analysis
 # =============================================================
@@ -5448,6 +5988,7 @@ if ($Sources -contains "Persistence")      { Parse-Persistence }
 if ($Sources -contains "Amcache")          { Parse-Amcache }
 if ($Sources -contains "PowerShellHistory") { Parse-PowerShellHistory }
 if ($Sources -contains "SystemInfo")       { Parse-SystemInfo }
+if ($Sources -contains "AntiVirus")        { Parse-AntiVirus }
 if ($Sources -contains "Memory")           { Parse-Memory }
 
 # =============================================================
