@@ -6,6 +6,7 @@
 # Use Run-TimelineBuilder.bat to launch (handles elevation + policy)
 # =============================================================
 
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSReviewUnusedParameter", "MaxUsnEntries", Justification = "Read by Parse-UsnJournal through script scope")]
 [CmdletBinding(DefaultParameterSetName = "Direct")]
 param(
     [Parameter(ParameterSetName = "Direct", Mandatory = $true)]
@@ -187,7 +188,7 @@ if ($Browse) {
         }
     }
 
-    # The extracted folder may contain a single subfolder — find the actual collection root
+    # The extracted folder may contain a single subfolder -- find the actual collection root
     $children = Get-ChildItem -Path $extractDir -Directory
     if ($children.Count -eq 1 -and -not (Get-ChildItem -Path $extractDir -File)) {
         $InputPath = $children[0].FullName
@@ -472,7 +473,8 @@ function Get-CollectionInfo {
             if ($tz) { $info.CollectorTimeZone = $tz }
             $info.TargetTimeZone = Get-TimeZoneById ([string]$j.TargetTimeZoneId)
             if ($j.CollectorCulture) {
-                try { $info.CollectorCulture = [System.Globalization.CultureInfo]::GetCultureInfo([string]$j.CollectorCulture) } catch {}
+                try { $info.CollectorCulture = [System.Globalization.CultureInfo]::GetCultureInfo([string]$j.CollectorCulture) }
+                catch { Write-Verbose "Could not load collector culture '$($j.CollectorCulture)': $($_.Exception.Message)" }
             }
         }
         catch { Log-Warning "Could not read collection_info.json: $($_.Exception.Message)" }
@@ -715,7 +717,6 @@ function Parse-EventLogs {
 
         try {
             # Determine which events to look for based on the log name
-            $filterXml = $null
             $events = @()
 
             # Security log events
@@ -1548,7 +1549,8 @@ function Parse-RecentFiles {
 
             $details = "Target=$targetPath Args=$arguments WorkDir=$workDir"
             $header = $null
-            try { $header = Read-LnkHeader $lnk.FullName } catch {}
+            try { $header = Read-LnkHeader $lnk.FullName }
+            catch { Write-Verbose "Could not read LNK header of $($lnk.Name): $($_.Exception.Message)" }
             if ($header) {
                 foreach ($pair in @(@("TargetCreatedUtc", $header.TargetCreated), @("TargetAccessedUtc", $header.TargetAccessed), @("TargetModifiedUtc", $header.TargetModified))) {
                     if ($pair[1]) { $details += " $($pair[0])=$($pair[1].ToString('yyyy-MM-dd HH:mm:ss'))" }
@@ -1680,7 +1682,10 @@ function Mount-TimelineHive {
 function Dismount-TimelineHive {
     param($Mount)
     if (-not $Mount) { return }
-    if ($Mount.Root) { try { $Mount.Root.Close() } catch {} }
+    if ($Mount.Root) {
+        try { $Mount.Root.Close() }
+        catch { Write-Verbose "Could not close root key of hive $($Mount.Name): $($_.Exception.Message)" }
+    }
     # Force release of any lingering references to the hive before unloading
     [gc]::Collect()
     [gc]::WaitForPendingFinalizers()
@@ -1809,7 +1814,8 @@ function Read-NtUserHive {
                         if ($ftData -is [byte[]] -and $ftData.Length -ge 8) {
                             $ft = [BitConverter]::ToInt64($ftData, 0)
                             if ($ft -gt 0) {
-                                try { $t = [PSCustomObject]@{ Time = [datetime]::FromFileTimeUtc($ft); Note = "Time=TypedURLsTime (when typed); MRU position $pos" } } catch {}
+                                try { $t = [PSCustomObject]@{ Time = [datetime]::FromFileTimeUtc($ft); Note = "Time=TypedURLsTime (when typed); MRU position $pos" } }
+                                catch { Write-Verbose "Invalid TypedURLsTime for $val, using key time: $($_.Exception.Message)" }
                             }
                         }
                     }
@@ -1866,6 +1872,7 @@ function Read-NtUserHive {
                 $base = if ($c -ge 97) { 97 } else { 65 }
                 [string][char]((($c - $base + 13) % 26) + $base)
             }
+            $badTimeCount = 0
             foreach ($guidName in $userAssistKey.GetSubKeyNames()) {
                 $guidKey = $userAssistKey.OpenSubKey($guidName)
                 if (-not $guidKey) { continue }
@@ -1884,7 +1891,8 @@ function Read-NtUserHive {
                                 $runCount = [BitConverter]::ToInt32($data, 4)
                                 $fileTime = [BitConverter]::ToInt64($data, 60)
                                 if ($fileTime -gt 0) {
-                                    try { $lastRun = [datetime]::FromFileTimeUtc($fileTime) } catch {}
+                                    try { $lastRun = [datetime]::FromFileTimeUtc($fileTime) }
+                                    catch { $badTimeCount++; $badTimeError = $_.Exception.Message }
                                 }
                             }
 
@@ -1900,6 +1908,7 @@ function Read-NtUserHive {
                 }
                 $guidKey.Close()
             }
+            if ($badTimeCount -gt 0) { Log-Warning "    $badTimeCount UserAssist entr(ies) skipped: invalid last-run time (last error: $badTimeError)" }
             $userAssistKey.Close()
         }
     }
@@ -2310,7 +2319,8 @@ function Find-Sqlite3Exe {
     $urls = @("https://www.sqlite.org/$sqliteYear/sqlite-tools-win-x64-$sqliteVersion.zip")
 
     Log "  sqlite3.exe not found locally. Downloading sqlite-tools $sqliteVersion from sqlite.org..."
-    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 }
+    catch { Write-Verbose "Could not enable TLS 1.2: $($_.Exception.Message)" }
     foreach ($url in $urls) {
         $zipPath = Join-Path $env:TEMP "sqlite3_download_$(Get-Random).zip"
         try {
@@ -2345,7 +2355,8 @@ function Invoke-Sqlite3Query {
             Copy-Item -LiteralPath "$DbPath-wal" -Destination "$tempDb-wal" -Force -ErrorAction SilentlyContinue
         }
         # sqlite3 writes UTF-8; without this, titles are decoded with the OEM code page
-        try { $prevEncoding = [Console]::OutputEncoding; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
+        try { $prevEncoding = [Console]::OutputEncoding; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 }
+        catch { Write-Verbose "Could not set console output encoding to UTF-8: $($_.Exception.Message)" }
         $output = & $Sqlite3Exe -csv $tempDb $Query 2>&1
         if ($LASTEXITCODE -eq 0) { return @($output | Where-Object { $_ -is [string] }) }
         Log-Warning "    sqlite3 error: $output"
@@ -2356,7 +2367,10 @@ function Invoke-Sqlite3Query {
         return @()
     }
     finally {
-        if ($prevEncoding) { try { [Console]::OutputEncoding = $prevEncoding } catch {} }
+        if ($prevEncoding) {
+            try { [Console]::OutputEncoding = $prevEncoding }
+            catch { Write-Verbose "Could not restore console output encoding: $($_.Exception.Message)" }
+        }
         foreach ($tmp in @($tempDb, "$tempDb-wal", "$tempDb-shm", "$tempDb-journal")) {
             if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
         }
@@ -2792,6 +2806,7 @@ function Parse-FileSystem {
             try {
                 $files = Import-Csv -Path $csv.FullName -ErrorAction Stop
                 $count = 0
+                $timeErrorCount = 0
                 foreach ($f in $files) {
                     $path = if ($f.PSObject.Properties["FullName"]) { $f.FullName }
                             elseif ($f.PSObject.Properties["Path"]) { $f.Path }
@@ -2812,7 +2827,7 @@ function Parse-FileSystem {
                                 $count++
                                 break
                             }
-                            catch {}
+                            catch { $timeErrorCount++; $lastTimeError = $_.Exception.Message }
                         }
                     }
 
@@ -2830,7 +2845,7 @@ function Parse-FileSystem {
                                 $count++
                                 break
                             }
-                            catch {}
+                            catch { $timeErrorCount++; $lastTimeError = $_.Exception.Message }
                         }
                     }
 
@@ -2839,6 +2854,9 @@ function Parse-FileSystem {
                         Log-Warning "  File system entries capped at 50,000 to prevent excessive output."
                         break
                     }
+                }
+                if ($timeErrorCount -gt 0) {
+                    Log-Warning "  $timeErrorCount time value(s) in $($csv.Name) could not be parsed and were skipped (last error: $lastTimeError)"
                 }
             }
             catch {
@@ -3837,7 +3855,6 @@ function Parse-Amcache {
 
     foreach ($amcache in $amcacheFiles) {
         $hiveName = "TEMP_AMCACHE_$(Get-Random)"
-        $hivePath = "HKLM:\$hiveName"
         $loaded = $false
         $tempHiveDir = $null
 
@@ -3876,6 +3893,7 @@ function Parse-Amcache {
                 # compile timestamp from the file header -- often meaningless
                 # (e.g. 2105 for reproducible builds) -- so it only goes in Details.
                 $noTimeCount = 0
+                $readErrorCount = 0
 
                 # Read through .NET RegistryKey objects and close every handle:
                 # keys opened through the PowerShell registry provider stay open,
@@ -3911,7 +3929,7 @@ function Parse-Amcache {
                                         -Artifact "Amcache" -RawPath $amcache.FullName
                                     $count++
                                 }
-                                catch {}
+                                catch { $readErrorCount++; $lastReadError = $_.Exception.Message }
                                 finally { $entry.Close() }
                             }
                         }
@@ -3944,7 +3962,7 @@ function Parse-Amcache {
                                         -Artifact "Amcache" -RawPath $amcache.FullName
                                     $count++
                                 }
-                                catch {}
+                                catch { $readErrorCount++; $lastReadError = $_.Exception.Message }
                                 finally { $entry.Close() }
                             }
                         }
@@ -3955,6 +3973,7 @@ function Parse-Amcache {
                     if ($rootKey) { $rootKey.Close() }
                 }
                 if ($noTimeCount -gt 0) { Log-Warning "  $noTimeCount Amcache entr(ies) skipped: key last-write time unavailable." }
+                if ($readErrorCount -gt 0) { Log-Warning "  $readErrorCount Amcache entr(ies) skipped: could not be read (last error: $lastReadError)" }
 
                 Log "  Parsed $count Amcache entries."
             }
@@ -4147,13 +4166,14 @@ function Get-AppCompatCacheFromRegText {
 
     $bytes = $null
     # .NET 5+ (PowerShell 7)
-    try { $bytes = [Convert]::FromHexString($hex) } catch {}
+    try { $bytes = [Convert]::FromHexString($hex) }
+    catch { Write-Verbose "Convert.FromHexString not available, trying SoapHexBinary: $($_.Exception.Message)" }
     if ($null -eq $bytes) {
         # .NET Framework (Windows PowerShell 5.1)
         try {
             Add-Type -AssemblyName System.Runtime.Remoting -ErrorAction Stop
             $bytes = [System.Runtime.Remoting.Metadata.W3cXsd2001.SoapHexBinary]::Parse($hex).Value
-        } catch {}
+        } catch { Write-Verbose "SoapHexBinary not available, decoding hex manually: $($_.Exception.Message)" }
     }
     if ($null -eq $bytes) {
         $bytes = New-Object byte[] ($hex.Length / 2)
@@ -4188,7 +4208,10 @@ function ConvertFrom-AppCompatCacheBinary {
         $ft = [BitConverter]::ToInt64($Data, $pathStart + $pathLen)
         $dataLen = [int][BitConverter]::ToUInt32($Data, $pathStart + $pathLen + 8)
         $modified = $null
-        if ($ft -gt 0) { try { $modified = [datetime]::FromFileTimeUtc($ft) } catch {} }
+        if ($ft -gt 0) {
+            try { $modified = [datetime]::FromFileTimeUtc($ft) }
+            catch { Write-Verbose "Invalid AppCompatCache file time for $path, entry kept without it: $($_.Exception.Message)" }
+        }
         $index++
         $entries.Add([PSCustomObject]@{ Position = $index; Path = $path; LastModifiedUtc = $modified; DataSize = $dataLen })
         # Next entry: after the 12-byte entry header plus the entry data size
@@ -4542,7 +4565,8 @@ function Parse-Memory {
                     "windows.pslist" {
                         # Parse CreateTime if available
                         if ($entry.CreateTime -and $entry.CreateTime -ne "N/A" -and $entry.CreateTime -notmatch "^0") {
-                            try { $ts = [datetime]::Parse($entry.CreateTime) } catch {}
+                            try { $ts = [datetime]::Parse($entry.CreateTime) }
+                            catch { Write-Verbose "Could not parse CreateTime '$($entry.CreateTime)', using dump time: $($_.Exception.Message)" }
                         }
                         $procId = if ($entry.PID) { $entry.PID } else { "" }
                         $ppid = if ($entry.PPID) { $entry.PPID } else { "" }
@@ -4558,7 +4582,8 @@ function Parse-Memory {
                     }
                     "windows.netscan" {
                         if ($entry.Created -and $entry.Created -ne "N/A" -and $entry.Created -notmatch "^0") {
-                            try { $ts = [datetime]::Parse($entry.Created) } catch {}
+                            try { $ts = [datetime]::Parse($entry.Created) }
+                            catch { Write-Verbose "Could not parse Created '$($entry.Created)', using dump time: $($_.Exception.Message)" }
                         }
                         $proto = if ($entry.Proto) { $entry.Proto } else { "" }
                         $localAddr = if ($entry.LocalAddr) { "$($entry.LocalAddr):$($entry.LocalPort)" } else { "" }
@@ -5085,7 +5110,6 @@ Log "  Viewer selection: $($($menuOptions | Where-Object { $_.Key -eq $viewerCho
 
 # --- Helper: ensure Timeline Explorer is available ---
 function Get-TimelineExplorer {
-    $teExe = $null
     $teLocations = @(
         (Join-Path $PSScriptRoot "tools\TimelineExplorer\TimelineExplorer\TimelineExplorer.exe"),
         (Join-Path $PSScriptRoot "tools\TimelineExplorer\TimelineExplorer.exe"),
