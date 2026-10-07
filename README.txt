@@ -178,6 +178,10 @@ themselves are never committed.
                   are kept (older ones are dropped first). Default 0 =
                   unlimited. The USN journal is usually the largest source;
                   see "Known Limitations" for the Excel row limit.
+  -Viewer         Viewer to open at the end without the menu: Excel,
+                  TimelineExplorer, Both or None (for scripts and automation).
+  -NoExcel        CSV only: don't generate timeline.xlsx (ImportExcel is then
+                  not needed).
   -MftDays        $MFT file-system events: only times within this many days
                   before the collection are added. Default 7; 0 = all. A
                   full $MFT can produce millions of rows, and one Windows
@@ -836,6 +840,21 @@ parsing is skipped, and the timeline CSV can be opened manually.
   Processing time: 5-30 minutes depending on dump size (16-64 GB typical).
   Memory artifacts are interleaved with disk artifacts in the timeline and
   color-coded by EventType like all other entries.
+
+
+## Tests
+
+  tests\Test-Parsers.ps1 runs the builder on the fixture collection in
+  tests\fixtures\av\ (public Symantec, Sophos and McAfee sample logs from the
+  plaso project, Apache-2.0 -- see that folder's README.txt) and compares the
+  timeline with tests\fixtures\av\expected.csv. CI runs it on every pull
+  request in Windows PowerShell 5.1 and PowerShell 7.
+
+  Run it locally from an elevated PowerShell (the builder needs admin):
+    powershell -ExecutionPolicy Bypass -File tests\Test-Parsers.ps1
+
+  After an intended change to the parser output, regenerate the expected rows
+  with -UpdateExpected and review the diff before committing.
 
 
 ## Windows Built-In Tools Used

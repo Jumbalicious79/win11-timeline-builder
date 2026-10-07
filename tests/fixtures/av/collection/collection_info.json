@@ -1,0 +1,12 @@
+{
+  "SchemaVersion": 1,
+  "ComputerName": "FIXTURE-HOST",
+  "CollectorUser": "FIXTURE\\analyst",
+  "Mode": "Live",
+  "TargetDrive": "C",
+  "TargetRoot": "C:\\",
+  "CollectionStartUtc": "2026-01-01T00:00:00.0000000Z",
+  "CollectorTimeZoneId": "Pacific Standard Time",
+  "CollectorCulture": "en-US",
+  "TargetTimeZoneId": "Pacific Standard Time"
+}
