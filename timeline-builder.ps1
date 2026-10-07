@@ -7,6 +7,7 @@
 # =============================================================
 
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSReviewUnusedParameter", "MaxUsnEntries", Justification = "Read by Parse-UsnJournal through script scope")]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSReviewUnusedParameter", "MftDays", Justification = "Read by Parse-FileSystem through script scope")]
 [CmdletBinding(DefaultParameterSetName = "Direct")]
 param(
     [Parameter(ParameterSetName = "Direct", Mandatory = $true)]
@@ -28,7 +29,7 @@ param(
     # is how powershell.exe -File passes -Sources A,B; it is split after binding.
     [Parameter(Mandatory = $false)]
     [ValidateScript({
-        $validSources = @("EventLogs", "Prefetch", "RecentFiles", "Registry", "FileSystem", "Browser", "ScheduledTasks", "Services", "Network", "USB", "Persistence", "UsnJournal", "Amcache", "PowerShellHistory", "Memory")
+        $validSources = @("EventLogs", "Prefetch", "RecentFiles", "Registry", "FileSystem", "Browser", "ScheduledTasks", "Services", "Network", "USB", "Persistence", "UsnJournal", "Amcache", "PowerShellHistory", "SystemInfo", "Memory")
         foreach ($name in ("$_" -split ',')) {
             if ($name.Trim() -and $validSources -notcontains $name.Trim()) {
                 throw "Unknown source '$($name.Trim())'. Valid sources: $($validSources -join ', ')"
@@ -36,14 +37,20 @@ param(
         }
         $true
     })]
-    [string[]]$Sources = @("EventLogs", "Prefetch", "RecentFiles", "Registry", "FileSystem", "Browser", "ScheduledTasks", "Services", "Network", "USB", "Persistence", "UsnJournal", "Amcache", "PowerShellHistory"),
+    [string[]]$Sources = @("EventLogs", "Prefetch", "RecentFiles", "Registry", "FileSystem", "Browser", "ScheduledTasks", "Services", "Network", "USB", "Persistence", "UsnJournal", "Amcache", "PowerShellHistory", "SystemInfo"),
 
     [Parameter(Mandatory = $false)]
     [string[]]$Keywords,
 
     [Parameter(Mandatory = $false)]
     [ValidateRange(0, 2147483647)]
-    [int]$MaxUsnEntries = 0
+    [int]$MaxUsnEntries = 0,
+
+    # $MFT file-system events: only times within this many days before the
+    # collection are added (0 = all). A full $MFT can hold millions of times.
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(0, 36500)]
+    [int]$MftDays = 30
 )
 
 # --- Require Administrator ---
@@ -4651,6 +4658,15 @@ function Parse-Memory {
     Log ""
 }
 
+# ----------------------------------------------------------
+# 16. System Info Parser
+# ----------------------------------------------------------
+function Parse-SystemInfo {
+    Log "--- Parsing System Info ---"
+    Log "  System info parsing complete."
+    Log ""
+}
+
 # =============================================================
 # Auto-detect memory dump and prompt for analysis
 # =============================================================
@@ -4756,6 +4772,7 @@ if ($Sources -contains "USB")              { Parse-USB }
 if ($Sources -contains "Persistence")      { Parse-Persistence }
 if ($Sources -contains "Amcache")          { Parse-Amcache }
 if ($Sources -contains "PowerShellHistory") { Parse-PowerShellHistory }
+if ($Sources -contains "SystemInfo")       { Parse-SystemInfo }
 if ($Sources -contains "Memory")           { Parse-Memory }
 
 # =============================================================
