@@ -3284,9 +3284,13 @@ function Add-OfficeTrustRecordRows {
         $t = $keyTime
         $trusted = ConvertFrom-RegistryFileTime -FileTime ([BitConverter]::ToInt64($data, 0))
         if ($trusted) { $t = [PSCustomObject]@{ Time = $trusted; Note = "TrustRecords FILETIME (when the user trusted the document)" } }
+        # Office records local documents with "/" (e.g. %USERPROFILE%/Downloads/x.docm):
+        # Path uses "\" like other rows; URLs (https://...) are kept as they are
+        $path = if ($doc -match '^[A-Za-z][A-Za-z0-9+.-]*://') { $doc } else { $doc.Replace('/', '\') }
         $details = Format-ArtifactDetails ([ordered]@{
             App      = $App
             Version  = $Version
+            Path     = $path
             Document = $doc
             Trust    = $(if ($macros) { "macros (active content) enabled" } else { "editing enabled" })
             Data     = [BitConverter]::ToString($data).Replace("-", "")
@@ -3295,12 +3299,12 @@ function Add-OfficeTrustRecordRows {
         })
         if ($macros) {
             Add-TimelineEntry -Timestamp $t.Time -Source "Registry-TrustRecords" -EventType "Execution" `
-                -Description "Office macros enabled on document ($App): $doc" `
+                -Description "Office macros enabled on document ($App): $path" `
                 -User $User -Details $details -Artifact "Registry" -RawPath $RawPath
         }
         else {
             Add-TimelineEntry -Timestamp $t.Time -Source "Registry-TrustRecords" -EventType "FileAccess" `
-                -Description "Office editing enabled on document ($App): $doc" `
+                -Description "Office editing enabled on document ($App): $path" `
                 -User $User -Details $details -Artifact "Registry" -RawPath $RawPath
         }
         $added++
@@ -3663,10 +3667,11 @@ function Add-IfeoDebuggerRow {
 # Image File Execution Options hijacks in one loaded SOFTWARE hive:
 #   IFEO\<exe> Debugger  starts another program instead of the exe (also in
 #       UseFilter subkeys, for one FilterFullPath)
-#   SilentProcessExit\<exe>  MonitorProcess runs when the exe exits;
-#       ReportingMode (1 = launch monitor, 2 = local dump, 4 = notification)
-#       and LocalDumpFolder write a dump of it. Only active when the exe's
-#       IFEO GlobalFlag has 0x200 (FLG_MONITOR_SILENT_PROCESS_EXIT).
+#   SilentProcessExit\<exe>  when the exe exits, ReportingMode bit 0x1
+#       launches MonitorProcess and bit 0x2 writes a dump (to
+#       LocalDumpFolder; 0x4 = notification). Only active when the exe's
+#       IFEO GlobalFlag has 0x200 (FLG_MONITOR_SILENT_PROCESS_EXIT); a
+#       MonitorProcess without bit 0x1 is configured but never launched.
 # Returns the number of rows added.
 function Read-IfeoHijacks {
     param([Microsoft.Win32.RegistryKey]$HiveRoot, [string]$RawPath, [datetime]$FallbackTime)
@@ -3718,7 +3723,7 @@ function Read-IfeoHijacks {
                     $mode = ConvertTo-RegistryNumber ($exeKey.GetValue("ReportingMode"))
                     $dumpFolder = Get-RegistryValueText $exeKey "LocalDumpFolder"
                     if (-not $monitor -and -not $mode -and -not $dumpFolder) { continue }
-                    $modeText = ""
+                    $modeText = "not set"
                     if ($null -ne $mode) {
                         $modeNames = @()
                         if ($mode -band 1) { $modeNames += "launch monitor process" }
@@ -3727,11 +3732,20 @@ function Read-IfeoHijacks {
                         $modeText = "$mode"
                         if ($modeNames.Count -gt 0) { $modeText += " ($($modeNames -join ', '))" }
                     }
+                    # The description follows what ReportingMode makes Windows
+                    # do: launch MonitorProcess (0x1) or write a dump (0x2)
+                    $launches = ($null -ne $mode -and ($mode -band 1) -ne 0 -and $monitor)
+                    $dumps = ($null -ne $mode -and ($mode -band 2) -ne 0)
                     $flag = $globalFlags[$exe.ToLowerInvariant()]
-                    $active = ($null -ne $flag -and ($flag -band 0x200) -ne 0)
-                    if ($monitor) { $desc = "SilentProcessExit monitor process for ${exe}: $monitor" }
-                    elseif ($dumpFolder) { $desc = "SilentProcessExit dump on exit for ${exe}: $dumpFolder" }
+                    $flagSet = ($null -ne $flag -and ($flag -band 0x200) -ne 0)
+                    if ($launches) { $desc = "SilentProcessExit monitor process for ${exe}: $monitor" }
+                    elseif ($dumps) { $desc = "SilentProcessExit dump on exit for ${exe}: $(if ($dumpFolder) { $dumpFolder } else { '%TEMP%\Silent Process Exit (default folder)' })" }
+                    elseif ($monitor) { $desc = "SilentProcessExit monitor process configured for ${exe}, not launched (ReportingMode lacks 0x1): $monitor" }
+                    elseif ($dumpFolder) { $desc = "SilentProcessExit dump folder configured for ${exe}, no dump (ReportingMode lacks 0x2): $dumpFolder" }
                     else { $desc = "SilentProcessExit reporting set for ${exe}: ReportingMode=$modeText" }
+                    if (-not $flagSet) { $activeText = "no (IFEO GlobalFlag lacks 0x200)" }
+                    elseif ($launches -or $dumps) { $activeText = "yes (IFEO GlobalFlag has 0x200, ReportingMode has 0x1 or 0x2)" }
+                    else { $activeText = "no (ReportingMode has neither 0x1 nor 0x2)" }
                     $t = Get-RegistryKeyTime -Key $exeKey -FallbackTime $FallbackTime
                     Add-TimelineEntry -Timestamp $t.Time -Source "Registry-SilentProcessExit" -EventType "PersistenceChange" `
                         -Description $desc `
@@ -3742,7 +3756,7 @@ function Read-IfeoHijacks {
                             LocalDumpFolder = $dumpFolder
                             DumpType        = Get-RegistryValueText $exeKey "DumpType"
                             GlobalFlag      = $(if ($null -ne $flag) { "0x{0:X8}" -f $flag } else { "not set" })
-                            Active          = $(if ($active) { "yes (IFEO GlobalFlag has 0x200)" } else { "no (IFEO GlobalFlag lacks 0x200)" })
+                            Active          = $activeText
                             Key             = "HKLM\SOFTWARE\$spePath\$exe"
                             Time            = $t.Note
                         })) `
@@ -3806,7 +3820,9 @@ function Read-AppInitDlls {
             $dlls = Get-RegistryValueText $key "AppInit_DLLs"
             if (-not ($dlls -replace '[\s,;]', '')) { continue }
             $load = ConvertTo-RegistryNumber ($key.GetValue("LoadAppInit_DLLs"))
-            $state = if ($load) { "loading enabled" } else { "loading disabled, LoadAppInit_DLLs=0" }
+            if ($load) { $state = "loading enabled" }
+            elseif ($null -eq $load) { $state = "loading disabled, LoadAppInit_DLLs not set" }
+            else { $state = "loading disabled, LoadAppInit_DLLs=0" }
             $t = Get-RegistryKeyTime -Key $key -FallbackTime $FallbackTime -KeyLabel "Windows key"
             Add-TimelineEntry -Timestamp $t.Time -Source "Registry-AppInitDLLs" -EventType "PersistenceChange" `
                 -Description "AppInit_DLLs set ($state): $dlls" `
@@ -3866,17 +3882,22 @@ function ConvertFrom-TaskCacheActions {
             if ($id.Next + 20 -gt $Data.Length) { break }
             $clsid = New-Object System.Guid (,[byte[]]$Data[$id.Next..($id.Next + 15)])
             $actions += "COM handler {$($clsid.ToString().ToUpper())}"
-            $pos = $id.Next + 20 + [int][BitConverter]::ToUInt32($Data, $id.Next + 16)
+            # The data size is a uint32: check it before using it as an offset
+            $size = [long][BitConverter]::ToUInt32($Data, $id.Next + 16)
+            if ($id.Next + 20 + $size -gt $Data.Length) { break }
+            $pos = $id.Next + 20 + [int]$size
         }
         else { break }
     }
     return ($actions -join "; ")
 }
 
-# Walk TaskCache\Tree: every key with an Id value is a task. Fills $Tasks
-# (task GUID in upper case -> Path, HasSD, Index, KeyTime, KeyPath).
+# Walk TaskCache\Tree: every key with an Id value is a task, every other key
+# below Tree a task folder (which has only an SD value). Fills $Tasks (task
+# GUID in upper case -> Path, HasSD, Index, KeyTime, KeyPath) and $Folders
+# (folder path -> HasSD, KeyTime, KeyPath).
 function Read-TaskCacheTreeNode {
-    param([Microsoft.Win32.RegistryKey]$Key, [string]$TaskPath, [string]$KeyPath, [hashtable]$Tasks, [int]$Depth)
+    param([Microsoft.Win32.RegistryKey]$Key, [string]$TaskPath, [string]$KeyPath, [hashtable]$Tasks, [hashtable]$Folders, [int]$Depth)
     if ($Depth -gt 32) { return }
     foreach ($name in $Key.GetSubKeyNames()) {
         $child = $null
@@ -3884,35 +3905,91 @@ function Read-TaskCacheTreeNode {
         catch { Log-Warning "    Cannot open $KeyPath\$name : $($_.Exception.Message)" }
         if (-not $child) { continue }
         try {
-            $id = Get-RegistryValueText $child "Id"
-            if ($id) {
-                $sd = $child.GetValue("SD")
-                $Tasks[$id.Trim('{', '}').ToUpperInvariant()] = [PSCustomObject]@{
-                    Path    = "$TaskPath\$name"
-                    HasSD   = ($sd -is [byte[]] -and $sd.Length -gt 0)
-                    Index   = Get-RegistryValueText $child "Index"
-                    KeyTime = Get-RegistryKeyLastWriteUtc $child
-                    KeyPath = "$KeyPath\$name"
-                }
+            $sd = $child.GetValue("SD")
+            $node = [PSCustomObject]@{
+                Path    = "$TaskPath\$name"
+                HasSD   = ($sd -is [byte[]] -and $sd.Length -gt 0)
+                Index   = Get-RegistryValueText $child "Index"
+                KeyTime = Get-RegistryKeyLastWriteUtc $child
+                KeyPath = "$KeyPath\$name"
             }
-            Read-TaskCacheTreeNode -Key $child -TaskPath "$TaskPath\$name" -KeyPath "$KeyPath\$name" -Tasks $Tasks -Depth ($Depth + 1)
+            $id = Get-RegistryValueText $child "Id"
+            if ($id) { $Tasks[$id.Trim('{', '}').ToUpperInvariant()] = $node }
+            else { $Folders[$node.Path] = $node }
+            Read-TaskCacheTreeNode -Key $child -TaskPath "$TaskPath\$name" -KeyPath "$KeyPath\$name" -Tasks $Tasks -Folders $Folders -Depth ($Depth + 1)
         }
         finally { $child.Close() }
     }
 }
 
+# Scheduled tasks that the collection's task list already puts on the
+# timeline (Parse-ScheduledTasks): scheduled_tasks.csv (live collections;
+# HasLastRun = the CSV gives a last run time, read like Get-ScheduledTaskInfo
+# from the same scheduler state as TaskCache DynamicInfo) and
+# ScheduledTasks_XML (mounted images; no run times). Task path in lower case
+# -> HasLastRun. Empty when the ScheduledTasks source is not selected.
+function Get-CollectedTaskNames {
+    $listed = @{}
+    if ($Sources -notcontains "ScheduledTasks") { return $listed }
+    foreach ($csv in @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("scheduled_tasks.csv") | Where-Object { -not $_.PSIsContainer })) {
+        try {
+            foreach ($task in (Import-Csv -Path $csv.FullName -ErrorAction Stop)) {
+                $taskName = Get-ArtifactRowValue $task @("TaskName", "Name")
+                if (-not $taskName) { continue }
+                $taskPath = Get-ArtifactRowValue $task @("TaskPath")
+                $fullName = if ($taskPath) { $taskPath.TrimEnd('\') + "\" + $taskName } else { "\" + $taskName }
+                $lastRun = ConvertFrom-UtcText (Get-ArtifactRowValue $task @("LastRunTimeUtc"))
+                $listed[$fullName.ToLowerInvariant()] = ($null -ne $lastRun -and $lastRun.Year -ge 2000)
+            }
+        }
+        catch { Log-Warning "    Could not read $($csv.FullName) for the TaskCache comparison: $($_.Exception.Message)" }
+    }
+    foreach ($dir in @(Get-ChildItem -Path $InputPath -Directory -Recurse -Filter "ScheduledTasks_XML" -ErrorAction SilentlyContinue)) {
+        foreach ($tf in @(Get-ChildItem -Path $dir.FullName -File -Recurse -ErrorAction SilentlyContinue)) {
+            try {
+                $doc = New-Object System.Xml.XmlDocument
+                $doc.Load($tf.FullName)
+                if (-not $doc.DocumentElement -or $doc.DocumentElement.LocalName -ne "Task") { continue }
+                $uri = Get-TaskXmlText $doc.DocumentElement "RegistrationInfo/URI"
+                $fullName = if ($uri) { $uri } else { "\" + $tf.Name }
+                if (-not $listed.ContainsKey($fullName.ToLowerInvariant())) { $listed[$fullName.ToLowerInvariant()] = $false }
+            }
+            catch { Write-Verbose "Not a readable task XML file: $($tf.FullName): $($_.Exception.Message)" }
+        }
+    }
+    return $listed
+}
+
+# The first of $Folders (task folder paths) that contains the task or
+# folder $Path, or ""
+function Get-TaskCacheParentFolder {
+    param([string]$Path, [string[]]$Folders)
+    foreach ($folder in $Folders) {
+        if ($Path.StartsWith("$folder\", [System.StringComparison]::OrdinalIgnoreCase)) { return $folder }
+    }
+    return ""
+}
+
 # Scheduled tasks in the TaskCache of one loaded SOFTWARE hive
 # (Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache):
 #   Tree\<folder>\<task>  Id (task GUID), Index and SD (security
-#       descriptor). A task whose SD value is missing is hidden from
-#       schtasks and the Task Scheduler UI but still runs.
+#       descriptor); a folder key has only SD. A task or folder whose SD
+#       value is missing is hidden from schtasks and the Task Scheduler UI,
+#       but its tasks still run (G DATA, "Windows Registry Analysis -
+#       Today's Episode: Tasks", cyber.wtf, 2022).
 #   Tasks\{GUID}  Path, Author, Actions, DynamicInfo.
 # DynamicInfo, 28 bytes (Windows 7) or 36 bytes (Windows 8 and later), as
-# documented by plaso's task cache parser; other sizes are skipped:
-#   0  uint32    unknown          12 FILETIME  last launch (run) time
-#   4  FILETIME  last registered  20 uint32    unknown, 24 uint32 unknown
-#   28 FILETIME  unknown (36-byte form only; not used)
+# documented by plaso's task cache parser and G DATA's winreg-tasks; other
+# sizes are skipped:
+#   0  uint32    magic (3)           20 uint32    task state (no longer used)
+#   4  FILETIME  created/registered  24 uint32    last error code
+#   12 FILETIME  last run (launch)   28 FILETIME  last successful run (36 bytes)
 # Times later than the hive file time + 1 day are treated as invalid.
+# "Scheduled task registered" / "last run" rows are only added where they
+# are new to the timeline: a task that scheduled_tasks.csv or
+# ScheduledTasks_XML lists (Get-CollectedTaskNames) gets its rows from the
+# ScheduledTasks source, so only its last run is added, and only when the
+# list has no run time for it. Hidden tasks are never in scheduled_tasks.csv.
 # Actions (format version 3; older versions are not parsed): uint16 version,
 # uint32 size + UTF-16 context, then per action uint16 type, uint32 size +
 # UTF-16 id and for type 0x6666 (exec) command, arguments and working
@@ -3921,20 +3998,30 @@ function Read-TaskCacheTreeNode {
 # any other type.
 # Returns the number of rows added.
 function Read-TaskCache {
-    param([Microsoft.Win32.RegistryKey]$HiveRoot, [string]$RawPath, [datetime]$FallbackTime)
+    param([Microsoft.Win32.RegistryKey]$HiveRoot, [string]$RawPath, [datetime]$FallbackTime, [hashtable]$ListedTasks = @{})
     $cachePath = "Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache"
     $added = 0
     $tree = @{}
+    $folders = @{}
     $treeKey = $HiveRoot.OpenSubKey("$cachePath\Tree")
     if ($treeKey) {
-        try { Read-TaskCacheTreeNode -Key $treeKey -TaskPath "" -KeyPath "HKLM\SOFTWARE\$cachePath\Tree" -Tasks $tree -Depth 0 }
+        try { Read-TaskCacheTreeNode -Key $treeKey -TaskPath "" -KeyPath "HKLM\SOFTWARE\$cachePath\Tree" -Tasks $tree -Folders $folders -Depth 0 }
         finally { $treeKey.Close() }
     }
+
+    # Hidden folders (no SD value). Only reported when other folders of this
+    # hive have one, so a Windows version that keeps no SD on folder keys
+    # does not turn every folder into a finding.
+    $hiddenFolders = @()
+    $noSdFolders = @($folders.Keys | Where-Object { -not $folders[$_].HasSD } | Sort-Object)
+    if ($noSdFolders.Count -gt 0 -and $noSdFolders.Count -lt $folders.Count) { $hiddenFolders = $noSdFolders }
+    elseif ($noSdFolders.Count -gt 0) { Log-Warning "    $($noSdFolders.Count) TaskCache\Tree folder(s) without an SD value not reported: no folder in this hive has one" }
 
     $latest = $FallbackTime.AddDays(1)
     $actionsById = @{}
     $taskCount = 0
     $badDynamicInfo = 0
+    $leftToList = 0
     $tasksKey = $HiveRoot.OpenSubKey("$cachePath\Tasks")
     if ($tasksKey) {
         try {
@@ -3943,6 +4030,8 @@ function Read-TaskCache {
                 try { $taskKey = $tasksKey.OpenSubKey($guidName) }
                 catch { Log-Warning "    Cannot open TaskCache\Tasks\$guidName : $($_.Exception.Message)" }
                 if (-not $taskKey) { continue }
+                # One bad task is skipped; the others and the hidden-task
+                # check below still run
                 try {
                     $taskCount++
                     $id = $guidName.Trim('{', '}').ToUpperInvariant()
@@ -3957,72 +4046,128 @@ function Read-TaskCache {
                         if ($null -ne $dynamicInfo) { $badDynamicInfo++ }
                         continue
                     }
+
+                    # Listed by the collection (by its Path value or its Tree location)?
+                    $names = @($taskPath.ToLowerInvariant())
+                    if ($treeEntry) { $names += $treeEntry.Path.ToLowerInvariant() }
+                    $isListed = $false
+                    $listedRun = $false
+                    foreach ($name in $names) {
+                        if (-not $ListedTasks.ContainsKey($name)) { continue }
+                        $isListed = $true
+                        if ($ListedTasks[$name]) { $listedRun = $true }
+                    }
+
+                    $hidden = ""
+                    if ($treeEntry -and -not $treeEntry.HasSD) { $hidden = "yes (no SD value in TaskCache\Tree)" }
+                    else {
+                        $hiddenFolder = Get-TaskCacheParentFolder -Path $(if ($treeEntry) { $treeEntry.Path } else { $taskPath }) -Folders $hiddenFolders
+                        if ($hiddenFolder) { $hidden = "yes (folder $hiddenFolder has no SD value in TaskCache\Tree)" }
+                    }
+                    $lastSuccess = $null
+                    if ($dynamicInfo.Length -eq 36) { $lastSuccess = ConvertFrom-RegistryFileTime -FileTime ([BitConverter]::ToInt64($dynamicInfo, 28)) -Latest $latest }
                     $times = [ordered]@{
                         "registered" = ConvertFrom-RegistryFileTime -FileTime ([BitConverter]::ToInt64($dynamicInfo, 4)) -Latest $latest
                         "last run"   = ConvertFrom-RegistryFileTime -FileTime ([BitConverter]::ToInt64($dynamicInfo, 12)) -Latest $latest
                     }
                     foreach ($what in $times.Keys) {
                         if (-not $times[$what]) { continue }
+                        if (($what -eq "registered" -and $isListed) -or ($what -eq "last run" -and $listedRun)) {
+                            $leftToList++
+                            continue
+                        }
+                        $isRun = ($what -eq "last run")
                         $details = Format-ArtifactDetails ([ordered]@{
-                            Id      = $guidName
-                            Actions = $actions
-                            Author  = Get-RegistryValueText $taskKey "Author"
-                            Hidden  = $(if ($treeEntry -and -not $treeEntry.HasSD) { "yes (no SD value in TaskCache\Tree)" } else { "" })
-                            Key     = "HKLM\SOFTWARE\$cachePath\Tasks\$guidName"
-                            Time    = $(if ($what -eq "registered") { "TaskCache DynamicInfo last registered time" } else { "TaskCache DynamicInfo last launch time" })
+                            Id                   = $guidName
+                            Actions              = $actions
+                            Author               = Get-RegistryValueText $taskKey "Author"
+                            Hidden               = $hidden
+                            LastErrorCode        = $(if ($isRun) { "0x{0:X8}" -f [BitConverter]::ToUInt32($dynamicInfo, 24) } else { "" })
+                            LastSuccessfulRunUtc = $(if ($isRun -and $lastSuccess) { $lastSuccess.ToString("yyyy-MM-dd HH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture) } else { "" })
+                            Listed               = $(if ($isListed) { "yes (scheduled task list of the collection, without a run time)" } else { "" })
+                            Key                  = "HKLM\SOFTWARE\$cachePath\Tasks\$guidName"
+                            Time                 = $(if ($isRun) { "TaskCache DynamicInfo last run time" } else { "TaskCache DynamicInfo created (registered) time" })
                         })
-                        $eventType = if ($what -eq "registered") { "ScheduledTaskChange" } else { "Execution" }
+                        $eventType = if ($isRun) { "Execution" } else { "ScheduledTaskChange" }
                         Add-TimelineEntry -Timestamp $times[$what] -Source "Registry-TaskCache" -EventType $eventType `
                             -Description "Scheduled task ${what}: $taskPath" `
                             -Details $details -Artifact "Registry" -RawPath $RawPath
                         $added++
                     }
                 }
+                catch { Log-Warning "    Failed to parse TaskCache\Tasks\$guidName : $($_.Exception.Message)" }
                 finally { $taskKey.Close() }
             }
         }
         finally { $tasksKey.Close() }
     }
 
-    # Hidden tasks: Tree entry without SD. The Tree key's last-write time is
-    # when the SD value was removed (or the key last changed).
+    # Hidden tasks and folders: Tree key without SD. The key's last-write
+    # time is when the SD value was removed (or the key last changed).
     $hiddenCount = 0
+    $hiddenEntries = @()
     foreach ($id in @($tree.Keys)) {
-        $entry = $tree[$id]
-        if ($entry.HasSD) { continue }
+        if (-not $tree[$id].HasSD) { $hiddenEntries += , @($id, $tree[$id]) }
+    }
+    foreach ($folder in $hiddenFolders) { $hiddenEntries += , @("", $folders[$folder]) }
+    foreach ($hiddenEntry in $hiddenEntries) {
+        $id = $hiddenEntry[0]
+        $entry = $hiddenEntry[1]
         $ts = $entry.KeyTime
         $timeNote = "TaskCache\Tree key last write (when the SD value was removed, or the key last changed)"
         if ($null -eq $ts) {
             $ts = $FallbackTime
             $timeNote = "hive file time (key last-write time unavailable)"
         }
+        if ($id) {
+            $description = "Hidden scheduled task (no SD value in TaskCache\Tree): $($entry.Path)"
+            $details = [ordered]@{ Id = "{$id}"; Index = $entry.Index; Actions = $actionsById[$id]; Key = $entry.KeyPath; Time = $timeNote }
+        }
+        else {
+            $description = "Hidden scheduled task folder (no SD value in TaskCache\Tree): $($entry.Path)"
+            $inside = @($tree.Values | Where-Object { $_.Path.StartsWith("$($entry.Path)\", [System.StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { $_.Path } | Sort-Object)
+            $details = [ordered]@{ Tasks = ($inside -join "; "); Key = $entry.KeyPath; Time = $timeNote }
+        }
         Add-TimelineEntry -Timestamp $ts -Source "Registry-TaskCache" -EventType "ScheduledTaskChange" `
-            -Description "Hidden scheduled task (no SD value in TaskCache\Tree): $($entry.Path)" `
-            -Details (Format-ArtifactDetails ([ordered]@{ Id = "{$id}"; Index = $entry.Index; Actions = $actionsById[$id]; Key = $entry.KeyPath; Time = $timeNote })) `
-            -Artifact "Registry" -RawPath $RawPath
+            -Description $description -Details (Format-ArtifactDetails $details) -Artifact "Registry" -RawPath $RawPath
         $added++
         $hiddenCount++
     }
-    Log "    TaskCache: $taskCount task(s), $hiddenCount hidden (no SD value)"
+    Log "    TaskCache: $taskCount task(s), $hiddenCount hidden task(s)/folder(s) (no SD value), $leftToList time(s) already on the timeline from the ScheduledTasks source"
     if ($badDynamicInfo -gt 0) { Log-Warning "    $badDynamicInfo TaskCache DynamicInfo value(s) skipped: size is not 28 or 36 bytes" }
     return $added
 }
 
-# Output folder the triage collector excluded from Defender while it ran:
-# the "Output directory:" line of collection_log.txt (Path), and the name of
-# the collection folder (Name; the zip's top folder is the output folder).
-# Either is "" when unknown.
+# Lines of a text file written by the triage collector with Add-Content
+# (collection_log.txt): ANSI in Windows PowerShell 5.1, UTF-8 without BOM in
+# PowerShell 7, whichever edition reads it. Strict UTF-8 first, else the
+# system ANSI code page.
+function Read-CollectorTextLines {
+    param([string]$Path)
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    try { $text = (New-Object System.Text.UTF8Encoding($false, $true)).GetString($bytes) }
+    catch {
+        Write-Verbose "$Path is not UTF-8, reading it as ANSI: $($_.Exception.Message)"
+        $text = [System.Text.Encoding]::GetEncoding(0).GetString($bytes)
+    }
+    return ($text.TrimStart([char]0xFEFF) -split "`r?`n")
+}
+
+# Output folder the triage collector excluded from Defender while it ran,
+# from collection_log.txt: the "Output directory:" line (Path), the name of
+# the collection folder (Name; the zip's top folder is the output folder)
+# and whether the cleanup at the end of the run logged that the exclusion
+# was removed (Removed = "yes", "no" or "" when not logged). "" when unknown.
 function Get-CollectorOutputFolder {
-    $result = [PSCustomObject]@{ Path = ""; Name = "" }
+    $result = [PSCustomObject]@{ Path = ""; Name = ""; Removed = "" }
     $collLog = Get-ChildItem -Path $InputPath -Filter "collection_log.txt" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $collLog) { return $result }
     $result.Name = Split-Path $collLog.DirectoryName -Leaf
     try {
-        foreach ($line in (Get-Content -LiteralPath $collLog.FullName -TotalCount 60 -ErrorAction Stop)) {
-            if ($line -match '^\[[^\]]+\] Output directory: (.+?)\s*$') {
-                $result.Path = $Matches[1].TrimEnd('\')
-                break
-            }
+        foreach ($line in (Read-CollectorTextLines $collLog.FullName)) {
+            if (-not $result.Path -and $line -match '^\[[^\]]+\] Output directory: (.+?)\s*$') { $result.Path = $Matches[1].TrimEnd('\') }
+            elseif ($line -match '^\[[^\]]+\] OK: Defender exclusion removed\.') { $result.Removed = "yes" }
+            elseif ($line -match '^\[[^\]]+\] WARNING: Could not remove the temporary Defender exclusion') { $result.Removed = "no" }
         }
     }
     catch { Log-Warning "  Could not read collection_log.txt: $($_.Exception.Message)" }
@@ -4031,16 +4176,24 @@ function Get-CollectorOutputFolder {
 
 # How a Defender path exclusion relates to the triage collector: "this" (the
 # output folder of this collection), "other" (a collector output folder of
-# another collection, so that run did not remove its exclusion) or ""
+# another collection, so that run did not remove its exclusion) or "".
+# Non-ASCII characters are compared loosely: a log written on a machine
+# with another ANSI code page decodes them differently. The folder name
+# alone identifies this collection when the log has no path, or when it is
+# the collector's default name (TriageCollection_<date>_<minute>).
 function Get-CollectorExclusionKind {
     param([string]$Exclusion, $CollectorFolder)
     $path = $Exclusion.Trim().TrimEnd('\')
     $leaf = $path -replace '^.*\\', ''
-    if ($CollectorFolder -and $CollectorFolder.Path) {
-        if ($path -eq $CollectorFolder.Path) { return "this" }
+    $defaultName = '^TriageCollection_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}$'
+    if ($CollectorFolder) {
+        if ($CollectorFolder.Path) {
+            if ($path -eq $CollectorFolder.Path) { return "this" }
+            if (($path -replace '[^\x20-\x7E]+', '?') -eq ($CollectorFolder.Path -replace '[^\x20-\x7E]+', '?')) { return "this" }
+        }
+        if ($CollectorFolder.Name -and $leaf -eq $CollectorFolder.Name -and (-not $CollectorFolder.Path -or $leaf -match $defaultName)) { return "this" }
     }
-    elseif ($CollectorFolder -and $CollectorFolder.Name -and $leaf -eq $CollectorFolder.Name) { return "this" }
-    if ($leaf -match '^TriageCollection_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}$') { return "other" }
+    if ($leaf -match $defaultName) { return "other" }
     return ""
 }
 
@@ -4049,14 +4202,31 @@ function Get-CollectorExclusionKind {
 # Policies\Microsoft\Windows Defender\Exclusions\<type> (Group Policy). Each
 # value name is one exclusion; types are Paths, Extensions, Processes,
 # IpAddresses (and TemporaryPaths). One SecurityAlert row per exclusion,
-# timed with its type key's last-write time. The triage collector excludes
-# its own output folder while it runs and the hive is saved during the run,
-# so that exclusion is a Snapshot row labelled as the collector's own.
+# timed with its type key's last-write time. When Group Policy sets
+# DisableLocalAdminMerge, only the Group Policy lists are used: local
+# exclusions are then "ignored by policy" instead of "in effect". The
+# triage collector excludes its own output folder while it runs and the
+# hive is saved during the run, so that exclusion is a Snapshot row
+# labelled as the collector's own (a SecurityAlert if collection_log.txt
+# says the collector could not remove it).
 # Returns the number of rows added.
 function Read-DefenderExclusionKeys {
     param([Microsoft.Win32.RegistryKey]$HiveRoot, [string]$RawPath, [datetime]$FallbackTime, $CollectorFolder)
     $added = 0
+    $merge = $null
+    try {
+        $policyKey = $HiveRoot.OpenSubKey("Policies\Microsoft\Windows Defender")
+        if ($policyKey) {
+            try { $merge = ConvertTo-RegistryNumber ($policyKey.GetValue("DisableLocalAdminMerge")) }
+            finally { $policyKey.Close() }
+        }
+    }
+    catch { Log-Warning "    Could not read Defender DisableLocalAdminMerge (local exclusions are reported as in effect): $($_.Exception.Message)" }
+    $localIgnored = ($null -ne $merge -and $merge -ne 0)
+    $removed = if ($CollectorFolder) { $CollectorFolder.Removed } else { "" }
     foreach ($basePath in @("Microsoft\Windows Defender\Exclusions", "Policies\Microsoft\Windows Defender\Exclusions")) {
+        $isPolicy = $basePath -like "Policies\*"
+        $state = if ($localIgnored -and -not $isPolicy) { "ignored by policy" } else { "in effect" }
         $baseKey = $HiveRoot.OpenSubKey($basePath)
         if (-not $baseKey) { continue }
         try {
@@ -4082,25 +4252,30 @@ function Read-DefenderExclusionKeys {
                         elseif ($collectorAdded) { $timeNote = "Exclusions\$type key last write, when the triage collector added its own exclusion during the collection; this exclusion is older" }
                         else { $timeNote = "Exclusions\$type key last write (key last changed; this exclusion may be older)" }
                         $details = [ordered]@{
-                            Type      = $type
-                            Exclusion = $exclusion
-                            Policy    = $(if ($basePath -like "Policies\*") { "yes (Group Policy)" } else { "" })
-                            Origin    = ""
-                            Key       = "HKLM\SOFTWARE\$basePath\$type"
-                            Time      = $timeNote
+                            Type        = $type
+                            Exclusion   = $exclusion
+                            Policy      = $(if ($isPolicy) { "yes (Group Policy)" } else { "" })
+                            NotInEffect = $(if ($state -ne "in effect") { "local exclusion lists are ignored (Group Policy DisableLocalAdminMerge=$merge)" } else { "" })
+                            Origin      = ""
+                            Key         = "HKLM\SOFTWARE\$basePath\$type"
+                            Time        = $timeNote
                         }
-                        if ($kind -eq "this") {
-                            $details["Origin"] = "triage collector: output folder of this collection, excluded while the collector ran and removed when it finished"
-                            Add-TimelineEntry -Timestamp $ts -Source "Registry-DefenderExclusions" -EventType "Snapshot" `
-                                -Description "Defender exclusion in effect ($type): $exclusion (triage collector's own temporary exclusion)" `
-                                -Details (Format-ArtifactDetails $details) -Artifact "Registry" -RawPath $RawPath
+                        $eventType = "SecurityAlert"
+                        $description = "Defender exclusion $state ($type): $exclusion"
+                        if ($kind -eq "this" -and $removed -eq "no") {
+                            $details["Origin"] = "triage collector: output folder of this collection; collection_log.txt records that the collector could not remove it at the end of the collection, so it was left in place"
+                            $description += " (triage collector's own exclusion, not removed after the collection)"
                         }
-                        else {
-                            if ($kind -eq "other") { $details["Origin"] = "triage collector output folder of another collection; the collector removes its exclusion when it finishes, so this one was left behind" }
-                            Add-TimelineEntry -Timestamp $ts -Source "Registry-DefenderExclusions" -EventType "SecurityAlert" `
-                                -Description "Defender exclusion in effect ($type): $exclusion" `
-                                -Details (Format-ArtifactDetails $details) -Artifact "Registry" -RawPath $RawPath
+                        elseif ($kind -eq "this") {
+                            $details["Origin"] = "triage collector: output folder of this collection, excluded while the collector ran; " +
+                                $(if ($removed -eq "yes") { "collection_log.txt records that it was removed at the end of the collection" } else { "its removal is not recorded in collection_log.txt" })
+                            $eventType = "Snapshot"
+                            $description += " (triage collector's own temporary exclusion)"
                         }
+                        elseif ($kind -eq "other") { $details["Origin"] = "triage collector output folder of another collection; the collector removes its exclusion when it finishes, so this one was left behind" }
+                        Add-TimelineEntry -Timestamp $ts -Source "Registry-DefenderExclusions" -EventType $eventType `
+                            -Description $description `
+                            -Details (Format-ArtifactDetails $details) -Artifact "Registry" -RawPath $RawPath
                         $added++
                     }
                 }
@@ -4116,7 +4291,7 @@ function Read-DefenderExclusionKeys {
 # exclusions from one loaded SOFTWARE hive (root = HKLM\SOFTWARE). Returns
 # the number of rows added.
 function Read-SoftwareHive {
-    param([Microsoft.Win32.RegistryKey]$HiveRoot, [string]$RawPath, [datetime]$FallbackTime, $CollectorFolder)
+    param([Microsoft.Win32.RegistryKey]$HiveRoot, [string]$RawPath, [datetime]$FallbackTime, $CollectorFolder, [hashtable]$ListedTasks = @{})
     $added = 0
     try { $added += Read-IfeoHijacks -HiveRoot $HiveRoot -RawPath $RawPath -FallbackTime $FallbackTime }
     catch { Log-Warning "    Failed to parse Image File Execution Options / SilentProcessExit: $($_.Exception.Message)" }
@@ -4124,7 +4299,7 @@ function Read-SoftwareHive {
     catch { Log-Warning "    Failed to parse Winlogon: $($_.Exception.Message)" }
     try { $added += Read-AppInitDlls -HiveRoot $HiveRoot -RawPath $RawPath -FallbackTime $FallbackTime }
     catch { Log-Warning "    Failed to parse AppInit_DLLs: $($_.Exception.Message)" }
-    try { $added += Read-TaskCache -HiveRoot $HiveRoot -RawPath $RawPath -FallbackTime $FallbackTime }
+    try { $added += Read-TaskCache -HiveRoot $HiveRoot -RawPath $RawPath -FallbackTime $FallbackTime -ListedTasks $ListedTasks }
     catch { Log-Warning "    Failed to parse TaskCache: $($_.Exception.Message)" }
     try { $added += Read-DefenderExclusionKeys -HiveRoot $HiveRoot -RawPath $RawPath -FallbackTime $FallbackTime -CollectorFolder $CollectorFolder }
     catch { Log-Warning "    Failed to parse Defender exclusions: $($_.Exception.Message)" }
@@ -4289,7 +4464,8 @@ function Parse-Registry {
             $mount = Mount-TimelineHive -HiveFile $hiveFile -Prefix $(if ($hiveName -eq "SOFTWARE") { "TEMP_TLSW" } else { "TEMP_TLSYS" })
             if ($mount -and $mount.Root) {
                 if ($hiveName -eq "SOFTWARE") {
-                    $rowCount = Read-SoftwareHive -HiveRoot $mount.Root -RawPath $hiveFile.FullName -FallbackTime $hiveTime -CollectorFolder (Get-CollectorOutputFolder)
+                    $rowCount = Read-SoftwareHive -HiveRoot $mount.Root -RawPath $hiveFile.FullName -FallbackTime $hiveTime `
+                        -CollectorFolder (Get-CollectorOutputFolder) -ListedTasks (Get-CollectedTaskNames)
                 }
                 else {
                     $rowCount = Read-SystemHive -HiveRoot $mount.Root -RawPath $hiveFile.FullName -FallbackTime $hiveTime
