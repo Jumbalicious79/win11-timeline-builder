@@ -5718,7 +5718,8 @@ function Parse-Amcache {
                 Log "  Parsed $count Amcache entries."
             }
             else {
-                Log-Warning "  Could not load Amcache hive: $(($regLoadResult | Out-String).Trim()) -- No Amcache data available."
+                $regLoadText = (@($regLoadResult) | ForEach-Object { "$_".Trim() } | Where-Object { $_ }) -join " "
+                Log-Warning "  Could not load Amcache hive: $regLoadText -- No Amcache data available."
             }
         }
         catch {
