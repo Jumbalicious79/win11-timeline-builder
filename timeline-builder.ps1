@@ -48,7 +48,7 @@ param(
 
     # $MFT file-system events: only times within this many days before the
     # collection are added (0 = all). A full $MFT can hold millions of times.
-    # Mark-of-the-Web (downloaded file) rows are always added.
+    # Mark-of-the-Web (downloaded or extracted file) rows are always added.
     [Parameter(Mandatory = $false)]
     [ValidateRange(0, 36500)]
     [int]$MftDays = 7,
@@ -3916,7 +3916,8 @@ function Parse-Services {
 # small, so it is almost always resident (non-resident flag 0x08 = 0) and the
 # text is in the record itself. Attributes in an extension record (one an
 # $ATTRIBUTE_LIST points to) count for its base record, names and this stream
-# alike. A non-resident stream's text is in clusters outside the $MFT: such a
+# alike (the stream only from an in-use extension record when the file is in
+# use). A non-resident stream's text is in clusters outside the $MFT: such a
 # file still gets a row, with the zone unknown.
 function Initialize-MftParser {
     if ($null -ne $script:mftParserReady) { return $script:mftParserReady }
@@ -3939,6 +3940,7 @@ namespace TimelineNtfs
         public string Description { get; set; }
         public string User { get; set; }
         public string Details { get; set; }
+        public bool MarkOfTheWeb { get; set; }
     }
 
     public sealed class MftResult
@@ -3975,7 +3977,9 @@ namespace TimelineNtfs
         public long ZoneNonResident { get; set; }
         public long ZoneFolders { get; set; }
         public long ZoneRows { get; set; }
+        public long ZoneExtracted { get; set; }
         public long ZoneDeleted { get; set; }
+        public long ZoneFnTime { get; set; }
         public long ZoneOutsideWindow { get; set; }
         public long ZoneNoTime { get; set; }
         public SortedDictionary<string, long> ZoneCounts { get; private set; }
@@ -3998,6 +4002,8 @@ namespace TimelineNtfs
         const byte StZoneNonResident = 64;   // non-resident Zone.Identifier (text not in the $MFT)
         const string ZoneStreamName = "zone.identifier";
         static readonly long MaxFileTime = DateTime.MaxValue.ToFileTimeUtc();
+        // Add-TimelineEntry drops times before 1980
+        static readonly long MinRowTime = new DateTime(1980, 1, 1, 0, 0, 0, DateTimeKind.Utc).ToFileTimeUtc();
         static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
         static readonly Encoding StrictUtf8 = new UTF8Encoding(false, true);
         static readonly Encoding Ansi = GetAnsiEncoding();
@@ -4016,6 +4022,7 @@ namespace TimelineNtfs
             public long Size;
             public string Zone;
             public bool ZoneNonResident;
+            public bool InUse;
         }
 
         readonly MftResult result = new MftResult();
@@ -4084,6 +4091,11 @@ namespace TimelineNtfs
         static bool IsValidTime(long fileTime)
         {
             return fileTime > 0 && fileTime <= MaxFileTime;
+        }
+
+        static bool IsRowTime(long fileTime)
+        {
+            return fileTime >= MinRowTime && fileTime <= MaxFileTime;
         }
 
         void ReadFile(string path)
@@ -4191,6 +4203,7 @@ namespace TimelineNtfs
                     part.Size = curSize;
                     part.Zone = curZone;
                     part.ZoneNonResident = curZoneNonResident;
+                    part.InUse = (flags & 0x01) != 0;
                     extensions.Add(part);
                 }
                 return;
@@ -4369,6 +4382,9 @@ namespace TimelineNtfs
                     fnCreated[r] = part.FnCreated;
                 }
                 if (part.Size >= 0 && dataSize[r] < 0) dataSize[r] = part.Size;
+                // A freed extension record keeps the stream an in-use file has
+                // since lost (Unblock-File): only a deleted file takes it
+                if (!part.InUse && (state[r] & StInUse) != 0) continue;
                 if (part.Zone != null && (state[r] & StZone) == 0)
                 {
                     zoneTexts[r] = part.Zone;
@@ -4500,8 +4516,30 @@ namespace TimelineNtfs
         // ReferrerUrl=, HostUrl=, sometimes LastWriterPackageFamilyName,
         // AppZoneId). Section and comment lines and empty values are skipped,
         // the first of a repeated key is kept, the three usual keys come first
-        // with their usual spelling, then the others in file order.
+        // with their usual spelling, then the others in file order. The text is
+        // written by whatever saved the file, so keys not known here get a
+        // "Zone." prefix (a stream line cannot pose as MftRecord, SI.Created and
+        // so on) and "|" becomes %7C (Details stay splittable on " | ").
         static readonly string[] ZoneKeys = { "ZoneId", "HostUrl", "ReferrerUrl" };
+        static readonly string[] OtherZoneKeys = { "LastWriterPackageFamilyName", "AppZoneId", "AppDefinedZoneId", "HostIpAddress" };
+
+        static string ZoneField(string text)
+        {
+            return text.IndexOf('|') < 0 ? text : text.Replace("|", "%7C");
+        }
+
+        static string ZoneKey(string key)
+        {
+            foreach (string known in ZoneKeys)
+            {
+                if (string.Equals(key, known, StringComparison.OrdinalIgnoreCase)) return known;
+            }
+            foreach (string known in OtherZoneKeys)
+            {
+                if (string.Equals(key, known, StringComparison.OrdinalIgnoreCase)) return known;
+            }
+            return "Zone." + ZoneField(key);
+        }
 
         static List<KeyValuePair<string, string>> ParseZoneText(string text)
         {
@@ -4514,12 +4552,10 @@ namespace TimelineNtfs
                 if (eq <= 0) continue;
                 string key = line.Substring(0, eq).Trim();
                 string value = line.Substring(eq + 1).Trim();
-                if (key.Length == 0 || value.Length == 0 || ZoneValue(found, key) != null) continue;
-                foreach (string known in ZoneKeys)
-                {
-                    if (string.Equals(key, known, StringComparison.OrdinalIgnoreCase)) { key = known; break; }
-                }
-                found.Add(new KeyValuePair<string, string>(key, value));
+                if (key.Length == 0 || value.Length == 0) continue;
+                key = ZoneKey(key);
+                if (ZoneValue(found, key) != null) continue;
+                found.Add(new KeyValuePair<string, string>(key, ZoneField(value)));
             }
             List<KeyValuePair<string, string>> pairs = new List<KeyValuePair<string, string>>(found.Count);
             foreach (string known in ZoneKeys)
@@ -4560,19 +4596,38 @@ namespace TimelineNtfs
             }
         }
 
-        // Appended to the Details of the file's "File created" row
+        // Appended to the Details of the file's "File created" row: ZoneId and
+        // HostUrl, or ReferrerUrl when there is no HostUrl (an extracted file)
         static string ZoneSuffix(List<KeyValuePair<string, string>> pairs)
         {
             if (pairs == null) return "";
             StringBuilder sb = new StringBuilder(128);
             string zoneId = ZoneValue(pairs, "ZoneId");
             string hostUrl = ZoneValue(pairs, "HostUrl");
+            string referrerUrl = ZoneValue(pairs, "ReferrerUrl");
             if (zoneId != null) sb.Append(" | ZoneId=").Append(zoneId);
             if (hostUrl != null) sb.Append(" | HostUrl=").Append(hostUrl);
+            else if (referrerUrl != null) sb.Append(" | ReferrerUrl=").Append(referrerUrl);
             return sb.ToString();
         }
 
-        string ZoneDetails(int r, List<KeyValuePair<string, string>> pairs, string stomp)
+        // Explorer (and other unzip tools) give each file extracted from an
+        // archive with Mark of the Web the archive's ZoneId and its local or
+        // network path as ReferrerUrl, with no HostUrl
+        static bool IsExtracted(List<KeyValuePair<string, string>> pairs)
+        {
+            if (ZoneValue(pairs, "HostUrl") != null) return false;
+            string referrer = ZoneValue(pairs, "ReferrerUrl");
+            if (referrer == null) return false;
+            if (referrer.Length >= 3 && referrer[1] == ':' && (referrer[2] == '\\' || referrer[2] == '/'))
+            {
+                char drive = char.ToUpperInvariant(referrer[0]);
+                if (drive >= 'A' && drive <= 'Z') return true;
+            }
+            return referrer.StartsWith("\\\\", StringComparison.Ordinal) || referrer.StartsWith("file:", StringComparison.OrdinalIgnoreCase);
+        }
+
+        string ZoneDetails(int r, List<KeyValuePair<string, string>> pairs, bool fnTime, string stomp)
         {
             StringBuilder sb = new StringBuilder(512);
             if (pairs == null) sb.Append("ZoneIdentifier=non-resident (its text is not in the $MFT)");
@@ -4592,32 +4647,44 @@ namespace TimelineNtfs
             AppendTime(sb, "SI.MftChanged", siChanged[r]);
             AppendTime(sb, "SI.Accessed", siAccessed[r]);
             AppendTime(sb, "FN.Created", fnCreated[r]);
+            if (fnTime) sb.Append(" | RowTime=FN.Created");
             if (stomp != null) sb.Append(" | Timestomp=").Append(stomp);
             return sb.ToString();
         }
 
-        // "Downloaded file (Mark of the Web, <zone>): <path>" at SI Created, or at
-        // FN Created when SI Created looks backdated ([SI<FN]) or is missing.
-        // Added whatever the -MftDays window. False if the file has no valid time.
+        // "Downloaded file (Mark of the Web, <zone>): <path>", or "Extracted
+        // file (...)" (see IsExtracted), "; record deleted" in the brackets for
+        // a record no longer in use. The row is at SI Created, or at FN Created
+        // (RowTime=FN.Created in Details) when SI Created is missing, before 1980
+        // or more than 1 s earlier: backdating tools, and extraction (which sets
+        // the archive entry's time), change SI Created, while FN Created is when
+        // the file arrived on the volume. [SI<FN] as on the file's other rows,
+        // but not for an extracted file, whose earlier SI Created the stream
+        // explains. Added whatever the -MftDays window. False if the file has no
+        // time from 1980 on.
         bool AddZoneRow(int r, string path, string user, List<KeyValuePair<string, string>> pairs, string stomp, long windowStart)
         {
+            long time = siCreated[r];
+            bool fnTime = IsRowTime(fnCreated[r]) && (!IsRowTime(time) || time < fnCreated[r] - TicksPerSecond);
+            if (fnTime) time = fnCreated[r];
+            if (!IsRowTime(time)) { result.ZoneNoTime++; return false; }
             string zone = ZoneLabel(pairs);
             long seen;
             result.ZoneCounts.TryGetValue(zone, out seen);
             result.ZoneCounts[zone] = seen + 1;
-            long time = siCreated[r];
-            if (stomp != null || !IsValidTime(time)) time = fnCreated[r];
-            if (!IsValidTime(time)) { result.ZoneNoTime++; return false; }
+            if (fnTime) result.ZoneFnTime++;
             if (time < windowStart) result.ZoneOutsideWindow++;
             string noun = "Downloaded file";
-            if ((state[r] & StInUse) == 0) { noun = "Deleted downloaded file"; result.ZoneDeleted++; }
+            if (IsExtracted(pairs)) { noun = "Extracted file"; stomp = null; result.ZoneExtracted++; }
+            string qualifier = zone;
+            if ((state[r] & StInUse) == 0) { qualifier += "; record deleted"; result.ZoneDeleted++; }
             string marker = stomp != null ? " [SI<FN]" : "";
-            AddRow(time, noun + " (Mark of the Web, " + zone + "): " + path + marker, user, ZoneDetails(r, pairs, stomp));
+            AddRow(time, noun + " (Mark of the Web, " + qualifier + "): " + path + marker, user, ZoneDetails(r, pairs, fnTime, stomp)).MarkOfTheWeb = true;
             result.ZoneRows++;
             return true;
         }
 
-        void AddRow(long fileTime, string description, string user, string details)
+        MftRow AddRow(long fileTime, string description, string user, string details)
         {
             MftRow row = new MftRow();
             row.Time = DateTime.FromFileTimeUtc(fileTime);
@@ -4625,6 +4692,7 @@ namespace TimelineNtfs
             row.User = user;
             row.Details = details;
             result.Rows.Add(row);
+            return row;
         }
 
         static long Newer(long newest, long fileTime, long limit)
@@ -4747,12 +4815,14 @@ namespace TimelineNtfs
 # kept. Records flagged [SI<FN] (possible timestomping) are also kept when
 # their FN Created time is in the window, as backdating moves SI times out of it.
 # A file with a Zone.Identifier stream (Mark of the Web) also gets a
-# "Downloaded file (Mark of the Web, <zone>): <path>" row with ZoneId, HostUrl,
-# ReferrerUrl and any other key=value of the stream in Details, at SI Created
-# (FN Created when the record is flagged [SI<FN]: SI Created looks backdated).
-# These rows are always added, whatever -MftDays: there are few of them and
-# they tie a file to the URL it came from. The file's "File created" row, when
-# in the window, gets ZoneId and HostUrl appended to its Details.
+# "Downloaded file (Mark of the Web, <zone>): <path>" row ("Extracted file"
+# when the stream names the archive it came from instead of a URL) with ZoneId,
+# HostUrl, ReferrerUrl and any other key=value of the stream in Details, at SI
+# Created, or at FN Created when SI Created is earlier (backdated, or the
+# archive entry time). These rows are added whatever -MftDays: there are few of
+# them and they tie a file to the URL it came from. The file's "File created"
+# row, when in the window, gets ZoneId and HostUrl (or ReferrerUrl) appended to
+# its Details.
 function Add-MftTimelineEntries {
     param([System.IO.FileInfo]$File)
     if (-not (Initialize-MftParser)) { return }
@@ -4793,10 +4863,13 @@ function Add-MftTimelineEntries {
 
     $before = $script:timelineEntries.Count
     $rawPath = $File.FullName
+    $zoneAdded = 0
     foreach ($row in $mftResult.Rows) {
+        $entryCount = $script:timelineEntries.Count
         Add-TimelineEntry -Timestamp $row.Time -Source "MFT" -EventType "FileAccess" `
             -Description $row.Description -User $row.User -Details $row.Details `
             -Artifact "FileSystem" -RawPath $rawPath
+        if ($row.MarkOfTheWeb -and $script:timelineEntries.Count -gt $entryCount) { $zoneAdded++ }
     }
     $added = $script:timelineEntries.Count - $before
     $summary = "  Added $added row(s); $($mftResult.OutsideWindow) time(s) outside the window skipped"
@@ -4809,13 +4882,19 @@ function Add-MftTimelineEntries {
         $zoneSummary = @($mftResult.ZoneCounts.GetEnumerator() | ForEach-Object { "$($_.Value) $($_.Key)" }) -join ", "
         Log ("  Mark of the Web: $($mftResult.ZoneStreams) Zone.Identifier stream(s), $($mftResult.ZoneResident) resident (text read from the `$MFT), " +
             "$($mftResult.ZoneNonResident) non-resident (text not in the `$MFT; their rows say 'zone unknown').")
-        Log ("  Mark of the Web: $($mftResult.ZoneRows) 'Downloaded file' row(s) ($zoneSummary), $($mftResult.ZoneDeleted) of them deleted files; " +
-            "always added, $($mftResult.ZoneOutsideWindow) of them dated before the -MftDays window.")
+        if ($mftResult.ZoneRows -gt 0) {
+            Log ("  Mark of the Web: $($mftResult.ZoneRows) row(s) ($zoneSummary): $($mftResult.ZoneExtracted) 'Extracted file', " +
+                "$($mftResult.ZoneDeleted) with the record deleted, $($mftResult.ZoneFnTime) at FN Created (RowTime=FN.Created); " +
+                "added regardless of -MftDays, $($mftResult.ZoneOutsideWindow) of them dated before its window.")
+        }
+        if ($mftResult.ZoneRows -gt $zoneAdded) {
+            Log "  Mark of the Web: $($mftResult.ZoneRows - $zoneAdded) of these row(s) dropped by -StartDate/-EndDate."
+        }
         if ($mftResult.ZoneFolders -gt 0) {
             Log "  Mark of the Web: $($mftResult.ZoneFolders) folder(s) with a Zone.Identifier stream skipped (rows are for files)."
         }
         if ($mftResult.ZoneNoTime -gt 0) {
-            Log-Warning "  Mark of the Web: $($mftResult.ZoneNoTime) file(s) with a Zone.Identifier stream skipped: no valid created time."
+            Log-Warning "  Mark of the Web: $($mftResult.ZoneNoTime) file(s) with a Zone.Identifier stream skipped: no SI or FN Created time from 1980 on."
         }
     }
     else {
