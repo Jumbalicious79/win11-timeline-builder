@@ -4459,40 +4459,68 @@ function Parse-PowerShellHistory {
 # ----------------------------------------------------------
 # 15. Memory Dump Parser (Volatility 3)
 # ----------------------------------------------------------
+# Memory dump for this collection: the collector saves it next to the zip
+# (<zip name>_memory_dump.dmp / .raw) because it is too large to zip.
+# DumpIt writes Microsoft crash dumps (.dmp); WinPmem and Magnet RAM
+# Capture write raw images (.raw). Returns the full path or $null.
+function Find-MemoryDump {
+    $extensions = @("dmp", "raw")
+
+    # Check 1: Sibling of the selected zip (browse mode)
+    if ($script:selectedZipPath -and (Test-Path -LiteralPath $script:selectedZipPath)) {
+        $zipDir = Split-Path $script:selectedZipPath -Parent
+        $zipBaseName = [System.IO.Path]::GetFileNameWithoutExtension($script:selectedZipPath)
+        foreach ($ext in $extensions) {
+            $siblingDump = Join-Path $zipDir "${zipBaseName}_memory_dump.$ext"
+            if (Test-Path -LiteralPath $siblingDump) { return $siblingDump }
+        }
+    }
+
+    # Check 2: Inside the collection directory (uncompressed collections)
+    $memFiles = @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("memory_dump.dmp", "memory_dump.raw", "memdump.raw", "memory.raw", "physmem.raw"))
+    if ($memFiles.Count -gt 0) { return $memFiles[0].FullName }
+
+    # Check 3: Alongside the InputPath directory
+    $parentDir = Split-Path $InputPath -Parent
+    foreach ($ext in $extensions) {
+        $dumpFiles = @(Get-ChildItem -LiteralPath $parentDir -Filter "*_memory_dump.$ext" -File -ErrorAction SilentlyContinue)
+        if ($dumpFiles.Count -gt 0) { return $dumpFiles[0].FullName }
+    }
+    return $null
+}
+
+# CPU architecture of a Microsoft crash dump from its header ("PAGEDU64":
+# machine type at 0x30; "PAGEDUMP": 32-bit x86). "Raw" for raw images,
+# "Unknown" if the header can't be read.
+function Get-MemoryDumpArchitecture {
+    param([string]$Path)
+    $header = New-Object byte[] 0x40
+    try {
+        $stream = [System.IO.File]::OpenRead($Path)
+        try { $read = $stream.Read($header, 0, $header.Length) } finally { $stream.Dispose() }
+    }
+    catch {
+        Write-Verbose "Could not read memory dump header of ${Path}: $($_.Exception.Message)"
+        return "Unknown"
+    }
+    if ($read -lt $header.Length) { return "Unknown" }
+    $signature = [System.Text.Encoding]::ASCII.GetString($header, 0, 8)
+    if ($signature -eq "PAGEDUMP") { return "x86" }
+    if ($signature -ne "PAGEDU64") { return "Raw" }
+    switch ([BitConverter]::ToUInt32($header, 0x30)) {
+        0x8664 { return "x64" }
+        0xAA64 { return "ARM64" }
+        default { return "Unknown" }
+    }
+}
+
 function Parse-Memory {
     Log "--- Parsing Memory Dump (Volatility 3) ---"
 
     $memParsed = $false
 
     # --- Find the memory dump file ---
-    $dumpPath = $null
-
-    # Check 1: Sibling of the selected zip (browse mode)
-    if ($script:selectedZipPath -and (Test-Path $script:selectedZipPath)) {
-        $zipDir = Split-Path $script:selectedZipPath -Parent
-        $zipBaseName = [System.IO.Path]::GetFileNameWithoutExtension($script:selectedZipPath)
-        $siblingDump = Join-Path $zipDir "${zipBaseName}_memory_dump.raw"
-        if (Test-Path $siblingDump) {
-            $dumpPath = $siblingDump
-        }
-    }
-
-    # Check 2: Inside the collection directory
-    if (-not $dumpPath) {
-        $memFiles = Find-ArtifactFiles -BasePath $InputPath -FileNames @("memory_dump.raw", "memdump.raw", "memory.raw", "physmem.raw")
-        if ($memFiles.Count -gt 0) {
-            $dumpPath = $memFiles[0].FullName
-        }
-    }
-
-    # Check 3: Alongside the InputPath directory
-    if (-not $dumpPath) {
-        $parentDir = Split-Path $InputPath -Parent
-        $dumpFiles = Get-ChildItem -Path $parentDir -Filter "*_memory_dump.raw" -File -ErrorAction SilentlyContinue
-        if ($dumpFiles.Count -gt 0) {
-            $dumpPath = $dumpFiles[0].FullName
-        }
-    }
+    $dumpPath = Find-MemoryDump
 
     if (-not $dumpPath) {
         Log-Warning "No memory dump found in collection or alongside zip."
@@ -4501,8 +4529,18 @@ function Parse-Memory {
         return
     }
 
-    $dumpSizeGB = [math]::Round((Get-Item $dumpPath).Length / 1GB, 2)
-    Log "  Found memory dump: $dumpPath ($dumpSizeGB GB)"
+    $dumpSizeGB = [math]::Round((Get-Item -LiteralPath $dumpPath).Length / 1GB, 2)
+    $dumpArch = Get-MemoryDumpArchitecture -Path $dumpPath
+    Log "  Found memory dump: $dumpPath ($dumpSizeGB GB, $dumpArch)"
+
+    # Volatility 3's Windows support is for Intel x86/x64 memory only
+    if ($dumpArch -eq "ARM64") {
+        Log-Warning "  This is a Windows ARM64 memory dump. Volatility 3 cannot analyze Windows ARM64 memory, so memory analysis is skipped."
+        Log "  The .dmp file is a Microsoft crash dump: open it in WinDbg to examine it manually."
+        Log "  Memory parsing complete."
+        Log ""
+        return
+    }
     Log "  Analyzing in-place (not copied to temp)"
 
     # --- Find Volatility 3 ---
@@ -4672,27 +4710,15 @@ function Parse-SystemInfo {
 # =============================================================
 if ($Sources -notcontains "Memory") {
     # Check if a memory dump exists alongside the collection
-    $detectedDump = $null
-
-    # Check 1: Sibling of the selected zip (browse mode)
-    if ($script:selectedZipPath -and (Test-Path $script:selectedZipPath)) {
-        $zipDir = Split-Path $script:selectedZipPath -Parent
-        $zipBaseName = [System.IO.Path]::GetFileNameWithoutExtension($script:selectedZipPath)
-        $siblingDump = Join-Path $zipDir "${zipBaseName}_memory_dump.raw"
-        if (Test-Path $siblingDump) { $detectedDump = $siblingDump }
-    }
-
-    # Check 2: Inside the collection directory
-    if (-not $detectedDump) {
-        $memFiles = Get-ChildItem -Path $InputPath -Filter "memory_dump.raw" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($memFiles) { $detectedDump = $memFiles.FullName }
-    }
-
-    # Check 3: Alongside the InputPath
-    if (-not $detectedDump) {
-        $parentDir = Split-Path $InputPath -Parent
-        $dumpFiles = Get-ChildItem -Path $parentDir -Filter "*_memory_dump.raw" -File -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($dumpFiles) { $detectedDump = $dumpFiles.FullName }
+    $detectedDump = Find-MemoryDump
+    if ($detectedDump -and (Get-MemoryDumpArchitecture -Path $detectedDump) -eq "ARM64") {
+        # Volatility 3 cannot analyze Windows ARM64 memory: don't offer it
+        Log ""
+        Log "Memory dump detected: $(Split-Path $detectedDump -Leaf) (Windows ARM64)."
+        Log "  Volatility 3 cannot analyze Windows ARM64 memory, so it is not offered."
+        Log "  Open the .dmp file in WinDbg to examine it manually."
+        Log ""
+        $detectedDump = $null
     }
 
     # If dump found, check if Volatility 3 is available
