@@ -5127,12 +5127,13 @@ function Read-TaskCacheTreeNode {
     }
 }
 
-# Scheduled tasks that the collection's task list already puts on the
+# Scheduled tasks that the collection's task list also puts on the
 # timeline (Parse-ScheduledTasks): scheduled_tasks.csv (live collections;
 # HasLastRun = the CSV gives a last run time, read like Get-ScheduledTaskInfo
-# from the same scheduler state as TaskCache DynamicInfo) and
-# ScheduledTasks_XML (mounted images; no run times). Task path in lower case
-# -> HasLastRun. Empty when the ScheduledTasks source is not selected.
+# from the same scheduler state as TaskCache DynamicInfo, so Read-TaskCache
+# leaves that task's last run to the list) and ScheduledTasks_XML (mounted
+# images; no run times). Task path in lower case -> HasLastRun. Empty when
+# the ScheduledTasks source is not selected.
 function Get-CollectedTaskNames {
     $listed = @{}
     if ($Sources -notcontains "ScheduledTasks") { return $listed }
@@ -5175,6 +5176,11 @@ function Get-TaskCacheParentFolder {
     return ""
 }
 
+# TaskCache registered times (UTC) by task path in lower case, filled by
+# Read-TaskCache (Registry source, which runs first) and read by
+# Test-TaskCacheRegistered (ScheduledTasks source)
+$script:taskCacheRegistered = @{}
+
 # Scheduled tasks in the TaskCache of one loaded SOFTWARE hive
 # (Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache):
 #   Tree\<folder>\<task>  Id (task GUID), Index and SD (security
@@ -5190,11 +5196,16 @@ function Get-TaskCacheParentFolder {
 #   4  FILETIME  created/registered  24 uint32    last error code
 #   12 FILETIME  last run (launch)   28 FILETIME  last successful run (36 bytes)
 # Times later than the hive file time + 1 day are treated as invalid.
-# "Scheduled task registered" / "last run" rows are only added where they
-# are new to the timeline: a task that scheduled_tasks.csv or
-# ScheduledTasks_XML lists (Get-CollectedTaskNames) gets its rows from the
-# ScheduledTasks source, so only its last run is added, and only when the
-# list has no run time for it. Hidden tasks are never in scheduled_tasks.csv.
+# "Scheduled task registered" is added for every task, also one that
+# scheduled_tasks.csv or ScheduledTasks_XML lists: Windows records the
+# created time, while the date those lists give is the task XML's
+# RegistrationInfo/Date, which whoever wrote the task sets (Microsoft's own
+# tasks: often years before the install). The registered times are kept in
+# $script:taskCacheRegistered, so Parse-ScheduledTasks leaves out an XML
+# date that is the same time. "Last run" is only added where it is new to
+# the timeline: not for a task that scheduled_tasks.csv lists with a run
+# time (Get-CollectedTaskNames). Hidden tasks are never in
+# scheduled_tasks.csv.
 # Actions (format version 3; older versions are not parsed): uint16 version,
 # uint32 size + UTF-16 context, then per action uint16 type, uint32 size +
 # UTF-16 id and for type 0x6666 (exec) command, arguments and working
@@ -5277,11 +5288,17 @@ function Read-TaskCache {
                     }
                     foreach ($what in $times.Keys) {
                         if (-not $times[$what]) { continue }
-                        if (($what -eq "registered" -and $isListed) -or ($what -eq "last run" -and $listedRun)) {
+                        $isRun = ($what -eq "last run")
+                        if ($isRun -and $listedRun) {
                             $leftToList++
                             continue
                         }
-                        $isRun = ($what -eq "last run")
+                        if (-not $isRun) {
+                            foreach ($name in $names) {
+                                if (-not $script:taskCacheRegistered.ContainsKey($name)) { $script:taskCacheRegistered[$name] = @() }
+                                $script:taskCacheRegistered[$name] += $times[$what]
+                            }
+                        }
                         $details = Format-ArtifactDetails ([ordered]@{
                             Id                   = $guidName
                             Actions              = $actions
@@ -5289,7 +5306,7 @@ function Read-TaskCache {
                             Hidden               = $hidden
                             LastErrorCode        = $(if ($isRun) { "0x{0:X8}" -f [BitConverter]::ToUInt32($dynamicInfo, 24) } else { "" })
                             LastSuccessfulRunUtc = $(if ($isRun -and $lastSuccess) { $lastSuccess.ToString("yyyy-MM-dd HH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture) } else { "" })
-                            Listed               = $(if ($isListed) { "yes (scheduled task list of the collection, without a run time)" } else { "" })
+                            Listed               = $(if (-not $isListed) { "" } elseif ($isRun) { "yes (scheduled task list of the collection, without a run time)" } else { "yes (scheduled task list of the collection)" })
                             Key                  = "HKLM\SOFTWARE\$cachePath\Tasks\$guidName"
                             Time                 = $(if ($isRun) { "TaskCache DynamicInfo last run time" } else { "TaskCache DynamicInfo created (registered) time" })
                         })
@@ -5338,7 +5355,7 @@ function Read-TaskCache {
         $added++
         $hiddenCount++
     }
-    Log "    TaskCache: $taskCount task(s), $hiddenCount hidden task(s)/folder(s) (no SD value), $leftToList time(s) already on the timeline from the ScheduledTasks source"
+    Log "    TaskCache: $taskCount task(s), $hiddenCount hidden task(s)/folder(s) (no SD value), $leftToList last run time(s) already on the timeline from the ScheduledTasks source"
     if ($badDynamicInfo -gt 0) { Log-Warning "    $badDynamicInfo TaskCache DynamicInfo value(s) skipped: size is not 28 or 36 bytes" }
     return $added
 }
@@ -6880,14 +6897,36 @@ function Get-TaskXmlText {
     return ""
 }
 
+# $true when Read-TaskCache recorded a TaskCache registered time for the
+# task (path such as "\Folder\Task") less than 2 seconds from $Time, a date
+# from the task XML: that date is then the time Windows recorded (it often
+# has whole seconds only) and its row would repeat the TaskCache row
+function Test-TaskCacheRegistered {
+    param([string]$TaskName, [datetime]$Time)
+    if (-not $script:taskCacheRegistered -or -not $TaskName) { return $false }
+    $key = $TaskName.ToLowerInvariant()
+    if (-not $script:taskCacheRegistered.ContainsKey($key)) { return $false }
+    foreach ($cacheTime in $script:taskCacheRegistered[$key]) {
+        if ([Math]::Abs(($cacheTime - $Time).TotalSeconds) -lt 2) { return $true }
+    }
+    return $false
+}
+
 function Parse-ScheduledTasks {
     Log "--- Parsing Scheduled Tasks ---"
 
     $tasksParsed = $false
 
+    # The registration date of the task XML (RegistrationInfo/Date) is set by
+    # whoever wrote the task, not recorded by Windows: its rows say so. The
+    # time Windows recorded is the TaskCache "Scheduled task registered" row
+    # (Registry source); a date that is that time is not added again.
+    $authorDateNote = "task XML RegistrationInfo/Date (author-supplied, not recorded by Windows)"
+
     # scheduled_tasks.csv from the triage collector (live systems). Newer
-    # collectors add RegistrationDateUtc and LastRunTimeUtc; a task with
-    # neither (and every task from older collectors) becomes one Snapshot row.
+    # collectors add RegistrationDateUtc (the XML date, as Get-ScheduledTask
+    # reports it) and LastRunTimeUtc; a task with no row from either (and
+    # every task from older collectors) becomes one Snapshot row.
     $tasksCsv = Find-ArtifactFiles -BasePath $InputPath -FileNames @("scheduled_tasks.csv")
 
     foreach ($csv in $tasksCsv) {
@@ -6897,11 +6936,14 @@ function Parse-ScheduledTasks {
             $snapshotTs = Get-SnapshotTimeUtc -File $csv
             $eventRows = 0
             $snapshotRows = 0
+            $sameAsCache = 0
             foreach ($task in $tasks) {
                 $taskName = Get-ArtifactRowValue $task @("TaskName", "Name")
                 if (-not $taskName) { $taskName = "Unknown" }
                 $taskPath = Get-ArtifactRowValue $task @("TaskPath")
                 $fullName = if ($taskPath) { $taskPath.TrimEnd('\') + "\" + $taskName } else { $taskName }
+                # Task path as Get-CollectedTaskNames and the TaskCache name it
+                $cacheName = if ($taskPath) { $fullName } else { "\" + $taskName }
                 $userId = Get-ArtifactRowValue $task @("UserId")
                 $author = Get-ArtifactRowValue $task @("Author")
                 $taskUser = if ($userId) { $userId } else { $author }
@@ -6915,15 +6957,21 @@ function Parse-ScheduledTasks {
 
                 $registered = ConvertFrom-UtcText (Get-ArtifactRowValue $task @("RegistrationDateUtc"))
                 if (-not $registered) { $registered = ConvertFrom-TaskDateText (Get-ArtifactRowValue $task @("Date")) }
+                if ($registered -and (Test-TaskCacheRegistered -TaskName $cacheName -Time $registered)) {
+                    $registered = $null
+                    $sameAsCache++
+                }
                 $lastRun = ConvertFrom-UtcText (Get-ArtifactRowValue $task @("LastRunTimeUtc"))
                 # Task Scheduler reports 11/30/1999 for tasks that never ran
                 if ($lastRun -and $lastRun.Year -lt 2000) { $lastRun = $null }
 
                 if ($registered) {
+                    $pairs["Time"] = $authorDateNote
                     Add-TimelineEntry -Timestamp $registered -Source "ScheduledTasks" -EventType "ScheduledTaskChange" `
-                        -Description "Scheduled task registered: $fullName" `
+                        -Description "Scheduled task registration date (author-supplied): $fullName" `
                         -User $taskUser -Details (Format-ArtifactDetails $pairs) `
                         -Artifact "ScheduledTasks" -RawPath $csv.FullName
+                    $pairs.Remove("Time")
                     $eventRows++
                 }
                 if ($lastRun) {
@@ -6944,6 +6992,7 @@ function Parse-ScheduledTasks {
                 $tasksParsed = $true
             }
             Log "    $eventRows dated row(s), $snapshotRows snapshot row(s)"
+            if ($sameAsCache -gt 0) { Log "    $sameAsCache registration date(s) not added: the same time as the task's TaskCache registered row" }
         }
         catch {
             Log-Warning "  Failed to parse scheduled tasks CSV: $($_.Exception.Message)"
@@ -6951,7 +7000,8 @@ function Parse-ScheduledTasks {
     }
 
     # Task XML definitions copied from a mounted image (Windows\System32\Tasks).
-    # RegistrationInfo/Date gives the registration time; tasks without it
+    # RegistrationInfo/Date gives the (author-supplied) registration date;
+    # tasks without it, or whose date is the TaskCache registered time,
     # become Snapshot rows.
     $xmlDirs = @(Get-ChildItem -Path $InputPath -Directory -Recurse -Filter "ScheduledTasks_XML" -ErrorAction SilentlyContinue)
     foreach ($dir in $xmlDirs) {
@@ -6959,6 +7009,7 @@ function Parse-ScheduledTasks {
         Log "  Parsing: $($dir.FullName) ($($taskFiles.Count) file(s))"
         $eventRows = 0
         $snapshotRows = 0
+        $sameAsCache = 0
         $skipped = 0
         foreach ($tf in $taskFiles) {
             try {
@@ -6983,19 +7034,24 @@ function Parse-ScheduledTasks {
                 }
                 $triggers = @()
                 foreach ($trig in $taskNode.SelectNodes("*[local-name()='Triggers']/*")) { $triggers += $trig.LocalName }
-                $details = Format-ArtifactDetails ([ordered]@{
+                $pairs = [ordered]@{
                     Actions  = ($actions -join "; ")
                     UserId   = $userId
                     Author   = $author
                     Enabled  = Get-TaskXmlText $taskNode "Settings/Enabled"
                     Triggers = ($triggers -join ", ")
-                })
+                }
 
                 $registered = ConvertFrom-TaskDateText (Get-TaskXmlText $taskNode "RegistrationInfo/Date")
+                if ($registered -and (Test-TaskCacheRegistered -TaskName $fullName -Time $registered)) {
+                    $registered = $null
+                    $sameAsCache++
+                }
                 if ($registered) {
+                    $pairs["Time"] = $authorDateNote
                     Add-TimelineEntry -Timestamp $registered -Source "ScheduledTasks-XML" -EventType "ScheduledTaskChange" `
-                        -Description "Scheduled task registered: $fullName" `
-                        -User $taskUser -Details $details `
+                        -Description "Scheduled task registration date (author-supplied): $fullName" `
+                        -User $taskUser -Details (Format-ArtifactDetails $pairs) `
                         -Artifact "ScheduledTasks" -RawPath $tf.FullName
                     $eventRows++
                 }
@@ -7004,7 +7060,7 @@ function Parse-ScheduledTasks {
                     if ($snapshotTs) {
                         Add-TimelineEntry -Timestamp $snapshotTs -Source "ScheduledTasks-XML" -EventType "Snapshot" `
                             -Description "Scheduled task: $fullName" `
-                            -User $taskUser -Details $details `
+                            -User $taskUser -Details (Format-ArtifactDetails $pairs) `
                             -Artifact "ScheduledTasks" -RawPath $tf.FullName
                         $snapshotRows++
                     }
@@ -7016,6 +7072,7 @@ function Parse-ScheduledTasks {
             }
         }
         Log "    $eventRows dated row(s), $snapshotRows snapshot row(s)"
+        if ($sameAsCache -gt 0) { Log "    $sameAsCache registration date(s) not added: the same time as the task's TaskCache registered row" }
         if ($skipped -gt 0) { Log-Warning "    Skipped $skipped file(s) that are not readable task XML." }
     }
 

@@ -11,9 +11,11 @@
 # mounted_devices.txt is the cut-off one of older collectors: the hive
 # must win over both). The
 # fixture collection also has a scheduled_tasks.csv (a task listed there
-# gets no TaskCache rows) and a collection_log.txt (the collector's own
-# Defender exclusion). Hives the builder leaves loaded, and work folders it
-# leaves behind, fail the test and are cleaned up.
+# still gets its TaskCache registered row; the list's own registration date,
+# author-supplied, gets a row only when it is not that time, and the list's
+# last run time replaces the TaskCache one) and a collection_log.txt (the
+# collector's own Defender exclusion). Hives the builder leaves loaded, and
+# work folders it leaves behind, fail the test and are cleaned up.
 #
 # The hives are made by writing the values below a temporary key,
 # HKCU\Software\TriageTimelineTest_<guid>, and saving its subkeys with
@@ -162,8 +164,15 @@ function New-TaskDynamicInfo {
 $script:FixtureTimes = @{
     TaskRegistered        = [datetime]::SpecifyKind([datetime]"2024-01-02 03:04:05", [System.DateTimeKind]::Utc)
     TaskLastRun           = [datetime]::SpecifyKind([datetime]"2024-01-03 04:05:06", [System.DateTimeKind]::Utc)
-    ListedRegistered      = [datetime]::SpecifyKind([datetime]"2024-01-04 01:02:03", [System.DateTimeKind]::Utc)
+    # Has milliseconds; scheduled_tasks.csv gives it in whole seconds
+    ListedRegistered      = [datetime]::SpecifyKind([datetime]"2024-01-04 01:02:03.456", [System.DateTimeKind]::Utc)
     ListedLastRun         = [datetime]::SpecifyKind([datetime]"2024-01-04 02:03:04", [System.DateTimeKind]::Utc)
+    DatedRegistered       = [datetime]::SpecifyKind([datetime]"2024-01-04 03:04:05", [System.DateTimeKind]::Utc)
+    DatedLastRun          = [datetime]::SpecifyKind([datetime]"2024-01-04 04:05:06", [System.DateTimeKind]::Utc)
+    # Author-supplied registration date of \Folder\DatedTask in
+    # scheduled_tasks.csv, older than its TaskCache time (like the dates of
+    # Windows' own tasks)
+    DatedAuthorDate       = [datetime]::SpecifyKind([datetime]"2005-06-23 21:48:00", [System.DateTimeKind]::Utc)
     UnlistedRegistered    = [datetime]::SpecifyKind([datetime]"2024-01-04 05:06:07", [System.DateTimeKind]::Utc)
     FolderTaskRegistered  = [datetime]::SpecifyKind([datetime]"2024-01-04 08:09:10", [System.DateTimeKind]::Utc)
     FolderTaskLastRun     = [datetime]::SpecifyKind([datetime]"2024-01-04 09:10:11", [System.DateTimeKind]::Utc)
@@ -177,6 +186,7 @@ $script:HiddenTaskId = "{6A1F0C3E-0D2B-4C55-9E7A-0B1C2D3E4F50}"
 $script:ListedTaskId = "{7B2E1D4F-1E3C-4D66-8F8B-1C2D3E4F5061}"
 $script:UnlistedTaskId = "{8C3F2E50-2F4D-4E77-908C-2D3E4F506172}"
 $script:FolderTaskId = "{9D403F61-3051-4F88-A19D-3E4F50617283}"
+$script:DatedTaskId = "{AE514072-4162-4F99-B2AE-4F5061728394}"
 $script:ComHandlerId = "0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F9"
 # The collector's output folder, with a non-ASCII character (o with
 # umlaut) that the two PowerShell editions write to collection_log.txt in
@@ -216,14 +226,18 @@ function New-TestRegistryFixture {
 
     # --- SOFTWARE: TaskCache. No SD value: \HiddenTask (hidden task) and
     #     \HiddenFolder (hidden folder); \Folder has one. The collection's
-    #     scheduled_tasks.csv lists \Folder\ListedTask, so its TaskCache
-    #     times are left to the ScheduledTasks source. ---
+    #     scheduled_tasks.csv lists \Folder\ListedTask (registration date
+    #     the same as here, and a last run time, which is left to the
+    #     ScheduledTasks source) and \Folder\DatedTask (an older,
+    #     author-supplied date and no last run time). ---
     $cache = "Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache"
     $sd = [byte[]](1, 0, 4, 0x80, 0x14, 0, 0, 0)
     Set-TestKey -Root $Software -Path "$cache\Tree\HiddenTask" -Values @(@("Id", $script:HiddenTaskId, $sz), @("Index", 3, $dword))
     Set-TestKey -Root $Software -Path "$cache\Tree\Folder" -Values @(, @("SD", $sd, $binary))
     Set-TestKey -Root $Software -Path "$cache\Tree\Folder\ListedTask" -Values @(
         @("Id", $script:ListedTaskId, $sz), @("Index", 1, $dword), @("SD", $sd, $binary))
+    Set-TestKey -Root $Software -Path "$cache\Tree\Folder\DatedTask" -Values @(
+        @("Id", $script:DatedTaskId, $sz), @("Index", 1, $dword), @("SD", $sd, $binary))
     Set-TestKey -Root $Software -Path "$cache\Tree\Folder\UnlistedTask" -Values @(
         @("Id", $script:UnlistedTaskId, $sz), @("Index", 1, $dword), @("SD", $sd, $binary))
     Set-TestKey -Root $Software -Path "$cache\Tree\HiddenFolder\InnerTask" -Values @(
@@ -235,6 +249,9 @@ function New-TestRegistryFixture {
     Set-TestKey -Root $Software -Path "$cache\Tasks\$($script:ListedTaskId)" -Values @(
         @("Path", "\Folder\ListedTask", $sz),
         @("DynamicInfo", (New-TaskDynamicInfo -Created $times.ListedRegistered -LastRun $times.ListedLastRun), $binary))
+    Set-TestKey -Root $Software -Path "$cache\Tasks\$($script:DatedTaskId)" -Values @(
+        @("Path", "\Folder\DatedTask", $sz),
+        @("DynamicInfo", (New-TaskDynamicInfo -Created $times.DatedRegistered -LastRun $times.DatedLastRun), $binary))
     # A malformed COM handler action must not stop the other tasks
     Set-TestKey -Root $Software -Path "$cache\Tasks\$($script:UnlistedTaskId)" -Values @(
         @("Path", "\Folder\UnlistedTask", $sz), @("Actions", (New-TaskComActions $script:ComHandlerId), $binary),
@@ -357,6 +374,21 @@ function Get-ExpectedRegistryRows {
             @("Hidden=yes (folder \HiddenFolder has no SD value in TaskCache\Tree)")),
         @("Registry-TaskCache", "Execution", "Scheduled task last run: \HiddenFolder\InnerTask", $times.FolderTaskLastRun, "",
             @("LastErrorCode=0x00000001", "LastSuccessfulRunUtc=$lastSuccess")),
+        # Tasks that scheduled_tasks.csv lists: TaskCache adds the registered
+        # time Windows recorded, and a last run only when the list has none
+        @("Registry-TaskCache", "ScheduledTaskChange", "Scheduled task registered: \Folder\ListedTask", $times.ListedRegistered, "",
+            @("Listed=yes (scheduled task list of the collection)", "Time=TaskCache DynamicInfo created (registered) time")),
+        @("Registry-TaskCache", "ScheduledTaskChange", "Scheduled task registered: \Folder\DatedTask", $times.DatedRegistered, "",
+            @("Id=$($script:DatedTaskId)", "Listed=yes (scheduled task list of the collection)")),
+        @("Registry-TaskCache", "Execution", "Scheduled task last run: \Folder\DatedTask", $times.DatedLastRun, "",
+            @("Listed=yes (scheduled task list of the collection, without a run time)", "Time=TaskCache DynamicInfo last run time")),
+        # scheduled_tasks.csv: the last run of \Folder\ListedTask; its
+        # registration date is the TaskCache time, so no row of its own (nor a
+        # Snapshot row); the older date of \Folder\DatedTask is author-supplied
+        @("ScheduledTasks", "Execution", "Scheduled task last run: \Folder\ListedTask", $times.ListedLastRun, "SYSTEM",
+            @("Actions=C:\ProgramData\listed.exe", "LastTaskResult=0")),
+        @("ScheduledTasks", "ScheduledTaskChange", "Scheduled task registration date (author-supplied): \Folder\DatedTask", $times.DatedAuthorDate, "SYSTEM",
+            @("Actions=C:\ProgramData\dated.exe", "Time=task XML RegistrationInfo/Date (author-supplied, not recorded by Windows)")),
         @("Registry-DefenderExclusions", "SecurityAlert", "Defender exclusion in effect (Paths): C:\Users\Public\Tools", $null, "",
             @("Key=HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths", "Time=Exclusions\Paths key last write", "this exclusion is older")),
         @("Registry-DefenderExclusions", "Snapshot", "Defender exclusion in effect (Paths): $($script:CollectorOutput) (triage collector's own temporary exclusion)", $null, "",
@@ -417,7 +449,8 @@ function Get-ExpectedRegistryRows {
     }
 }
 
-# Sources of the registry rows covered by this test
+# Sources of the rows covered by this test (registry rows, MountedDevices,
+# and the scheduled_tasks.csv rows next to the TaskCache ones)
 $script:TestedSources = @(
     "Registry-IFEO"
     "Registry-SilentProcessExit"
@@ -435,6 +468,7 @@ $script:TestedSources = @(
     "Registry-LastVisitedMRU"
     "Registry-WordWheelQuery"
     "USB-MountedDevices"
+    "ScheduledTasks"
 )
 
 # Builder -Sources of the test run
@@ -447,11 +481,10 @@ $script:TestSources = @(
 # Compare the timeline rows (objects with Timestamp, Source, EventType,
 # Description, User, Details) with the expected rows. Rows of the tested
 # sources that are not expected (e.g. a default LSA package, a hidden-task
-# row for a task with SD, a TaskCache row for the task scheduled_tasks.csv
-# lists) and rows timed with the hive file time are failures too. The task
-# listed in scheduled_tasks.csv must have exactly one registered and one
-# last-run row (from the ScheduledTasks source). Returns the number of
-# failures.
+# row for a task with SD, a TaskCache last run of a task that
+# scheduled_tasks.csv lists with a run time, or a registration date from
+# scheduled_tasks.csv that is the TaskCache time) and rows timed with the
+# hive file time are failures too. Returns the number of failures.
 function Test-RegistryRows {
     param([object[]]$Rows, [datetime]$WindowStart, [datetime]$WindowEnd)
     $failures = 0
@@ -501,33 +534,34 @@ function Test-RegistryRows {
         Write-TestFailure "unexpected row: [$($row.Source)] $($row.EventType) $($row.Description)"
         $failures++
     }
-    foreach ($what in @("registered", "last run")) {
-        $description = "Scheduled task ${what}: \Folder\ListedTask"
-        $hits = @($Rows | Where-Object { $_.Description -ceq $description })
-        if ($hits.Count -ne 1 -or $hits[0].Source -ne "ScheduledTasks") {
-            Write-TestFailure "$($hits.Count) row(s) '$description' from $(@($hits | ForEach-Object { $_.Source }) -join ', ') (expected one, from scheduled_tasks.csv)"
-            $failures++
-        }
-        else { Write-Host "PASS: one row '$description' (scheduled_tasks.csv; TaskCache adds none)" -ForegroundColor Green }
-    }
     return $failures
 }
 
 # scheduled_tasks.csv of the fixture collection (written by the live
-# collector): lists \Folder\ListedTask with a last run time
+# collector, times in whole seconds): \Folder\ListedTask with its TaskCache
+# registered time and a last run time, and \Folder\DatedTask with an older
+# author-supplied registration date and no last run
 function New-TestScheduledTasksCsv {
     param([string]$Path)
     $f = "yyyy-MM-dd'T'HH:mm:ss'Z'"
     $invariant = [System.Globalization.CultureInfo]::InvariantCulture
-    $row = [PSCustomObject]@{
-        TaskName = "ListedTask"; TaskPath = "\Folder\"; State = "Ready"; Author = "TESTHOST\tester"; UserId = "SYSTEM"
-        Actions = "C:\ProgramData\listed.exe"; Triggers = ""
-        RegistrationDateUtc = $script:FixtureTimes.ListedRegistered.ToString($f, $invariant)
-        LastRunTimeUtc = $script:FixtureTimes.ListedLastRun.ToString($f, $invariant)
-        NextRunTimeUtc = ""; LastTaskResult = "0"
-    }
+    $rows = @(
+        [PSCustomObject]@{
+            TaskName = "ListedTask"; TaskPath = "\Folder\"; State = "Ready"; Author = "TESTHOST\tester"; UserId = "SYSTEM"
+            Actions = "C:\ProgramData\listed.exe"; Triggers = ""
+            RegistrationDateUtc = $script:FixtureTimes.ListedRegistered.ToString($f, $invariant)
+            LastRunTimeUtc = $script:FixtureTimes.ListedLastRun.ToString($f, $invariant)
+            NextRunTimeUtc = ""; LastTaskResult = "0"
+        },
+        [PSCustomObject]@{
+            TaskName = "DatedTask"; TaskPath = "\Folder\"; State = "Ready"; Author = "TESTHOST\tester"; UserId = "SYSTEM"
+            Actions = "C:\ProgramData\dated.exe"; Triggers = ""
+            RegistrationDateUtc = $script:FixtureTimes.DatedAuthorDate.ToString($f, $invariant)
+            LastRunTimeUtc = ""; NextRunTimeUtc = ""; LastTaskResult = ""
+        }
+    )
     New-Item -ItemType Directory -Path (Split-Path $Path -Parent) -Force | Out-Null
-    $row | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8
+    $rows | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8
 }
 
 # USB\ of the fixture collection: MountedDevices sources the builder must
@@ -665,8 +699,9 @@ try {
 
     # Collector metadata: the Defender exclusion of the output folder is
     # recognised from collection_log.txt, the scheduled task list decides
-    # which TaskCache times are new to the timeline, and USB\ holds the
-    # MountedDevices sources the SYSTEM hive must win over
+    # which TaskCache last run times are new to the timeline and gives
+    # registration dates of its own (one the TaskCache time, one older),
+    # and USB\ holds the MountedDevices sources the SYSTEM hive must win over
     $info = [ordered]@{
         SchemaVersion = 1; ComputerName = "TESTHOST"; CollectorUser = "TESTHOST\tester"; Mode = "Live"
         TargetDrive = "C"; TargetRoot = "C:\"; CollectionStartUtc = "2026-01-01T00:00:00.0000000Z"

@@ -102,6 +102,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: ./tests/Test-SummaryCounts.ps1
 
+      - name: Run scheduled tasks test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-ScheduledTasks.ps1
+
   analyze:
     name: PSScriptAnalyzer
     runs-on: windows-latest
