@@ -691,12 +691,18 @@ addresses and Firefox's encrypted user names and passwords are never read
 (the queries never select them, and in logins.json they are blanked before
 parsing). key4.db is never opened. The same holds for the newer files: in
 Preferences, Secure Preferences and Local State the members os_crypt,
-password_hash_data_list, protection, account_info, gaia_cookie and the
-per-site content settings are blanked before the JSON is parsed; Firefox
-session cookies, form data, session storage, POST data, typed text and
-page state likewise; Chromium session page state is skipped unread; and
-Firefox prefs named like a secret (token, secret, password, userAgentID)
-are not read.
+password_hash_data_list, protection, account_info, gaia_cookie, the
+per-site content settings, keystore_encryption_key_state and every member
+whose name contains encrypted_key, _encrypted_data, token or _salt are
+blanked before the JSON is parsed; Firefox session cookies, form data,
+session storage, POST data, typed text and page state likewise; Chromium
+session page state is skipped unread; and Firefox prefs named like a secret
+(token, secret, password, userAgentID) are not read.
+
+This blanking happens before the file is parsed, so it holds even when the
+collection was made with the collector's -IncludeSecrets switch, which copies
+these browser files UNREDACTED (see below): no secret value reaches the
+timeline. The members blanked here cover every member the collector blanks.
 
 ### 6. Scheduled Tasks
 Parses scheduled_tasks.csv from the triage collection (live collections):
@@ -928,6 +934,30 @@ Mail's mail stores (listed only), and other listed files (WebView data,
 parser reads them: an attached .lnk, .evtx or $MFT is not this system's
 shortcut, event log or MFT.
 
+### Collections made with the collector's -IncludeSecrets switch
+A collection made with -IncludeSecrets holds two things this builder treats
+specially (collection_info.json records SecretsIncluded: true, and the builder
+logs one line about it at the start):
+  - A top-level Secrets\ folder with DPAPI credential material (per-user and
+    system master keys, Credentials, Vault). No parser ever reads anything
+    there: the Secrets\ exclusion is applied at the Find-ArtifactFiles choke
+    point (so all of its callers skip it) and on every other recursive search
+    that walks the whole collection -- the $MFT search, the ScheduledTasks_XML
+    folders, the SRUDB.dat search and the AntiVirus vendor / Defender folders.
+    A $MFT, Preferences, Task XML, SRUDB.dat or antivirus file left in Secrets\
+    is not parsed. Only the collection's own top-level Secrets\ folder (next to
+    collection_info.json) is excluded, so a user profile folder named "Secrets"
+    is unaffected. Nothing from Secrets\ reaches the timeline, and no row has a
+    RawPath under it.
+  - UNREDACTED browser settings and session files (the collector did not blank
+    them). The builder blanks the secret members itself, before the JSON is
+    parsed (see "Browser" above), so no key, token, salt, password hash,
+    cookie, form value or page state reaches the timeline either way. The
+    builder's blank set covers every member the collector would have blanked.
+collection_info.json also carries ThunderbirdIndexIncluded. Both fields are
+additive (SchemaVersion stays 1); collections from older collectors lack them
+and are treated as false.
+
 ### 19. SRUM (System Resource Usage Monitor)
 Parses Execution\SRUM\SRUDB.dat, the ESE database in which Windows records,
 about once an hour, the network bytes and CPU/disk use of each application
@@ -1092,6 +1122,16 @@ Timeline Explorer at the same time.
 
 
 ## Known Limitations and Expected Warnings
+
+  - Secrets are never decrypted. The builder reads credential, cookie and
+    form stores as metadata only and blanks secret members before parsing
+    (see "Browser"); it never decrypts saved passwords or cookies and never
+    reads the Secrets\ folder of a collection made with the collector's
+    -IncludeSecrets switch. Decrypting those is a separate, offline step with
+    other tools (the collector's README explains what is needed). In
+    particular, Chrome/Edge App-Bound Encryption can only be undone on the
+    live machine, so App-Bound-protected passwords and cookies cannot be
+    recovered from a collection at all; this builder does not attempt it.
 
   - USN journal size -- All USN rows are kept by default. On a very busy
     system the timeline can exceed Excel's row limit (see above); use
@@ -1401,6 +1441,24 @@ parsing is skipped, and the timeline CSV can be opened manually.
   and pages still in history give no rows. A canary string in every secret
   or private field must not appear in the timeline, the log or the output.
 
+  tests\Test-SecretsHandling.ps1 -- builds a synthetic collection made as if
+  by the collector's -IncludeSecrets switch: UNREDACTED Chromium Local State,
+  Preferences and Secure Preferences, Firefox prefs.js and Chromium/Firefox
+  session files that still hold canary secret values, collection_info.json
+  with SecretsIncluded true, and a top-level Secrets\ folder with DPAPI
+  credential material (plus a $MFT, a Preferences file, a ScheduledTasks_XML
+  task, a SRUDB.dat and an AntiVirus vendor folder planted there, to exercise
+  every exclusion). A control user profile named "Secrets" holds ordinary
+  artifacts that must still be parsed. Runs the builder with -Sources
+  Browser,FileSystem,ScheduledTasks,SRUM,AntiVirus and checks that the canary
+  appears nowhere in the timeline, log or output (the builder blanks the secret
+  members before parsing), that no row has a RawPath under the top-level
+  Secrets\ folder (no parser reads it: the $MFT search, ScheduledTasks_XML,
+  SRUDB.dat, AntiVirus and the Find-ArtifactFiles callers all skip it), that
+  the "Secrets" control user's artifacts still produced rows, that the "made
+  with -IncludeSecrets" log line appears, and that non-secret settings and URLs
+  still produced rows (so the canary-free result is not vacuous).
+
   tests\Test-EmailParsers.ps1 -- lays out a synthetic Email\<user>\
   collection (listing CSVs, copied attachments, manifest,
   UserSettings.json, prefs.js and a global-messages-db.sqlite built with
@@ -1430,8 +1488,8 @@ parsing is skipped, and the timeline CSV can be opened manually.
   Thousands of truncated and corrupted copies must read without an
   exception.
 
-  The browser extras, email, SRUM and Defender tests need admin like the
-  builder, or -BuilderPath with a copy without the admin check (kept under
+  The browser extras, secrets, email, SRUM and Defender tests need admin like
+  the builder, or -BuilderPath with a copy without the admin check (kept under
   the git-ignored reports\ folder); a missing sqlite3.exe is downloaded by
   one builder run. Apart from Test-SrumParsers part 2, they change nothing
   on the system.
@@ -1442,6 +1500,7 @@ parsing is skipped, and the timeline CSV can be opened manually.
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers2.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-BrowserParsers.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-BrowserExtrasParsers.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-SecretsHandling.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-EmailParsers.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-SrumParsers.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-DefenderParsers.ps1

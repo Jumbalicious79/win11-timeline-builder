@@ -383,7 +383,11 @@ function Find-ArtifactFiles {
     catch {
         Log-Warning "Error searching for files in $BasePath : $_"
     }
-    return @($results | Where-Object { -not (Test-EmailAttachmentCopy (Get-RelativeCollectionPath $_.FullName)) })
+    # Email attachment copies ($MFT and other stray names inside them) and the
+    # Secrets\ folder (credential material) are never returned to a parser.
+    return @($results | Where-Object {
+        -not (Test-EmailAttachmentCopy (Get-RelativeCollectionPath $_.FullName)) -and -not (Test-SecretsPath $_.FullName)
+    })
 }
 
 # =============================================================
@@ -398,6 +402,7 @@ function Find-ArtifactFiles {
 $script:collectionRoot = [System.IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($InputPath)).TrimEnd('\')
 $script:collectionInfo = $null
 $script:manifestTimes = $null
+$script:secretsRoot = $null
 
 # Path of a file relative to the collection root, or $null if it is outside it
 function Get-RelativeCollectionPath {
@@ -408,6 +413,39 @@ function Get-RelativeCollectionPath {
         return $full.Substring($script:collectionRoot.Length + 1)
     }
     return $null
+}
+
+# Full path of the collection's top-level Secrets\ folder -- the one next to
+# collection_info.json (the sibling the collector's -IncludeSecrets writes),
+# computed once. Anchoring to it means a user profile folder that happens to be
+# named "Secrets" (Browser\Secrets\, UserActivity\secrets\, ...) is NOT treated
+# as the credential folder. Falls back to <collection root>\Secrets when there
+# is no collection_info.json (older collections, which have no Secrets folder).
+function Get-SecretsRoot {
+    if ($null -ne $script:secretsRoot) { return $script:secretsRoot }
+    $base = $script:collectionRoot
+    $jsonFile = Get-ChildItem -Path $InputPath -Filter "collection_info.json" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($jsonFile) {
+        try { $base = [System.IO.Path]::GetFullPath($jsonFile.DirectoryName).TrimEnd('\') } catch { Write-Verbose "Resolving the collection base: $($_.Exception.Message)" }
+    }
+    $script:secretsRoot = (Join-Path $base "Secrets")
+    return $script:secretsRoot
+}
+
+# $true when the path is inside the collection's top-level Secrets\ folder
+# (DPAPI credential material collected with the collector's -IncludeSecrets).
+# No parser reads anything there: it holds only secrets, nothing the timeline
+# needs. Used by Find-ArtifactFiles (so every caller skips it), the recursive
+# searches that bypass it (ScheduledTasks_XML, SRUDB.dat, AntiVirus vendors)
+# and the raw $MFT search.
+function Test-SecretsPath {
+    param([string]$FullPath)
+    if (-not $FullPath) { return $false }
+    try { $full = [System.IO.Path]::GetFullPath($FullPath) } catch { $full = $FullPath }
+    $secretsRoot = Get-SecretsRoot
+    if (-not $secretsRoot) { return $false }
+    return ($full.StartsWith($secretsRoot + '\', [System.StringComparison]::OrdinalIgnoreCase) -or
+        ($full.TrimEnd('\') -ieq $secretsRoot))
 }
 
 # Account an artifact belongs to, from the collection's own folder layout
@@ -490,6 +528,11 @@ function Get-CollectionInfo {
         TargetTimeZone     = $null
         CollectorCulture   = $null
         TargetRoot         = ""
+        # Additive collection_info.json fields (older collections lack them):
+        # whether the collection holds unredacted browser files + DPAPI
+        # credential material (the Secrets\ folder) and Thunderbird's index
+        SecretsIncluded          = $false
+        ThunderbirdIndexIncluded = $false
     }
 
     $jsonFile = Get-ChildItem -Path $InputPath -Filter "collection_info.json" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -505,6 +548,8 @@ function Get-CollectionInfo {
             $tz = Get-TimeZoneById ([string]$j.CollectorTimeZoneId)
             if ($tz) { $info.CollectorTimeZone = $tz }
             $info.TargetTimeZone = Get-TimeZoneById ([string]$j.TargetTimeZoneId)
+            if ($j.PSObject.Properties["SecretsIncluded"]) { $info.SecretsIncluded = [bool]$j.SecretsIncluded }
+            if ($j.PSObject.Properties["ThunderbirdIndexIncluded"]) { $info.ThunderbirdIndexIncluded = [bool]$j.ThunderbirdIndexIncluded }
             if ($j.CollectorCulture) {
                 try { $info.CollectorCulture = [System.Globalization.CultureInfo]::GetCultureInfo([string]$j.CollectorCulture) }
                 catch { Write-Verbose "Could not load collector culture '$($j.CollectorCulture)': $($_.Exception.Message)" }
@@ -639,6 +684,9 @@ function Get-RegistryKeyLastWriteUtc {
 
 # Load and log collection metadata up front
 $null = Get-CollectionInfo
+if ((Get-CollectionInfo).SecretsIncluded) {
+    Log "Collection made with -IncludeSecrets: browser files are unredacted and a Secrets\ folder holds DPAPI credential material. No parser reads Secrets\, and secret values are blanked before the browser files are parsed."
+}
 Log ""
 
 # ----------------------------------------------------------
@@ -5636,7 +5684,7 @@ function Get-CollectedTaskNames {
         }
         catch { Log-Warning "    Could not read $($csv.FullName) for the TaskCache comparison: $($_.Exception.Message)" }
     }
-    foreach ($dir in @(Get-ChildItem -Path $InputPath -Directory -Recurse -Filter "ScheduledTasks_XML" -ErrorAction SilentlyContinue)) {
+    foreach ($dir in @(Get-ChildItem -Path $InputPath -Directory -Recurse -Filter "ScheduledTasks_XML" -ErrorAction SilentlyContinue | Where-Object { -not (Test-SecretsPath $_.FullName) })) {
         foreach ($tf in @(Get-ChildItem -Path $dir.FullName -File -Recurse -ErrorAction SilentlyContinue)) {
             try {
                 $doc = New-Object System.Xml.XmlDocument
@@ -7268,6 +7316,56 @@ namespace TimelineBrowser
             return sb.ToString();
         }
 
+        // Like BlankJsonMembers, but a member is also blanked when its name
+        // (lowercased) contains one of nameParts. This mirrors the collector's
+        // secret-name pattern (names containing encrypted_key, _encrypted_data,
+        // token or _salt) so an UNREDACTED browser file collected with
+        // -IncludeSecrets still has those values removed before it is parsed.
+        // nameParts must be lowercase.
+        public static string BlankJsonMembersMatching(string json, string[] names, string[] nameParts)
+        {
+            HashSet<string> blank = new HashSet<string>(names ?? new string[0], StringComparer.Ordinal);
+            string[] parts = nameParts ?? new string[0];
+            StringBuilder sb = new StringBuilder(json.Length);
+            int n = json.Length;
+            int i = 0;
+            while (i < n)
+            {
+                char c = json[i];
+                if (c != '"') { sb.Append(c); i++; continue; }
+                int end = SkipString(json, i);
+                sb.Append(json, i, end - i);
+                int j = end;
+                while (j < n && char.IsWhiteSpace(json[j])) { j++; }
+                bool isMember = j < n && json[j] == ':' && end - i >= 2;
+                bool match = false;
+                if (isMember)
+                {
+                    string key = json.Substring(i + 1, end - i - 2);
+                    match = blank.Contains(key);
+                    if (!match && parts.Length > 0)
+                    {
+                        string lower = key.ToLowerInvariant();
+                        for (int p = 0; p < parts.Length; p++)
+                        {
+                            if (lower.IndexOf(parts[p], StringComparison.Ordinal) >= 0) { match = true; break; }
+                        }
+                    }
+                }
+                if (match)
+                {
+                    sb.Append(json, end, j + 1 - end);
+                    int v = j + 1;
+                    while (v < n && char.IsWhiteSpace(json[v])) { v++; }
+                    sb.Append("null");
+                    i = SkipValue(json, v);
+                    continue;
+                }
+                i = end;
+            }
+            return sb.ToString();
+        }
+
         // The JSON text without // and /* */ comments and without commas
         // that close a list or object (outside strings)
         public static string StripJsonComments(string json)
@@ -7545,12 +7643,16 @@ function ConvertFrom-BrowserJsonText {
 # comments and trailing commas are removed first (extension manifest.json
 # and messages.json, which Chromium reads with comments allowed).
 function Read-BrowserJsonFile {
-    param([string]$Path, [string[]]$Blank, [switch]$AllowComments)
+    param([string]$Path, [string[]]$Blank, [string[]]$BlankNameParts, [switch]$AllowComments)
     $text = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
-    if ($Blank -or $AllowComments) {
+    if ($Blank -or $BlankNameParts -or $AllowComments) {
         if (-not (Initialize-BrowserReader)) { throw "not read (the browser file reader is not available)" }
         if ($AllowComments) { $text = [TimelineBrowser.Reader]::StripJsonComments($text) }
-        if ($Blank) { $text = [TimelineBrowser.Reader]::BlankJsonMembers($text, $Blank) }
+        # -BlankNameParts also blanks members whose name contains a secret
+        # substring (Chromium Preferences / Local State), so an unredacted copy
+        # is cleaned before parsing; otherwise exact names only.
+        if ($BlankNameParts) { $text = [TimelineBrowser.Reader]::BlankJsonMembersMatching($text, [string[]]$Blank, [string[]]$BlankNameParts) }
+        elseif ($Blank) { $text = [TimelineBrowser.Reader]::BlankJsonMembers($text, $Blank) }
     }
     if ([string]::IsNullOrWhiteSpace($text)) { return $null }
     try { return (ConvertFrom-BrowserJsonText $text) }
@@ -7618,8 +7720,15 @@ $script:ChromiumDisableReasons = @(
     @(134217728, "BY_ANOTHER_EXTENSION")
 )
 # Members never read from Chromium Preferences, Secure Preferences and Local
-# State: keys, password hashes, MACs, account data and per-site settings
-$script:ChromiumPrefsBlankMembers = @("os_crypt", "password_hash_data_list", "protection", "account_info", "gaia_cookie", "content_settings", "incognito_content_settings")
+# State: keys, password hashes, MACs, account data and per-site settings.
+# keystore_encryption_key_state is the Chromium sync keystore key the
+# collector also blanks.
+$script:ChromiumPrefsBlankMembers = @("os_crypt", "password_hash_data_list", "protection", "account_info", "gaia_cookie", "content_settings", "incognito_content_settings", "keystore_encryption_key_state")
+# Secret-name substrings (lowercase) blanked in those files too, so an
+# UNREDACTED copy (collector -IncludeSecrets) still has its encrypted keys,
+# tokens and salts removed before parsing. Mirrors the collector's secret
+# pattern (names containing encrypted_key, _encrypted_data, token or _salt).
+$script:ChromiumSecretNameParts = @("encrypted_key", "_encrypted_data", "token", "_salt")
 
 # Disable reasons of a Chromium extension (a bit mask, or a list in newer
 # versions) as names; unknown bits as numbers
@@ -8688,7 +8797,7 @@ function Parse-BrowserHistory {
         $documents = @()
         foreach ($pf in $prefsFiles) {
             try {
-                $doc = Read-BrowserJsonFile -Path $pf.FullName -Blank $script:ChromiumPrefsBlankMembers
+                $doc = Read-BrowserJsonFile -Path $pf.FullName -Blank $script:ChromiumPrefsBlankMembers -BlankNameParts $script:ChromiumSecretNameParts
                 if ($doc) { $documents += $doc }
             }
             catch { Log-Warning "    Could not read $($pf.FullName): $($_.Exception.Message)" }
@@ -8712,7 +8821,7 @@ function Parse-BrowserHistory {
         $browserName = Get-ChromiumBrowserName $ls.FullName
         Log "  Parsing: $browserName Local State ($(Get-CollectionUser $ls.FullName))"
         try {
-            $doc = Read-BrowserJsonFile -Path $ls.FullName -Blank $script:ChromiumPrefsBlankMembers
+            $doc = Read-BrowserJsonFile -Path $ls.FullName -Blank $script:ChromiumPrefsBlankMembers -BlankNameParts $script:ChromiumSecretNameParts
             $flags = Get-BrowserJsonValue -Documents @($doc) -Path "browser.enabled_labs_experiments"
             $flags = @($flags | Where-Object { $_ })
             $snapshotTime = Get-SnapshotTimeUtc -File $ls
@@ -9101,7 +9210,7 @@ function Parse-ScheduledTasks {
     # Task XML definitions copied from a mounted image (Windows\System32\Tasks).
     # RegistrationInfo/Date gives the registration time; tasks without it
     # become Snapshot rows.
-    $xmlDirs = @(Get-ChildItem -Path $InputPath -Directory -Recurse -Filter "ScheduledTasks_XML" -ErrorAction SilentlyContinue)
+    $xmlDirs = @(Get-ChildItem -Path $InputPath -Directory -Recurse -Filter "ScheduledTasks_XML" -ErrorAction SilentlyContinue | Where-Object { -not (Test-SecretsPath $_.FullName) })
     foreach ($dir in $xmlDirs) {
         $taskFiles = @(Get-ChildItem -Path $dir.FullName -File -Recurse -ErrorAction SilentlyContinue)
         Log "  Parsing: $($dir.FullName) ($($taskFiles.Count) file(s))"
@@ -10264,9 +10373,10 @@ function Parse-FileSystem {
 
     # Raw $MFT from newer collectors (FileSystem\$MFT). -Force: a copy may keep
     # the Hidden/System attributes of the original. A mail attachment named
-    # $MFT (in the Email\ attachment copies) is not this system's MFT.
+    # $MFT (in the Email\ attachment copies), or anything under Secrets\, is
+    # not this system's MFT and is skipped.
     $mftFiles = @(Get-ChildItem -Path $InputPath -Filter '$MFT' -Recurse -File -Force -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -eq '$MFT' -and -not (Test-EmailAttachmentCopy (Get-RelativeCollectionPath $_.FullName)) })
+        Where-Object { $_.Name -eq '$MFT' -and -not (Test-EmailAttachmentCopy (Get-RelativeCollectionPath $_.FullName)) -and -not (Test-SecretsPath $_.FullName) })
     if ($mftFiles.Count -gt 0) {
         foreach ($mftFile in $mftFiles) {
             Add-MftTimelineEntries -File $mftFile
@@ -13230,7 +13340,7 @@ function Add-SrumTimelineEntries {
 function Parse-Srum {
     Log "--- Parsing SRUM ---"
     # -Force: a copy may keep the Hidden/System attributes of the original
-    $dbFiles = @(Get-ChildItem -Path $InputPath -Filter "SRUDB.dat" -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq "SRUDB.dat" })
+    $dbFiles = @(Get-ChildItem -Path $InputPath -Filter "SRUDB.dat" -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq "SRUDB.dat" -and -not (Test-SecretsPath $_.FullName) })
     if ($dbFiles.Count -eq 0) {
         Log "  No SRUM database (SRUDB.dat) in this collection (collected by newer collector versions, Execution\SRUM)."
         Log ""
@@ -15213,7 +15323,10 @@ function Parse-AntiVirus {
     $sophosPattern = '^\s*\d{8}\s\d{6}\s'
     $mcafeePattern = '^\s*\d{1,4}[./-]\d{1,2}[./-]\d{1,4}\t[^\t]*\t\s*(?:Would be blocked|Blocked) by (?:Access Protection|port blocking) rule'
 
-    $allDirs = @(Get-ChildItem -Path $InputPath -Directory -Recurse -ErrorAction SilentlyContinue)
+    # Secrets\ is never parsed: filtering $allDirs here covers the vendor
+    # folders, the Defender DetectionHistory folders and the Quarantine Entries
+    # folders, which are all derived from it below.
+    $allDirs = @(Get-ChildItem -Path $InputPath -Directory -Recurse -ErrorAction SilentlyContinue | Where-Object { -not (Test-SecretsPath $_.FullName) })
     $vendorDirs = @($allDirs | Where-Object { $_.Parent -and $_.Parent.Name -eq "AntiVirus" } | Sort-Object FullName)
     $parsedFiles = 0
     foreach ($dir in $vendorDirs) {
