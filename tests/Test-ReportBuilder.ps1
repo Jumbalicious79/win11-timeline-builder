@@ -12,9 +12,13 @@
 #      and one Finding column, the same findings, no administrator rights
 #      needed);
 #   -ReportOnly -ReportRules <file> -NoExcel uses another rules file and
-#      leaves the workbook alone;
+#      leaves the workbook alone (and says its findings are from an earlier
+#      report);
 #   a missing -ReportRules file and -NoReport leave the timeline intact
 #      and write no report;
+#   -ReportOnly works in a folder named "case [1]" (wildcard characters),
+#      and a report.pdf held open elsewhere is reported as out of date while
+#      the new PDF gets its own name;
 #   -ReportOnly on a folder without a timeline fails cleanly.
 #
 # Needs Administrator rights, like the builder (GitHub Actions Windows
@@ -293,6 +297,10 @@ try {
     Write-TestResult -Succeeded ($custom.ExitCode -eq 0 -and ($customRules -join ",") -eq "FIXTURE-RUNKEY" -and @($customLines | Where-Object { $_.RowNumber }).Count -eq 3) -Message "-ReportRules uses the given rules file (findings: $($customRules -join ','))"
     $xlsxUnchanged = (-not $xlsxHashBefore) -or ((Get-FileHash -LiteralPath $xlsxPath).Hash -eq $xlsxHashBefore)
     Write-TestResult -Succeeded ($xlsxUnchanged -and -not $customModel.Workbook.Available) -Message "-ReportOnly -NoExcel leaves the workbook as it is, and the report does not link to it"
+    if ($xlsxHashBefore) {
+        Write-TestResult -Succeeded (@($custom.Output | Where-Object { $_ -match 'WARNING:.*from an earlier report' }).Count -eq 1 -and
+            @($customModel.Caveats | Where-Object { $_ -match 'from an earlier report' }).Count -eq 1) -Message "a workbook left as it is is called out as holding an earlier report's findings (log warning and caveat)"
+    }
 
     # --- 4. A missing rules file and -NoReport: timeline only ---
     $missingDir = Join-Path $workDir "missing-rules"
@@ -306,7 +314,32 @@ try {
     $leftovers = @("findings.csv", "report.html", "report.pdf", "report-model.json") | Where-Object { Test-Path -LiteralPath (Join-Path $noReportDir $_) }
     Write-TestResult -Succeeded ($noReport.ExitCode -eq 0 -and (Test-Path -LiteralPath (Join-Path $noReportDir "timeline.csv")) -and @($leftovers).Count -eq 0) -Message "-NoReport writes the timeline and no report files"
 
-    # --- 5. -ReportOnly without a timeline fails cleanly ---
+    # --- 5. -ReportOnly in a folder whose name has [ ] (wildcard characters),
+    # and with report.pdf held open by another program ---
+    $bracketDir = Join-Path $workDir "case [1]"
+    New-Item -ItemType Directory -Path $bracketDir | Out-Null
+    foreach ($name in @("timeline.csv", "timeline.xlsx", "collection_info.json", "collection_log.txt")) {
+        $from = Join-Path $runDir $name
+        if (Test-Path -LiteralPath $from) { Copy-Item -LiteralPath $from -Destination (Join-Path $bracketDir $name) }
+    }
+    $bracket = Invoke-TimelineBuilder -Arguments @("-ReportOnly", $bracketDir, "-Viewer", "None")
+    $bracketLog = Join-Path $bracketDir "report_log.txt"
+    Write-TestResult -Succeeded ($bracket.ExitCode -eq 0 -and (Test-Path -LiteralPath $bracketLog) -and (Test-Path -LiteralPath (Join-Path $bracketDir "report.html")) -and
+        @($bracket.Output | Where-Object { $_ -match 'Add-Content|Cannot find path|Could not find' }).Count -eq 0) -Message "-ReportOnly works in a folder named 'case [1]' and logs to its report_log.txt (exit code $($bracket.ExitCode))"
+    if ($workbook) {
+        $bracketModel = Get-Content -LiteralPath (Join-Path $bracketDir "report-model.json") -Raw | ConvertFrom-Json
+        Write-TestResult -Succeeded ($bracketModel.Workbook.Available) -Message "-ReportOnly updates the workbook in a folder whose name has [ ]"
+    }
+    $bracketPdf = Join-Path $bracketDir "report.pdf"
+    if ($edge -and (Test-Path -LiteralPath $bracketPdf)) {
+        $holder = [System.IO.File]::Open($bracketPdf, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        try { $locked = Invoke-TimelineBuilder -Arguments @("-ReportOnly", $bracketDir, "-Viewer", "None") }
+        finally { $holder.Dispose() }
+        $newPdfs = @(Get-ChildItem -LiteralPath $bracketDir -Filter "report_*.pdf" -File)
+        Write-TestResult -Succeeded ($locked.ExitCode -eq 0 -and @($locked.Output | Where-Object { $_ -match 'WARNING:.*report\.pdf is open in another program.*OUT OF DATE' }).Count -eq 1 -and $newPdfs.Count -eq 1) -Message "a report.pdf held open elsewhere is reported as out of date and the new PDF gets its own name ($($newPdfs.Name -join ', '))"
+    }
+
+    # --- 6. -ReportOnly without a timeline fails cleanly ---
     $emptyDir = Join-Path $workDir "empty"
     New-Item -ItemType Directory -Path $emptyDir | Out-Null
     $noTimeline = Invoke-TimelineBuilder -Arguments @("-ReportOnly", $emptyDir, "-Viewer", "None")

@@ -1,7 +1,6 @@
 # =============================================================
 # Report rules test
-# Dot-sources report\TimelineReport.Engine.ps1 (built by the engine
-# workstream; present after integration), loads the real report rules
+# Dot-sources report\TimelineReport.Engine.ps1, loads the real report rules
 # (report\report-rules.json) and runs them over a synthetic timeline of
 # cases (tests\fixtures\report\rules\cases.csv).
 #
@@ -15,8 +14,9 @@
 # Row i of the CSV (0-based among data rows) is Excel row i + 2, the same
 # numbering Invoke-ReportRules uses.
 #
-# Exit code 0 = every expectation held (or the engine is not present yet),
-# 1 = a failure. Runs in Windows PowerShell 5.1 and PowerShell 7.
+# Exit code 0 = every expectation held, 1 = a failure (a missing engine,
+# rules file or cases file is a failure). Runs in Windows PowerShell 5.1 and
+# PowerShell 7.
 #
 #   powershell -ExecutionPolicy Bypass -File tests\Test-ReportRules.ps1
 #   ... -EnginePath <TimelineReport.Engine.ps1>   (override the engine path)
@@ -33,23 +33,20 @@ if (-not $RulesPath) { $RulesPath = Join-Path $repoRoot "report\report-rules.jso
 if (-not $CasesPath) { $CasesPath = Join-Path $PSScriptRoot "fixtures\report\rules\cases.csv" }
 
 # --- Locate the engine ---------------------------------------
-if (-not $EnginePath) {
-    $candidates = @(
-        (Join-Path $repoRoot "report\TimelineReport.Engine.ps1"),
-        "C:\Users\buzz\code\.wt\p3-engine\report\TimelineReport.Engine.ps1"
-    )
-    $EnginePath = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-}
-if (-not $EnginePath -or -not (Test-Path -LiteralPath $EnginePath)) {
-    Write-Host "SKIP: TimelineReport.Engine.ps1 not found (it is built by the engine workstream and will be present after integration). Pass -EnginePath to run now." -ForegroundColor Yellow
-    exit 0
+if (-not $EnginePath) { $EnginePath = Join-Path $repoRoot "report\TimelineReport.Engine.ps1" }
+if (-not (Test-Path -LiteralPath $EnginePath)) {
+    Write-Host "FAIL: report engine not found: $EnginePath" -ForegroundColor Red
+    if ($env:GITHUB_ACTIONS) { Write-Host "::error file=tests/Test-ReportRules.ps1::report engine not found: $EnginePath" }
+    exit 1
 }
 if (-not (Test-Path -LiteralPath $RulesPath)) {
     Write-Host "FAIL: report rules file not found: $RulesPath" -ForegroundColor Red
+    if ($env:GITHUB_ACTIONS) { Write-Host "::error file=tests/Test-ReportRules.ps1::report rules file not found" }
     exit 1
 }
 if (-not (Test-Path -LiteralPath $CasesPath)) {
     Write-Host "FAIL: cases fixture not found: $CasesPath" -ForegroundColor Red
+    if ($env:GITHUB_ACTIONS) { Write-Host "::error file=tests/Test-ReportRules.ps1::cases fixture not found" }
     exit 1
 }
 

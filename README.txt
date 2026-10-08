@@ -442,11 +442,17 @@ half a minute to a run.
 
   1  Summary page, written for a manager or client:
        - the bottom line: how many High and Medium leads, and the earliest
-         and latest flagged time (in UTC and the machine's local time);
+         and latest flagged time (in UTC and the machine's local time).
+         Leads dated by file times -- timestomp candidates and
+         Amcache/ShimCache entries, whose times can be years old or forged
+         -- are left out of that window and counted beside it;
        - key facts: computer, operating system, user accounts, when the
-         evidence was collected and how, the machine's time zone, the time
-         span the timeline covers, the Excel workbook;
-       - the top five leads in one plain sentence each;
+         evidence was collected and how, the machine's time zone (marked
+         "assumed" when the collection does not record it), the time span
+         the timeline covers, the Excel workbook;
+       - the top five leads in one plain sentence each: the first lead of
+         each rule (High first), so one rule cannot fill the list, with
+         "and N similar leads" where a rule has more;
        - a box "What this report can't tell you".
      Then "All leads at a glance": every High and Medium lead in one table
      with its first row numbers (the rest of the report is for the analyst).
@@ -454,7 +460,8 @@ half a minute to a run.
      (first and last time, days before the collection), cleared logs,
      boots and shutdowns, logging that was off (no 4688 process creation,
      no 4104 script blocks, no Sysmon, the USN journal's span, ...),
-     collector errors, and the Integrity leads
+     collector errors and warnings (or that the collector's log is
+     missing), and the Integrity leads
   3  Antivirus verdicts       4  Access       5  Persistence
   6  Execution                7  Initial access       8  File system
      (and "Other leads" when a rule uses another category)
@@ -495,12 +502,21 @@ half a minute to a run.
                            the severity (that row is among the evidence);
                            rows set aside by the allowlist; "Every row is
                            from during the collection" (maybe the collector
-                           itself)
+                           itself); "Folds N similar groups" (see
+                           maxFindings below); "Dated by file times"
     evidence rows          row number, time, source and event type,
-                           description and details, user -- earliest
-                           first, up to the rule's limit ("Showing the first
-                           N of M matching rows" when there are more)
+                           description and details, user -- at most 15 on
+                           the card: the rows that raised the severity and
+                           the earliest ("Showing 15 of the 59 rows of this
+                           lead" when there are more). findings.csv and the
+                           Findings sheet list up to the rule's limit
+                           (maxEvidence), and the Finding column tags all
     In Excel: ...          where to find every row of the finding
+
+  Values from the examined computer are shown as text: markup is escaped,
+  and right-to-left override and other invisible formatting characters
+  (used to disguise file names, such as invoice[U+202E]fdp.exe) appear as
+  visible markers like [U+202E], in the report and on the Findings sheet.
 
   Row numbers are rows of the "Timeline" sheet in timeline.xlsx: the header
   is row 1, so the first event is row 2. Type one into Excel's Name Box (or
@@ -537,10 +553,13 @@ half a minute to a run.
   the PDF has bookmarks, and the ids on the summary page and in the index
   link to the cards.
 
-  Without Edge -- or when it fails or needs more than 3 minutes -- a
-  warning is logged and the run goes on: report.html is complete, and any
-  browser can print it to PDF. A report.pdf from an earlier run is removed
-  first, so it never sits next to a newer report.html.
+  Without Edge -- or when it fails or needs more than 3 minutes (plus 12
+  seconds per MB of HTML) -- a warning is logged and the run goes on:
+  report.html is complete, and any browser can print it to PDF. A
+  report.pdf from an earlier run is removed first. When it cannot be
+  removed because a PDF viewer has it open, the new PDF is written as
+  report_<date>_<time>.pdf and a warning says that report.pdf is out of
+  date.
 
   The report links to the workbook with a relative link (./timeline.xlsx),
   not with a full path: the PDF holds no local path (or user name), and the
@@ -558,17 +577,23 @@ half a minute to a run.
   report-model.json in that folder. When timeline.xlsx is there with the
   same number of rows, its Findings sheet and Finding column are replaced
   (close it in Excel first; with -NoExcel it is left alone and the report
-  does not link to it). Nothing is parsed, the collection is not needed,
-  and no Administrator rights are needed. It logs to report_log.txt in the
-  folder. On a 286,000-row timeline it takes about 35 seconds, 20 of them
-  for the workbook.
+  does not link to it). When the workbook is not updated -- -NoExcel,
+  ImportExcel missing, the file open in Excel, a different row count -- it
+  keeps the Findings sheet and Finding column of the earlier report, whose
+  finding ids no longer match: the log and the report's caveats say so.
+  Nothing is parsed, the collection is not needed, and no Administrator
+  rights are needed. It logs to report_log.txt in the folder. On a
+  286,000-row timeline it takes about 35 seconds, 20 of them for the
+  workbook.
 
   The collection facts (computer name, collector user, collection time,
   mode and time zone) come from the collection_info.json and
   collection_log.txt that every run copies next to the timeline. For a
   timeline folder made before the report existed, the collection time, mode
   and time zone are read from its timeline_builder_log.txt and the computer
-  name from the timeline's SystemInfo row.
+  name from the timeline's SystemInfo row. When the original run had to
+  assume the time zone (an older collection or a mounted image without it),
+  the report marks the zone as assumed.
 
 ### Report rules file
 
@@ -597,7 +622,9 @@ half a minute to a run.
                       "sameKey": "user", "match": { ... } },
         "why": "...", "technical": "...", "nextSteps": "...",
         "falsePositives": "...", "references": ["MITRE ATT&CK T1204.002"],
-        "maxEvidence": 40,                     evidence rows shown (25)
+        "maxEvidence": 40,                     evidence rows listed (25)
+        "maxFindings": 5,                      separate leads at most (20)
+        "activityTime": false,                 times are file times (true)
         "enabled": true                        false turns the rule off
       } ],
       "allowlist": [ { "ruleId": "AV-EXCLUSION", "match": { ... },
@@ -624,16 +651,33 @@ half a minute to a run.
   after one of the finding's rows, with the same sameKey value ("user",
   "source", "description", "eventType", "detail:<Key>" or "none"), raises
   the finding to escalate.severity and is added to its evidence.
+  maxEvidence (default 25): the evidence rows findings.csv and the
+  Findings sheet list per finding (the card prints at most 15 of them).
+  maxFindings (default 20; 0 = no limit): at most this many separate leads
+  from the rule. When there are more groups (one per attacking address of
+  a password-spraying run, say), the escalated ones and those with the most
+  rows stay separate and the rest fold into one lead that lists them;
+  every row still gets its id in the Finding column.
+  activityTime false: the rule's row times are file times (which can be
+  years old or forged), so its leads are left out of the summary's
+  flagged-activity window and their cards say so.
   Members whose names start with "_", and "comment" and "notes", are
   comments. Any other unknown member, a bad regular expression or an
   unknown list stops the report with an error that names the rule and the
-  field; the timeline is not affected.
+  field; the timeline is not affected. Each pattern match may take at most
+  2 seconds; a rule whose patterns time out 3 times (a pattern that
+  backtracks badly) is stopped with a warning and reports nothing, so a
+  bad custom rule cannot hang the run.
 
   Tuning:
     - Known-benign activity: add an allowlist entry (a ruleId, or "*" for
       every rule, a match object and a reason). Allowlisted rows are counted
       on the finding and in the log but never flagged. The collector's own
-      temporary Defender exclusion is allowlisted this way.
+      temporary Defender exclusion of its output folder
+      (TriageCollection_<date>_<time>) is allowlisted this way when it is
+      added or removed (Defender Operational 5007, MPLog, and the
+      registry row the builder labels); an exclusion of such a folder that
+      is still in effect after a collection is listed.
     - A rule you don't want: "enabled": false.
     - A noisy rule: narrow its match, add a threshold, group it differently
       or lower its severity. Keep your copy of the file outside the
@@ -643,6 +687,34 @@ half a minute to a run.
     - tests\Test-ReportRules.ps1 checks report\report-rules.json against
       tests\fixtures\report\rules\cases.csv (a matching and a near-miss row
       for every rule); add cases there when you change a rule.
+
+  Where the shipped rules differ from the rule plan, on purpose:
+    - EXEC-STAGING leaves out Temp folders (the plan's R13 lists them):
+      installers unpack and run from Temp all the time. Downloads,
+      Users\Public, PerfLogs and the Recycle Bin are flagged.
+    - ACCESS-RDP-RECONNECT (4778) is Info, not Medium (P5): reconnecting
+      to one's own session is everyday use.
+    - ACCESS-PASSWORD-RESET (4724) is Info, not Medium (P3): creating an
+      account also logs a reset for it, so every new account would be a
+      second lead.
+    - AV-ASR-BLOCK is Medium, as P7 says; Defender's own detections of
+      the same activity are High.
+    - Microsoft Defender reported as off by Security Center is Medium
+      (AV-DEFENDER-PRODUCT-OFF): Windows reports it off whenever another
+      antivirus takes over. Defender's own real-time protection switch-off
+      (5001) stays High (AV-RTP-OFF).
+    - Browser extensions: High only for --load-extension (CommandLine);
+      unpacked, local-policy and registry installs are Medium; enterprise
+      store installs by policy (ExternalPolicyDownload) are not flagged.
+    - EXEC-PS-DOWNLOAD is High only when the download is also run
+      (Invoke-Expression, as the plan's "cradle plus IEX"); a download alone
+      is EXEC-PS-DOWNLOAD-FILE (Medium).
+    - Not expressible with the current rule engine, so not flagged: a
+      task deleted soon after it was created (R7), a timestomped file that
+      also ran (R14 High), a security service stop "near a finding" (R15:
+      crashes and disabling are flagged, routine stops for updates are
+      not), deleted .evtx/.pf files (P17), and downloads from file-sharing
+      hosts (R11).
 
 ### What the report can't tell you
 
@@ -670,8 +742,9 @@ half a minute to a run.
       in later collections.
   Plus, when they apply: credential material in the collection
   (-IncludeSecrets), the -MftDays window, dropped USN entries, a
-  -StartDate/-EndDate range, collector errors, an unknown time zone or
-  collection time, a mounted-image collection, no workbook.
+  -StartDate/-EndDate range, collector errors, an unknown or assumed time
+  zone, an unknown collection time, a mounted-image collection, no
+  workbook (or one that still holds an earlier report's findings).
 
   And about the report itself:
     - The rules only know the patterns in the rules file. Everything else
@@ -1882,8 +1955,10 @@ parsing is skipped, and the timeline CSV can be opened manually.
   (report\TimelineReport.Engine.ps1) on synthetic rows and rules in
   tests\fixtures\report\engine\: every match condition, lists, grouping,
   threshold windows, escalation, the allowlist, numbering, evidence limits,
-  row numbers, invalid rules files (each error names the rule and field),
-  the report model, findings.csv and the timeline CSV reader.
+  maxFindings roll-ups, activityTime, the stop of a rule whose pattern
+  keeps timing out, row numbers, invalid rules files (each error names the
+  rule and field), the report model, findings.csv and the timeline CSV
+  reader.
 
   tests\Test-ReportRules.ps1 -- loads report\report-rules.json with the
   engine and checks it against tests\fixtures\report\rules\cases.csv: rows
@@ -1892,9 +1967,11 @@ parsing is skipped, and the timeline CSV can be opened manually.
 
   tests\Test-ReportRender.ps1 -- renders report.html from the synthetic
   models in tests\fixtures\report\render\ and from in-memory models and
-  checks the sections and their order, the summary page, escaping, the
-  offline page (no scripts or external loads), ASCII output, the charts and
-  the appendix; then prints PDFs with Edge (skipped without Edge) and checks
+  checks the sections and their order, the summary page, escaping (also of
+  right-to-left override characters), long unbroken values, the card's
+  evidence limit, the offline page (no scripts or external loads), ASCII
+  output, the charts and the appendix; then prints PDFs with Edge (skipped
+  without Edge) and checks
   the page size, the relative ./timeline.xlsx link, that no local path is
   in the PDF and that Edge's temporary profile is removed.
 
@@ -1907,8 +1984,10 @@ parsing is skipped, and the timeline CSV can be opened manually.
   first sheet is Findings, every row links to its Timeline row, and the
   Finding column tags exactly the rows of each finding. Then -ReportOnly
   (the same findings, no duplicate sheet or column), -ReportOnly with
-  -ReportRules and -NoExcel, a missing rules file, -NoReport and -ReportOnly
-  without a timeline. It needs admin like the builder, or -BuilderPath with
+  -ReportRules and -NoExcel (the workbook is called stale), a missing rules
+  file, -NoReport, -ReportOnly in a folder named "case [1]" and with
+  report.pdf held open by another program, and -ReportOnly without a
+  timeline. It needs admin like the builder, or -BuilderPath with
   a copy without the admin check that has the report\ folder beside it.
   Like a user run, the builder installs ImportExcel from the PowerShell
   Gallery when it is missing; if it cannot, the workbook checks are SKIPPED.
@@ -1918,8 +1997,9 @@ parsing is skipped, and the timeline CSV can be opened manually.
     powershell -ExecutionPolicy Bypass -File tests\Test-ReportRender.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-ReportBuilder.ps1
 
-  The parser tests above run the builder with its defaults, so they also
-  write a findings report next to their temporary timelines (and remove it).
+  The parser tests above run the builder with -NoReport: the report has
+  its own tests, and a parser test must not fail because Edge is missing
+  or slow on a machine.
 
   Run them from an elevated PowerShell; -AllowSystemChanges lets the event
   log, registry and SRUM tests change this machine:

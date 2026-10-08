@@ -829,7 +829,7 @@ else {
         try {
             Write-Host "Running the builder ($powershellExe) on $collection ..."
             $builderOutput = & $powershellExe -NoProfile -ExecutionPolicy Bypass -File $builder -InputPath $collection -Sources "EventLogs" `
-                -OutputFile $timelineCsv -NoExcel -Viewer None 2>&1
+                -OutputFile $timelineCsv -NoExcel -NoReport -Viewer None 2>&1
             if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $timelineCsv)) {
                 $builderOutput | ForEach-Object { Write-Host "  | $_" }
                 Write-TestResult -Name "Part 2: builder run" -Passed $false -Message "the builder exited with code $LASTEXITCODE or wrote no timeline"

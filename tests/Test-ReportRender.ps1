@@ -185,7 +185,7 @@ try {
         '<td class="num mono">74550</td>', '<td class="num mono">74553</td>', "2026-10-01 09:12:03.412", "Escalated:", 'href="./timeline.xlsx"', "Finding&quot; column")
     $missing = @($fieldChecks | Where-Object { -not $f001.Contains($_) })
     Write-TestResult -Succeeded ($missing.Count -eq 0) -Message "a finding card shows why, technical detail, next steps, false positives, references, evidence rows with Excel row numbers and the workbook link (missing: $($missing -join ' | '))"
-    Write-TestResult -Succeeded ($html.Contains("Showing the first 12 of 40 matching rows.")) -Message "a truncated evidence list says how many rows matched in all"
+    Write-TestResult -Succeeded ($html.Contains("Showing 12 of the 40 rows of this lead (the earliest")) -Message "a truncated evidence list says how many rows the lead has in all"
     Write-TestResult -Succeeded ($html.Contains("1 more matching row was set aside by the allowlist")) -Message "allowlisted rows are counted on the finding"
     $fileSystemStart = $html.IndexOf('id="file-system"')
     $fileSystem = $html.Substring($fileSystemStart, $html.IndexOf('</section>', $fileSystemStart) - $fileSystemStart)
@@ -216,7 +216,7 @@ try {
     Test-HtmlSafety -Html $minimal -Label "the minimal report"
     Write-TestResult -Succeeded ($minimal.Contains("The rules found <b>no High or Medium leads</b>") -and $minimal.Contains("That is not proof that the computer is clean")) -Message "the minimal report says no leads were found, without a verdict"
     Write-TestResult -Succeeded (-not $minimal.Contains("<article") -and -not $minimal.Contains('id="leads"') -and -not $minimal.Contains('href="./')) -Message "the minimal report has no finding cards, no leads index and no workbook link"
-    Write-TestResult -Succeeded ($minimal.Contains("Not created for this timeline (CSV only)")) -Message "the minimal report says the workbook was not created"
+    Write-TestResult -Succeeded ($minimal.Contains("Not created for this timeline (CSV only), or not updated for this report. Row numbers in this report are rows of timeline.csv, counting the header as row 1, as Excel would.</td>")) -Message "the minimal report says the workbook was not created, in a whole sentence that names timeline.csv"
     Write-TestResult -Succeeded ($minimal.Contains("2026-10-08 14:20 UTC") -and $minimal.Contains("Report made 2026-10-08 15:22 UTC")) -Message "/Date(ms)/ dates are read"
     Write-TestResult -Succeeded ($minimal.Contains("credential material") -and $minimal.Contains("size: a4;")) -Message "the minimal report flags credential material and uses A4 when asked"
 
@@ -261,6 +261,53 @@ try {
     Write-TestResult -Succeeded ($engineShape.Contains($csvHash) -and $engineShape.Contains("Collection (zip)</td><td>collection.zip</td>") -and $engineShape.Contains($zipHash) -and -not $engineShape.Contains(">Hashes<")) -Message "Appendix D uses the model's Files.Hashes (timeline.csv, the collection zip) and does not list Hashes as a file"
     Write-TestResult -Succeeded ($engineShape.Contains("Every row is from during the collection")) -Message "a lead whose rows are all from during the collection says it may be the collector's own activity"
     Write-TestResult -Succeeded ($engineShape.Contains(">CSV row</th>") -and -not $engineShape.Contains(">Excel row</th>") -and $engineShape.Contains("Rows are numbered as in timeline.csv")) -Message "without the workbook, row numbers are labelled as timeline.csv rows"
+
+    # --- Hostile and edge values: bidi controls, a long unbroken title, more
+    # evidence than a card prints, a lead dated by file times, a folded lead,
+    # an assumed time zone, a missing collector log, a {{group}} rule title ---
+    $rtlo = [string][char]0x202E
+    $finding.Title = "Lead " + ("x" * 300)
+    $finding.Why = "Short why." + $rtlo + " reversed sentence follows. Second sentence."
+    $finding.Escalated = $true
+    $finding.Count = 29
+    $finding.RowNumbers = @(2001..2030)
+    $finding.EvidenceTruncated = $true
+    $finding.Evidence = @(1..20 | ForEach-Object {
+        [pscustomobject]@{ RowNumber = 2000 + $_; Timestamp = ("2026-10-07 09:13:{0:00}.000" -f $_); Source = "Security.evtx"; EventType = "Logon"; Description = ("invoice" + $rtlo + "fdp.exe row " + $_); User = "carol"; Details = ""; Escalation = ($_ -eq 20) }
+    })
+    $fileTimed = [ordered]@{ Id = "F002"; RuleId = "T-2"; Title = "File-time lead"; Category = "FileSystem"; Severity = "Medium"; Why = "Old file times."; Count = 1; ActivityTime = $false
+        FirstSeenUtc = [datetime]::new(2020, 1, 1, 0, 0, 0, [System.DateTimeKind]::Utc); LastSeenUtc = [datetime]::new(2020, 1, 1, 0, 0, 0, [System.DateTimeKind]::Utc); Evidence = @($evidenceRow) }
+    $foldedLead = [ordered]@{ Id = "F003"; RuleId = "T-1"; Title = "In-memory lead (7 more, folded into one lead)"; Category = "Access"; Severity = "Medium"; Why = "Plain words."; Count = 7; FoldedGroups = 7
+        GroupKey = "7 more: a, b, c, d, e, f, g"; FirstSeenUtc = $collectionStart.AddHours(-3); LastSeenUtc = $collectionStart.AddHours(-2); Evidence = @($evidenceRow) }
+    $memoryModel.Findings = @($finding, $fileTimed, $foldedLead)
+    $memoryModel.Counts = [ordered]@{ High = 1; Medium = 2; Info = 0 }
+    $memoryModel.TopFindings = @("F001", "F002")
+    $memoryModel.Collection.TargetTimeZoneId = "Pacific Standard Time"
+    $memoryModel.Collection.TargetTimeZoneAssumed = $true
+    $memoryModel.Coverage.CollectorErrors = [ordered]@{ Available = $false; Count = $null; Lines = @() }
+    $memoryModel.Rules = @([ordered]@{ Id = "T-1"; Title = "Lead about {{group}}"; Severity = "High"; Category = "Access" })
+    Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath -NoFileHashes
+    $hostile = [System.IO.File]::ReadAllText($memoryHtmlPath)
+    Write-TestResult -Succeeded ($hostile.Contains("invoice[U+202E]fdp.exe row 1") -and $hostile.Contains("Short why.[U+202E] reversed") -and -not $hostile.Contains("&#x202E;")) -Message "a right-to-left override in a value becomes a visible [U+202E] marker, so it cannot reverse the report's text"
+    Write-TestResult -Succeeded ($hostile.Contains("Lead " + ("x" * 155) + " [...]") -and -not $hostile.Contains("x" * 200)) -Message "a long title is cut on the card and in the index (the full value stays under 'Grouped by')"
+    Write-TestResult -Succeeded ($hostile.Contains("h1, h2, h3, h4, p, li, td, th, div, span, a { overflow-wrap: anywhere; }")) -Message "long unbroken values wrap anywhere, so a page is never wider than the paper (Chromium would shrink the whole PDF)"
+    $hostileCardStart = $hostile.IndexOf('id="finding-F001"')
+    $hostileCard = $hostile.Substring($hostileCardStart, $hostile.IndexOf('</article>', $hostileCardStart) - $hostileCardStart)
+    $printedRows = @([regex]::Matches($hostileCard, '<td class="num mono">(\d+)</td>') | ForEach-Object { $_.Groups[1].Value })
+    Write-TestResult -Succeeded ($printedRows.Count -eq 15 -and $printedRows -contains "2020" -and $printedRows -contains "2001" -and $printedRows -notcontains "2015") -Message "a card prints 15 evidence rows: the row that raised the severity and the earliest ($($printedRows -join ','))"
+    Write-TestResult -Succeeded ($hostileCard.Contains("Showing 15 of the 30 rows of this lead (the earliest, and the rows that raised its severity). findings.csv lists 20.")) -Message "the card says how many rows it shows, of how many, and where the rest are"
+    $hostileSummary = $hostile.Substring($hostile.IndexOf('id="summary"'), $hostile.IndexOf('" id="leads">') - $hostile.IndexOf('id="summary"'))
+    Write-TestResult -Succeeded ($hostileSummary.Contains("<b>2026-10-07 14:20 UTC") -and -not $hostileSummary.Contains("<b>2020-01-01") -and $hostileSummary.Contains("(plus 1 lead dated by file times")) -Message "the flagged-activity window leaves out a lead dated by file times and says so"
+    Write-TestResult -Succeeded ($hostileSummary.Contains("(and 1 similar lead)")) -Message "a top lead says how many more leads its rule has"
+    Write-TestResult -Succeeded ($hostileSummary.Contains("<b>assumed</b>: the collection does not record the computer&#39;s time zone")) -Message "an assumed time zone is marked as assumed"
+    Write-TestResult -Succeeded ($hostile.Contains("Folds 7 similar groups of this rule into one lead") -and $hostile.Contains("Dated by file times")) -Message "a folded lead and a lead dated by file times are flagged on their cards"
+    Write-TestResult -Succeeded ($hostile.Contains("collection_log.txt) was not available, so problems during the collection are unknown") -and -not $hostile.Contains("logged no errors")) -Message "a missing collector log is not reported as a collection without errors"
+    Write-TestResult -Succeeded ($hostile.Contains(">Lead about</td>") -and -not $hostile.Contains("{{group}}")) -Message "Appendix B shows rule titles without the {{group}} placeholder"
+    Write-TestResult -Succeeded ($hostile.Contains("2001, 2002, 2003 +27 more")) -Message "the leads index counts every row of a lead after the first ones, not only evidence rows"
+    $memoryModel.Coverage.CollectorErrors = [ordered]@{ Available = $true; Count = 0; WarningCount = 1; Lines = @("[2026-10-08 14:20:00] WARNING: Could not copy BBI") }
+    Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath -NoFileHashes
+    $warned = [System.IO.File]::ReadAllText($memoryHtmlPath)
+    Write-TestResult -Succeeded ($warned.Contains("The collector logged 0 errors and 1 warning.") -and $warned.Contains("WARNING: Could not copy BBI")) -Message "collector warnings are counted as warnings, not errors"
 
     # --- PDF with Microsoft Edge ---
     $result = @(ConvertTo-ReportPdf -HtmlPath $fullHtmlPath -PdfPath (Join-Path $fullDir "nope.pdf") -EdgePath (Join-Path $workDir "no-such-folder\msedge.exe"))

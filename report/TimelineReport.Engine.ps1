@@ -89,6 +89,9 @@ namespace TimelineReport
         public int[] EvidenceRows;
         public long FirstTicks = -1;
         public long LastTicks = -1;
+        // A roll-up group (Engine.Fold): how many groups it stands for, and their keys
+        public int FoldedGroups;
+        public List<string> FoldedKeys = new List<string>();
     }
 
     public sealed class RuleResult
@@ -100,6 +103,9 @@ namespace TimelineReport
         public List<GroupResult> Groups = new List<GroupResult>();
         public int RegexTimeouts;
         public double Milliseconds;
+        // Set when the rule was stopped (repeated regex timeouts or its time
+        // budget): Groups is then empty and Abandoned says why
+        public string Abandoned;
     }
 
     // The timeline rows as column arrays, built once per row list: the rules
@@ -344,6 +350,13 @@ namespace TimelineReport
 
     public static class Engine
     {
+        // A rule is stopped after this many regex match timeouts (each match is
+        // limited by the regex's own timeout), or when it has run this long: a
+        // backtracking pattern in a custom rules file would otherwise cost the
+        // timeout on every row
+        public static int MaxRegexTimeouts = 3;
+        public static long RuleBudgetMilliseconds = 120000;
+
         // A match object with its Source / EventType / User conditions already
         // tested against every distinct value of the row table
         sealed class Prepared
@@ -515,8 +528,33 @@ namespace TimelineReport
             return kept;
         }
 
+        // Why the rule must stop now (too many regex timeouts, or out of time),
+        // or null to go on
+        static string StopReason(int[] timeouts, Stopwatch watch)
+        {
+            if (timeouts[0] >= MaxRegexTimeouts)
+            {
+                return "its patterns timed out " + timeouts[0].ToString(CultureInfo.InvariantCulture) + " times (each match is limited, so a pattern that backtracks badly would cost that limit on every row)";
+            }
+            if (RuleBudgetMilliseconds > 0 && watch.ElapsedMilliseconds > RuleBudgetMilliseconds)
+            {
+                return "it ran longer than " + (RuleBudgetMilliseconds / 1000).ToString(CultureInfo.InvariantCulture) + " seconds";
+            }
+            return null;
+        }
+
+        static RuleResult Abandon(RuleResult result, string reason, int[] timeouts, Stopwatch watch)
+        {
+            result.Abandoned = reason;
+            result.Groups.Clear();
+            result.RegexTimeouts = timeouts[0];
+            result.Milliseconds = watch.Elapsed.TotalMilliseconds;
+            return result;
+        }
+
         // Evaluates one rule over all rows: base match AND (any anyOf), minus
-        // allowlisted rows, grouped, thresholded, then escalated
+        // allowlisted rows, grouped, thresholded, then escalated. A rule that
+        // keeps timing out or runs out of time is stopped (Abandoned).
         public static RuleResult Evaluate(RowTable t, CompiledRule rule, long collectionStartTicks)
         {
             Stopwatch watch = Stopwatch.StartNew();
@@ -527,13 +565,22 @@ namespace TimelineReport
             Prepared[] anyOf = PrepareAll(t, rule.AnyOf, timeouts);
             Prepared[] allow = PrepareAll(t, rule.Allowlist, timeouts);
             result.AllowlistedPerEntry = new int[allow.Length];
+            string stop = StopReason(timeouts, watch);
+            if (stop != null) return Abandon(result, stop, timeouts, watch);
 
             Dictionary<string, GroupResult> groups = new Dictionary<string, GroupResult>(StringComparer.OrdinalIgnoreCase);
             List<GroupResult> order = new List<GroupResult>();
             Dictionary<string, int> allowlistedByKey = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             long start = collectionStartTicks;
+            int seenTimeouts = 0;
             for (int i = 0; i < t.Count; i++)
             {
+                if (timeouts[0] != seenTimeouts || (i & 4095) == 0)
+                {
+                    seenTimeouts = timeouts[0];
+                    stop = StopReason(timeouts, watch);
+                    if (stop != null) return Abandon(result, stop, timeouts, watch);
+                }
                 if (!IsMatch(t, baseMatch, i, start, timeouts)) continue;
                 if (anyOf.Length > 0 && FirstMatch(t, anyOf, i, start, timeouts) < 0) continue;
                 result.MatchedRows++;
@@ -574,7 +621,8 @@ namespace TimelineReport
 
             if (rule.EscalateMatch != null && result.Groups.Count > 0)
             {
-                Escalate(t, rule, result.Groups, allow, start, timeouts);
+                stop = Escalate(t, rule, result.Groups, allow, start, timeouts, watch);
+                if (stop != null) return Abandon(result, stop, timeouts, watch);
             }
             result.RegexTimeouts = timeouts[0];
             result.Milliseconds = watch.Elapsed.TotalMilliseconds;
@@ -582,15 +630,23 @@ namespace TimelineReport
         }
 
         // Adds to each group the rows that match escalate.match within the
-        // window after one of the group's rows (with the same sameKey value)
-        static void Escalate(RowTable t, CompiledRule rule, List<GroupResult> groups, Prepared[] allow, long start, int[] timeouts)
+        // window after one of the group's rows (with the same sameKey value).
+        // Returns why the rule must stop, or null.
+        static string Escalate(RowTable t, CompiledRule rule, List<GroupResult> groups, Prepared[] allow, long start, int[] timeouts, Stopwatch watch)
         {
             Prepared escalate = Prepare(t, rule.EscalateMatch, timeouts);
             bool anyKey = rule.EscalateKey == null || rule.EscalateKey.Kind == "none";
             List<int> candidates = new List<int>();
             List<string> candidateKeys = new List<string>();
+            int seenTimeouts = -1;
             for (int i = 0; i < t.Count; i++)
             {
+                if (timeouts[0] != seenTimeouts || (i & 4095) == 0)
+                {
+                    seenTimeouts = timeouts[0];
+                    string stop = StopReason(timeouts, watch);
+                    if (stop != null) return stop;
+                }
                 if (t.Ticks[i] < 0 || !IsMatch(t, escalate, i, start, timeouts)) continue;
                 if (FirstMatch(t, allow, i, start, timeouts) >= 0) continue;
                 string key = anyKey ? "" : GetKey(t, i, rule.EscalateKey, null, timeouts);
@@ -598,7 +654,7 @@ namespace TimelineReport
                 candidates.Add(i);
                 candidateKeys.Add(key);
             }
-            if (candidates.Count == 0) return;
+            if (candidates.Count == 0) return null;
 
             foreach (GroupResult g in groups)
             {
@@ -630,6 +686,69 @@ namespace TimelineReport
                     if (at >= 0 && tc - list[at] <= rule.EscalateWindowTicks) g.EscalationRows.Add(row);
                 }
             }
+            return null;
+        }
+
+        // Keeps at most maxFindings groups of a rule. When there are more, the
+        // first (maxFindings - 1) by priority stay and all the others fold into
+        // one roll-up group at the end, so a rule can never flood the report
+        // (one group per attacking address of a brute force, say). Priority:
+        // escalated groups, then more rows, then the earlier first row, then
+        // the key. The roll-up keeps every row (the Finding column tags them
+        // all) and the folded keys, most rows first. maxFindings < 2: no limit.
+        public static void Fold(RowTable t, RuleResult result, int maxFindings)
+        {
+            if (maxFindings < 2 || result.Groups.Count <= maxFindings) return;
+            long[] ticks = t.Ticks;
+            Dictionary<GroupResult, long> firstRow = new Dictionary<GroupResult, long>();
+            foreach (GroupResult g in result.Groups)
+            {
+                long f = long.MaxValue;
+                foreach (int r in g.Rows)
+                {
+                    if (ticks[r] >= 0 && ticks[r] < f) f = ticks[r];
+                }
+                firstRow[g] = f;
+            }
+            List<GroupResult> ranked = new List<GroupResult>(result.Groups);
+            ranked.Sort(delegate(GroupResult a, GroupResult b)
+            {
+                int c = (b.EscalationRows.Count > 0).CompareTo(a.EscalationRows.Count > 0);
+                if (c != 0) return c;
+                c = b.Rows.Count.CompareTo(a.Rows.Count);
+                if (c != 0) return c;
+                c = firstRow[a].CompareTo(firstRow[b]);
+                if (c != 0) return c;
+                return StringComparer.OrdinalIgnoreCase.Compare(a.Key, b.Key);
+            });
+            HashSet<GroupResult> keep = new HashSet<GroupResult>();
+            for (int k = 0; k < maxFindings - 1; k++) keep.Add(ranked[k]);
+            GroupResult rollUp = new GroupResult();
+            rollUp.Key = "";
+            HashSet<int> escalation = new HashSet<int>();
+            for (int k = maxFindings - 1; k < ranked.Count; k++)
+            {
+                GroupResult g = ranked[k];
+                rollUp.Rows.AddRange(g.Rows);
+                foreach (int r in g.EscalationRows) escalation.Add(r);
+                rollUp.Allowlisted += g.Allowlisted;
+                rollUp.FoldedGroups++;
+                rollUp.FoldedKeys.Add(g.Key);
+            }
+            HashSet<int> own = new HashSet<int>(rollUp.Rows);
+            foreach (int r in escalation)
+            {
+                if (!own.Contains(r)) rollUp.EscalationRows.Add(r);
+            }
+            rollUp.Rows.Sort();
+            rollUp.EscalationRows.Sort();
+            List<GroupResult> kept = new List<GroupResult>();
+            foreach (GroupResult g in result.Groups)
+            {
+                if (keep.Contains(g)) kept.Add(g);
+            }
+            kept.Add(rollUp);
+            result.Groups = kept;
         }
 
         // All rows (rule rows and escalation rows, ascending), the first and
@@ -1176,6 +1295,10 @@ namespace TimelineReport
 # Rules file
 # =============================================================
 
+# Match timeout of every rule pattern (set it before Import-ReportRules). A
+# rule is stopped after [TimelineReport.Engine]::MaxRegexTimeouts timeouts.
+$script:ReportEngineRegexTimeout = [TimeSpan]::FromSeconds(2)
+
 # Message of an invalid-rules-file error: names the file, the rule and the field
 function Format-ReportEngineRuleError {
     param([string]$File, [string]$Where, [string]$Problem)
@@ -1222,7 +1345,8 @@ function Assert-ReportEngineMembers {
 # Regex from a rule pattern: {{list:<name>}} becomes (?:escaped1|escaped2|...).
 # Case-insensitive, culture-invariant, and "." also matches line breaks
 # (Details can hold multi-line script blocks and privilege lists). A match
-# timeout keeps a runaway pattern from hanging the builder.
+# timeout ($script:ReportEngineRegexTimeout) plus the engine's stop after a
+# few timeouts keep a runaway pattern from hanging the builder.
 function ConvertTo-ReportEngineRegex {
     param($Pattern, [hashtable]$Lists, [string]$File, [string]$Where)
     if (-not ($Pattern -is [string])) {
@@ -1245,8 +1369,10 @@ function ConvertTo-ReportEngineRegex {
     [void]$text.Append($Pattern, $position, $Pattern.Length - $position)
     $options = [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::CultureInvariant -bor
         [System.Text.RegularExpressions.RegexOptions]::Singleline
+    $timeout = $script:ReportEngineRegexTimeout
+    if (-not ($timeout -is [TimeSpan]) -or $timeout -le [TimeSpan]::Zero) { $timeout = [TimeSpan]::FromSeconds(2) }
     try {
-        return [System.Text.RegularExpressions.Regex]::new($text.ToString(), $options, [TimeSpan]::FromSeconds(2))
+        return [System.Text.RegularExpressions.Regex]::new($text.ToString(), $options, $timeout)
     }
     catch {
         $inner = $_.Exception
@@ -1384,7 +1510,7 @@ function Import-ReportRules {
         throw (Format-ReportEngineRuleError -File $file -Where "rules" -Problem "must be a non-empty array of rules")
     }
     $ruleFields = @("id", "title", "category", "severity", "match", "anyOf", "groupBy", "threshold", "escalate", "why",
-        "technical", "nextSteps", "falsePositives", "references", "maxEvidence", "enabled", "comment", "notes")
+        "technical", "nextSteps", "falsePositives", "references", "maxEvidence", "maxFindings", "activityTime", "enabled", "comment", "notes")
     $rules = New-Object System.Collections.Generic.List[object]
     $ruleIds = @{}
     for ($n = 0; $n -lt $rulesJson.Count; $n++) {
@@ -1429,6 +1555,19 @@ function Import-ReportRules {
         if (-not (Test-ReportEngineInteger $maxEvidence) -or [int]$maxEvidence -lt 1 -or [int]$maxEvidence -gt 10000) {
             throw (Format-ReportEngineRuleError -File $file -Where "$where.maxEvidence" -Problem "must be a whole number from 1 to 10000")
         }
+        # maxFindings: at most this many findings from the rule; the groups
+        # beyond it fold into one roll-up finding (0 = no limit)
+        $maxFindings = Get-ReportEngineMember $ruleJson "maxFindings"
+        if ($null -eq $maxFindings) { $maxFindings = 20 }
+        if (-not (Test-ReportEngineInteger $maxFindings) -or [int]$maxFindings -lt 0 -or [int]$maxFindings -eq 1 -or [int]$maxFindings -gt 10000) {
+            throw (Format-ReportEngineRuleError -File $file -Where "$where.maxFindings" -Problem "must be 0 (no limit) or a whole number from 2 to 10000")
+        }
+        # activityTime false: the rule's row times are file times (which can be
+        # old or forged), not activity times; the summary leaves them out of
+        # the flagged-activity window
+        $activityTime = Get-ReportEngineMember $ruleJson "activityTime"
+        if ($null -eq $activityTime) { $activityTime = $true }
+        if (-not ($activityTime -is [bool])) { throw (Format-ReportEngineRuleError -File $file -Where "$where.activityTime" -Problem "must be true or false") }
         $enabled = Get-ReportEngineMember $ruleJson "enabled"
         if ($null -eq $enabled) { $enabled = $true }
         if (-not ($enabled -is [bool])) { throw (Format-ReportEngineRuleError -File $file -Where "$where.enabled" -Problem "must be true or false") }
@@ -1512,6 +1651,8 @@ function Import-ReportRules {
             Threshold      = $threshold
             Escalate       = $escalate
             MaxEvidence    = [int]$maxEvidence
+            MaxFindings    = [int]$maxFindings
+            ActivityTime   = $activityTime
             Enabled        = $enabled
             Compiled       = $compiled
         })
@@ -1678,9 +1819,14 @@ function Invoke-ReportRules {
     foreach ($rule in $Rules.Rules) {
         if (-not $rule.Enabled) { continue }
         $result = [TimelineReport.Engine]::Evaluate($table, $rule.Compiled, $startTicks)
-        if ($result.RegexTimeouts -gt 0) {
+        if ($result.Abandoned) {
+            Write-Warning "Report rule $($rule.Id) was stopped and reports nothing: $($result.Abandoned). Fix or disable its pattern in the rules file."
+        }
+        elseif ($result.RegexTimeouts -gt 0) {
             Write-Warning "Report rule $($rule.Id): $($result.RegexTimeouts) regular expression match(es) timed out; those rows were not flagged."
         }
+        $groupsBeforeFold = $result.Groups.Count
+        [TimelineReport.Engine]::Fold($table, $result, $rule.MaxFindings)
         foreach ($group in $result.Groups) {
             [TimelineReport.Engine]::Summarize($table, $group, $rule.MaxEvidence)
             $severity = $rule.Severity
@@ -1692,13 +1838,27 @@ function Invoke-ReportRules {
             foreach ($index in $group.EscalationRows) { [void]$escalationRows.Add($index) }
             $evidence = @(foreach ($index in $group.EvidenceRows) { New-ReportEngineRowObject -Table $table -Index $index -Escalation $escalationRows.Contains($index) })
             $groupKey = $group.Key
+            $title = $rule.Title.Replace("{{group}}", $groupKey)
+            $why = $rule.Why.Replace("{{group}}", $groupKey)
+            $foldedKeys = [string[]]@()
+            if ($group.FoldedGroups -gt 0) {
+                # The roll-up of the groups beyond maxFindings: its key lists
+                # the folded values (most rows first), shortened for display
+                $foldedKeys = [string[]]@($group.FoldedKeys | Select-Object -First 200)
+                $shown = @($group.FoldedKeys | Select-Object -First 20 | ForEach-Object { if ("$_") { Limit-ReportEngineText "$_" 120 } else { "(blank)" } })
+                $groupKey = "$($group.FoldedGroups) more: " + ($shown -join ", ")
+                if ($group.FoldedGroups -gt $shown.Count) { $groupKey += ", ..." }
+                $label = "$($group.FoldedGroups) more, folded into one lead"
+                if ($rule.Title.Contains("{{group}}")) { $title = $rule.Title.Replace("{{group}}", $label) } else { $title = "$($rule.Title) ($label)" }
+                $why = $rule.Why.Replace("{{group}}", "several") + " This lead folds together $($group.FoldedGroups) more groups of the rule (it keeps at most $($rule.MaxFindings) leads); every row is in the Findings sheet and findings.csv."
+            }
             $findings.Add([PSCustomObject]@{
                 Id                = ""
                 RuleId            = $rule.Id
-                Title             = $rule.Title.Replace("{{group}}", $groupKey)
+                Title             = $title
                 Category          = $rule.Category
                 Severity          = $severity
-                Why               = $rule.Why.Replace("{{group}}", $groupKey)
+                Why               = $why
                 Technical         = $rule.Technical
                 NextSteps         = $rule.NextSteps
                 FalsePositives    = $rule.FalsePositives
@@ -1715,6 +1875,9 @@ function Invoke-ReportRules {
                 EscalationCount   = $group.EscalationRows.Count
                 RowNumbers        = $group.RowNumbers
                 DuringCollection  = ($startTicks -ge 0 -and $group.FirstTicks -ge $startTicks)
+                ActivityTime      = [bool]$rule.ActivityTime
+                FoldedGroups      = $group.FoldedGroups
+                FoldedKeys        = $foldedKeys
             })
         }
         if ($null -ne $Statistics) {
@@ -1728,8 +1891,10 @@ function Invoke-ReportRules {
                 MatchedRows     = $result.MatchedRows
                 AllowlistedRows = $result.AllowlistedRows
                 Findings        = $result.Groups.Count
+                Groups          = $groupsBeforeFold
                 Milliseconds    = [Math]::Round($result.Milliseconds, 1)
                 RegexTimeouts   = $result.RegexTimeouts
+                Abandoned       = [string]$result.Abandoned
                 Allowlisted     = [object[]]$allowlisted
             }
         }
@@ -2003,12 +2168,16 @@ function New-ReportModel {
     }
     $secrets = [bool](Get-ReportEngineInfoValue $CollectionInfo @("SecretsIncluded"))
     $thunderbird = [bool](Get-ReportEngineInfoValue $CollectionInfo @("ThunderbirdIndexIncluded"))
+    # The builder assumes the collecting computer's zone when the collection
+    # does not record the examined computer's (older collections, images)
+    $zoneAssumed = [bool]$zoneId -and [bool](Get-ReportEngineInfoValue $CollectionInfo @("TargetTimeZoneAssumed"))
     $collection = [PSCustomObject]@{
         ComputerName             = $computer
         OS                       = $os
         Users                    = [string[]]@($users)
         Mode                     = $mode
         TargetTimeZoneId         = if ($zoneId) { [string]$zoneId } else { "" }
+        TargetTimeZoneAssumed    = $zoneAssumed
         CollectionStartUtc       = $collectionStart
         CollectorUser            = $collectorUser
         SecretsIncluded          = $secrets
@@ -2020,8 +2189,35 @@ function New-ReportModel {
     $leads = @($all | Where-Object { $_.Severity -eq "High" -or $_.Severity -eq "Medium" })
     $info = @($all | Where-Object { $_.Severity -ne "High" -and $_.Severity -ne "Medium" })
     $highCount = @($leads | Where-Object { $_.Severity -eq "High" }).Count
-    $leadFirst = $leads | Where-Object { $_.FirstSeenUtc } | ForEach-Object { $_.FirstSeenUtc } | Sort-Object | Select-Object -First 1
-    $leadLast = $leads | Where-Object { $_.LastSeenUtc } | ForEach-Object { $_.LastSeenUtc } | Sort-Object -Descending | Select-Object -First 1
+    # The flagged-activity window leaves out leads dated by file times
+    # (activityTime false: timestomp candidates, Amcache/ShimCache entries)
+    $timedLeads = @($leads | Where-Object { -not ($_.PSObject.Properties["ActivityTime"] -and $_.ActivityTime -eq $false) })
+    $leadFirst = $timedLeads | Where-Object { $_.FirstSeenUtc } | ForEach-Object { $_.FirstSeenUtc } | Sort-Object | Select-Object -First 1
+    $leadLast = $timedLeads | Where-Object { $_.LastSeenUtc } | ForEach-Object { $_.LastSeenUtc } | Sort-Object -Descending | Select-Object -First 1
+    # Top leads: the first lead of each rule (High first, then by time), then
+    # the next ones, so one rule cannot fill the summary page. Within a
+    # severity, leads dated by file times come last: an old or forged file
+    # time would otherwise put them first.
+    $leadOrder = @{}
+    for ($i = 0; $i -lt $leads.Count; $i++) { $leadOrder[[string]$leads[$i].Id] = $i }
+    $candidates = @($leads | Sort-Object -Property @{ Expression = { - (Get-ReportEngineSeverityRank $_.Severity) } },
+        @{ Expression = { if ($_.PSObject.Properties["ActivityTime"] -and $_.ActivityTime -eq $false) { 1 } else { 0 } } },
+        @{ Expression = { $leadOrder[[string]$_.Id] } })
+    $topIds = New-Object System.Collections.Generic.List[string]
+    $topRules = @{}
+    foreach ($lead in $candidates) {
+        if ($topIds.Count -ge 5) { break }
+        if ($topRules.ContainsKey([string]$lead.RuleId)) { continue }
+        $topRules[[string]$lead.RuleId] = $true
+        $topIds.Add([string]$lead.Id)
+    }
+    foreach ($lead in $candidates) {
+        if ($topIds.Count -ge 5) { break }
+        if (-not $topIds.Contains([string]$lead.Id)) { $topIds.Add([string]$lead.Id) }
+    }
+    $candidateOrder = @{}
+    for ($i = 0; $i -lt $candidates.Count; $i++) { $candidateOrder[[string]$candidates[$i].Id] = $i }
+    $topFindings = [string[]]@($topIds | Sort-Object { $candidateOrder[$_] })
 
     # --- Coverage ---
     $sources = @(foreach ($s in $stats.Sources) {
@@ -2102,10 +2298,11 @@ function New-ReportModel {
         $collectorErrorCount = @($collectorLog.ProblemLines | Where-Object { $_ -match '\] ERROR: ' }).Count
     }
     $collectorErrors = [PSCustomObject]@{
-        Available = $collectorLog.Available
-        Count     = $collectorErrorCount
-        Lines     = [string[]]@($collectorLog.ProblemLines | Select-Object -First 50)
-        LineCount = @($collectorLog.ProblemLines).Count
+        Available    = $collectorLog.Available
+        Count        = $collectorErrorCount
+        WarningCount = @($collectorLog.ProblemLines | Where-Object { $_ -match '\] WARNING: ' }).Count
+        Lines        = [string[]]@($collectorLog.ProblemLines | Select-Object -First 50)
+        LineCount    = @($collectorLog.ProblemLines).Count
     }
     $builderWarnings = [PSCustomObject]@{
         Available = $builderLog.Available
@@ -2139,6 +2336,9 @@ function New-ReportModel {
     if (-not $zoneId) {
         $caveats.Add("The computer's time zone is unknown: times that Windows records in local time were converted with an assumed time zone.")
     }
+    elseif ($zoneAssumed) {
+        $caveats.Add("The computer's time zone was not recorded in the collection: $zoneId (the collecting computer's) was assumed for times that Windows records in local time, and for the machine times shown here.")
+    }
     if ($mode -eq "MountedImage") {
         $caveats.Add("The collection was made from a mounted disk image, so live state (running programs, network connections, the DNS cache) is not included.")
     }
@@ -2164,7 +2364,10 @@ function New-ReportModel {
     $workbookName = if ($WorkbookPath) { Split-Path -Leaf $WorkbookPath } else { [System.IO.Path]::ChangeExtension($timelineName, ".xlsx") }
     $workbookExists = [bool]($WorkbookPath -and (Test-Path -LiteralPath $WorkbookPath -PathType Leaf))
     $workbookOk = if ($PSBoundParameters.ContainsKey("WorkbookAvailable")) { [bool]$WorkbookAvailable } else { $workbookExists }
-    if (-not $workbookOk) {
+    if (-not $workbookOk -and $workbookExists) {
+        $caveats.Add("The Excel workbook ($workbookName) was not updated for this report, so the report has no Excel links: any Findings sheet or Finding column in it is from an earlier report, and its finding ids do not match these. Row numbers are the rows of $timelineName (the header is row 1, as Excel shows it).")
+    }
+    elseif (-not $workbookOk) {
         $caveats.Add("The Excel workbook ($workbookName) was not created or not updated for this report, so the report has no Excel links. Its row numbers are the rows of $timelineName (the header is row 1, as Excel shows it).")
     }
     $findingsName = if ($FindingsCsvPath) { Split-Path -Leaf $FindingsCsvPath } else { "findings.csv" }
@@ -2180,8 +2383,10 @@ function New-ReportModel {
         catch { Write-Warning "Could not hash $target : $($_.Exception.Message)" }
     }
 
+    # Rule titles without the {{group}} placeholder ("A known tool ran: {{group}}")
     $ruleList = @(foreach ($rule in @(if ($Rules) { $Rules.Rules })) {
-        [PSCustomObject]@{ Id = $rule.Id; Title = $rule.Title; Severity = $rule.Severity; Category = $rule.Category; Enabled = $rule.Enabled }
+        $ruleTitle = ($rule.Title -replace '\s*[:(-]?\s*\{\{group\}\}\)?', '').Trim()
+        [PSCustomObject]@{ Id = $rule.Id; Title = $ruleTitle; Severity = $rule.Severity; Category = $rule.Category; Enabled = $rule.Enabled }
     })
     $allowlisted = @(if ($RuleStatistics) {
         foreach ($key in ($RuleStatistics.Keys | Sort-Object)) { foreach ($entry in $RuleStatistics[$key].Allowlisted) { $entry } }
@@ -2197,8 +2402,8 @@ function New-ReportModel {
             Rows     = $table.Count
         }
         Counts        = [PSCustomObject]@{ High = $highCount; Medium = $leads.Count - $highCount; Info = $info.Count }
-        LeadSpan      = [PSCustomObject]@{ FirstUtc = $leadFirst; LastUtc = $leadLast }
-        TopFindings   = [string[]]@($leads | Select-Object -First 5 | ForEach-Object { $_.Id })
+        LeadSpan      = [PSCustomObject]@{ FirstUtc = $leadFirst; LastUtc = $leadLast; FileTimeLeads = $leads.Count - $timedLeads.Count }
+        TopFindings   = $topFindings
         Findings      = [object[]]$leads
         InfoFindings  = [object[]]$info
         Coverage      = [PSCustomObject]@{

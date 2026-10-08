@@ -582,7 +582,7 @@ try {
     Write-Host "Running the builder ($powershellExe) on $collection ..."
     $hivesBefore = Get-BuilderHiveState
     $builderOutput = & $powershellExe -NoProfile -ExecutionPolicy Bypass -File $builder `
-        -InputPath $collection -Sources "Registry,ScheduledTasks" -OutputFile $timelineCsv -NoExcel -Viewer None 2>&1
+        -InputPath $collection -Sources "Registry,ScheduledTasks" -OutputFile $timelineCsv -NoExcel -NoReport -Viewer None 2>&1
     $windowEnd = [datetime]::UtcNow.AddMinutes(2)
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $timelineCsv)) {
         $builderOutput | ForEach-Object { Write-Host "  | $_" }

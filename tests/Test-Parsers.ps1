@@ -35,7 +35,7 @@ try {
     Write-Host "Running the builder ($powershellExe) on $fixtureDir\collection ..."
     $builderOutput = & $powershellExe -NoProfile -ExecutionPolicy Bypass -File $builder `
         -InputPath (Join-Path $fixtureDir "collection") -Sources "AntiVirus" `
-        -OutputFile $timelineCsv -NoExcel -Viewer None 2>&1
+        -OutputFile $timelineCsv -NoExcel -NoReport -Viewer None 2>&1
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $timelineCsv)) {
         $builderOutput | ForEach-Object { Write-Host "  | $_" }
         Write-Host "FAIL: the builder exited with code $LASTEXITCODE or wrote no timeline" -ForegroundColor Red

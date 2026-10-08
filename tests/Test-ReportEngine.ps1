@@ -7,11 +7,13 @@
 #     (rule, description, user, source, capture and detail:<Key> with both
 #     Details styles), threshold windows, escalate with sameKey, allowlist
 #     (per rule and "*", duringCollection), disabled rules, numbering and
-#     ordering, evidence caps and Excel row numbers;
+#     ordering, evidence caps and Excel row numbers, maxFindings roll-ups,
+#     activityTime, and the stop of a rule whose pattern keeps timing out;
 #   - invalid rules files fail with an error that names the rule and field;
 #   - the report model: coverage per source, log clears, boots, audit notes,
-#     collector errors, activity per day / hour / source / user, caveats,
-#     top findings, file hashes;
+#     collector errors and warnings, activity per day / hour / source / user,
+#     caveats (assumed time zone, stale workbook), top findings (one per
+#     rule first), the lead window, rule titles, file hashes;
 #   - findings.csv, report-model.json and Import-TimelineCsvForReport
 #     (fields with line breaks, quotes and commas).
 # Needs no Administrator rights and does not run the builder.
@@ -293,6 +295,50 @@ try {
     try { $null = Invoke-ReportRules -Rows $rows -Rules (Join-Path $fixtureDir "rules.json") } catch { $message = $_.Exception.Message }
     Write-TestResult -Succeeded ($message -match 'Import-ReportRules') -Message "Invoke-ReportRules refuses rules that were not imported ($message)"
 
+    # maxFindings: the groups beyond the limit fold into one roll-up finding
+    # (every row kept); activityTime false is carried to the findings
+    $foldRules = Join-Path $workDir "fold-rules.json"
+    New-TestTextFile $foldRules '{ "schemaVersion": 1, "rules": [ { "id": "FOLD", "title": "Burst from {{group}}", "category": "Access", "severity": "Medium", "match": { "description": "^fail from (?<key>\\S+)$" }, "groupBy": "capture", "maxFindings": 3, "activityTime": false, "why": "Failures from {{group}}." } ] }'
+    $foldRows = @(foreach ($n in 1..6) { foreach ($k in 1..$n) { @{ Timestamp = ("2026-01-0{0} 00:00:{1:00}.000" -f $n, $k); Source = "S"; EventType = "E"; Description = "fail from ip$n"; User = ""; Details = "" } } })
+    $foldStats = @{}
+    $folded = @(Invoke-ReportRules -Rows $foldRows -Rules (Import-ReportRules -Path $foldRules) -Statistics $foldStats)
+    $rollUp = $folded | Where-Object { $_.FoldedGroups -gt 0 }
+    Assert-Equal "$($folded.Count)|$((@($folded | Where-Object { $_.FoldedGroups -eq 0 } | ForEach-Object { $_.GroupKey }) | Sort-Object) -join ',')|$($foldStats['FOLD'].Groups)|$($foldStats['FOLD'].Findings)" "3|ip5,ip6|6|3" -Message "maxFindings 3: the two groups with the most rows stay, 6 groups give 3 findings"
+    Assert-Equal "$($rollUp.FoldedGroups)|$($rollUp.GroupKey)|$($rollUp.Count)|$(@($rollUp.RowNumbers).Count)|$($rollUp.Title)" "4|4 more: ip4, ip3, ip2, ip1|10|10|Burst from 4 more, folded into one lead" -Message "the roll-up finding folds the other 4 groups (most rows first) with all their rows"
+    Write-TestResult -Succeeded ($rollUp.Why.StartsWith("Failures from several.") -and $rollUp.Why.Contains("folds together 4 more groups") -and (@($rollUp.FoldedKeys) -join ",") -eq "ip4,ip3,ip2,ip1") -Message "the roll-up's why says what it folds, and FoldedKeys lists the folded groups"
+    $taggedRows = 0
+    foreach ($f in $folded) { $taggedRows += @($f.RowNumbers).Count }
+    Assert-Equal "$taggedRows|$(@($folded | Where-Object { $_.ActivityTime }).Count)" "21|0" -Message "every row is still in a finding (for the Finding column), and activityTime false is carried to every finding"
+    $foldModel = New-ReportModel -Rows $foldRows -Findings $folded
+    Assert-Equal "$($null -eq $foldModel.LeadSpan.FirstUtc)|$($foldModel.LeadSpan.FileTimeLeads)" "True|3" -Message "model.LeadSpan leaves out leads dated by file times (activityTime false)"
+    $topRulesPath = Join-Path $workDir "top-rules.json"
+    New-TestTextFile $topRulesPath '{ "schemaVersion": 1, "rules": [ { "id": "FILETIME", "title": "File time", "category": "FileSystem", "severity": "Medium", "match": { "description": "^old file" }, "activityTime": false, "why": "w" }, { "id": "ACTIVITY", "title": "Activity", "category": "Execution", "severity": "Medium", "match": { "description": "^new run" }, "why": "w" } ] }'
+    $topRows = @(
+        @{ Timestamp = "2020-01-01 00:00:00.000"; Source = "S"; EventType = "E"; Description = "old file"; User = ""; Details = "" },
+        @{ Timestamp = "2026-01-01 00:00:00.000"; Source = "S"; EventType = "E"; Description = "new run"; User = ""; Details = "" })
+    $topLeads = @(Invoke-ReportRules -Rows $topRows -Rules (Import-ReportRules -Path $topRulesPath))
+    $topModel = New-ReportModel -Rows $topRows -Findings $topLeads
+    $ruleOfId = @{}
+    foreach ($lead in $topLeads) { $ruleOfId[$lead.Id] = $lead.RuleId }
+    Assert-Equal "$(@($topLeads | ForEach-Object { $_.RuleId }) -join ',')|$(@($topModel.TopFindings | ForEach-Object { $ruleOfId[$_] }) -join ',')|$(Format-TestUtc $topModel.LeadSpan.FirstUtc)" "FILETIME,ACTIVITY|ACTIVITY,FILETIME|2026-01-01 00:00:00" -Message "numbering keeps time order, but the top leads and the lead window put a lead dated by an old file time after one dated by activity"
+
+    # A pattern that keeps timing out stops its rule after a few timeouts
+    # instead of costing the timeout on every row; other rules still run
+    $script:ReportEngineRegexTimeout = [TimeSpan]::FromMilliseconds(50)
+    $slowRules = Join-Path $workDir "slow-rules.json"
+    New-TestTextFile $slowRules '{ "schemaVersion": 1, "rules": [ { "id": "SLOW", "title": "Slow", "category": "Other", "severity": "Medium", "match": { "description": "^(a+)+$" }, "why": "w" }, { "id": "FAST", "title": "Fast", "category": "Other", "severity": "Medium", "match": { "description": "^b" }, "why": "w" } ] }'
+    $slowRows = @(foreach ($n in 1..20) { @{ Timestamp = "2026-01-01 00:00:00.000"; Source = "S"; EventType = "E"; Description = ("a" * 40) + "!"; User = ""; Details = "" } })
+    $slowRows += @{ Timestamp = "2026-01-01 00:00:01.000"; Source = "S"; EventType = "E"; Description = "b row"; User = ""; Details = "" }
+    $slowImported = Import-ReportRules -Path $slowRules
+    $script:ReportEngineRegexTimeout = [TimeSpan]::FromSeconds(2)
+    $slowStats = @{}
+    $slowWarnings = $null
+    $slowWatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $slowFindings = @(Invoke-ReportRules -Rows $slowRows -Rules $slowImported -Statistics $slowStats -WarningVariable slowWarnings -WarningAction SilentlyContinue)
+    $slowWatch.Stop()
+    Assert-Equal "$($slowStats['SLOW'].RegexTimeouts)|$([bool]$slowStats['SLOW'].Abandoned)|$(@($slowFindings | Where-Object { $_.RuleId -eq 'SLOW' }).Count)|$(@($slowFindings | Where-Object { $_.RuleId -eq 'FAST' }).Count)" "3|True|0|1" -Message "a rule is stopped after 3 regex timeouts and reports nothing; the next rule still runs"
+    Write-TestResult -Succeeded ((@($slowWarnings) -join " ") -match 'SLOW was stopped' -and $slowWatch.Elapsed.TotalSeconds -lt 10) -Message "the stop is logged as a warning, and the run takes the time of 3 timeouts, not 20 ($([Math]::Round($slowWatch.Elapsed.TotalSeconds, 1)) s)"
+
     # =========================================================
     # Invalid rules files: the error names the file, rule and field
     # =========================================================
@@ -326,6 +372,8 @@ try {
         @(('{ "schemaVersion": 1, "rules": [ { ' + $rule + ', "match": { "description": "x" } } ], "allowlist": [ { "ruleId": "NOPE", "match": { "description": "x" }, "reason": "r" } ] }'), @("allowlist[0].ruleId", "'NOPE'")),
         @(('{ "schemaVersion": 1, "rules": [ { ' + $rule + ', "match": { "description": "x" } } ], "allowlist": [ { "ruleId": "BAD-1", "match": { "description": "x" } } ] }'), @("allowlist[0] (ruleId 'BAD-1')", ".reason", "is required")),
         @(('{ "schemaVersion": 1, "rules": [ { ' + $rule + ', "match": { "description": "x" } } ], "allowlist": [ { "ruleId": "*", "match": { "user": "(" }, "reason": "r" } ] }'), @("allowlist[0] (ruleId '*')", "match.user", "invalid regular expression")),
+        @(('{ "schemaVersion": 1, "rules": [ { ' + $rule + ', "match": { "description": "x" }, "maxFindings": 1 } ] }'), @("rule 'BAD-1'", ".maxFindings", "0 (no limit) or a whole number from 2")),
+        @(('{ "schemaVersion": 1, "rules": [ { ' + $rule + ', "match": { "description": "x" }, "activityTime": "no" } ] }'), @("rule 'BAD-1'", ".activityTime", "true or false")),
         @('{ "schemaVersion": 1, "rules": [ ] }', @("invalid.json", "rules", "non-empty array")),
         @('{ "schemaVersion": 1, "rule": [ ] }', @("invalid.json", "unknown field 'rule'"))
     )
@@ -378,7 +426,7 @@ try {
 
     Assert-Equal "$(Format-TestUtc $model.TimeSpan.FirstUtc)|$(Format-TestUtc $model.TimeSpan.LastUtc)|$($model.TimeSpan.Rows)" "2026-03-09 08:00:00|2026-03-10 12:10:00|69" -Message "model.TimeSpan"
     Assert-Equal "$($model.Counts.High)|$($model.Counts.Medium)|$($model.Counts.Info)" "6|7|8" -Message "model.Counts"
-    Assert-Equal ($model.TopFindings -join ",") "F001,F002,F003,F004,F005" -Message "model.TopFindings: the first 5 High/Medium findings"
+    Assert-Equal ($model.TopFindings -join ",") "F001,F002,F003,F004,F006" -Message "model.TopFindings: the first lead of each rule, High first (F005 is a second T-SVC lead, so F006 takes its place)"
     Assert-Equal "$(@($model.Findings).Count)|$(@($model.InfoFindings).Count)|$(@($model.Findings | Where-Object { $_.Severity -eq 'Info' }).Count)" "13|8|0" -Message "model.Findings holds High and Medium, InfoFindings the rest"
     Assert-Equal "$(Format-TestUtc $model.LeadSpan.FirstUtc)|$(Format-TestUtc $model.LeadSpan.LastUtc)" "2026-03-09 08:10:00|2026-03-10 12:10:00" -Message "model.LeadSpan: earliest and latest High/Medium time"
 
@@ -400,7 +448,7 @@ try {
         Write-TestResult -Succeeded (@($notes | Where-Object { $_.Contains($fragment) }).Count -eq 1) -Message "model.Coverage.AuditNotes: '$fragment'"
     }
     $collectorErrors = $model.Coverage.CollectorErrors
-    Assert-Equal "$($collectorErrors.Available)|$($collectorErrors.Count)|$($collectorErrors.LineCount)" "True|2|3" -Message "model.Coverage.CollectorErrors: the collector's error count and its ERROR/WARNING lines"
+    Assert-Equal "$($collectorErrors.Available)|$($collectorErrors.Count)|$($collectorErrors.WarningCount)|$($collectorErrors.LineCount)" "True|2|1|3" -Message "model.Coverage.CollectorErrors: the collector's error count, its warning count and its ERROR/WARNING lines"
     Write-TestResult -Succeeded (@($collectorErrors.Lines)[0] -match 'WARNING: Could not copy') -Message "model.Coverage.CollectorErrors.Lines keep the log lines"
     Assert-Equal "$($model.Coverage.BuilderWarnings.Count)" "1" -Message "model.Coverage.BuilderWarnings: the builder log's warnings"
     Write-TestResult -Succeeded (@($model.Coverage.Notes) -contains "Sources parsed by the builder: EventLogs, Prefetch, FileSystem, UsnJournal, SystemInfo.") -Message "model.Coverage.Notes: the sources the builder parsed"
@@ -458,6 +506,11 @@ try {
     $builderModel = New-ReportModel -Rows $rows -Findings $findings -CollectionInfo $builderInfo
     Assert-Equal "$($builderModel.Collection.TargetTimeZoneId)|$(Format-TestUtc $builderModel.Collection.CollectionStartUtc)|$($builderModel.Collection.Mode)|$($builderModel.Collection.ComputerName)" "Pacific Standard Time|2026-03-10 12:00:00|MountedImage|WS01" -Message "model from the builder's Get-CollectionInfo object"
     Write-TestResult -Succeeded (@($builderModel.Caveats | Where-Object { $_ -match 'mounted disk image' }).Count -eq 1) -Message "caveats: a mounted-image collection"
+    $builderInfo | Add-Member -NotePropertyName TargetTimeZoneAssumed -NotePropertyValue $true
+    $assumedModel = New-ReportModel -Rows $rows -Findings $findings -CollectionInfo $builderInfo -WorkbookPath $workbook -WorkbookAvailable:$false
+    Write-TestResult -Succeeded ($assumedModel.Collection.TargetTimeZoneAssumed -and @($assumedModel.Caveats | Where-Object { $_.Contains("time zone was not recorded in the collection: Pacific Standard Time") }).Count -eq 1) -Message "an assumed time zone is marked in the model and named in a caveat"
+    Write-TestResult -Succeeded (@($assumedModel.Caveats | Where-Object { $_.Contains("any Findings sheet or Finding column in it is from an earlier report") }).Count -eq 1 -and -not @($assumedModel.Files.Hashes | Where-Object { $_.Name -eq "timeline.xlsx" }).Count) -Message "a workbook that exists but was not updated: the caveat says its findings are stale, and it is not hashed"
+    Assert-Equal (($model.Rules | Where-Object { $_.Id -eq "T-SVC" }).Title) "Suspicious service" -Message "model.Rules: titles without the {{group}} placeholder"
 
     # =========================================================
     # report-model.json

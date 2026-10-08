@@ -267,28 +267,28 @@ function Log {
     param([string]$Message)
     $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message"
     Write-Host $entry
-    Add-Content -Path $logFile -Value $entry
+    Add-Content -LiteralPath $logFile -Value $entry
 }
 
 function Log-Warning {
     param([string]$Message)
     $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] WARNING: $Message"
     Write-Host $entry -ForegroundColor Yellow
-    Add-Content -Path $logFile -Value $entry
+    Add-Content -LiteralPath $logFile -Value $entry
 }
 
 function Log-Error {
     param([string]$Message)
     $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ERROR: $Message"
     Write-Host $entry -ForegroundColor Red
-    Add-Content -Path $logFile -Value $entry
+    Add-Content -LiteralPath $logFile -Value $entry
 }
 
 function Log-Success {
     param([string]$Message)
     $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message"
     Write-Host $entry -ForegroundColor Green
-    Add-Content -Path $logFile -Value $entry
+    Add-Content -LiteralPath $logFile -Value $entry
 }
 
 # Characters that are not allowed in XML 1.0 (and so break the .xlsx):
@@ -341,6 +341,7 @@ function Get-TimelineReportCollectionInfo {
         CollectorUser            = ""
         Mode                     = ""
         TargetTimeZoneId         = ""
+        TargetTimeZoneAssumed    = $false
         CollectionStartUtc       = $null
         SecretsIncluded          = $false
         ThunderbirdIndexIncluded = $false
@@ -363,6 +364,7 @@ function Get-TimelineReportCollectionInfo {
         if ($BuilderInfo.Mode) { $info.Mode = [string]$BuilderInfo.Mode }
         if ($BuilderInfo.CollectionStartUtc) { $info.CollectionStartUtc = $BuilderInfo.CollectionStartUtc }
         if ($BuilderInfo.TargetTimeZone) { $info.TargetTimeZoneId = $BuilderInfo.TargetTimeZone.Id }
+        $info.TargetTimeZoneAssumed = [bool]$BuilderInfo.TargetTimeZoneAssumed
         $info.SecretsIncluded = [bool]$BuilderInfo.SecretsIncluded
         $info.ThunderbirdIndexIncluded = [bool]$BuilderInfo.ThunderbirdIndexIncluded
     }
@@ -381,6 +383,7 @@ function Get-TimelineReportCollectionInfo {
                 }
             }
             elseif ($line -match '\] Collection made with -IncludeSecrets') { $info.SecretsIncluded = $true }
+            elseif ($line -match '\] WARNING: Target time zone unknown -- assuming') { $info.TargetTimeZoneAssumed = $true }
         }
     }
     return [PSCustomObject]$info
@@ -450,12 +453,23 @@ function Invoke-TimelineReportRules {
     }
 }
 
-# Cell text for the workbook: no XML-invalid characters, at most 32,767
-# characters (Excel's cell limit)
+# Bidirectional-text controls and invisible characters in a Findings-sheet
+# cell become visible markers ("[U+202E]"), as in the report: a right-to-left
+# override in a file name would otherwise show it spoofed (the Timeline sheet
+# keeps the raw value). Built from code points so this file stays ASCII.
+$script:reportBidiRegex = New-Object System.Text.RegularExpressions.Regex('[' + (-join (@(0x061C, 0x200B, 0x200E, 0x200F, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2060, 0x2066, 0x2067, 0x2068, 0x2069, 0xFEFF) | ForEach-Object { [string][char]$_ })) + ']')
+$script:reportBidiEvaluator = [System.Text.RegularExpressions.MatchEvaluator] {
+    param($match)
+    return "[U+" + ([int]$match.Value[0]).ToString("X4") + "]"
+}
+
+# Cell text for the Findings sheet: bidirectional controls marked, no
+# XML-invalid characters, at most 32,767 characters (Excel's cell limit)
 function ConvertTo-TimelineReportCellText {
     param([string]$Text)
     if (-not $Text) { return "" }
-    $clean = $script:xmlInvalidRegex.Replace($Text, '')
+    $clean = $script:reportBidiRegex.Replace($Text, $script:reportBidiEvaluator)
+    $clean = $script:xmlInvalidRegex.Replace($clean, '')
     if ($clean.Length -gt 32767) { $clean = $clean.Substring(0, 32755) + " [TRUNCATED]" }
     return $clean
 }
@@ -611,15 +625,19 @@ function Add-TimelineReportWorkbookSheets {
 # same rows as timeline.csv). $true when the workbook was updated.
 function Update-TimelineReportWorkbook {
     param([string]$Path, [object[]]$Findings, [int]$RowCount)
+    $staleNote = "$(Split-Path $Path -Leaf) keeps the Findings sheet and Finding column of the earlier report (if it has them): their finding ids do not match this report."
     if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
-        Log-Warning "  ImportExcel is not installed, so the workbook's findings are not updated (Install-Module -Name ImportExcel -Scope CurrentUser)."
+        Log-Warning "  ImportExcel is not installed, so the workbook's findings are not updated (Install-Module -Name ImportExcel -Scope CurrentUser). $staleNote"
         return $false
     }
     $package = $null
     try {
         Import-Module ImportExcel -ErrorAction Stop
         Log "  Updating the workbook: $Path"
-        $package = Open-ExcelPackage -Path $Path
+        # Opened by its literal path: Open-ExcelPackage -Path treats [ ] in a
+        # folder name ("case [1]") as wildcards and finds nothing
+        $package = New-Object OfficeOpenXml.ExcelPackage (New-Object System.IO.FileInfo $Path)
+        if (-not $package.Workbook -or $package.Workbook.Worksheets.Count -eq 0) { throw "it could not be read as an Excel workbook" }
         $timeline = $package.Workbook.Worksheets["Timeline"]
         if (-not $timeline -or -not $timeline.Dimension) { throw "it has no Timeline sheet" }
         $sheetRows = $timeline.Dimension.End.Row - 1
@@ -631,7 +649,7 @@ function Update-TimelineReportWorkbook {
         return $true
     }
     catch {
-        Log-Warning "  Could not update the workbook: $($_.Exception.Message). The report gives timeline.csv row numbers instead of Excel links."
+        Log-Warning "  Could not update the workbook: $($_.Exception.Message). The report gives timeline.csv row numbers instead of Excel links. $staleNote"
         if ($package) { Close-ExcelPackage $package -NoSave }
         return $false
     }
@@ -680,9 +698,22 @@ function Complete-TimelineReport {
     }
     Log-Success "  Findings (CSV): $findingsCsv"
     Log-Success "  Report (HTML) : $htmlPath"
-    # A PDF from an earlier run must not sit next to a newer report.html
-    if (Test-Path -LiteralPath $pdfPath) { Remove-Item -LiteralPath $pdfPath -Force -ErrorAction SilentlyContinue }
-    $pdfWritten = ConvertTo-ReportPdf -HtmlPath $htmlPath -PdfPath $pdfPath
+    # A PDF from an earlier run must not sit next to a newer report.html. When
+    # it cannot be removed (open in a PDF viewer), the new PDF gets its own
+    # name and the old one is reported as out of date.
+    if (Test-Path -LiteralPath $pdfPath) {
+        try { Remove-Item -LiteralPath $pdfPath -Force -ErrorAction Stop }
+        catch {
+            $lockedPdf = $pdfPath
+            $pdfPath = Join-Path $folder ("report_" + (Get-Date -Format "yyyy-MM-dd_HH-mm-ss") + ".pdf")
+            Log-Warning "  $(Split-Path $lockedPdf -Leaf) is open in another program and could not be replaced: it is OUT OF DATE. The new PDF is $(Split-Path $pdfPath -Leaf)."
+        }
+    }
+    # Edge needs longer for a bigger page (about a minute per 5 MB of HTML)
+    $pdfTimeout = 180
+    try { $pdfTimeout = [int][Math]::Min(1800, 180 + 12 * [Math]::Ceiling((Get-Item -LiteralPath $htmlPath).Length / 1MB)) }
+    catch { Write-Verbose "Could not size report.html; using the default PDF timeout" }
+    $pdfWritten = ConvertTo-ReportPdf -HtmlPath $htmlPath -PdfPath $pdfPath -TimeoutSeconds $pdfTimeout
     if ($pdfWritten) { Log-Success "  Report (PDF)  : $pdfPath" }
     else {
         Log-Warning "  PDF not created: $($script:ReportPdfLastError)"
@@ -927,7 +958,7 @@ if ($ReportOnly) {
     if ($xlsxFile -ne $OutputFile -and (Test-Path -LiteralPath $xlsxFile -PathType Leaf)) {
         Log ""
         Log "--- Adding the Findings to the Excel Workbook ---"
-        if ($NoExcel) { Log "  -NoExcel: the workbook is left as it is, so the report does not link to it." }
+        if ($NoExcel) { Log-Warning "  -NoExcel: the workbook is left as it is, so the report does not link to it. Its Findings sheet and Finding column (if any) are from an earlier report and do not match this report's finding ids." }
         else { $workbookReady = Update-TimelineReportWorkbook -Path $xlsxFile -Findings $reportState.Findings -RowCount $reportRows.Count }
     }
     else {
@@ -1206,6 +1237,9 @@ function Get-CollectionInfo {
         CollectionStartUtc = $null
         CollectorTimeZone  = [System.TimeZoneInfo]::Local
         TargetTimeZone     = $null
+        # True when the examined computer's zone is not recorded and the
+        # collector's zone stands in for it (older collections, images)
+        TargetTimeZoneAssumed = $false
         CollectorCulture   = $null
         TargetRoot         = ""
         # Additive collection_info.json fields (older collections lack them):
@@ -1275,6 +1309,7 @@ function Get-CollectionInfo {
     if (-not $info.TargetTimeZone) {
         if ($info.Mode -ne "Live") {
             Log-Warning "Target time zone unknown -- assuming the collector's time zone ($($info.CollectorTimeZone.Id)) for target-local timestamps."
+            $info.TargetTimeZoneAssumed = $true
         }
         $info.TargetTimeZone = $info.CollectorTimeZone
     }
