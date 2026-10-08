@@ -8693,6 +8693,352 @@ function Compare-ManifestSetupApiLogs {
     return $result
 }
 
+# One MountedDevices value, decoded into the columns of the collector's
+# USB\mounted_devices.csv (the same decoder as the collector's). Kind:
+#   GPT         "DMIO:ID:" + partition GUID (24 bytes; also dynamic volumes)
+#   MBR         disk signature (4 bytes) + partition offset in bytes (8)
+#   DevicePath  UTF-16 device path starting "_??_" or "\??\", such as
+#               _??_USBSTOR#Disk&Ven_...&Prod_...#<serial>&0#{...}
+#   Other       anything else, including a value that is not binary
+# HexData is the raw data (as text for a value that is not binary)
+function ConvertFrom-MountedDeviceValue {
+    param([string]$Name, $Data)
+    $row = [ordered]@{
+        Name            = $Name
+        Kind            = "Other"
+        DiskSignature   = ""
+        PartitionOffset = ""
+        PartitionGuid   = ""
+        DevicePath      = ""
+        DataLength      = 0
+        HexData         = ""
+    }
+    if ($Data -isnot [byte[]]) {
+        if ($null -ne $Data) { $row.HexData = (@($Data) | ForEach-Object { "$_" }) -join "; " }
+        return [PSCustomObject]$row
+    }
+    $row.DataLength = $Data.Length
+    $row.HexData = [BitConverter]::ToString($Data).Replace("-", "")
+    if ($Data.Length -eq 24 -and [System.Text.Encoding]::ASCII.GetString($Data, 0, 8) -eq "DMIO:ID:") {
+        $row.Kind = "GPT"
+        $row.PartitionGuid = (New-Object Guid (, [byte[]]$Data[8..23])).ToString("B")
+    }
+    elseif ($Data.Length -eq 12) {
+        $row.Kind = "MBR"
+        $row.DiskSignature = "{0:X8}" -f [BitConverter]::ToUInt32($Data, 0)
+        $row.PartitionOffset = [string][BitConverter]::ToUInt64($Data, 4)
+    }
+    elseif ($Data.Length -ge 8 -and $Data.Length % 2 -eq 0 -and $Data[1] -eq 0) {
+        $text = [System.Text.Encoding]::Unicode.GetString($Data).TrimEnd([char]0)
+        if ($text -match '^(_\?\?_|\\\?\?\\)') {
+            $row.Kind = "DevicePath"
+            $row.DevicePath = $text
+        }
+    }
+    return [PSCustomObject]$row
+}
+
+# Values of the mounted_devices.txt older collectors wrote: Format-List
+# output of the MountedDevices key that shows only the first 4 bytes of
+# each value, followed by "..." (or the ellipsis character), e.g.
+#   \DosDevices\G:                                   : {182, 240, 19, 166...}
+#   \??\Volume{00000000-0000-11f0-8000-000000000001} : {95, 0, 63, 0...}
+# The first bytes still tell the kind: "DMIO" is GPT, "_?" or "\?" in
+# UTF-16 a device path, anything else is taken for MBR, whose first 4
+# bytes are the whole disk signature. A value shown in full (up to 4
+# bytes) is decoded. Rows have the mounted_devices.csv columns; a cut-off
+# value has DataLength "", the known bytes plus "..." as HexData and
+# Truncated = $true. Other lines (PSPath, ..., or the decoded
+# "Name : ..." lists of newer collectors) are ignored.
+function ConvertFrom-MountedDevicesText {
+    param([string[]]$Lines)
+    $ellipsis = [regex]::Escape([string][char]0x2026)
+    $pattern = '^(\\DosDevices\\[A-Za-z]:|\\\?\?\\Volume\{[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\})\s+:\s\{((?:\d{1,3}, )*\d{1,3})?(\.\.\.|' + $ellipsis + ')?\}\s*$'
+    $rows = @()
+    foreach ($line in $Lines) {
+        if ($line -notmatch $pattern) { continue }
+        $name = $Matches[1]
+        $cut = [bool]$Matches[3]
+        $numbers = @()
+        if ($Matches[2]) { $numbers = @($Matches[2] -split ', ' | ForEach-Object { [int]$_ }) }
+        if (@($numbers | Where-Object { $_ -gt 255 }).Count -gt 0) { continue }
+        $bytes = [byte[]]$numbers
+        if (-not $cut) {
+            $row = ConvertFrom-MountedDeviceValue -Name $name -Data $bytes
+            $row | Add-Member -NotePropertyName KeyLastWriteUtc -NotePropertyValue ""
+            $row | Add-Member -NotePropertyName Truncated -NotePropertyValue $false
+            $rows += $row
+            continue
+        }
+        $row = [PSCustomObject]@{
+            Name = $name; Kind = "Other"; DiskSignature = ""; PartitionOffset = ""; PartitionGuid = ""; DevicePath = ""
+            DataLength = ""; HexData = [BitConverter]::ToString($bytes).Replace("-", "") + "..."; KeyLastWriteUtc = ""; Truncated = $true
+        }
+        if ($bytes.Length -ge 4) {
+            if ([System.Text.Encoding]::ASCII.GetString($bytes, 0, 4) -eq "DMIO") { $row.Kind = "GPT" }
+            elseif (($bytes[0] -eq 95 -or $bytes[0] -eq 92) -and $bytes[1] -eq 0 -and $bytes[2] -eq 63 -and $bytes[3] -eq 0) { $row.Kind = "DevicePath" }
+            else {
+                $row.Kind = "MBR"
+                $row.DiskSignature = "{0:X8}" -f [BitConverter]::ToUInt32($bytes, 0)
+            }
+        }
+        $rows += $row
+    }
+    return $rows
+}
+
+# MountedDevices values of a loaded SYSTEM hive (the key is at the hive
+# root, not in a control set), decoded, with the key's last-write time as
+# KeyLastWriteUtc (ISO 8601, as in mounted_devices.csv). Empty when the
+# hive has no MountedDevices key.
+function Get-OfflineMountedDeviceRows {
+    param([Microsoft.Win32.RegistryKey]$SystemRoot)
+    $rows = @()
+    $key = $SystemRoot.OpenSubKey("MountedDevices")
+    if (-not $key) { return $rows }
+    try {
+        $lastWrite = Get-RegistryKeyLastWriteUtc $key
+        $lastWriteText = if ($lastWrite) { $lastWrite.ToString("o", [System.Globalization.CultureInfo]::InvariantCulture) } else { "" }
+        foreach ($valueName in $key.GetValueNames()) {
+            if (-not $valueName) { continue }
+            $row = ConvertFrom-MountedDeviceValue -Name $valueName -Data $key.GetValue($valueName, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $row | Add-Member -NotePropertyName KeyLastWriteUtc -NotePropertyValue $lastWriteText
+            $rows += $row
+        }
+    }
+    finally { $key.Close() }
+    return $rows
+}
+
+# MountedDevices of the examined system, from the best source in the
+# collection:
+#   1. mounted_devices.csv with at least one row (decoded by the collector;
+#      live collections)
+#   2. MountedDevices at the root of the collected SYSTEM hive (also
+#      mounted-image collections)
+#   3. mounted_devices.txt of older collectors (first 4 bytes of each
+#      value only, see ConvertFrom-MountedDevicesText)
+# Returns Rows (mounted_devices.csv columns), Source (for the log) and
+# File (where the rows came from); Rows is empty when no source has a value.
+function Read-CollectionMountedDevices {
+    $result = [PSCustomObject]@{ Rows = @(); Source = ""; File = $null }
+    foreach ($csvFile in @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("mounted_devices.csv") | Where-Object { -not $_.PSIsContainer })) {
+        Log "  Parsing: $($csvFile.FullName)"
+        try { $rows = @(Import-Csv -LiteralPath $csvFile.FullName -ErrorAction Stop | Where-Object { $_.Name }) }
+        catch {
+            Log-Warning "  Failed to parse mounted devices CSV: $($_.Exception.Message)"
+            continue
+        }
+        if ($rows.Count -gt 0) {
+            $result.Rows = $rows
+            $result.Source = $csvFile.FullName
+            $result.File = $csvFile
+            return $result
+        }
+        Log "    No values in $($csvFile.Name)."
+    }
+
+    $systemHive = Find-OfflineHiveFile "SYSTEM"
+    if ($systemHive) {
+        $mount = $null
+        try {
+            $mount = Mount-TimelineHive -HiveFile $systemHive -Prefix "TEMP_TLUSB"
+            if ($mount -and $mount.Root) {
+                $rows = @(Get-OfflineMountedDeviceRows -SystemRoot $mount.Root)
+                if ($rows.Count -gt 0) {
+                    $result.Rows = $rows
+                    $result.Source = "the SYSTEM hive $($systemHive.FullName)"
+                    $result.File = $systemHive
+                }
+                else { Log "    No MountedDevices values in the SYSTEM hive." }
+            }
+        }
+        catch { Log-Warning "  Failed to read MountedDevices from the SYSTEM hive: $($_.Exception.Message)" }
+        finally { Dismount-TimelineHive $mount }
+        if ($result.Rows.Count -gt 0) { return $result }
+    }
+
+    foreach ($txtFile in @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("mounted_devices.txt") | Where-Object { -not $_.PSIsContainer })) {
+        Log "  Parsing: $($txtFile.FullName)"
+        # Read-AntiVirusTextLines reads any of the encodings collectors wrote
+        # (UTF-8 with a BOM from Windows PowerShell 5.1, without one from 7)
+        try { $rows = @(ConvertFrom-MountedDevicesText -Lines (Read-AntiVirusTextLines $txtFile.FullName)) }
+        catch {
+            Log-Warning "  Failed to parse mounted devices: $($_.Exception.Message)"
+            continue
+        }
+        if (@($rows | Where-Object { $_.Truncated }).Count -gt 0) {
+            Log-Warning "  $($txtFile.Name) is from an older collector: it shows only the first 4 bytes of each value, so partition GUIDs, offsets and device names are missing (they are read from the SYSTEM hive when the collection has one that loads)."
+        }
+        if ($rows.Count -gt 0) {
+            $result.Rows = $rows
+            $result.Source = $txtFile.FullName
+            $result.File = $txtFile
+            return $result
+        }
+        Log "    No MountedDevices values in $($txtFile.Name)."
+    }
+    return $result
+}
+
+# Device instance ID of a device path from MountedDevices, e.g.
+#   _??_USBSTOR#Disk&Ven_Generic-&Prod_SD#MMC&Rev_1.00#0123456789&0#{53f56307-b6bf-11d0-94f2-00a0c91efb8b}
+#   -> USBSTOR\Disk&Ven_Generic-&Prod_SD/MMC&Rev_1.00\0123456789&0
+# The path writes each "\" of the ID as "#" and ends with the interface
+# class GUID. A "/" in the ID (Prod_SD/MMC) is a "#" in the path too, so
+# the fields between the first and the last are joined with "/". "" when
+# the path has fewer than three fields.
+function ConvertTo-DeviceInstanceId {
+    param([string]$DevicePath)
+    $fields = @(($DevicePath -replace '^(_\?\?_|\\\?\?\\)', '').TrimEnd([char]0) -split '#')
+    if ($fields.Count -gt 1 -and $fields[-1] -match '^\{[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\}$') {
+        $fields = @($fields[0..($fields.Count - 2)])
+    }
+    if ($fields.Count -lt 3) { return "" }
+    return (@($fields[0], (@($fields[1..($fields.Count - 2)]) -join "/"), $fields[-1]) -join "\")
+}
+
+# Volume GUID Windows uses for an MBR partition (e.g. the MountPoints2 key
+# name): the disk signature, two zero groups, then the 8 bytes of the
+# partition offset, {<signature>-0000-0000-<offset bytes>}. "" when the
+# signature (hex) or the offset (decimal) cannot be read.
+function Get-MbrVolumeGuid {
+    param([string]$DiskSignature, [string]$PartitionOffset)
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    $signature = [uint32]0
+    $offset = [uint64]0
+    if (-not [uint32]::TryParse($DiskSignature, [System.Globalization.NumberStyles]::AllowHexSpecifier, $invariant, [ref]$signature)) { return "" }
+    if (-not [uint64]::TryParse($PartitionOffset, [System.Globalization.NumberStyles]::None, $invariant, [ref]$offset)) { return "" }
+    $bytes = [byte[]]([BitConverter]::GetBytes($signature) + (New-Object byte[] 4) + [BitConverter]::GetBytes($offset))
+    return (New-Object Guid (, $bytes)).ToString("B")
+}
+
+# Timeline text for decoded MountedDevices values (rows with the
+# mounted_devices.csv columns). One object per value with Name, Kind,
+# Description and Details, e.g. "Drive letter H: -> MBR disk 0A1B2C3D,
+# partition at offset 1048576" or "Volume {...} -> USB storage <device>".
+# Details: Kind and the decoded fields; VolumeGuid (the \??\Volume{} name
+# of a value with the same data, else for GPT the partition GUID and for
+# MBR {<signature>-0000-0000-<offset bytes>}, the names MountPoints2
+# uses); InstanceId, Serial and DevicePath of a device path; SameDataAs
+# (values with the same bytes); SameDisk (other values with the same MBR
+# disk signature); KeyLastWriteUtc; PnPRecord for a USBSTOR device path
+# when $StorageSerials is given (usb_storage_devices.csv as serial ->
+# instance ID; $null when that file was not read); CollectorDrive=yes for
+# the drive letter of the collector's output folder. The times inside
+# volume GUIDs (version 1 UUIDs) are not used: they are not mount times.
+function ConvertTo-MountedDeviceEntries {
+    param([object[]]$Rows, [hashtable]$StorageSerials = $null, [string]$CollectorDrive = "")
+    $values = @(foreach ($row in $Rows) {
+            $name = Get-ArtifactRowValue $row @("Name")
+            if (-not $name) { continue }
+            $volume = ""
+            if ($name -match '^\\\?\?\\Volume(\{[0-9A-Fa-f-]{36}\})$') { $volume = $Matches[1] }
+            [PSCustomObject]@{
+                Row       = $row
+                Name      = $name
+                Kind      = Get-ArtifactRowValue $row @("Kind")
+                Volume    = $volume
+                Hex       = (Get-ArtifactRowValue $row @("HexData")).ToUpperInvariant()
+                Signature = (Get-ArtifactRowValue $row @("DiskSignature")).ToUpperInvariant()
+                Truncated = "$($row.Truncated)" -eq "True"
+            }
+        })
+    $entries = @()
+    for ($i = 0; $i -lt $values.Count; $i++) {
+        $v = $values[$i]
+        $row = $v.Row
+        $sameData = @(for ($j = 0; $j -lt $values.Count; $j++) {
+                if ($j -ne $i -and -not $v.Truncated -and -not $values[$j].Truncated -and $v.Hex -and $values[$j].Hex -eq $v.Hex) { $values[$j].Name }
+            })
+        $sameDisk = @(for ($j = 0; $j -lt $values.Count; $j++) {
+                if ($j -ne $i -and $v.Kind -eq "MBR" -and $v.Signature -and $values[$j].Kind -eq "MBR" -and $values[$j].Signature -eq $v.Signature -and $sameData -notcontains $values[$j].Name) { $values[$j].Name }
+            })
+        $volumes = @(for ($j = 0; $j -lt $values.Count; $j++) {
+                if ($values[$j].Volume -and ($j -eq $i -or $sameData -contains $values[$j].Name)) { $values[$j].Volume }
+            })
+
+        if ($v.Name -match '^\\DosDevices\\([A-Za-z]:)$') { $what = "Drive letter $($Matches[1].ToUpperInvariant())" }
+        elseif ($v.Volume) { $what = "Volume $($v.Volume)" }
+        else { $what = "Value $($v.Name)" }
+
+        # Empty fields are left out of Details
+        $details = [ordered]@{
+            Kind            = $v.Kind
+            PartitionGuid   = ""
+            DiskSignature   = ""
+            PartitionOffset = ""
+            VolumeGuid      = $volumes -join ", "
+            InstanceId      = ""
+            Serial          = ""
+            DevicePath      = ""
+            HexData         = ""
+            SameDataAs      = $sameData -join ", "
+            SameDisk        = $sameDisk -join ", "
+            KeyLastWriteUtc = Format-UtcDetailTime (ConvertFrom-UtcText (Get-ArtifactRowValue $row @("KeyLastWriteUtc")))
+            PnPRecord       = ""
+            CollectorDrive  = ""
+            Truncated       = ""
+        }
+        if ($v.Kind -eq "GPT") {
+            $details.PartitionGuid = Get-ArtifactRowValue $row @("PartitionGuid")
+            if (-not $details.VolumeGuid) { $details.VolumeGuid = $details.PartitionGuid }
+            $target = "GPT partition $($details.PartitionGuid)"
+        }
+        elseif ($v.Kind -eq "MBR") {
+            $details.DiskSignature = $v.Signature
+            $details.PartitionOffset = Get-ArtifactRowValue $row @("PartitionOffset")
+            if (-not $details.VolumeGuid) { $details.VolumeGuid = Get-MbrVolumeGuid -DiskSignature $v.Signature -PartitionOffset $details.PartitionOffset }
+            $target = "MBR disk $($v.Signature)"
+            if ($details.PartitionOffset) { $target += ", partition at offset $($details.PartitionOffset)" }
+        }
+        elseif ($v.Kind -eq "DevicePath") {
+            $details.DevicePath = Get-ArtifactRowValue $row @("DevicePath")
+            $details.InstanceId = ConvertTo-DeviceInstanceId $details.DevicePath
+            if ($details.InstanceId) {
+                # The last field is the serial number plus "&<LUN>", or an ID
+                # made up by Windows ("&" as its second character)
+                $instance = ($details.InstanceId -split '\\')[-1] -replace '&\d+$', ''
+                if ($instance.Length -gt 1 -and $instance[1] -ne '&') { $details.Serial = $instance }
+                if ($details.InstanceId -like "USBSTOR\*") {
+                    $target = "USB storage $(Get-DeviceInstanceLabel $details.InstanceId)"
+                    if ($null -ne $StorageSerials) {
+                        if ($StorageSerials.ContainsKey($instance)) { $details.PnPRecord = "in USBSTOR at collection time: $($StorageSerials[$instance])" }
+                        else { $details.PnPRecord = "not in USBSTOR at collection time" }
+                    }
+                }
+                else { $target = "device $(Get-DeviceInstanceLabel $details.InstanceId)" }
+            }
+            elseif ($details.DevicePath) { $target = "device path $($details.DevicePath)" }
+            else { $target = "device path" }
+        }
+        else {
+            $details.HexData = Get-ArtifactRowValue $row @("HexData")
+            $length = Get-ArtifactRowValue $row @("DataLength")
+            if ($v.Truncated -or -not $length) { $target = "unrecognized data" }
+            elseif ($length -eq "0" -and $v.Hex) { $target = "unrecognized value (not binary)" }
+            else { $target = "unrecognized data ($length bytes)" }
+        }
+        if ($v.Truncated) {
+            # mounted_devices.txt of an older collector: only the kind (and an
+            # MBR disk signature) can be read from the first 4 bytes
+            $details.HexData = Get-ArtifactRowValue $row @("HexData")
+            $details.Truncated = "yes (only the first 4 bytes are in mounted_devices.txt; the kind is taken from them)"
+            if ($v.Kind -eq "GPT") { $target = "GPT partition" }
+            elseif ($v.Kind -eq "DevicePath") { $target = "device path" }
+            $target += " (value cut off)"
+        }
+        if ($CollectorDrive -and $v.Name -match '^\\DosDevices\\([A-Za-z]:)$' -and $Matches[1] -eq $CollectorDrive) { $details.CollectorDrive = "yes" }
+        $entries += [PSCustomObject]@{
+            Name        = $v.Name
+            Kind        = $v.Kind
+            Description = "$what -> $target"
+            Details     = Format-ArtifactDetails $details
+        }
+    }
+    return $entries
+}
+
 # Parse Format-List text ("Name : value" blocks separated by blank lines,
 # long values wrapped onto indented lines) into ordered hashtables
 function ConvertFrom-FormatListBlocks {
@@ -8727,11 +9073,21 @@ function Parse-USB {
 
     # USB storage devices with PnP install/arrival/removal times (newer collectors, live only)
     $haveStorageCsv = $false
+    # Serial -> instance ID of these devices, for the mounted devices below
+    # ($null when there is no usb_storage_devices.csv)
+    $storageSerials = $null
     $usbCsvFiles = Find-ArtifactFiles -BasePath $InputPath -FileNames @("usb_storage_devices.csv")
     foreach ($csvFile in $usbCsvFiles) {
         Log "  Parsing: $($csvFile.FullName)"
         try {
             $rows = @(Import-Csv -Path $csvFile.FullName -ErrorAction Stop)
+            if ($null -eq $storageSerials) { $storageSerials = @{} }
+            foreach ($row in $rows) {
+                $serial = Get-ArtifactRowValue $row @("Serial")
+                if (-not $serial) { $serial = ("$($row.InstanceId)" -split '\\')[-1] }
+                $serial = $serial -replace '&\d+$', ''
+                if ($serial) { $storageSerials[$serial] = Get-ArtifactRowValue $row @("InstanceId") }
+            }
             $count = 0
             foreach ($row in $rows) {
                 $name = $row.FriendlyName
@@ -8829,24 +9185,38 @@ function Parse-USB {
         catch { Log-Warning "  Failed to parse USB devices: $($_.Exception.Message)" }
     }
 
-    # Mounted devices (state at collection time)
-    $mountedFiles = Find-ArtifactFiles -BasePath $InputPath -FileNames @("mounted_devices.txt")
-    foreach ($mountFile in $mountedFiles) {
-        Log "  Parsing: $($mountFile.FullName)"
-        try {
-            $ts = Get-SnapshotTimeUtc -File $mountFile
-            $content = Get-Content -Path $mountFile.FullName -ErrorAction Stop
-            foreach ($line in $content) {
-                if ($ts -and $line -match '(\\DosDevices\\[A-Z]:|\\\?\?\\Volume\{)') {
+    # Mounted devices (state at collection time): the disk, partition or
+    # device each drive letter and volume GUID last belonged to, one
+    # Snapshot row per MountedDevices value (sources: see
+    # Read-CollectionMountedDevices; Details: see ConvertTo-MountedDeviceEntries)
+    try {
+        $mounted = Read-CollectionMountedDevices
+        if ($mounted.Rows.Count -gt 0) {
+            # The collector's output drive: a drive letter of the examined
+            # system only in a live collection
+            $collectorDrive = ""
+            if ((Get-CollectionInfo).Mode -eq "Live") {
+                $outputFolder = Get-CollectorOutputFolder
+                if ($outputFolder.Path -match '^([A-Za-z]:)') { $collectorDrive = $Matches[1].ToUpperInvariant() }
+            }
+            $entries = @(ConvertTo-MountedDeviceEntries -Rows $mounted.Rows -StorageSerials $storageSerials -CollectorDrive $collectorDrive)
+            $ts = Get-SnapshotTimeUtc -File $mounted.File
+            if ($ts) {
+                foreach ($entry in $entries) {
                     Add-TimelineEntry -Timestamp $ts -Source "USB-MountedDevices" -EventType "Snapshot" `
-                        -Description "Mounted device: $($line.Trim() -replace '\s{2,}', ' ')" `
-                        -Artifact "USB" -RawPath $mountFile.FullName
+                        -Description $entry.Description `
+                        -Details $entry.Details `
+                        -Artifact "USB" -RawPath $mounted.File.FullName
                     $usbParsed = $true
                 }
             }
+            $kindCounts = "$(@($entries | Where-Object { $_.Kind -eq 'GPT' }).Count) GPT, $(@($entries | Where-Object { $_.Kind -eq 'MBR' }).Count) MBR, $(@($entries | Where-Object { $_.Kind -eq 'DevicePath' }).Count) device path"
+            $otherCount = @($entries | Where-Object { @("GPT", "MBR", "DevicePath") -notcontains $_.Kind }).Count
+            if ($otherCount -gt 0) { $kindCounts += ", $otherCount other" }
+            Log "  Parsed $($entries.Count) mounted device value(s) ($kindCounts) from $($mounted.Source)"
         }
-        catch { Log-Warning "  Failed to parse mounted devices: $($_.Exception.Message)" }
     }
+    catch { Log-Warning "  Failed to parse mounted devices: $($_.Exception.Message)" }
 
     # SetupAPI device logs (device first-install times). Windows rotates setupapi.dev.log
     # to setupapi.dev.<yyyymmdd_hhmmss>.log, so every setupapi.dev*.log is parsed.
