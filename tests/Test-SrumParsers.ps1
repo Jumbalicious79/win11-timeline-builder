@@ -11,16 +11,21 @@
 # is not an ESE database (reported, skipped) and a bam_entries.csv that
 # names one user SID. The database uses 32 KB pages, which the builder must
 # take from the database header.
+# Part 1 also makes a database in dirty-shutdown state (the engine stopped
+# without flushing, as in a live copy), collected read-only with its logs:
+# the builder must recover a temp copy in its own process (records that
+# were only in the logs appear) without touching the database at the path
+# recorded in the logs. A database with a damaged data page must give the
+# rows of the records read before it, marked Partial. The builder's own ESE
+# use must write no ESENT events to the Application event log.
 #
-# Part 2 makes a database in dirty-shutdown state (the engine stopped
-# without flushing, as in a live copy) and checks that the builder recovers
-# a temp copy with the collected logs (esentutl /r: records that were only
-# in the logs appear), and repairs it when there are no logs (esentutl /p).
-# esentutl writes ESENT events to the Application event log, so part 2 runs
-# only in GitHub Actions or with -AllowSystemChanges; otherwise it prints
-# SKIPPED. With Administrator rights it also saves a SOFTWARE hive with a
-# ProfileList entry (a temporary HKCU key and reg save, undone afterwards)
-# so a SID is named from it; without them that check is SKIPPED.
+# Part 2 checks the repair with esentutl /p: of the dirty database without
+# its logs, and of a database whose header says clean but whose catalog page
+# is damaged. esentutl writes ESENT events to the Application event log, so
+# part 2 runs only in GitHub Actions or with -AllowSystemChanges; otherwise
+# it prints SKIPPED. With Administrator rights it also saves a SOFTWARE hive
+# with a ProfileList entry (a temporary HKCU key and reg save, undone
+# afterwards) so a SID is named from it; without them that check is SKIPPED.
 # Every run checks that the collection's files are not changed and that the
 # builder's temp copies are removed.
 #
@@ -368,7 +373,7 @@ $schema = [ordered]@{
 }
 $networkNames = [string[]]@("TimeStamp", "AppId", "UserId", "InterfaceLuid", "L2ProfileId", "BytesSent", "BytesRecvd")
 $appNames = [string[]]@("TimeStamp", "AppId", "UserId", "ForegroundCycleTime", "BackgroundCycleTime", "ForegroundBytesRead",
-    "ForegroundBytesWritten", "BackgroundBytesRead", "BackgroundBytesWritten")
+    "ForegroundBytesWritten", "BackgroundBytesRead", "BackgroundBytesWritten", "FaceTime")
 
 # Test user SIDs: alice is named by bam_entries.csv, carol only by the
 # ProfileList of the SOFTWARE hive (part 2, as Administrator)
@@ -409,12 +414,13 @@ function Add-NetworkRecords {
 
 # Application Resource Usage records, each @(time, AppId, UserId,
 # ForegroundCycleTime, BackgroundCycleTime, ForegroundBytesRead,
-# ForegroundBytesWritten, BackgroundBytesRead, BackgroundBytesWritten)
+# ForegroundBytesWritten, BackgroundBytesRead, BackgroundBytesWritten,
+# FaceTime)
 function Add-AppRecords {
     param($Writer, [object[]]$Records)
     foreach ($r in $Records) {
         $values = @((ConvertTo-RecordTime $r[0]), [int]$r[1], [int]$r[2])
-        foreach ($v in $r[3..8]) { $values += [long]$v }
+        foreach ($v in $r[3..9]) { $values += [long]$v }
         $Writer.Insert($appTable, $appNames, [object[]]$values)
     }
 }
@@ -505,6 +511,44 @@ function Test-TimelineRows {
     }
 }
 
+# Damages a database page: XORs Count bytes at Offset (more than the page
+# checksum's error correction can repair, so reading the page fails)
+function Write-DamagedBytes {
+    param([string]$Path, [long]$Offset, [int]$Count)
+    $stream = [System.IO.File]::Open($Path, "Open", "ReadWrite", "None")
+    try {
+        $bytes = New-Object byte[] $Count
+        $stream.Position = $Offset
+        $read = $stream.Read($bytes, 0, $Count)
+        for ($i = 0; $i -lt $read; $i++) { $bytes[$i] = $bytes[$i] -bxor 0x5A }
+        $stream.Position = $Offset
+        $stream.Write($bytes, 0, $read)
+    }
+    finally { $stream.Dispose() }
+}
+
+# Offset of a byte sequence in a file, or -1 (Latin-1 maps every byte to
+# one character, so a string search finds it)
+function Find-FileBytes {
+    param([string]$Path, [byte[]]$Pattern)
+    $latin1 = [System.Text.Encoding]::GetEncoding(28591)
+    return $latin1.GetString([System.IO.File]::ReadAllBytes($Path)).IndexOf($latin1.GetString($Pattern), [System.StringComparison]::Ordinal)
+}
+
+# A timeline collection folder with collection_info.json and bam_entries.csv
+# (alice) and an empty Execution\SRUM folder; returns that SRUM folder
+function New-TestCollection {
+    param([string]$Path)
+    $srum = Join-Path $Path "Execution\SRUM"
+    New-Item -ItemType Directory -Path $srum -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $Path "collection_info.json"),
+        '{"Mode":"Live","CollectionStartUtc":"2026-03-07T00:00:00Z","CollectorTimeZoneId":"UTC","TargetTimeZoneId":"UTC"}')
+    # bam_entries.csv names alice's SID (the collector writes it on live systems)
+    [System.IO.File]::WriteAllText((Join-Path $Path "Execution\bam_entries.csv"),
+        "`"Sid`",`"User`",`"Path`",`"LastExecutionUtc`"`r`n`"$aliceSid`",`"alice`",`"\Device\HarddiskVolume3\Windows\notepad.exe`",`"2026-03-01T10:00:00.0000000Z`"`r`n")
+    return $srum
+}
+
 $workDir = Join-Path ([System.IO.Path]::GetTempPath()) ("srum-test-" + [guid]::NewGuid().ToString("N"))
 $reportsDir = Join-Path $builderDir "reports"
 $reportsBefore = @(Get-ChildItem -LiteralPath $reportsDir -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
@@ -516,11 +560,9 @@ try {
     # =========================================================
     # Part 1: a clean database (32 KB pages)
     # =========================================================
+    $part1Start = Get-Date
     $collection = Join-Path $workDir "collection"
-    $srumDir = Join-Path $collection "Execution\SRUM"
-    New-Item -ItemType Directory -Path $srumDir -Force | Out-Null
-    [System.IO.File]::WriteAllText((Join-Path $collection "collection_info.json"),
-        '{"Mode":"Live","CollectionStartUtc":"2026-03-07T00:00:00Z","CollectorTimeZoneId":"UTC","TargetTimeZoneId":"UTC"}')
+    $srumDir = New-TestCollection $collection
 
     $writer = New-SrumDatabase -DatabasePath (Join-Path $srumDir "SRUDB.dat") -LogFolder (Join-Path $workDir "clean-logs") -PageSize 32768
     try {
@@ -545,9 +587,9 @@ try {
         # Application Resource Usage: Photos (packaged app) / alice, two
         # records; DiagTrack (service) / SYSTEM, one record
         Add-AppRecords -Writer $writer -Records @(
-            @("2026-03-01 10:00:00", 3, 10, 1000, 200, 4096, 1024, 0, 0),
-            @("2026-03-01 12:00:00", 3, 10, 3000, 800, 4096, 1024, 2048, 512),
-            @("2026-03-01 08:00:00", 4, 11, 0, 50000, 0, 0, 1048576, 2097152)
+            @("2026-03-01 10:00:00", 3, 10, 1000, 200, 4096, 1024, 0, 0, 600000000),
+            @("2026-03-01 12:00:00", 3, 10, 3000, 800, 4096, 1024, 2048, 512, 1200000000),
+            @("2026-03-01 08:00:00", 4, 11, 0, 50000, 0, 0, 1048576, 2097152, 0)
         )
         # Network Connectivity (not parsed)
         $writer.Insert($connectivityTable, [string[]]@("TimeStamp", "AppId", "UserId", "ConnectedTime"), [object[]]@((ConvertTo-RecordTime "2026-03-01 10:00:00"), 1, 10, 3600))
@@ -555,9 +597,6 @@ try {
     }
     finally { $writer.Dispose() }
 
-    # bam_entries.csv names alice's SID (the collector writes it on live systems)
-    [System.IO.File]::WriteAllText((Join-Path $collection "Execution\bam_entries.csv"),
-        "`"Sid`",`"User`",`"Path`",`"LastExecutionUtc`"`r`n`"$aliceSid`",`"alice`",`"\Device\HarddiskVolume3\Windows\notepad.exe`",`"2026-03-01T10:00:00.0000000Z`"`r`n")
     # A SRUDB.dat that is not an ESE database: reported and skipped
     $bogus = Join-Path $collection "Other\SRUDB.dat"
     New-Item -ItemType Directory -Path (Split-Path $bogus -Parent) | Out-Null
@@ -615,12 +654,12 @@ try {
         @{ Time = "2026-03-01 12:00:00.000"; Source = "SRUM-AppUsage"; Type = "Execution"; User = "alice"
             Text = "SRUM app activity: Microsoft.Windows.Photos_8wekyb3d8bbwe"
             Has = @("Day=2026-03-01 | App=Microsoft.Windows.Photos_8wekyb3d8bbwe | AppId=3 | UserSid=$aliceSid | User=alice",
-                "ForegroundCycleTime=4000 | BackgroundCycleTime=1000 | ForegroundBytesRead=8192 | ForegroundBytesWritten=2048 | BackgroundBytesRead=2048 | BackgroundBytesWritten=512",
+                "ForegroundCycleTime=4000 | BackgroundCycleTime=1000 | FaceTime=1800000000 | ForegroundBytesRead=8192 | ForegroundBytesWritten=2048 | BackgroundBytesRead=2048 | BackgroundBytesWritten=512",
                 "BytesRead=10240 | BytesWritten=2560 | Records=2 | FirstRecordUtc=2026-03-01 10:00:00 | LastRecordUtc=2026-03-01 12:00:00")
             Lacks = @("BytesSent=", "Interfaces=") }
         @{ Time = "2026-03-01 08:00:00.000"; Source = "SRUM-AppUsage"; Type = "Execution"; User = "SYSTEM"
             Text = "SRUM app activity: DiagTrack"
-            Has = @("App=DiagTrack | AppId=4 | UserSid=S-1-5-18 | User=SYSTEM", "ForegroundCycleTime=0 | BackgroundCycleTime=50000", "BytesRead=1048576 | BytesWritten=2097152 | Records=1") }
+            Has = @("App=DiagTrack | AppId=4 | UserSid=S-1-5-18 | User=SYSTEM", "ForegroundCycleTime=0 | BackgroundCycleTime=50000 | FaceTime=0", "BytesRead=1048576 | BytesWritten=2097152 | Records=1") }
     )
     Test-TimelineRows -Rows $rows -Expected $expected -Label "clean" -Exact
 
@@ -638,77 +677,196 @@ try {
     }
 
     # =========================================================
-    # Part 2: dirty-shutdown databases (esentutl recovery / repair)
+    # Part 1, continued: a dirty-shutdown database with its logs
     # =========================================================
-    if (-not $allowChanges) {
-        Write-Host "SKIPPED: dirty-shutdown recovery and repair (esentutl writes ESENT events to the Application event log); run with -AllowSystemChanges or in GitHub Actions" -ForegroundColor Yellow
+    # 8 KB pages; the 2026-03-05 records are written to the database file
+    # (clean shutdown), the 2026-03-06 records only to the logs (the engine
+    # then stops without flushing). The logs name the database by this
+    # original path, which recovery must not touch.
+    $dirtyDb = Join-Path $workDir "dirty\SRUDB.dat"
+    $dirtyLogs = Join-Path $workDir "dirty-logs"
+    $writer = New-SrumDatabase -DatabasePath $dirtyDb -LogFolder $dirtyLogs -PageSize 8192
+    try {
+        Add-NetworkRecords -Writer $writer -Records @(, @("2026-03-05 10:00:00", 1, 10, $wifi, 0, 1000, 2000))
+        $writer.Close($false)
+    }
+    finally { $writer.Dispose() }
+    $writer = New-Object SrumTestEse.TestEseWriter($dirtyLogs, "SRU", 8192)
+    try {
+        $writer.OpenDatabase($dirtyDb)
+        $writer.OpenTable($networkTable, $networkNames)
+        Add-NetworkRecords -Writer $writer -Records @(, @("2026-03-06 10:00:00", 2, 10, $ethernet, 0, 3000, 4000))
+        $writer.Close($true)
+    }
+    finally { $writer.Dispose() }
+    $dirtyHash = (Get-FileHash -LiteralPath $dirtyDb -Algorithm SHA256).Hash
+
+    $day1 = @{ Time = "2026-03-05 10:00:00.000"; Source = "SRUM-Network"; Type = "NetworkConnection"; User = "alice"
+        Text = "SRUM network usage: $chromePath sent 1000 bytes, received 2.0 KB" }
+    $day2 = @{ Time = "2026-03-06 10:00:00.000"; Source = "SRUM-Network"; Type = "NetworkConnection"; User = "alice"
+        Text = "SRUM network usage: $uploadPath sent 2.9 KB, received 3.9 KB" }
+
+    # Runs the builder on a collection with a copy of the dirty database
+    # (and the logs and checkpoint with -WithLogs); returns its output and
+    # rows, or $null if it failed
+    function Invoke-DirtyCase {
+        param([string]$Case, [switch]$WithLogs, [switch]$ReadOnly)
+        $caseCollection = Join-Path $workDir "collection-$Case"
+        $caseSrum = New-TestCollection $caseCollection
+        Copy-Item -Path (Join-Path (Split-Path $dirtyDb -Parent) "*") -Destination $caseSrum
+        if ($WithLogs) { Copy-Item -Path (Join-Path $dirtyLogs "SRU*") -Destination $caseSrum }
+        # Evidence is often marked read-only; the builder's temp copies must
+        # still be recoverable
+        if ($ReadOnly) {
+            foreach ($file in (Get-ChildItem -LiteralPath $caseSrum -File)) { $file.Attributes = [System.IO.FileAttributes]::ReadOnly }
+        }
+        $stateByte = [System.IO.File]::ReadAllBytes((Join-Path $caseSrum "SRUDB.dat"))[52]
+        Write-TestResult -Succeeded ($stateByte -eq 2) -Message "${Case}: the test database is in dirty-shutdown state"
+        $caseBefore = Get-FolderHashes $caseCollection
+        $caseCsv = Join-Path $workDir "timeline-$Case.csv"
+        Write-Host "Running the builder on $caseCollection ..."
+        $caseOutput = Invoke-TimelineBuilder -CollectionPath $caseCollection -OutputFile $caseCsv
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $caseCsv)) {
+            $caseOutput | ForEach-Object { Write-Host "  | $_" }
+            Write-TestResult -Succeeded $false -Message "${Case}: the builder exited with code $LASTEXITCODE or wrote no timeline"
+            return $null
+        }
+        Write-TestResult -Succeeded (Test-SameHashes $caseBefore (Get-FolderHashes $caseCollection)) -Message "${Case}: the collection's files are unchanged"
+        if ($ReadOnly) {
+            $notReadOnly = @(Get-ChildItem -LiteralPath $caseSrum -File | Where-Object { -not $_.IsReadOnly })
+            Write-TestResult -Succeeded ($notReadOnly.Count -eq 0) -Message "${Case}: the collection's files are still read-only"
+        }
+        Write-TestResult -Succeeded ((Get-FileHash -LiteralPath $dirtyDb -Algorithm SHA256).Hash -eq $dirtyHash) -Message "${Case}: the database at the path recorded in the logs is not touched"
+        $caseText = $caseOutput -join "`n"
+        Write-TestResult -Succeeded ($caseText -match 'ESE database: 8192-byte pages, dirty shutdown') -Message "${Case}: dirty-shutdown state and 8 KB pages read from the header"
+        return [PSCustomObject]@{ Text = $caseText; Rows = @(Import-Csv -LiteralPath $caseCsv) }
+    }
+
+    # Soft recovery in the builder's process (no esentutl, no events), on
+    # read-only evidence
+    $recovery = Invoke-DirtyCase -Case "recovery" -WithLogs -ReadOnly
+    if ($recovery) {
+        Write-TestResult -Succeeded ($recovery.Text -match 'Soft recovery succeeded\.') -Message "recovery: soft recovery with the collected logs succeeded"
+        Write-TestResult -Succeeded ($recovery.Text -notmatch 'esentutl|Repair') -Message "recovery: done in the builder's process (no esentutl, no repair)"
+        $day1.Has = @("Database=soft recovery (in-process)")
+        $day2.Has = @("Database=soft recovery (in-process)", "BytesSent=3000 | BytesRecvd=4000")
+        # The 2026-03-06 record was only in the logs
+        Test-TimelineRows -Rows $recovery.Rows -Expected @($day1, $day2) -Label "recovery" -Exact
+    }
+
+    # =========================================================
+    # Part 1, continued: a damaged data page
+    # =========================================================
+    # 400 records on 2026-03-03, a marker record, 400 on 2026-03-04. The page
+    # holding the marker is damaged: the scan stops there, the rows keep the
+    # records read before it (marked Partial) and 2026-03-04 has no row.
+    $damagedCollection = Join-Path $workDir "collection-damaged"
+    $damagedSrum = New-TestCollection $damagedCollection
+    $damagedDb = Join-Path $damagedSrum "SRUDB.dat"
+    $writer = New-SrumDatabase -DatabasePath $damagedDb -LogFolder (Join-Path $workDir "damaged-logs") -PageSize 8192
+    try {
+        $records = New-Object System.Collections.Generic.List[object]
+        for ($i = 0; $i -lt 400; $i++) { $records.Add(@(([datetime]"2026-03-03 00:00:00").AddMinutes($i).ToString("yyyy-MM-dd HH:mm:ss"), 1, 10, $wifi, 0, 100, 1)) }
+        $records.Add(@("2026-03-03 23:00:00", 1, 10, $wifi, 0, 0x0123456789ABCDEF, 1))
+        for ($i = 0; $i -lt 400; $i++) { $records.Add(@(([datetime]"2026-03-04 00:00:00").AddMinutes($i).ToString("yyyy-MM-dd HH:mm:ss"), 1, 10, $wifi, 0, 100, 1)) }
+        Add-NetworkRecords -Writer $writer -Records $records.ToArray()
+        $writer.Close($false)
+    }
+    finally { $writer.Dispose() }
+    $markerOffset = Find-FileBytes -Path $damagedDb -Pattern ([BitConverter]::GetBytes([long]0x0123456789ABCDEF))
+    if ($markerOffset -lt 0) {
+        Write-TestResult -Succeeded $false -Message "damaged: marker record not found in the test database"
     }
     else {
-        # 8 KB pages; the 2026-03-05 records are written to the database
-        # file (clean shutdown), the 2026-03-06 records only to the logs
-        # (the engine then stops without flushing)
-        $dirtyDb = Join-Path $workDir "dirty\SRUDB.dat"
-        $dirtyLogs = Join-Path $workDir "dirty-logs"
-        $writer = New-SrumDatabase -DatabasePath $dirtyDb -LogFolder $dirtyLogs -PageSize 8192
+        Write-DamagedBytes -Path $damagedDb -Offset $markerOffset -Count 32
+        $damagedCsv = Join-Path $workDir "timeline-damaged.csv"
+        Write-Host "Running the builder on $damagedCollection ..."
+        $damagedOutput = Invoke-TimelineBuilder -CollectionPath $damagedCollection -OutputFile $damagedCsv
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $damagedCsv)) {
+            $damagedOutput | ForEach-Object { Write-Host "  | $_" }
+            Write-TestResult -Succeeded $false -Message "damaged: the builder exited with code $LASTEXITCODE or wrote no timeline"
+        }
+        else {
+            $damagedText = $damagedOutput -join "`n"
+            $damagedRows = @(Import-Csv -LiteralPath $damagedCsv)
+            $partialRows = @($damagedRows | Where-Object { $_.Timestamp -like "2026-03-03 *" -and $_.Source -eq "SRUM-Network" })
+            $partialCount = 0
+            if ($partialRows.Count -eq 1 -and $partialRows[0].Details -match 'Records=(\d+)') { $partialCount = [int]$Matches[1] }
+            Write-TestResult -Succeeded ($partialRows.Count -eq 1 -and $partialCount -gt 0 -and $partialCount -lt 400 -and $partialRows[0].Details -match 'Partial=yes') -Message "damaged: the records before the damaged page give a row marked Partial ($partialCount record(s))"
+            Write-TestResult -Succeeded (-not ($damagedRows | Where-Object { $_.Timestamp -like "2026-03-04 *" })) -Message "damaged: no row from after the damaged page"
+            # The ESE error depends on what the damage hits (checksum or
+            # page structure): -1018 or -1206
+            $errorReported = $damagedText -match 'Network Data Usage: read error after \d+ record\(s\): JetMove\(\{973F5D5C-1D90-4944-BE8E-24B94231A174\}\) failed: JET_err\w+ \(-\d+\)'
+            Write-TestResult -Succeeded $errorReported -Message "damaged: the read error is reported"
+            if (-not $errorReported) { $damagedOutput | Where-Object { $_ -match 'SRUM|ESE|error' } | ForEach-Object { Write-Host "  | $_" } }
+            Write-TestResult -Succeeded ($damagedText -notmatch 'esentutl|Repair|Failed to parse SRUM') -Message "damaged: no repair and no parser failure"
+        }
+    }
+
+    # The builder's own ESE use (reader and in-process recovery) writes
+    # nothing to the Application event log
+    $part1End = Get-Date
+    $eventFilter = @{ LogName = "Application"; ProviderName = "ESENT"; StartTime = $part1Start; EndTime = $part1End.AddSeconds(5) }
+    $eventError = $null
+    $ownEvents = @(Get-WinEvent -FilterHashtable $eventFilter -ErrorAction SilentlyContinue -ErrorVariable eventError |
+        Where-Object { $_.Message -match 'TimelineSrum_|TimelineEse|srum-test-' })
+    # "No events found" is reported as an error too
+    $readError = @($eventError | Where-Object { $_.FullyQualifiedErrorId -notmatch 'NoMatchingEventsFound' })
+    if ($readError.Count -gt 0) {
+        Write-Host "SKIPPED: ESENT event check (Application log not readable: $($readError[0].Exception.Message))" -ForegroundColor Yellow
+    }
+    else {
+        Write-TestResult -Succeeded ($ownEvents.Count -eq 0) -Message "no ESENT events from the builder's reader and recovery$(if ($ownEvents) { ': event ID(s) ' + (($ownEvents | ForEach-Object { $_.Id }) -join ', ') })"
+    }
+
+    # =========================================================
+    # Part 2: repair (esentutl /p)
+    # =========================================================
+    if (-not $allowChanges) {
+        Write-Host "SKIPPED: repair with esentutl (it writes ESENT events to the Application event log); run with -AllowSystemChanges or in GitHub Actions" -ForegroundColor Yellow
+    }
+    else {
+        # Without logs soft recovery is not possible: the copy is repaired
+        $repair = Invoke-DirtyCase -Case "repair"
+        if ($repair) {
+            Write-TestResult -Succeeded ($repair.Text -match 'No SRUM transaction logs') -Message "repair: missing logs reported"
+            Write-TestResult -Succeeded ($repair.Text -match 'Repair was needed') -Message "repair: the repair is reported"
+            $day1.Has = @("Database=repair (esentutl /p)")
+            # Records only in the (missing) logs are lost; the rows that
+            # were in the database file must be there
+            Test-TimelineRows -Rows $repair.Rows -Expected @($day1) -Label "repair"
+        }
+
+        # A database whose header says clean but whose catalog index page
+        # (page 10, checked when the database is attached) is damaged cannot
+        # be opened: it is repaired once and opened again
+        $catalogCollection = Join-Path $workDir "collection-catalog"
+        $catalogSrum = New-TestCollection $catalogCollection
+        $catalogDb = Join-Path $catalogSrum "SRUDB.dat"
+        $writer = New-SrumDatabase -DatabasePath $catalogDb -LogFolder (Join-Path $workDir "catalog-logs") -PageSize 8192
         try {
             Add-NetworkRecords -Writer $writer -Records @(, @("2026-03-05 10:00:00", 1, 10, $wifi, 0, 1000, 2000))
             $writer.Close($false)
         }
         finally { $writer.Dispose() }
-        $writer = New-Object SrumTestEse.TestEseWriter($dirtyLogs, "SRU", 8192)
-        try {
-            $writer.OpenDatabase($dirtyDb)
-            $writer.OpenTable($networkTable, $networkNames)
-            Add-NetworkRecords -Writer $writer -Records @(, @("2026-03-06 10:00:00", 2, 10, $ethernet, 0, 3000, 4000))
-            $writer.Close($true)
+        # Page n starts at (n + 1) * page size (two header pages)
+        Write-DamagedBytes -Path $catalogDb -Offset (11 * 8192 + 100) -Count 32
+        $catalogCsv = Join-Path $workDir "timeline-catalog.csv"
+        $catalogBefore = Get-FolderHashes $catalogCollection
+        Write-Host "Running the builder on $catalogCollection ..."
+        $catalogOutput = Invoke-TimelineBuilder -CollectionPath $catalogCollection -OutputFile $catalogCsv
+        Write-TestResult -Succeeded (Test-SameHashes $catalogBefore (Get-FolderHashes $catalogCollection)) -Message "catalog: the collection's files are unchanged"
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $catalogCsv)) {
+            $catalogOutput | ForEach-Object { Write-Host "  | $_" }
+            Write-TestResult -Succeeded $false -Message "catalog: the builder exited with code $LASTEXITCODE or wrote no timeline"
         }
-        finally { $writer.Dispose() }
-
-        $day1 = @{ Time = "2026-03-05 10:00:00.000"; Source = "SRUM-Network"; Type = "NetworkConnection"; User = "alice"
-            Text = "SRUM network usage: $chromePath sent 1000 bytes, received 2.0 KB" }
-        $day2 = @{ Time = "2026-03-06 10:00:00.000"; Source = "SRUM-Network"; Type = "NetworkConnection"; User = "alice"
-            Text = "SRUM network usage: $uploadPath sent 2.9 KB, received 3.9 KB" }
-
-        foreach ($case in @("recovery", "repair")) {
-            $caseCollection = Join-Path $workDir "collection-$case"
-            $caseSrum = Join-Path $caseCollection "Execution\SRUM"
-            New-Item -ItemType Directory -Path $caseSrum -Force | Out-Null
-            Copy-Item -LiteralPath (Join-Path $collection "collection_info.json"), (Join-Path $collection "Execution\bam_entries.csv") -Destination $caseCollection
-            Copy-Item -Path (Join-Path (Split-Path $dirtyDb -Parent) "*") -Destination $caseSrum
-            # The recovery case gets the logs and checkpoint, like a collection
-            if ($case -eq "recovery") { Copy-Item -Path (Join-Path $dirtyLogs "SRU*") -Destination $caseSrum }
-            $stateByte = [System.IO.File]::ReadAllBytes((Join-Path $caseSrum "SRUDB.dat"))[52]
-            Write-TestResult -Succeeded ($stateByte -eq 2) -Message "${case}: the test database is in dirty-shutdown state"
-
-            $caseBefore = Get-FolderHashes $caseCollection
-            $caseCsv = Join-Path $workDir "timeline-$case.csv"
-            Write-Host "Running the builder on $caseCollection ..."
-            $caseOutput = Invoke-TimelineBuilder -CollectionPath $caseCollection -OutputFile $caseCsv
-            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $caseCsv)) {
-                $caseOutput | ForEach-Object { Write-Host "  | $_" }
-                Write-TestResult -Succeeded $false -Message "${case}: the builder exited with code $LASTEXITCODE or wrote no timeline"
-                continue
-            }
-            $caseRows = @(Import-Csv -LiteralPath $caseCsv)
-            $caseText = $caseOutput -join "`n"
-            Write-TestResult -Succeeded ($caseText -match 'ESE database: 8192-byte pages, dirty shutdown') -Message "${case}: dirty-shutdown state and 8 KB pages read from the header"
-            if ($case -eq "recovery") {
-                Write-TestResult -Succeeded ($caseText -match 'Soft recovery succeeded') -Message "recovery: soft recovery with the collected logs succeeded"
-                Write-TestResult -Succeeded ($caseText -notmatch 'Repair') -Message "recovery: no repair needed"
-                $day1.Has = @("Database=soft recovery (esentutl /r)")
-                $day2.Has = @("Database=soft recovery (esentutl /r)", "BytesSent=3000 | BytesRecvd=4000")
-                # The 2026-03-06 record was only in the logs
-                Test-TimelineRows -Rows $caseRows -Expected @($day1, $day2) -Label "recovery" -Exact
-            }
-            else {
-                Write-TestResult -Succeeded ($caseText -match 'No SRUM transaction logs') -Message "repair: missing logs reported"
-                Write-TestResult -Succeeded ($caseText -match 'Repair was needed') -Message "repair: the repair is reported"
-                $day1.Has = @("Database=repair (esentutl /p)")
-                # Records only in the (missing) logs are lost; the rows that
-                # were in the database file must be there
-                Test-TimelineRows -Rows $caseRows -Expected @($day1) -Label "repair"
-            }
-            Write-TestResult -Succeeded (Test-SameHashes $caseBefore (Get-FolderHashes $caseCollection)) -Message "${case}: the collection's files are unchanged"
+        else {
+            $catalogText = $catalogOutput -join "`n"
+            Write-TestResult -Succeeded ($catalogText -match 'ESE database: 8192-byte pages, clean shutdown') -Message "catalog: the damaged database's header says clean"
+            Write-TestResult -Succeeded ($catalogText -match 'Could not open the SRUM database: .*JET_errDatabaseCorrupted') -Message "catalog: the failed open is reported"
+            Write-TestResult -Succeeded ($catalogText -match 'Repair was needed') -Message "catalog: the copy is repaired"
+            $day1.Has = @("Database=repair (esentutl /p)")
+            Test-TimelineRows -Rows @(Import-Csv -LiteralPath $catalogCsv) -Expected @($day1) -Label "catalog" -Exact
         }
     }
 

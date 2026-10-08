@@ -8654,6 +8654,9 @@ function Parse-Persistence {
 # - The database is attached read-only to a private ESE instance with
 #   recovery off (nothing is logged or written), using the page size from
 #   the database header (offset 236; 0 means 4 KB), which must match.
+# - A copy in dirty-shutdown state is first brought to a clean state by
+#   soft recovery in this process (EseRecovery: the collected transaction
+#   logs are replayed into the temp copy, event logging off).
 # - Column names, ids and types come from JetGetTableColumnInfo
 #   (JET_ColInfoList: a temporary table with one row per column); records
 #   are read with JetMove / JetRetrieveColumn.
@@ -8665,6 +8668,8 @@ function Parse-Persistence {
 #   one record per application and user per hour (TimeStamp: an OLE
 #   Automation date in UTC). Records are summed per application, user and
 #   UTC day in C#, so a large database stays fast and the timeline readable.
+#   A read error (damaged page) stops a table's scan but keeps the sums of
+#   the records read before it (SrumTableResult.Error).
 # C# 5 (Windows PowerShell 5.1 compiler): no interpolation, no "=>" members.
 # The ESE constants and signatures follow esent.h (Microsoft ESE headers).
 function Initialize-SrumReader {
@@ -8703,13 +8708,19 @@ namespace TimelineEse
             string name = null;
             switch (error)
             {
+                case -327: name = "JET_errBadPageLink"; break;
                 case -501: name = "JET_errLogFileCorrupt"; break;
                 case -528: name = "JET_errMissingLogFile"; break;
+                case -533: name = "JET_errCheckpointCorrupt"; break;
+                case -539: name = "JET_errDatabaseLogSetMismatch"; break;
+                case -541: name = "JET_errLogFileSizeMismatch"; break;
                 case -543: name = "JET_errRequiredLogFilesMissing"; break;
                 case -550: name = "JET_errDatabaseDirtyShutdown"; break;
                 case -1003: name = "JET_errInvalidParameter"; break;
+                case -1008: name = "JET_errDatabaseFileReadOnly"; break;
                 case -1011: name = "JET_errOutOfMemory"; break;
                 case -1018: name = "JET_errReadVerifyFailure"; break;
+                case -1019: name = "JET_errPageNotInitialized"; break;
                 case -1022: name = "JET_errDiskIO"; break;
                 case -1023: name = "JET_errInvalidPath"; break;
                 case -1030: name = "JET_errAlreadyInitialized"; break;
@@ -8717,6 +8728,7 @@ namespace TimelineEse
                 case -1206: name = "JET_errDatabaseCorrupted"; break;
                 case -1209: name = "JET_errInvalidDatabaseVersion"; break;
                 case -1213: name = "JET_errPageSizeMismatch"; break;
+                case -1216: name = "JET_errAttachedDatabaseMismatch"; break;
                 case -1305: name = "JET_errObjectNotFound"; break;
                 case -1414: name = "JET_errSecondaryIndexCorrupted"; break;
                 case -1507: name = "JET_errColumnNotFound"; break;
@@ -8873,16 +8885,18 @@ namespace TimelineEse
     // off, so the file is never written. Dispose closes everything.
     public sealed class EseDatabase : IDisposable
     {
-        const uint ParamSystemPath = 0;
-        const uint ParamTempPath = 1;
-        const uint ParamLogFilePath = 2;
-        const uint ParamBaseName = 3;
-        const uint ParamRecovery = 34;
-        const uint ParamEnableIndexChecking = 45;
-        const uint ParamNoInformationEvent = 50;
-        const uint ParamEventLoggingLevel = 51;
-        const uint ParamDatabasePageSize = 64;
-        const uint ParamCreatePathIfNotExist = 100;
+        internal const uint ParamSystemPath = 0;
+        internal const uint ParamTempPath = 1;
+        internal const uint ParamLogFilePath = 2;
+        internal const uint ParamBaseName = 3;
+        internal const uint ParamLogFileSize = 11;
+        internal const uint ParamRecovery = 34;
+        internal const uint ParamEnableIndexChecking = 45;
+        internal const uint ParamNoInformationEvent = 50;
+        internal const uint ParamEventLoggingLevel = 51;
+        internal const uint ParamDatabasePageSize = 64;
+        internal const uint ParamCreatePathIfNotExist = 100;
+        internal const uint ParamAlternateDatabaseRecoveryPath = 113;
         const uint BitDbReadOnly = 0x1;
         const uint BitTableReadOnly = 0x4;
         const uint BitTableSequential = 0x8000;
@@ -8890,7 +8904,7 @@ namespace TimelineEse
         const uint BitTermAbrupt = 0x2;
         internal const int ErrNoCurrentRecord = -1603;
         const int ErrObjectNotFound = -1305;
-        const int ErrAlreadyInitialized = -1030;
+        internal const int ErrAlreadyInitialized = -1030;
 
         IntPtr instance;
         IntPtr sesid;
@@ -8917,7 +8931,9 @@ namespace TimelineEse
                 SetString(ParamBaseName, "tln");
                 SetString(ParamRecovery, "Off");
                 SetNumber(ParamCreatePathIfNotExist, 1);
-                // Nothing in the analysis machine's Application event log
+                // Event logging off: normally nothing goes to the analysis
+                // machine's Application event log (for a damaged database
+                // ESE may still log a diagnostic event, ID 901)
                 SetNumber(ParamNoInformationEvent, 1);
                 SetNumber(ParamEventLoggingLevel, 0);
                 // Indexes are not checked against this machine's sort order
@@ -9003,6 +9019,73 @@ namespace TimelineEse
                     }
                 }
             }
+        }
+    }
+
+    // Soft recovery of a database copy in this process: a private instance
+    // with recovery on replays the transaction logs in logFolder (base name,
+    // checkpoint and logs) into the database file in databaseFolder. The
+    // logs name the database by its original path;
+    // JET_paramAlternateDatabaseRecoveryPath makes the engine look for it in
+    // databaseFolder only, so the original is never touched. Event logging
+    // is off, as in the reader. logFileSizeKb: the size of the collected log
+    // files (JET_paramLogFileSize must match them), 0 for the default.
+    // Throws EseException when JetInit fails; the caller reads the database
+    // header to see whether the copy is now clean.
+    public static class EseRecovery
+    {
+        public static void Recover(string logFolder, string baseName, string databaseFolder, string engineFolder, int pageSize, int logFileSizeKb)
+        {
+            string logs = Path.GetFullPath(logFolder).TrimEnd('\\') + "\\";
+            string databases = Path.GetFullPath(databaseFolder).TrimEnd('\\');
+            string engine = Path.GetFullPath(engineFolder).TrimEnd('\\') + "\\";
+            IntPtr instance = IntPtr.Zero;
+            try
+            {
+                // Process-wide, so it is set before the instance is created
+                int err = NativeMethods.JetSetSystemParameterW(IntPtr.Zero, IntPtr.Zero, EseDatabase.ParamDatabasePageSize, new IntPtr(pageSize), null);
+                if (err < 0 && err != EseDatabase.ErrAlreadyInitialized) throw new EseException("JetSetSystemParameter(DatabasePageSize)", err);
+                Check("JetCreateInstance2", NativeMethods.JetCreateInstance2W(out instance, "TimelineEseRecovery" + Guid.NewGuid().ToString("N"), "Timeline builder recovery", 0));
+                // Checkpoint (system path) and logs: the collected ones
+                SetString(ref instance, EseDatabase.ParamSystemPath, logs);
+                SetString(ref instance, EseDatabase.ParamLogFilePath, logs);
+                SetString(ref instance, EseDatabase.ParamTempPath, engine);
+                SetString(ref instance, EseDatabase.ParamBaseName, baseName);
+                SetString(ref instance, EseDatabase.ParamRecovery, "On");
+                SetString(ref instance, EseDatabase.ParamAlternateDatabaseRecoveryPath, databases);
+                if (logFileSizeKb > 0) SetNumber(ref instance, EseDatabase.ParamLogFileSize, logFileSizeKb);
+                SetNumber(ref instance, EseDatabase.ParamCreatePathIfNotExist, 1);
+                SetNumber(ref instance, EseDatabase.ParamNoInformationEvent, 1);
+                SetNumber(ref instance, EseDatabase.ParamEventLoggingLevel, 0);
+                SetNumber(ref instance, EseDatabase.ParamEnableIndexChecking, 0);
+                // Recovery runs inside JetInit; on failure JetInit frees the
+                // instance and sets it to 0
+                Check("JetInit (soft recovery)", NativeMethods.JetInit(ref instance));
+            }
+            finally
+            {
+                if (instance != IntPtr.Zero && NativeMethods.JetTerm2(instance, 0x1) < 0)   // JET_bitTermComplete
+                {
+                    NativeMethods.JetTerm2(instance, 0x2);                                  // JET_bitTermAbrupt
+                }
+            }
+        }
+
+        static void Check(string api, int err)
+        {
+            if (err < 0) throw new EseException(api, err);
+        }
+
+        static void SetString(ref IntPtr instance, uint param, string value)
+        {
+            Check("JetSetSystemParameter(" + param.ToString(CultureInfo.InvariantCulture) + ")",
+                NativeMethods.JetSetInstanceParameterW(ref instance, IntPtr.Zero, param, IntPtr.Zero, value));
+        }
+
+        static void SetNumber(ref IntPtr instance, uint param, int value)
+        {
+            Check("JetSetSystemParameter(" + param.ToString(CultureInfo.InvariantCulture) + ")",
+                NativeMethods.JetSetInstanceParameterW(ref instance, IntPtr.Zero, param, new IntPtr(value), null));
         }
     }
 
@@ -9285,15 +9368,21 @@ namespace TimelineEse
         public long RecordsWithoutTime { get; set; }
         public DateTime FirstUtc { get; set; }
         public DateTime LastUtc { get; set; }
+        // The read error that stopped the scan (a damaged page), or null;
+        // the sums cover the records read before it
+        public string Error { get; set; }
         public List<string> MissingColumns { get; private set; }
         public List<SrumDayTotal> Days { get; private set; }
     }
 
     public static class SrumReader
     {
-        // SruDbIdMapTable entries, or null if the database has no such table
-        public static List<SrumIdEntry> ReadIdMap(EseDatabase database)
+        // SruDbIdMapTable entries, or null if the database has no such table.
+        // error: the read error that stopped the scan, or null; the entries
+        // read before it are returned.
+        public static List<SrumIdEntry> ReadIdMap(EseDatabase database, out string error)
         {
+            error = null;
             EseTable table = database.OpenTable("SruDbIdMapTable");
             if (table == null) return null;
             List<SrumIdEntry> entries = new List<SrumIdEntry>();
@@ -9306,26 +9395,33 @@ namespace TimelineEse
                 {
                     throw new InvalidDataException("SruDbIdMapTable has no IdType, IdIndex or IdBlob column");
                 }
-                bool more = table.MoveFirst();
-                while (more)
+                try
                 {
-                    long idType;
-                    long idIndex;
-                    if (table.TryGetInt64(typeColumn, out idType) && table.TryGetInt64(indexColumn, out idIndex))
+                    bool more = table.MoveFirst();
+                    while (more)
                     {
-                        SrumIdEntry entry = new SrumIdEntry();
-                        entry.IdType = idType;
-                        entry.IdIndex = idIndex;
-                        byte[] blob = table.GetBytes(blobColumn);
-                        if (idType == 3)
+                        long idType;
+                        long idIndex;
+                        if (table.TryGetInt64(typeColumn, out idType) && table.TryGetInt64(indexColumn, out idIndex))
                         {
-                            entry.Value = SidToString(blob);
-                            entry.IsSid = entry.Value != null;
+                            SrumIdEntry entry = new SrumIdEntry();
+                            entry.IdType = idType;
+                            entry.IdIndex = idIndex;
+                            byte[] blob = table.GetBytes(blobColumn);
+                            if (idType == 3)
+                            {
+                                entry.Value = SidToString(blob);
+                                entry.IsSid = entry.Value != null;
+                            }
+                            if (entry.Value == null) entry.Value = BlobToText(blob);
+                            entries.Add(entry);
                         }
-                        if (entry.Value == null) entry.Value = BlobToText(blob);
-                        entries.Add(entry);
+                        more = table.MoveNext();
                     }
-                    more = table.MoveNext();
+                }
+                catch (EseException e)
+                {
+                    error = e.Message;
                 }
             }
             finally
@@ -9420,50 +9516,64 @@ namespace TimelineEse
                 if (timeColumn == null || appColumn == null) return result;
 
                 Dictionary<string, SrumDayTotal> totals = new Dictionary<string, SrumDayTotal>(StringComparer.Ordinal);
-                bool more = table.MoveFirst();
-                while (more)
+                long[] values = new long[sumList.Count];
+                try
                 {
-                    result.RecordsRead++;
-                    DateTime time;
-                    if (!table.TryGetUtcTime(timeColumn, out time))
+                    bool more = table.MoveFirst();
+                    while (more)
                     {
-                        result.RecordsWithoutTime++;
+                        // Every column of the record is read before anything
+                        // is added, so a read error never leaves half a record
+                        DateTime time;
+                        if (!table.TryGetUtcTime(timeColumn, out time))
+                        {
+                            result.RecordsRead++;
+                            result.RecordsWithoutTime++;
+                            more = table.MoveNext();
+                            continue;
+                        }
+                        long appId;
+                        long userId;
+                        if (!table.TryGetInt64(appColumn, out appId)) appId = 0;
+                        if (!table.TryGetInt64(userColumn, out userId)) userId = 0;
+                        for (int i = 0; i < sumList.Count; i++)
+                        {
+                            if (!table.TryGetInt64(sumList[i], out values[i])) values[i] = 0;
+                        }
+                        long luid;
+                        if (!table.TryGetInt64(luidColumn, out luid)) luid = 0;
+                        long profileId;
+                        if (!table.TryGetInt64(profileColumn, out profileId)) profileId = 0;
+
+                        result.RecordsRead++;
+                        DateTime day = time.Date;
+                        string key = appId.ToString(CultureInfo.InvariantCulture) + "|" + userId.ToString(CultureInfo.InvariantCulture) + "|" + day.Ticks.ToString(CultureInfo.InvariantCulture);
+                        SrumDayTotal total;
+                        if (!totals.TryGetValue(key, out total))
+                        {
+                            total = new SrumDayTotal();
+                            total.AppId = appId;
+                            total.UserId = userId;
+                            total.Day = DateTime.SpecifyKind(day, DateTimeKind.Utc);
+                            total.FirstUtc = time;
+                            total.LastUtc = time;
+                            totals[key] = total;
+                        }
+                        total.Records++;
+                        if (time < total.FirstUtc) total.FirstUtc = time;
+                        if (time > total.LastUtc) total.LastUtc = time;
+                        if (result.RecordsRead - result.RecordsWithoutTime == 1 || time < result.FirstUtc) result.FirstUtc = time;
+                        if (time > result.LastUtc) result.LastUtc = time;
+                        for (int i = 0; i < sumList.Count; i++) total.Add(sumList[i].Name, values[i]);
+                        if (luid != 0) total.AddInterface((luid >> 48) & 0xFFFF);
+                        if (profileId != 0) total.AddProfile(profileId);
                         more = table.MoveNext();
-                        continue;
                     }
-                    long appId;
-                    long userId;
-                    if (!table.TryGetInt64(appColumn, out appId)) appId = 0;
-                    if (!table.TryGetInt64(userColumn, out userId)) userId = 0;
-                    DateTime day = time.Date;
-                    string key = appId.ToString(CultureInfo.InvariantCulture) + "|" + userId.ToString(CultureInfo.InvariantCulture) + "|" + day.Ticks.ToString(CultureInfo.InvariantCulture);
-                    SrumDayTotal total;
-                    if (!totals.TryGetValue(key, out total))
-                    {
-                        total = new SrumDayTotal();
-                        total.AppId = appId;
-                        total.UserId = userId;
-                        total.Day = DateTime.SpecifyKind(day, DateTimeKind.Utc);
-                        total.FirstUtc = time;
-                        total.LastUtc = time;
-                        totals[key] = total;
-                    }
-                    total.Records++;
-                    if (time < total.FirstUtc) total.FirstUtc = time;
-                    if (time > total.LastUtc) total.LastUtc = time;
-                    if (result.RecordsRead - result.RecordsWithoutTime == 1 || time < result.FirstUtc) result.FirstUtc = time;
-                    if (time > result.LastUtc) result.LastUtc = time;
-                    foreach (EseColumn column in sumList)
-                    {
-                        long value;
-                        if (table.TryGetInt64(column, out value)) total.Add(column.Name, value);
-                        else total.Add(column.Name, 0);
-                    }
-                    long luid;
-                    if (table.TryGetInt64(luidColumn, out luid) && luid != 0) total.AddInterface((luid >> 48) & 0xFFFF);
-                    long profileId;
-                    if (table.TryGetInt64(profileColumn, out profileId) && profileId != 0) total.AddProfile(profileId);
-                    more = table.MoveNext();
+                }
+                catch (EseException e)
+                {
+                    // A damaged page: keep what was read before it
+                    result.Error = e.Message;
                 }
                 result.Days.AddRange(totals.Values);
                 result.Days.Sort(delegate (SrumDayTotal a, SrumDayTotal b)
@@ -9580,14 +9690,32 @@ function Get-SrumSidNames {
     return $result
 }
 
+# Repairs the temp copy of a SRUM database (esentutl /p): works on the
+# database file alone, so records that were only in the transaction logs
+# are lost and damaged pages are dropped. Sets Header and Method of the copy
+# (from Get-SrumWorkingCopy); returns $true if the copy is now clean.
+function Repair-SrumWorkingCopy {
+    param([object]$Copy, [string]$TempDir)
+    Log "  Repairing the temp copy (esentutl /p)..."
+    $repair = Invoke-SrumEsentutl -Arguments ("/p `"{0}`" /o" -f $Copy.Database) -WorkingDirectory $TempDir
+    $Copy.Header = [TimelineEse.EseHeader]::Read($Copy.Database)
+    if ($Copy.Header.IsClean) {
+        $Copy.Method = "repair (esentutl /p)"
+        Log-Warning "  Repair was needed: records that were only in the transaction logs or on damaged pages may be missing. esentutl: $($repair.Result)"
+        return $true
+    }
+    Log-Warning "  Repair failed: $($repair.Result)"
+    return $false
+}
+
 # Copies SRUDB.dat and its ESE companion files (SRU*.log, SRU.chk,
 # SRUres*.jrs, SRUDB.jfm) from the collection to the (empty) temp folder and
 # brings the copy to a clean state if needed: soft recovery with the
-# collected logs (esentutl /r), else repair (esentutl /p, which can lose
-# data). The collection itself is never changed. Returns Database (the copy),
-# Header (Header.IsEse is false for a file that is not an ESE database,
-# Header.IsClean false if neither recovery nor repair worked) and Method
-# (what was needed: "" for a clean copy).
+# collected logs (in this process, else esentutl /r), else repair (esentutl
+# /p, which can lose data). The collection itself is never changed. Returns
+# Database (the copy), Header (Header.IsEse is false for a file that is not
+# an ESE database, Header.IsClean false if neither recovery nor repair
+# worked) and Method (what was needed: "" for a clean copy).
 function Get-SrumWorkingCopy {
     param([System.IO.FileInfo]$File, [string]$TempDir)
     $copy = [PSCustomObject]@{ Database = (Join-Path $TempDir "SRUDB.dat"); Header = $null; Method = "" }
@@ -9597,7 +9725,14 @@ function Get-SrumWorkingCopy {
     foreach ($companion in $companions) {
         Copy-Item -LiteralPath $companion.FullName -Destination (Join-Path $TempDir $companion.Name) -Force -ErrorAction SilentlyContinue
     }
-    $logCount = @($companions | Where-Object { $_.Extension -in ".log", ".jtx" }).Count
+    # Copies keep the attributes of the collection's files; a read-only copy
+    # (evidence marked read-only, read-only media) cannot be recovered or
+    # repaired
+    foreach ($tempFile in @(Get-ChildItem -LiteralPath $TempDir -File -Force)) {
+        $tempFile.Attributes = [System.IO.FileAttributes]::Normal
+    }
+    $logs = @($companions | Where-Object { $_.Extension -in ".log", ".jtx" })
+    $logCount = $logs.Count
     $copy.Header = [TimelineEse.EseHeader]::Read($copy.Database)
     if (-not $copy.Header.IsEse) { return $copy }
     Log "  ESE database: $($copy.Header.PageSize)-byte pages, $($copy.Header.StateName); $logCount SRUM transaction log file(s) next to it"
@@ -9605,35 +9740,48 @@ function Get-SrumWorkingCopy {
 
     # A copy of an open database (live collection, shadow copy) is normally
     # in dirty-shutdown state: replay the collected logs into the temp copy.
-    # /d makes esentutl look for the database in the temp folder (by default
-    # it uses the original path recorded in the logs).
     if ($logCount -gt 0) {
-        Log "  Soft recovery of the temp copy with the $logCount collected log file(s) (esentutl /r)..."
+        # In this process first: writes nothing to the Application event
+        # log. The engine must be told the size of the logs (all the same).
+        Log "  Soft recovery of the temp copy with the $logCount collected log file(s)..."
+        $logSizeKb = 0
+        $logLength = @($logs | Sort-Object { $_.Name -ne "SRU.log" } | Select-Object -First 1)[0].Length
+        if ($logLength -gt 0 -and $logLength % 1024 -eq 0) { $logSizeKb = [int]($logLength / 1024) }
+        $inProcessError = ""
+        try {
+            [TimelineEse.EseRecovery]::Recover($TempDir, "SRU", $TempDir, (Join-Path $TempDir "recovery"), $copy.Header.PageSize, $logSizeKb)
+        }
+        catch {
+            $failure = $_.Exception
+            if ($failure.InnerException) { $failure = $failure.InnerException }
+            $inProcessError = $failure.Message
+        }
+        $copy.Header = [TimelineEse.EseHeader]::Read($copy.Database)
+        if ($copy.Header.IsClean) {
+            $copy.Method = "soft recovery (in-process)"
+            Log "  Soft recovery succeeded."
+            return $copy
+        }
+        if (-not $inProcessError) { $inProcessError = "the database is still in state '$($copy.Header.StateName)'" }
+        Log-Warning "  Soft recovery in this process failed: $inProcessError -- trying esentutl /r."
+
+        # esentutl /r (writes ESENT events to the Application event log).
+        # /d makes it look for the database in the temp folder (by default
+        # it uses the original path recorded in the logs).
         $recovery = Invoke-SrumEsentutl -Arguments ("/r sru `"/l{0}`" `"/s{0}`" `"/d{0}`" /i /o" -f $TempDir) -WorkingDirectory $TempDir
         $copy.Header = [TimelineEse.EseHeader]::Read($copy.Database)
         if ($copy.Header.IsClean) {
             $copy.Method = "soft recovery (esentutl /r)"
-            Log "  Soft recovery succeeded: $($recovery.Result)"
+            Log "  Soft recovery with esentutl succeeded: $($recovery.Result)"
             return $copy
         }
-        Log-Warning "  Soft recovery failed: $($recovery.Result)"
+        Log-Warning "  Soft recovery with esentutl failed: $($recovery.Result)"
     }
     else {
         Log-Warning "  No SRUM transaction logs (SRU*.log) next to SRUDB.dat: soft recovery is not possible."
     }
 
-    # Repair works on the database file alone; records that were only in
-    # the logs are lost and damaged pages are dropped
-    Log "  Repairing the temp copy (esentutl /p)..."
-    $repair = Invoke-SrumEsentutl -Arguments ("/p `"{0}`" /o" -f $copy.Database) -WorkingDirectory $TempDir
-    $copy.Header = [TimelineEse.EseHeader]::Read($copy.Database)
-    if ($copy.Header.IsClean) {
-        $copy.Method = "repair (esentutl /p)"
-        Log-Warning "  Repair was needed: records not yet written to the database file may be missing. esentutl: $($repair.Result)"
-    }
-    else {
-        Log-Warning "  Repair failed: $($repair.Result)"
-    }
+    $null = Repair-SrumWorkingCopy -Copy $copy -TempDir $TempDir
     return $copy
 }
 
@@ -9657,23 +9805,36 @@ function Add-SrumTimelineEntries {
             Log-Warning "  SRUM database could not be brought to a clean state -- skipped."
             return
         }
-        try {
-            $database = New-Object TimelineEse.EseDatabase($copy.Database, (Join-Path $tempDir "engine"), $copy.Header.PageSize)
-        }
-        catch {
-            $failure = $_.Exception
-            if ($failure.InnerException) { $failure = $failure.InnerException }
-            Log-Warning "  Could not open the SRUM database: $($failure.Message) -- skipped."
-            return
+        # A database whose header says clean can still have damaged pages
+        # (the catalog, for example): those are repaired once and opened again
+        for ($attempt = 1; $attempt -le 2 -and -not $database; $attempt++) {
+            try {
+                $database = New-Object TimelineEse.EseDatabase($copy.Database, (Join-Path $tempDir "engine"), $copy.Header.PageSize)
+            }
+            catch {
+                $failure = $_.Exception
+                if ($failure.InnerException) { $failure = $failure.InnerException }
+                $damaged = $failure -is [TimelineEse.EseException] -and $failure.Error -in @(-327, -1018, -1019, -1022, -1206)
+                if ($attempt -eq 1 -and $damaged -and $copy.Method -notlike "repair*") {
+                    Log-Warning "  Could not open the SRUM database: $($failure.Message)"
+                    if (Repair-SrumWorkingCopy -Copy $copy -TempDir $tempDir) { continue }
+                }
+                Log-Warning "  Could not open the SRUM database: $($failure.Message) -- skipped."
+                return
+            }
         }
 
         # Id map: AppId / UserId -> application or SID
         $idMap = $null
-        try { $idMap = [TimelineEse.SrumReader]::ReadIdMap($database) }
+        $idMapError = $null
+        try { $idMap = [TimelineEse.SrumReader]::ReadIdMap($database, [ref]$idMapError) }
         catch {
             $failure = $_.Exception
             if ($failure.InnerException) { $failure = $failure.InnerException }
             Log-Warning "  Could not read SruDbIdMapTable: $($failure.Message)"
+        }
+        if ($idMapError) {
+            Log-Warning "  SruDbIdMapTable: read error after $(@($idMap).Count) entries: $idMapError -- applications and users after it are shown by their ids."
         }
         $ids = @{}
         if ($null -eq $idMap) { Log-Warning "  No SruDbIdMapTable: applications and users are shown by their ids." }
@@ -9694,7 +9855,7 @@ function Add-SrumTimelineEntries {
             [PSCustomObject]@{ Id = "{973F5D5C-1D90-4944-BE8E-24B94231A174}"; Label = "Network Data Usage"; Source = "SRUM-Network"; EventType = "NetworkConnection"
                 Sums = @("BytesSent", "BytesRecvd") }
             [PSCustomObject]@{ Id = "{D10CA2FE-6FCF-4F6D-848E-B2E99266FA89}"; Label = "Application Resource Usage"; Source = "SRUM-AppUsage"; EventType = "Execution"
-                Sums = @("ForegroundCycleTime", "BackgroundCycleTime", "ForegroundBytesRead", "ForegroundBytesWritten", "BackgroundBytesRead", "BackgroundBytesWritten") }
+                Sums = @("ForegroundCycleTime", "BackgroundCycleTime", "FaceTime", "ForegroundBytesRead", "ForegroundBytesWritten", "BackgroundBytesRead", "BackgroundBytesWritten") }
         )
         foreach ($table in $tables) {
             try { $result = [TimelineEse.SrumReader]::Aggregate($database, $table.Id, [string[]]$table.Sums) }
@@ -9761,6 +9922,7 @@ function Add-SrumTimelineEntries {
                 if ($day.ProfileIds.Count -gt 0) { $pairs["L2ProfileIds"] = ($day.ProfileIds -join ", ") }
                 $pairs["Time"] = "last SRUM record of the day (UTC)"
                 if ($copy.Method) { $pairs["Database"] = $copy.Method }
+                if ($result.Error) { $pairs["Partial"] = "yes (read error; later records of this table are missing)" }
                 Add-TimelineEntry -Timestamp $day.LastUtc -Source $table.Source -EventType $table.EventType `
                     -Description $description -User $user -Details (Format-ArtifactDetails $pairs) `
                     -Artifact "SRUM" -RawPath $File.FullName
@@ -9774,6 +9936,9 @@ function Add-SrumTimelineEntries {
             if ($table.Source -eq "SRUM-Network") { $summary += "; sent $(Format-SrumBytes $totalSent), received $(Format-SrumBytes $totalRecvd) in total" }
             else { $summary += "; read $(Format-SrumBytes $totalRead), written $(Format-SrumBytes $totalWritten) in total" }
             Log "$summary."
+            if ($result.Error) {
+                Log-Warning "  SRUM $($table.Label): read error after $($result.RecordsRead) record(s): $($result.Error) -- the rows cover only the records before it (Partial=yes in Details)."
+            }
             if ($result.RecordsWithoutTime -gt 0) {
                 Log-Warning "  SRUM $($table.Label): $($result.RecordsWithoutTime) record(s) without a valid TimeStamp skipped."
             }
