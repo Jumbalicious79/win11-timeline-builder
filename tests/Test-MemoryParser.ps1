@@ -18,7 +18,8 @@
 # also through Parse-Memory's "Dump time" line; and the rows made from
 # canned Volatility JSON (Add-MemoryPluginRows): pslist and netscan entries
 # with a valid time of their own are events, every other row is a Snapshot
-# row at the capture time, a rejected time stays in Details, and the
+# row at the capture time, a rejected time stays in Details, a 0 in a PID,
+# PPID, Threads, SessionId or port is kept (null and N/A give ""), and the
 # counts. The rows must be the same under the de-DE culture. A stub stands
 # in for vol.exe to check where its output goes (Invoke-VolatilityPlugin),
 # and in a whole Parse-Memory run (rows at the header's capture time, the
@@ -363,7 +364,9 @@ try {
     # Volatility 3's JSON renderer writes times as ISO 8601 in UTC and absent
     # values as null. 2025-06-07 is a day of 12 or less (day and month swap
     # under de-DE if parsed with the current culture). The end of the
-    # acquisition plus a day is 2025-07-01 12:02:14.500.
+    # acquisition plus a day is 2025-07-01 12:02:14.500. A 0 is a value and
+    # must stay in the row: System's PPID, SessionId 0 (services), Threads 0
+    # (a process that has exited), PID 0 and port 0 (a closed socket).
     $rowDump = $bracketedDump
     $pslistJson = @'
 [
@@ -375,7 +378,11 @@ try {
   {"PID": 7850, "PPID": 5120, "ImageFileName": "edge.exe", "Threads": 1, "SessionId": 1, "CreateTime": "1980-01-01T00:00:00+00:00", "ExitTime": null, "__children": []},
   {"PID": 7900, "PPID": 5120, "ImageFileName": "garbled.exe", "Threads": 1, "SessionId": 1, "CreateTime": "0x1f2e3d", "ExitTime": null, "__children": []},
   {"PID": 8, "PPID": null, "ImageFileName": null, "Threads": 3, "SessionId": null, "CreateTime": null, "ExitTime": null, "__children": []},
-  {"PID": 9, "PPID": 4, "ImageFileName": "na.exe", "Threads": 1, "SessionId": 1, "CreateTime": "N/A", "ExitTime": null, "__children": []}
+  {"PID": 9, "PPID": 4, "ImageFileName": "na.exe", "Threads": 1, "SessionId": 1, "CreateTime": "N/A", "ExitTime": null, "__children": []},
+  {"PID": 4, "PPID": 0, "ImageFileName": "System", "Threads": 150, "SessionId": null, "CreateTime": "2025-06-30T07:00:00+00:00", "ExitTime": null, "__children": []},
+  {"PID": 640, "PPID": 512, "ImageFileName": "services.exe", "Threads": 8, "SessionId": 0, "CreateTime": "2025-06-30T07:00:05+00:00", "ExitTime": null, "__children": []},
+  {"PID": 7950, "PPID": 5120, "ImageFileName": "exited.exe", "Threads": 0, "SessionId": 1, "CreateTime": "2025-06-30T09:00:00+00:00", "ExitTime": "2025-06-30T09:05:00+00:00", "__children": []},
+  {"PID": 0, "PPID": 0, "ImageFileName": "Idle", "Threads": 0, "SessionId": "N/A", "CreateTime": null, "ExitTime": null, "__children": []}
 ]
 '@
     $pslistRows = @(
@@ -387,47 +394,57 @@ try {
         "1980-01-01 00:00:00.000|ProcessCreation|Process in memory: edge.exe (PID: 7850, PPID: 5120)||Threads=1 SessionId=1",
         "$captureText|Snapshot|Process in memory: garbled.exe (PID: 7900, PPID: 5120)||Threads=1 SessionId=1 CreateTime=0x1f2e3d",
         "$captureText|Snapshot|Process in memory: Unknown (PID: 8, PPID: )||Threads=3 SessionId=",
-        "$captureText|Snapshot|Process in memory: na.exe (PID: 9, PPID: 4)||Threads=1 SessionId=1"
+        "$captureText|Snapshot|Process in memory: na.exe (PID: 9, PPID: 4)||Threads=1 SessionId=1",
+        "2025-06-30 07:00:00.000|ProcessCreation|Process in memory: System (PID: 4, PPID: 0)||Threads=150 SessionId=",
+        "2025-06-30 07:00:05.000|ProcessCreation|Process in memory: services.exe (PID: 640, PPID: 512)||Threads=8 SessionId=0",
+        "2025-06-30 09:00:00.000|ProcessCreation|Process in memory: exited.exe (PID: 7950, PPID: 5120)||Threads=0 SessionId=1",
+        "$captureText|Snapshot|Process in memory: Idle (PID: 0, PPID: 0)||Threads=0 SessionId="
     )
     $netscanJson = @'
 [
   {"Offset": 1, "Proto": "TCPv4", "LocalAddr": "192.0.2.10", "LocalPort": 49731, "ForeignAddr": "198.51.100.20", "ForeignPort": 443, "State": "ESTABLISHED", "PID": 7340, "Owner": "notepad.exe", "Created": "2025-06-30T11:59:01.250000+00:00", "__children": []},
   {"Offset": 2, "Proto": "UDPv4", "LocalAddr": "192.0.2.10", "LocalPort": 5353, "ForeignAddr": "*", "ForeignPort": "*", "State": "", "PID": 2044, "Owner": "svchost.exe", "Created": null, "__children": []},
-  {"Offset": 3, "Proto": "TCPv6", "LocalAddr": "::1", "LocalPort": 8080, "ForeignAddr": "::", "ForeignPort": 0, "State": "LISTENING", "PID": 1234, "Owner": "web.exe", "Created": "1601-01-01T00:00:00+00:00", "__children": []}
+  {"Offset": 3, "Proto": "TCPv6", "LocalAddr": "::1", "LocalPort": 8080, "ForeignAddr": "::", "ForeignPort": 0, "State": "LISTENING", "PID": 1234, "Owner": "web.exe", "Created": "1601-01-01T00:00:00+00:00", "__children": []},
+  {"Offset": 4, "Proto": "TCPv4", "LocalAddr": "0.0.0.0", "LocalPort": 0, "ForeignAddr": "0.0.0.0", "ForeignPort": 0, "State": "CLOSED", "PID": 0, "Owner": null, "Created": null, "__children": []}
 ]
 '@
     $netscanRows = @(
         "2025-06-30 11:59:01.250|NetworkConnection|Memory network: TCPv4 192.0.2.10:49731 -> 198.51.100.20:443 (ESTABLISHED)|notepad.exe|PID=7340",
         "$captureText|Snapshot|Memory network: UDPv4 192.0.2.10:5353 -> *:* ()|svchost.exe|PID=2044",
-        "$captureText|Snapshot|Memory network: TCPv6 ::1:8080 -> :::0 (LISTENING)|web.exe|PID=1234 Created=1601-01-01 00:00:00.000"
+        "$captureText|Snapshot|Memory network: TCPv6 ::1:8080 -> :::0 (LISTENING)|web.exe|PID=1234 Created=1601-01-01 00:00:00.000",
+        "$captureText|Snapshot|Memory network: TCPv4 0.0.0.0:0 -> 0.0.0.0:0 (CLOSED)||PID=0"
     )
     $cmdlineJson = @'
 [
   {"PID": 7340, "Process": "notepad.exe", "Args": "\"C:\\Windows\\system32\\notepad.exe\" C:\\Users\\Public\\notes.txt", "__children": []},
   {"PID": 4, "Process": "System", "Args": "N/A", "__children": []},
   {"PID": 88, "Process": "Registry", "Args": null, "__children": []},
-  {"PID": 404, "Process": "smss.exe", "Args": "\\SystemRoot\\System32\\smss.exe", "__children": []}
+  {"PID": 404, "Process": "smss.exe", "Args": "\\SystemRoot\\System32\\smss.exe", "__children": []},
+  {"PID": 0, "Process": "zero.exe", "Args": "C:\\Tools\\zero.exe /pid 0", "__children": []}
 ]
 '@
     $cmdlineRows = @(
         "$captureText|Snapshot|Process command line: notepad.exe (PID: 7340)||Args=`"C:\Windows\system32\notepad.exe`" C:\Users\Public\notes.txt",
-        "$captureText|Snapshot|Process command line: smss.exe (PID: 404)||Args=\SystemRoot\System32\smss.exe"
+        "$captureText|Snapshot|Process command line: smss.exe (PID: 404)||Args=\SystemRoot\System32\smss.exe",
+        "$captureText|Snapshot|Process command line: zero.exe (PID: 0)||Args=C:\Tools\zero.exe /pid 0"
     )
     $svcscanJson = @'
 [
   {"Offset": 1, "Order": 12, "PID": 2044, "Start": "SERVICE_AUTO_START", "State": "SERVICE_RUNNING", "Type": "SERVICE_WIN32_SHARE_PROCESS", "Name": "Dnscache", "Display": "DNS Client", "Binary": "C:\\Windows\\system32\\svchost.exe -k NetworkService -p", "__children": []},
-  {"Offset": 2, "Order": 13, "PID": null, "Start": "SERVICE_DEMAND_START", "State": "SERVICE_STOPPED", "Type": "SERVICE_KERNEL_DRIVER", "Name": "TestDrv", "Display": null, "Binary": null, "__children": []}
+  {"Offset": 2, "Order": 13, "PID": null, "Start": "SERVICE_DEMAND_START", "State": "SERVICE_STOPPED", "Type": "SERVICE_KERNEL_DRIVER", "Name": "TestDrv", "Display": null, "Binary": null, "__children": []},
+  {"Offset": 3, "Order": 14, "PID": 0, "Start": "SERVICE_AUTO_START", "State": "SERVICE_RUNNING", "Type": "SERVICE_WIN32_OWN_PROCESS", "Name": "ZeroSvc", "Display": "Zero PID Service", "Binary": "C:\\Tools\\zerosvc.exe", "__children": []}
 ]
 '@
     $svcscanRows = @(
         "$captureText|Snapshot|Service in memory: DNS Client (Dnscache)||State=SERVICE_RUNNING StartType=SERVICE_AUTO_START Binary=C:\Windows\system32\svchost.exe -k NetworkService -p PID=2044",
-        "$captureText|Snapshot|Service in memory: TestDrv (TestDrv)||State=SERVICE_STOPPED StartType=SERVICE_DEMAND_START Binary= PID="
+        "$captureText|Snapshot|Service in memory: TestDrv (TestDrv)||State=SERVICE_STOPPED StartType=SERVICE_DEMAND_START Binary= PID=",
+        "$captureText|Snapshot|Service in memory: Zero PID Service (ZeroSvc)||State=SERVICE_RUNNING StartType=SERVICE_AUTO_START Binary=C:\Tools\zerosvc.exe PID=0"
     )
     $pluginCases = @(
-        @{ Plugin = "windows.pslist"; Source = "Memory-Processes"; Json = $pslistJson; Counts = "9|4|5"; Rows = $pslistRows },
-        @{ Plugin = "windows.netscan"; Source = "Memory-Network"; Json = $netscanJson; Counts = "3|1|2"; Rows = $netscanRows },
-        @{ Plugin = "windows.cmdline"; Source = "Memory-CommandLine"; Json = $cmdlineJson; Counts = "2|0|2"; Rows = $cmdlineRows },
-        @{ Plugin = "windows.svcscan"; Source = "Memory-Services"; Json = $svcscanJson; Counts = "2|0|2"; Rows = $svcscanRows }
+        @{ Plugin = "windows.pslist"; Source = "Memory-Processes"; Json = $pslistJson; Counts = "13|7|6"; Rows = $pslistRows },
+        @{ Plugin = "windows.netscan"; Source = "Memory-Network"; Json = $netscanJson; Counts = "4|1|3"; Rows = $netscanRows },
+        @{ Plugin = "windows.cmdline"; Source = "Memory-CommandLine"; Json = $cmdlineJson; Counts = "3|0|3"; Rows = $cmdlineRows },
+        @{ Plugin = "windows.svcscan"; Source = "Memory-Services"; Json = $svcscanJson; Counts = "3|0|3"; Rows = $svcscanRows }
     )
     foreach ($case in $pluginCases) {
         $result = Invoke-MemoryPluginRows -Plugin $case.Plugin -Source $case.Source -Json $case.Json
@@ -437,6 +454,10 @@ try {
     }
     $result = Invoke-MemoryPluginRows -Plugin "windows.info" -Source "Memory-Info" -Json '[{"Variable": "Kernel Base", "Value": "0xf80000000000"}]'
     Assert-Equal -Name "another plugin: no rows" -Expected "0|0|0|0" -Actual "$($result.Counts)|$($result.Rows.Count)"
+    # The numbers of an entry: 0 (as ConvertFrom-Json gives it in either
+    # PowerShell version, or as text) is kept; null, empty and N/A are absent
+    $fieldTexts = foreach ($fieldValue in @(0, [long]0, "0", 4, " 7 ", "*", $null, "", " ", "N/A", "n/a")) { Get-MemoryFieldText $fieldValue }
+    Assert-Equal -Name "numbers of an entry: 0 kept, null, empty and N/A give an empty field" -Expected "0|0|0|4|7|*|||||" -Actual ($fieldTexts -join "|")
 
     # The same under the de-DE culture (day.month.year, comma decimal
     # separator); set inside one script block, which Windows PowerShell
@@ -519,11 +540,11 @@ try {
     $expectedLog = @(
         "Dump time: $captureText UTC (crash dump header)",
         "Using Volatility 3: $parseStub",
-        "windows.pslist: 9 entries (4 timed, 5 snapshot) in ",
+        "windows.pslist: 13 entries (7 timed, 6 snapshot) in ",
         "WARNING:     windows.netscan produced no output. Error: No output for windows.netscan",
-        "windows.cmdline: 2 entries (0 timed, 2 snapshot) in ",
-        "windows.svcscan: 2 entries (0 timed, 2 snapshot) in ",
-        "Memory analysis complete: 13 entries from 0 GB dump"
+        "windows.cmdline: 3 entries (0 timed, 3 snapshot) in ",
+        "windows.svcscan: 3 entries (0 timed, 3 snapshot) in ",
+        "Memory analysis complete: 19 entries from 0 GB dump"
     )
     $missingLog = @($expectedLog | Where-Object { -not $log.Contains($_) })
     Assert-Equal -Name "Parse-Memory: the dump time, the counts per plugin and the netscan warning are logged, the scratch folder is left empty" -Expected "|0" -Actual "$($missingLog -join ' / ')|$left"
