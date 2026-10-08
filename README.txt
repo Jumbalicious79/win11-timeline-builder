@@ -407,7 +407,9 @@ Both timeline.csv and timeline.xlsx contain the same columns:
 
   A row is removed as a duplicate only if Timestamp, Source, EventType,
   Description, User and Details are all identical (case-sensitive); the
-  first copy is kept. The count is shown in the summary.
+  first copy is kept. The summary shows how many rows were removed. Its
+  "Events by artifact source" counts the rows left in the timeline, so
+  they add up to "Total events".
 
 ### CSV vs Excel differences
 
@@ -1417,6 +1419,13 @@ parsing is skipped, and the timeline CSV can be opened manually.
   FileLastModified in tan and that the console color legend lists every
   EventType of the color map. No admin needed.
 
+  tests\Test-SummaryCounts.ps1 -- loads the builder's functions and checks
+  the counts per artifact of the run summary ("Events by artifact
+  source"): rows per Artifact, the largest count first and equal counts in
+  name order, only the rows it is given; and, in the builder's syntax
+  tree, that the summary counts the rows written to the CSV (after
+  deduplication), so the counts add up to "Total events". No admin needed.
+
   Run them from an elevated PowerShell; -AllowSystemChanges lets the event
   log and registry tests change this machine:
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers.ps1
@@ -1426,6 +1435,7 @@ parsing is skipped, and the timeline CSV can be opened manually.
     powershell -ExecutionPolicy Bypass -File tests\Test-MountedDevices.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-MemoryParser.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-ShimCacheParser.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-SummaryCounts.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers.ps1 -AllowSystemChanges
     powershell -ExecutionPolicy Bypass -File tests\Test-RegistryParsers.ps1 -AllowSystemChanges
 
