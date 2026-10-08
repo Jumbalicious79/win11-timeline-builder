@@ -351,6 +351,16 @@ function Add-TimelineEntry {
 # =============================================================
 # Helper: Find files recursively with extensions
 # =============================================================
+# $true for a path (relative to the collection) inside the email attachment
+# copies the collector makes (Email\<user>\Outlook\SecureTemp\,
+# Email\<user>\NewOutlook\Attachments\). They can have any name: an attached
+# .lnk or .evtx is not this system's shortcut or event log, so
+# Find-ArtifactFiles never returns them to a parser (Parse-Email reports them)
+function Test-EmailAttachmentCopy {
+    param([string]$RelativePath)
+    return $RelativePath -match '(?:^|\\)Email\\[^\\]+\\(?:Outlook\\SecureTemp|NewOutlook\\Attachments)\\'
+}
+
 function Find-ArtifactFiles {
     param(
         [string]$BasePath,
@@ -373,7 +383,7 @@ function Find-ArtifactFiles {
     catch {
         Log-Warning "Error searching for files in $BasePath : $_"
     }
-    return $results
+    return @($results | Where-Object { -not (Test-EmailAttachmentCopy (Get-RelativeCollectionPath $_.FullName)) })
 }
 
 # =============================================================
@@ -399,13 +409,14 @@ function Get-RelativeCollectionPath {
 }
 
 # Account an artifact belongs to, from the collection's own folder layout
-# (Registry\<user>\, UserActivity\<user>\, Browser\<user>\) or a Users\<user>\
-# segment inside the collection -- never from the analyst machine's path.
+# (Registry\<user>\, UserActivity\<user>\, Browser\<user>\, Email\<user>\) or
+# a Users\<user>\ segment inside the collection -- never from the analyst
+# machine's path.
 function Get-CollectionUser {
     param([string]$FullPath)
     $rel = Get-RelativeCollectionPath $FullPath
     if (-not $rel) { return "" }
-    if ($rel -match '^(?:Registry|UserActivity|Browser)\\([^\\]+)\\') { return $Matches[1] }
+    if ($rel -match '^(?:Registry|UserActivity|Browser|Email)\\([^\\]+)\\') { return $Matches[1] }
     if ($rel -match '(?:^|\\)Users\\([^\\]+)\\') { return $Matches[1] }
     return ""
 }
@@ -7903,10 +7914,518 @@ function ConvertFrom-FormatTableText {
     return $objects
 }
 
-# Email artifacts (Phase 2): replaced by the email parser
+# ----------------------------------------------------------
+# Email artifacts (the triage collector's Email category, Email\<user>\)
+# ----------------------------------------------------------
+# Listing CSVs the collector writes per user. Same columns in all: User,
+# Program, Store, Profile, Path, RelativePath, SizeBytes, CreatedUtc,
+# ModifiedUtc, AccessedUtc (UTC, ISO 8601), Status (Copied, Listed or
+# "Skipped: <reason>") and CollectedAs (path of the copy in the collection).
+$script:EmailListingFiles = @("outlook_temp_files.csv", "olk_files.csv", "outlook_data_files.csv", "thunderbird_mail_files.csv", "windows_mail_files.csv")
+# Newest messages added per Thunderbird search index
+$script:EmailMaxMessages = 20000
+# Description of an attachment row (and of its "modified" row) per program
+$script:EmailAttachmentLabels = @{
+    "Classic Outlook" = "Outlook attachment in temp folder"
+    "New Outlook"     = "New Outlook attachment in temp folder"
+    "Windows Mail"    = "Windows Mail attachment in mail store"
+}
+# Thunderbird socketType and authMethod values (nsMsgSocketType, nsMsgAuthMethod)
+$script:ThunderbirdSocketTypes = @{ "0" = "None"; "1" = "STARTTLS if available"; "2" = "STARTTLS"; "3" = "SSL/TLS" }
+$script:ThunderbirdAuthMethods = @{
+    "1" = "None"; "2" = "Old"; "3" = "Password"; "4" = "EncryptedPassword"; "5" = "Kerberos"
+    "6" = "NTLM"; "7" = "TLSCertificate"; "8" = "AnySecure"; "9" = "Any"; "10" = "OAuth2"
+}
+
+# Email\ rows of collection_manifest.csv by RelativePath: SHA256, SourcePath,
+# Size and the original file's Created/Modified/Accessed times (UTC)
+function Get-EmailManifestRows {
+    $rows = @{}
+    $mf = Get-ChildItem -Path $InputPath -Filter "collection_manifest.csv" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $mf) { return $rows }
+    try {
+        foreach ($row in (Import-Csv -Path $mf.FullName -ErrorAction Stop)) {
+            if (-not $row.PSObject.Properties["RelativePath"] -or $row.RelativePath -notlike "Email\*") { continue }
+            $rows[$row.RelativePath] = [PSCustomObject]@{
+                SHA256     = $row.SHA256
+                SourcePath = $row.SourcePath
+                Size       = $row.SizeBytes
+                Created    = ConvertFrom-UtcText (Get-ArtifactRowValue $row @("SourceCreatedUtc"))
+                Modified   = ConvertFrom-UtcText (Get-ArtifactRowValue $row @("SourceModifiedUtc"))
+                Accessed   = ConvertFrom-UtcText (Get-ArtifactRowValue $row @("SourceAccessedUtc"))
+            }
+        }
+    }
+    catch { Log-Warning "  Could not read the collection manifest: $($_.Exception.Message)" }
+    return $rows
+}
+
+# Text cut to -MaxLength characters (long recipient lists)
+function Limit-EmailText {
+    param([string]$Text, [int]$MaxLength = 1000)
+    if ($Text.Length -le $MaxLength) { return $Text }
+    return $Text.Substring(0, $MaxLength) + "... (cut, $($Text.Length) characters)"
+}
+
+# A row at a file's created time ("<CreatedText>: <Name>") and, when at least
+# a second later, one at its modified time ("<ModifiedText>: <Name>").
+# FileAccess rows. Returns the number of rows added.
+function Add-EmailFileTimeRows {
+    param(
+        [string]$Source,
+        [string]$CreatedText,
+        [string]$ModifiedText,
+        [string]$Name,
+        $Created,
+        $Modified,
+        [string]$User,
+        [System.Collections.IDictionary]$Details,
+        [string]$RawPath
+    )
+    $detailText = Format-ArtifactDetails $Details
+    $rows = @(, @($Created, "${CreatedText}: $Name"))
+    if ($Modified -and (-not $Created -or ($Modified - $Created).TotalSeconds -ge 1)) {
+        $rows += , @($Modified, "${ModifiedText}: $Name")
+    }
+    $count = 0
+    foreach ($row in $rows) {
+        if ($null -eq $row[0]) { continue }
+        Add-TimelineEntry -Timestamp $row[0] -Source $Source -EventType "FileAccess" `
+            -Description $row[1] `
+            -User $User -Details $detailText `
+            -Artifact "Email" -RawPath $RawPath
+        $count++
+    }
+    return $count
+}
+
+# Rows for one attachment in a mail client's temp folder or store (a listing
+# row, or a manifest row when the listing is missing): when it was saved
+# there -- Outlook saves an attachment to its temp folder when it is opened --
+# and when it was modified, if later (edited and saved). Times and SHA256 of
+# a copied file come from the manifest. Returns the number of rows added.
+function Add-EmailAttachmentRows {
+    param(
+        [string]$Program,
+        [string]$Path,
+        [string]$Size,
+        $Created,
+        $Modified,
+        $Accessed,
+        [string]$Status,
+        [object]$Copy,
+        [string]$User,
+        [string]$RawPath
+    )
+    $sha256 = ""
+    if ($Copy) {
+        if ($Copy.Created) { $Created = $Copy.Created }
+        if ($Copy.Modified) { $Modified = $Copy.Modified }
+        if ($Copy.Accessed) { $Accessed = $Copy.Accessed }
+        $sha256 = $Copy.SHA256
+    }
+    $label = $script:EmailAttachmentLabels[$Program]
+    if (-not $label) { $label = "$Program attachment in temp folder" }
+    $details = [ordered]@{
+        Program     = $Program
+        Folder      = [System.IO.Path]::GetDirectoryName($Path)
+        Size        = $Size
+        SHA256      = $sha256
+        Collected   = $(if ($Status -eq "Copied") { "Yes" } else { "No" })
+        Status      = $(if ($Status -ne "Copied") { $Status } else { "" })
+        CreatedUtc  = Format-UtcDetailTime $Created
+        ModifiedUtc = Format-UtcDetailTime $Modified
+        AccessedUtc = Format-UtcDetailTime $Accessed
+    }
+    return Add-EmailFileTimeRows -Source "Email-Attachments" -CreatedText $label -ModifiedText "$label modified" `
+        -Name ([System.IO.Path]::GetFileName($Path)) -Created $Created -Modified $Modified -User $User -Details $details -RawPath $RawPath
+}
+
+# Thunderbird mail folders of one listing (Mail\<account>\..., ImapMail\
+# <account>\...): an mbox file is a folder when it has a .msf summary next
+# to it or no extension (maildir message files in cur\, new\, tmp\ are left
+# out). Rows at the folder file's created and last modified times; the
+# account's message filter rules (msgFilterRules.dat) likewise. Returns the
+# number of rows added.
+function Add-ThunderbirdMailFolderRows {
+    param([object[]]$Rows, [string]$CsvUser, [string]$RawPath)
+    $known = @{}
+    foreach ($r in $Rows) { $known["$($r.Profile)|$($r.RelativePath)"] = $true }
+    $count = 0
+    foreach ($r in $Rows) {
+        $parts = @($r.RelativePath -split '\\')
+        if ($parts.Count -lt 3 -or @("Mail", "ImapMail") -notcontains $parts[0]) { continue }
+        $name = $parts[$parts.Count - 1]
+        $account = $parts[1]
+        $user = if ($r.User) { $r.User } else { $CsvUser }
+        $details = [ordered]@{
+            Program     = "Thunderbird"
+            Profile     = $r.Profile
+            Account     = $account
+            Storage     = $parts[0]
+            Folder      = ""
+            Path        = $r.Path
+            Size        = $r.SizeBytes
+            CreatedUtc  = Format-UtcDetailTime (ConvertFrom-UtcText $r.CreatedUtc)
+            ModifiedUtc = Format-UtcDetailTime (ConvertFrom-UtcText $r.ModifiedUtc)
+        }
+        if ($name -eq "msgFilterRules.dat" -and $parts.Count -eq 3) {
+            $count += Add-EmailFileTimeRows -Source "Email-MailFolders" -CreatedText "Thunderbird message filter rules created" `
+                -ModifiedText "Thunderbird message filter rules last modified" -Name $account `
+                -Created (ConvertFrom-UtcText $r.CreatedUtc) -Modified (ConvertFrom-UtcText $r.ModifiedUtc) -User $user -Details $details -RawPath $RawPath
+            continue
+        }
+        $inMaildir = $parts.Count -ge 4 -and @($parts[2..($parts.Count - 2)] | Where-Object { @("cur", "new", "tmp") -contains $_ }).Count -gt 0
+        $isFolder = $known.ContainsKey("$($r.Profile)|$($r.RelativePath).msf") -or ([System.IO.Path]::GetExtension($name) -eq "" -and -not $inMaildir)
+        if (-not $isFolder) { continue }
+        # INBOX.sbd\Work -> INBOX/Work
+        $folder = (@($parts[2..($parts.Count - 1)]) | ForEach-Object { $_ -replace '\.sbd$', '' }) -join "/"
+        $details["Folder"] = $folder
+        $count += Add-EmailFileTimeRows -Source "Email-MailFolders" -CreatedText "Thunderbird mail folder created" `
+            -ModifiedText "Thunderbird mail folder last modified" -Name "$account/$folder" `
+            -Created (ConvertFrom-UtcText $r.CreatedUtc) -Modified (ConvertFrom-UtcText $r.ModifiedUtc) -User $user -Details $details -RawPath $RawPath
+    }
+    return $count
+}
+
+# Rows from one email listing CSV: attachments (classic Outlook temp folder,
+# new Outlook Attachments\, Windows Mail store attachments), data files
+# (OST/PST, Windows Mail databases) and Thunderbird mail folders. Other
+# listed files (the new Outlook's WebView data, ...) get no rows. Copies
+# with a listing row are recorded in -ListedCopies. Returns the row count.
+function Add-EmailListingRows {
+    param([System.IO.FileInfo]$File, [hashtable]$ManifestRows, [hashtable]$ListedCopies)
+    $rows = @(Import-Csv -LiteralPath $File.FullName -ErrorAction Stop)
+    $csvUser = Get-CollectionUser $File.FullName
+    $count = 0
+    $mailRows = @()
+    foreach ($r in $rows) {
+        $user = if ($r.User) { $r.User } else { $csvUser }
+        $isAttachment = $r.Store -eq "SecureTemp" -or ($r.Store -eq "Olk" -and $r.RelativePath -like "Attachments\*") -or
+            ($r.Store -eq "WindowsMail" -and $r.RelativePath -like "*\Attachments\*")
+        if ($isAttachment) {
+            $copy = $null
+            $rawPath = $File.FullName
+            if ($r.Status -eq "Copied" -and $r.CollectedAs) {
+                $ListedCopies[$r.CollectedAs] = $true
+                $copy = $ManifestRows[$r.CollectedAs]
+                # Email\<user>\<program>\<listing>.csv: the collection root is three levels up
+                $rawPath = Join-Path $File.Directory.Parent.Parent.Parent.FullName $r.CollectedAs
+            }
+            $count += Add-EmailAttachmentRows -Program $r.Program -Path $r.Path -Size $r.SizeBytes `
+                -Created (ConvertFrom-UtcText $r.CreatedUtc) -Modified (ConvertFrom-UtcText $r.ModifiedUtc) -Accessed (ConvertFrom-UtcText $r.AccessedUtc) `
+                -Status $r.Status -Copy $copy -User $user -RawPath $rawPath
+        }
+        elseif ($r.Store -eq "DataFile" -or ($r.Store -eq "WindowsMail" -and @(".hxd", ".vol") -contains [System.IO.Path]::GetExtension($r.Path))) {
+            if ($r.Store -eq "DataFile") {
+                $texts = @("Outlook data file created", "Outlook data file last modified")
+                $name = [System.IO.Path]::GetFileName($r.Path)
+            }
+            else {
+                $texts = @("Windows Mail store file created", "Windows Mail store file last modified")
+                $name = $r.RelativePath
+            }
+            $details = [ordered]@{
+                Program     = $r.Program
+                Type        = [System.IO.Path]::GetExtension($r.Path).TrimStart('.').ToUpperInvariant()
+                Path        = $r.Path
+                Size        = $r.SizeBytes
+                CreatedUtc  = Format-UtcDetailTime (ConvertFrom-UtcText $r.CreatedUtc)
+                ModifiedUtc = Format-UtcDetailTime (ConvertFrom-UtcText $r.ModifiedUtc)
+                AccessedUtc = Format-UtcDetailTime (ConvertFrom-UtcText $r.AccessedUtc)
+            }
+            $count += Add-EmailFileTimeRows -Source "Email-DataFiles" -CreatedText $texts[0] -ModifiedText $texts[1] -Name $name `
+                -Created (ConvertFrom-UtcText $r.CreatedUtc) -Modified (ConvertFrom-UtcText $r.ModifiedUtc) -User $user -Details $details -RawPath $File.FullName
+        }
+        elseif ($r.Store -eq "ThunderbirdMail") {
+            $mailRows += $r
+        }
+    }
+    if ($mailRows.Count -gt 0) {
+        $count += Add-ThunderbirdMailFolderRows -Rows $mailRows -CsvUser $csvUser -RawPath $File.FullName
+    }
+    return $count
+}
+
+# New Outlook UserSettings.json: one Snapshot row per signed-in account
+# (Identities.IdentityMap: account -> identity id). Nothing else in the file
+# is read. Returns the number of rows added.
+function Add-NewOutlookAccountRows {
+    param([System.IO.FileInfo]$File, [hashtable]$ManifestRows)
+    $text = Get-Content -LiteralPath $File.FullName -Raw -Encoding UTF8 -ErrorAction Stop
+    if ([string]::IsNullOrWhiteSpace($text)) { return 0 }
+    # The JSON parser's error is not passed on (Windows PowerShell quotes the text)
+    try { $json = $text | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw "not valid JSON (damaged or incomplete file)" }
+    if (-not $json -or -not $json.PSObject.Properties["Identities"] -or -not $json.Identities.PSObject.Properties["IdentityMap"]) { return 0 }
+    $snapshotTs = Get-SnapshotTimeUtc -File $File
+    if (-not $snapshotTs) { return 0 }
+    $settings = $ManifestRows[(Get-RelativeCollectionPath $File.FullName)]
+    $user = Get-CollectionUser $File.FullName
+    $count = 0
+    foreach ($identity in $json.Identities.IdentityMap.PSObject.Properties) {
+        if (-not $identity.Name) { continue }
+        Add-TimelineEntry -Timestamp $snapshotTs -Source "Email-Accounts" -EventType "Snapshot" `
+            -Description "New Outlook account: $($identity.Name)" `
+            -User $user `
+            -Details (Format-ArtifactDetails ([ordered]@{
+                Program             = "New Outlook"
+                Account             = $identity.Name
+                IdentityId          = "$($identity.Value)"
+                SettingsModifiedUtc = $(if ($settings) { Format-UtcDetailTime $settings.Modified } else { "" })
+            })) `
+            -Artifact "Email" -RawPath $File.FullName
+        $count++
+    }
+    return $count
+}
+
+# Thunderbird prefs.js: user_pref("name", value); lines as a hashtable of
+# name -> value text (JavaScript string escapes decoded)
+function Read-ThunderbirdPrefs {
+    param([string]$Path)
+    $prefs = @{}
+    foreach ($line in [System.IO.File]::ReadAllLines($Path, [System.Text.Encoding]::UTF8)) {
+        if ($line -notmatch '^\s*user_pref\(\s*"((?:[^"\\]|\\.)*)"\s*,\s*(.*?)\s*\)\s*;\s*$') { continue }
+        $name = $Matches[1]
+        $value = $Matches[2]
+        if ($value -match '^"((?:[^"\\]|\\.)*)"$') {
+            $value = [regex]::Replace($Matches[1], '\\(u[0-9A-Fa-f]{4}|x[0-9A-Fa-f]{2}|.)', {
+                param($m)
+                $code = $m.Groups[1].Value
+                if ($code.Length -gt 1) { return [string][char][Convert]::ToInt32($code.Substring(1), 16) }
+                switch -CaseSensitive ($code) { "n" { return "`n" } "t" { return "`t" } "r" { return "`r" } default { return $code } }
+            })
+        }
+        $prefs[$name] = $value
+    }
+    return $prefs
+}
+
+# Thunderbird prefs.js: one Snapshot row per mail account (server type, host,
+# user name, connection security, identity email, outgoing server). Only
+# these settings are read -- never a password or token. Returns the number
+# of rows added.
+function Add-ThunderbirdAccountRows {
+    param([System.IO.FileInfo]$File, [hashtable]$ManifestRows)
+    $prefs = Read-ThunderbirdPrefs -Path $File.FullName
+    $snapshotTs = Get-SnapshotTimeUtc -File $File
+    if (-not $snapshotTs) { return 0 }
+    $prefsCopy = $ManifestRows[(Get-RelativeCollectionPath $File.FullName)]
+    $user = Get-CollectionUser $File.FullName
+    $profileName = $File.Directory.Name
+    # Accounts in the account manager's order; without that list, every server
+    $accounts = @("$($prefs['mail.accountmanager.accounts'])" -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $servers = @(foreach ($account in $accounts) { [PSCustomObject]@{ Account = $account; Server = "$($prefs["mail.account.$account.server"])" } })
+    if ($servers.Count -eq 0) {
+        $servers = @($prefs.Keys | Where-Object { $_ -match '^mail\.server\.([^.]+)\.type$' } | Sort-Object |
+            ForEach-Object { [PSCustomObject]@{ Account = ""; Server = ($_ -replace '^mail\.server\.([^.]+)\.type$', '$1') } })
+    }
+    $count = 0
+    foreach ($entry in $servers) {
+        $server = $entry.Server
+        if (-not $server) { continue }
+        $serverType = "$($prefs["mail.server.$server.type"])"
+        # "none" is Local Folders, not an account
+        if (-not $serverType -or $serverType -eq "none") { continue }
+        $serverHost = "$($prefs["mail.server.$server.realhostname"])"
+        if (-not $serverHost) { $serverHost = "$($prefs["mail.server.$server.hostname"])" }
+        $userName = "$($prefs["mail.server.$server.realuserName"])"
+        if (-not $userName) { $userName = "$($prefs["mail.server.$server.userName"])" }
+        $emails = @()
+        $smtpHosts = @()
+        $smtpUsers = @()
+        if ($entry.Account) {
+            foreach ($identity in @("$($prefs["mail.account.$($entry.Account).identities"])" -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+                $email = "$($prefs["mail.identity.$identity.useremail"])"
+                if ($email) { $emails += $email }
+                $smtp = "$($prefs["mail.identity.$identity.smtpServer"])"
+                if (-not $smtp) { $smtp = "$($prefs['mail.smtp.defaultserver'])" }
+                if ($smtp) {
+                    $smtpHost = "$($prefs["mail.smtpserver.$smtp.hostname"])"
+                    $smtpUser = "$($prefs["mail.smtpserver.$smtp.username"])"
+                    if ($smtpHost -and $smtpHosts -notcontains $smtpHost) { $smtpHosts += $smtpHost }
+                    if ($smtpUser -and $smtpUsers -notcontains $smtpUser) { $smtpUsers += $smtpUser }
+                }
+            }
+        }
+        $label = if ($emails.Count -gt 0) { $emails[0] } elseif ($userName) { $userName } else { $serverHost }
+        $socketType = "$($prefs["mail.server.$server.socketType"])"
+        $authMethod = "$($prefs["mail.server.$server.authMethod"])"
+        Add-TimelineEntry -Timestamp $snapshotTs -Source "Email-Accounts" -EventType "Snapshot" `
+            -Description "Thunderbird account: $label ($($serverType.ToUpperInvariant()) $serverHost)" `
+            -User $user `
+            -Details (Format-ArtifactDetails ([ordered]@{
+                Program          = "Thunderbird"
+                Profile          = $profileName
+                AccountId        = $entry.Account
+                ServerType       = $serverType
+                Host             = $serverHost
+                Port             = $prefs["mail.server.$server.port"]
+                UserName         = $userName
+                Security         = $(if ($socketType) { Get-AntiVirusCodeName -Names $script:ThunderbirdSocketTypes -Code $socketType } else { "" })
+                AuthMethod       = $(if ($authMethod) { Get-AntiVirusCodeName -Names $script:ThunderbirdAuthMethods -Code $authMethod } else { "" })
+                Email            = $emails -join ", "
+                SmtpHost         = $smtpHosts -join ", "
+                SmtpUser         = $smtpUsers -join ", "
+                Directory        = ("$($prefs["mail.server.$server.directory-rel"])" -replace '^\[ProfD\]', '')
+                PrefsModifiedUtc = $(if ($prefsCopy) { Format-UtcDetailTime $prefsCopy.Modified } else { "" })
+            })) `
+            -Artifact "Email" -RawPath $File.FullName
+        $count++
+    }
+    return $count
+}
+
+# Thunderbird global-messages-db.sqlite (the "gloda" search index): one row
+# per indexed message at its Date header (PRTime), newest
+# $script:EmailMaxMessages, with author, recipients (To), subject and
+# attachment names from the full-text table's content (messagesText_content)
+# and the folder. The message text (the body column) is never selected.
+# Returns the number of rows added.
+function Add-ThunderbirdMessageRows {
+    param([string]$Sqlite3Exe, [System.IO.FileInfo]$File)
+    $schema = Get-Sqlite3TableColumns -Sqlite3Exe $Sqlite3Exe -DbPath $File.FullName -Tables @("messages", "messagesText_content", "folderLocations")
+    $m = $schema["messages"]
+    if (-not $m -or $m -notcontains "date") { return 0 }
+    $t = $schema["messagesText_content"]
+    $f = $schema["folderLocations"]
+    # Text columns are c<n><name> (c0body, c1subject, ...); never add the body
+    $textSql = @()
+    foreach ($name in @("subject", "author", "recipients", "attachmentNames")) {
+        $column = @($t | Where-Object { $_ -match "^c\d+$name$" }) | Select-Object -First 1
+        if (-not $column) { $textSql += "''" }
+        elseif ($name -eq "attachmentNames") { $textSql += "replace(replace(coalesce(t.$column, ''), char(13), ''), char(10), '; ')" }
+        else { $textSql += (Get-SqliteColumnSql -Columns $t -Alias "t" -Names $column) }
+    }
+    $joins = ""
+    if ($t -and $t -contains "docid") { $joins += " LEFT JOIN messagesText_content t ON t.docid = m.id" }
+    else { $textSql = @("''", "''", "''", "''") }
+    $folderSql = @("''", "''")
+    if ($f -and $m -contains "folderID") {
+        $joins += " LEFT JOIN folderLocations f ON f.id = m.folderID"
+        $folderSql = @(Get-SqliteColumnSql -Columns $f -Alias "f" -Names @("name", "folderURI"))
+    }
+    $numbers = @(Get-SqliteColumnSql -Columns $m -Alias "m" -Number -Names @("date", "deleted"))
+    $messageId = @(Get-SqliteColumnSql -Columns $m -Alias "m" -Names @("headerMessageID"))
+    $query = "SELECT (SELECT COUNT(*) FROM messages WHERE date > 0), " + (($numbers + $messageId + $folderSql + $textSql) -join ", ") +
+             " FROM messages m$joins WHERE m.date > 0 ORDER BY m.date DESC LIMIT $($script:EmailMaxMessages);"
+    $rows = @(Invoke-Sqlite3Query -Sqlite3Exe $Sqlite3Exe -DbPath $File.FullName -Query $query)
+
+    $user = Get-CollectionUser $File.FullName
+    $profileName = $File.Directory.Name
+    $total = 0
+    $count = 0
+    foreach ($r in ($rows | ConvertFrom-Csv -Header "Total", "Date", "Deleted", "MessageId", "Folder", "FolderUri", "Subject", "Author", "Recipients", "Attachments")) {
+        if ($total -eq 0) { [void][int]::TryParse([string]$r.Total, [ref]$total) }
+        $ts = ConvertFrom-UnixTime $r.Date -Unit Microseconds
+        if ($null -eq $ts) { continue }
+        $subject = if ($r.Subject) { $r.Subject } else { "(no subject)" }
+        Add-TimelineEntry -Timestamp $ts -Source "Email-Messages" -EventType "NetworkConnection" `
+            -Description "Email (Thunderbird): $subject" `
+            -User $user `
+            -Details (Format-ArtifactDetails ([ordered]@{
+                Program     = "Thunderbird"
+                From        = $r.Author
+                To          = Limit-EmailText $r.Recipients
+                Attachments = Limit-EmailText $r.Attachments
+                Folder      = $r.Folder
+                FolderURI   = $r.FolderUri
+                MessageID   = $r.MessageId
+                Deleted     = $(if ($r.Deleted -ne "0") { "Yes" } else { "" })
+                Profile     = $profileName
+            })) `
+            -Artifact "Email" -RawPath $File.FullName
+        $count++
+    }
+    if ($total -gt $script:EmailMaxMessages) {
+        Log-Warning "    $total messages in the index; only the newest $($script:EmailMaxMessages) were added (cap)."
+    }
+    return $count
+}
+
 function Parse-Email {
     Log "--- Parsing Email Artifacts ---"
-    Log "  No email parser yet."
+
+    $listingFiles = @(Find-ArtifactFiles -BasePath $InputPath -FileNames $script:EmailListingFiles | Where-Object { -not $_.PSIsContainer })
+    $settingsFiles = @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("UserSettings.json") |
+        Where-Object { -not $_.PSIsContainer -and $_.Directory.Name -eq "NewOutlook" })
+    $prefsFiles = @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("prefs.js") |
+        Where-Object { -not $_.PSIsContainer -and $_.Directory.Parent -and $_.Directory.Parent.Name -eq "Thunderbird" })
+    $glodaFiles = @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("global-messages-db.sqlite") |
+        Where-Object { -not $_.PSIsContainer -and (Test-FileSignature -Path $_.FullName -Signature "SQLite format 3") })
+    $manifestRows = Get-EmailManifestRows
+    # Copied attachments (in the manifest) whose listing CSV is missing
+    $attachmentCopies = @($manifestRows.Keys | Where-Object { Test-EmailAttachmentCopy $_ })
+    if ($listingFiles.Count + $settingsFiles.Count + $prefsFiles.Count + $glodaFiles.Count + $attachmentCopies.Count -eq 0) {
+        Log "  No email artifacts in the collection (the collector's Email category)."
+        Log ""
+        return
+    }
+
+    $emailRows = 0
+    # Listings: attachments, data files, Thunderbird mail folders
+    $listedCopies = @{}
+    foreach ($csv in $listingFiles) {
+        Log "  Parsing: $($csv.Name) ($(Get-CollectionUser $csv.FullName))"
+        try {
+            $added = Add-EmailListingRows -File $csv -ManifestRows $manifestRows -ListedCopies $listedCopies
+            Log "    $added row(s) added."
+            $emailRows += $added
+        }
+        catch { Log-Warning "    Could not parse $($csv.FullName): $($_.Exception.Message)" }
+    }
+    $unlisted = @($attachmentCopies | Where-Object { -not $listedCopies.ContainsKey($_) } | Sort-Object)
+    if ($unlisted.Count -gt 0) {
+        Log "  $($unlisted.Count) copied attachment(s) without a listing row: rows from the manifest"
+        foreach ($relative in $unlisted) {
+            $copy = $manifestRows[$relative]
+            $program = if ($relative -match '\\NewOutlook\\') { "New Outlook" } else { "Classic Outlook" }
+            $copyPath = Join-Path $script:collectionRoot $relative
+            $emailRows += Add-EmailAttachmentRows -Program $program -Path ($copy.SourcePath -replace '^\(shadow\)', '') -Size $copy.Size `
+                -Created $null -Modified $null -Accessed $null -Status "Copied" -Copy $copy -User (Get-CollectionUser $copyPath) -RawPath $copyPath
+        }
+    }
+
+    # Accounts (Snapshot rows)
+    foreach ($settingsFile in $settingsFiles) {
+        Log "  Parsing: New Outlook UserSettings.json ($(Get-CollectionUser $settingsFile.FullName))"
+        try {
+            $added = Add-NewOutlookAccountRows -File $settingsFile -ManifestRows $manifestRows
+            Log "    $added account(s) added."
+            $emailRows += $added
+        }
+        catch { Log-Warning "    Could not read $($settingsFile.FullName): $($_.Exception.Message)" }
+    }
+    foreach ($prefsFile in $prefsFiles) {
+        Log "  Parsing: Thunderbird prefs.js, profile $($prefsFile.Directory.Name) ($(Get-CollectionUser $prefsFile.FullName))"
+        try {
+            $added = Add-ThunderbirdAccountRows -File $prefsFile -ManifestRows $manifestRows
+            Log "    $added account(s) added."
+            $emailRows += $added
+        }
+        catch { Log-Warning "    Could not read $($prefsFile.FullName): $($_.Exception.Message)" }
+    }
+
+    # Thunderbird search index (needs sqlite3.exe)
+    if ($glodaFiles.Count -gt 0) {
+        $sqlite3Exe = Find-Sqlite3Exe
+        if (-not $sqlite3Exe) {
+            Log-Warning "  sqlite3.exe not available -- Thunderbird messages (global-messages-db.sqlite) skipped."
+        }
+        foreach ($gloda in $glodaFiles) {
+            if (-not $sqlite3Exe) { break }
+            Log "  Parsing: Thunderbird global-messages-db.sqlite, profile $($gloda.Directory.Name) ($(Get-CollectionUser $gloda.FullName))"
+            try {
+                $added = Add-ThunderbirdMessageRows -Sqlite3Exe $sqlite3Exe -File $gloda
+                Log "    $added message(s) added."
+                $emailRows += $added
+            }
+            catch { Log-Warning "    Could not parse $($gloda.FullName): $($_.Exception.Message)" }
+        }
+    }
+
+    Log "  Email parsing complete: $emailRows row(s)."
     Log ""
 }
 
