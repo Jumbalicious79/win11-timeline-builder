@@ -407,10 +407,34 @@ Both timeline.csv and timeline.xlsx contain the same columns:
   example the work folder a zip is extracted to). Rows that do
   not belong to a specific profile have an empty User.
 
+  Event logs, scheduled tasks, BAM and other sources write the account in
+  their own way (HOST\alice, a SID, LocalSystem, ...). After all parsers
+  have run, every User value is put in one form per account, so that a
+  filter on an account finds all of its rows:
+  - A local account of the examined machine is its name alone (alice, not
+    HOST\alice or .\alice, in any case). The machine's names are the
+    computer name in collection_info.json (live collections only) and the
+    computer and host names in the collected SYSTEM hive.
+  - A SID gets the account name from the collected SOFTWARE hive's
+    ProfileList (the profile folder name) or from bam_entries.csv, and the
+    SID stays in Details as UserSID=<SID>. A SID with no name in the
+    collection is left as it is; the log lists such SIDs.
+  - The built-in accounts are NT AUTHORITY\SYSTEM (also for SYSTEM,
+    LocalSystem and S-1-5-18), NT AUTHORITY\LOCAL SERVICE and NT
+    AUTHORITY\NETWORK SERVICE, and Window Manager\DWM-n and Font Driver
+    Host\UMFD-n for their SIDs.
+  - Empty and "-" parts are dropped ("-\-" becomes an empty User).
+  - Everything else is left as it is: domain accounts (DOMAIN\alice),
+    MicrosoftAccount\..., AzureAD\..., the computer account
+    (WORKGROUP\HOST$), NT SERVICE\..., NT VIRTUAL MACHINE\... and group
+    names.
+  The log's "User column:" line says how many rows changed.
+
 ### Duplicates
 
   A row is removed as a duplicate only if Timestamp, Source, EventType,
-  Description, User and Details are all identical (case-sensitive); the
+  Description, User and Details are all identical (case-sensitive), with
+  User already in its one form per account (see "User column"); the
   first copy is kept. The summary shows how many rows were removed. Its
   "Events by artifact source" counts the rows left in the timeline, so
   they add up to "Total events".
@@ -474,7 +498,8 @@ Parses .evtx files using Get-WinEvent. Targets high-value forensic events
     markers of a boot and of a clean shutdown)
   - Application: software installed or removed (MsiInstaller 1033/1034,
     EventType Installation, with Product, Version, Manufacturer, Status and
-    the installing account as User; 11707/11724 only when there is no
+    the installing account as User, named from its SID (see "User
+    column"); 11707/11724 only when there is no
     matching 1033/1034), application crashes and hangs (Application Error
     1000, Application Hang 1002, EventType Execution, with the faulting
     Module and ExceptionCode), ESE database created, attached, detached or
@@ -491,7 +516,10 @@ Parses .evtx files using Get-WinEvent. Targets high-value forensic events
     Malwarebytes, Webroot, CrowdStrike) are SecurityAlert rows with the
     message text, trimmed: Critical, Error and Warning events, and
     Information events only when their text reports a detection
-  - PowerShell Operational: Script block logging (4104), module logging (4103)
+  - PowerShell Operational: Script block logging (4104, with ScriptBlockId
+    and the script's Path), module logging (4103). User is the event's
+    own user: a SID, named when the collection has its name (see "User
+    column")
   - Sysmon (if present): Process creation (1), network (3), image loads (7),
     file creation (11), registry changes (13)
   - Task Scheduler: Task registered (106), updated (140), deleted (141)
@@ -505,6 +533,7 @@ Parses .evtx files using Get-WinEvent. Targets high-value forensic events
     rule name; audits are folded into one row per rule, path, process and
     day, with Count and LastSeen) (EventType SecurityAlert)
   - BITS Client: background transfer jobs and the URLs they download from
+    (User: the job owner, or the event's own user for transfers)
   - Defender detections (defender_detections.csv) with the threat name and
     severity from defender_threats.csv
   - Defender support logs (MPLog-*.log): detections and remediations,
@@ -857,7 +886,8 @@ Volatility 3 analyzes Intel x86/x64 Windows memory only (use WinDbg).
   - windows.pslist: Running processes with creation timestamps, PIDs, parent
     PIDs (ProcessCreation at the creation time)
   - windows.netscan: Network connections with protocol, addresses, ports,
-    state (NetworkConnection at the time the connection was created)
+    state (NetworkConnection at the time the connection was created); the
+    process that owns the connection is in Details (Process=), not User
   - windows.cmdline: Full command line arguments for each process (Snapshot)
   - windows.svcscan: Windows services with binary paths, state, start type
     (Snapshot)
@@ -1171,6 +1201,16 @@ Timeline Explorer at the same time.
     "/". PnPRecord compares serial numbers with usb_storage_devices.csv
     (live collections only).
 
+  - User column -- A SID is named only from the collection (SOFTWARE
+    ProfileList or bam_entries.csv), so the SID of a deleted account stays
+    a SID. The name is the profile folder's, which can differ from the
+    account name (a renamed account, or a folder such as alice.DOMAIN). An
+    account written with an older computer name (before the machine was
+    renamed) keeps it, a Microsoft account (MicrosoftAccount\...) is not
+    merged with the local account it signs in to, and the computer account
+    (WORKGROUP\HOST$, the name Security events give SYSTEM as the subject)
+    is not turned into NT AUTHORITY\SYSTEM.
+
   - Excel row limit -- Timelines over 1,048,575 rows are written to CSV only.
 
   - Excel "Repaired Records" or recovery prompt -- Known ImportExcel/EPPlus
@@ -1344,15 +1384,22 @@ parsing is skipped, and the timeline CSV can be opened manually.
 
   tests\Test-EventLogParsers.ps1 -- Part 1 feeds the Security, System,
   Defender and Application handlers synthetic event records and checks
-  their rows and which event IDs and providers each log reads; it needs no
+  their rows and which event IDs and providers each log reads, and the User
+  of the Security, PowerShell (4104/4103) and BITS rows. It also checks the
+  User column: the one form per account for each kind of value, SID names
+  from ProfileList and bam_entries.csv, and the pass over all rows
+  (UserSID= in Details, the counts, and that it runs before
+  deduplication); the computer name and ProfileList are read from this
+  machine's own SYSTEM and SOFTWARE keys (read only). Part 1 needs no
   admin and always runs. Part 2 generates real events (audit policy, a
   temporary local user and group membership, scheduled task, service and
   classic event log), exports the logs with wevtutil, runs the builder on
-  them and checks the rows. It needs admin and runs only in GitHub Actions or with
-  -AllowSystemChanges; otherwise it is skipped. It undoes its changes, but
-  the event records stay in the Security and System logs. Only in CI does
-  it also clear the Security log (1102) and write synthetic Application
-  events.
+  them and checks the rows (the account that made the changes must be in
+  User without the computer name). It needs admin and runs only in GitHub
+  Actions or with -AllowSystemChanges; otherwise it is skipped. It undoes
+  its changes, but the event records stay in the Security and System logs.
+  Only in CI does it also clear the Security log (1102) and write
+  synthetic Application events.
 
   tests\Test-BrowserParsers.ps1 -- builds synthetic Chromium and Firefox
   databases with sqlite3.exe, runs the builder with -Sources Browser and
@@ -1364,15 +1411,18 @@ parsing is skipped, and the timeline CSV can be opened manually.
 
   tests\Test-RegistryParsers.ps1 -- writes known values (IFEO, Winlogon, a
   hidden TaskCache task, Defender exclusions, Office, Remote Desktop,
-  MountedDevices, ...) below a temporary key
+  MountedDevices, ProfileList, the computer name, ...) below a temporary key
   HKCU\Software\TriageTimelineTest_<guid>, saves them as SOFTWARE, SYSTEM
   and NTUSER.DAT hives with reg save, deletes the key, runs the builder
-  with -Sources Registry,ScheduledTasks,USB and checks the rows and times
-  (the MountedDevices rows must come from the SYSTEM hive, not from the
-  empty mounted_devices.csv or the cut-off mounted_devices.txt of an older
-  collector next to it; the tasks scheduled_tasks.csv lists keep their
-  TaskCache registered rows, and the list's own date is an author-supplied
-  row only where it is not the TaskCache time). Needs admin;
+  with -Sources Registry,ScheduledTasks,USB,Persistence and checks the rows
+  and times (the MountedDevices rows must come from the SYSTEM hive, not
+  from the empty mounted_devices.csv or the cut-off mounted_devices.txt of
+  an older collector next to it; the tasks scheduled_tasks.csv lists keep
+  their TaskCache registered rows, and the list's own date is an
+  author-supplied row only where it is not the TaskCache time; the User of
+  startup_entries.csv rows, written as TESTHOST\testuser, with the hive's
+  new host name or as a SID, must come out in one form per account, named
+  from the hives). Needs admin;
   because it writes to the registry it runs only in GitHub Actions or with
   -AllowSystemChanges (otherwise it prints SKIP).
 
@@ -1424,8 +1474,9 @@ parsing is skipped, and the timeline CSV can be opened manually.
   also with [ ] in the path and while another program has the file open),
   and the "Dump time" line of the Memory parser. It turns canned Volatility
   JSON for pslist, netscan, cmdline and svcscan into rows and checks each
-  row's time, EventType and Details (rejected times kept; a PID, PPID,
-  Threads, SessionId or port of 0 is kept, not left empty), the counts,
+  row's time, EventType, User and Details (rejected times kept; a PID,
+  PPID, Threads, SessionId or port of 0 is kept, not left empty; netscan's
+  owning process in Details, not in User), the counts,
   and that the rows are the same under the de-DE culture. A stub stands
   in for vol.exe to check that its output is read back from a scratch
   folder with [ ] in its path and deleted, and for a whole Memory parser
