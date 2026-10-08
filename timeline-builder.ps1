@@ -48,6 +48,7 @@ param(
 
     # $MFT file-system events: only times within this many days before the
     # collection are added (0 = all). A full $MFT can hold millions of times.
+    # Mark-of-the-Web (downloaded or extracted file) rows are always added.
     [Parameter(Mandatory = $false)]
     [ValidateRange(0, 36500)]
     [int]$MftDays = 7,
@@ -651,19 +652,47 @@ function Format-ArtifactDetails {
     return ($parts -join " | ")
 }
 
-# Events with the given IDs from an .evtx file (nothing if there are none)
+# Events with the given IDs from an .evtx file (nothing if there are none),
+# optionally only those of the given providers (with no -Ids: any ID of
+# them). The event log's XPath takes at most about 22 terms per query, so
+# longer ID and provider lists are read in groups. A file that cannot be read
+# is reported once: the remaining groups are skipped, and so are later calls
+# that pass the same -State hashtable (its Failed key is set).
 function Get-EvtxEventsById {
-    param([string]$Path, [int[]]$Ids, [string]$Label)
-    $xpath = "*[System[(" + (($Ids | ForEach-Object { "EventID=$_" }) -join " or ") + ")]]"
-    try {
-        return @(Get-WinEvent -Path $Path -FilterXPath $xpath -ErrorAction Stop)
+    param([string]$Path, [int[]]$Ids, [string]$Label, [string[]]$Providers, [hashtable]$State)
+    if ($State -and $State["Failed"]) { return @() }
+    $idSize = if ($Providers) { 15 } else { 20 }
+    $providerSize = if ($Ids) { 5 } else { 20 }
+    $idTerms = @()
+    for ($i = 0; $i -lt $Ids.Count; $i += $idSize) {
+        $group = $Ids[$i..([Math]::Min($i + $idSize, $Ids.Count) - 1)]
+        $idTerms += "(" + (($group | ForEach-Object { "EventID=$_" }) -join " or ") + ")"
     }
-    catch {
-        if ($_.FullyQualifiedErrorId -notlike "NoMatchingEventsFound*" -and $_.Exception.Message -notmatch "No events were found") {
-            Log-Warning "    Error reading $Label events from $(Split-Path $Path -Leaf) : $($_.Exception.Message)"
+    if ($idTerms.Count -eq 0) { $idTerms = @("") }
+    $providerTerms = @()
+    for ($i = 0; $i -lt $Providers.Count; $i += $providerSize) {
+        $group = $Providers[$i..([Math]::Min($i + $providerSize, $Providers.Count) - 1)]
+        $providerTerms += "Provider[" + (($group | ForEach-Object { "@Name='$_'" }) -join " or ") + "]"
+    }
+    if ($providerTerms.Count -eq 0) { $providerTerms = @("") }
+
+    $events = New-Object System.Collections.Generic.List[object]
+    foreach ($idTerm in $idTerms) {
+        foreach ($providerTerm in $providerTerms) {
+            $xpath = "*[System[" + ((@($providerTerm, $idTerm) | Where-Object { $_ }) -join " and ") + "]]"
+            try {
+                foreach ($record in (Get-WinEvent -Path $Path -FilterXPath $xpath -ErrorAction Stop)) { $events.Add($record) }
+            }
+            catch {
+                if ($_.FullyQualifiedErrorId -notlike "NoMatchingEventsFound*" -and $_.Exception.Message -notmatch "No events were found") {
+                    Log-Warning "    Error reading $Label events from $(Split-Path $Path -Leaf) : $($_.Exception.Message)"
+                    if ($State) { $State["Failed"] = $true }
+                    return $events.ToArray()
+                }
+            }
         }
-        return @()
     }
+    return $events.ToArray()
 }
 
 # Fields of an event record as a hashtable: EventData <Data Name="..."> values
@@ -948,6 +977,632 @@ function Read-DefenderSupportLog {
     return $added
 }
 
+# Names for the %%NNNN references in event 4719 (system audit policy changed),
+# as msobjs.dll gives them in English. Categories are %%8272-%%8280; the
+# subcategories of category n (0-8) are %%(12288 + 256 * n) and up.
+$script:AuditCategoryNames = @("System", "Logon/Logoff", "Object Access", "Privilege Use", "Detailed Tracking", "Policy Change", "Account Management", "DS Access", "Account Logon")
+$script:AuditSubcategoryNames = @(
+    @("Security State Change", "Security System Extension", "System Integrity", "IPsec Driver", "Other System Events"),
+    @("Logon", "Logoff", "Account Lockout", "IPsec Main Mode", "Special Logon", "IPsec Quick Mode", "IPsec Extended Mode", "Other Logon/Logoff Events", "Network Policy Server", "User / Device Claims", "Group Membership", "Access Rights"),
+    @("File System", "Registry", "Kernel Object", "SAM", "Other Object Access Events", "Certification Services", "Application Generated", "Handle Manipulation", "File Share", "Filtering Platform Packet Drop", "Filtering Platform Connection", "Detailed File Share", "Removable Storage", "Central Policy Staging"),
+    @("Sensitive Privilege Use", "Non Sensitive Privilege Use", "Other Privilege Use Events"),
+    @("Process Creation", "Process Termination", "DPAPI Activity", "RPC Events", "Plug and Play Events", "Token Right Adjusted Events"),
+    @("Audit Policy Change", "Authentication Policy Change", "Authorization Policy Change", "MPSSVC Rule-Level Policy Change", "Filtering Platform Policy Change", "Other Policy Change Events"),
+    @("User Account Management", "Computer Account Management", "Security Group Management", "Distribution Group Management", "Application Group Management", "Other Account Management Events"),
+    @("Directory Service Access", "Directory Service Changes", "Directory Service Replication", "Detailed Directory Service Replication"),
+    @("Credential Validation", "Kerberos Service Ticket Operations", "Other Account Logon Events", "Kerberos Authentication Service")
+)
+$script:AuditChangeNames = @{ 8448 = "Success removed"; 8449 = "Success added"; 8450 = "Failure removed"; 8451 = "Failure added" }
+
+# Service type and start type codes of event 4697 (as in the 7040 text)
+$script:ServiceTypeNames = @{ 1 = "kernel driver"; 2 = "file system driver"; 8 = "recognizer driver"; 16 = "own process"; 32 = "share process"; 272 = "interactive own process"; 288 = "interactive share process" }
+$script:ServiceStartTypeNames = @{ 0 = "boot start"; 1 = "system start"; 2 = "auto start"; 3 = "demand start"; 4 = "disabled" }
+
+# Attack surface reduction rule GUIDs (Defender 1121/1122 "ID") -> rule names,
+# from Microsoft's ASR rules reference
+$script:AsrRuleNames = @{
+    "56a863a9-875e-4185-98a7-b882c64b5ce5" = "Block abuse of exploited vulnerable signed drivers"
+    "9e6c4e1f-7d60-472f-ba1a-a39ef669e4b2" = "Block credential stealing from the Windows local security authority subsystem"
+    "e6db77e5-3df2-4cf1-b95a-636979351e5b" = "Block persistence through WMI event subscription"
+    "7674ba52-37eb-4a4f-a9a1-f0f9a1619a2c" = "Block Adobe Reader from creating child processes"
+    "d4f940ab-401b-4efc-aadc-ad5f3c50688a" = "Block all Office applications from creating child processes"
+    "be9ba2d9-53ea-4cdc-84e5-9b1eeee46550" = "Block executable content from email client and webmail"
+    "01443614-cd74-433a-b99e-2ecdc07bfc25" = "Block executable files from running unless they meet a prevalence, age, or trusted list criterion"
+    "5beb7efe-fd9a-4556-801d-275e5ffc04cc" = "Block execution of potentially obfuscated scripts"
+    "d3e037e1-3eb8-44c8-a917-57927947596d" = "Block JavaScript or VBScript from launching downloaded executable content"
+    "3b576869-a4ec-4529-8536-b80a7769e899" = "Block Office applications from creating executable content"
+    "75668c1f-73b5-4cf0-bb93-3ecf5cb7cc84" = "Block Office applications from injecting code into other processes"
+    "26190899-1602-49e8-8b27-eb1d0a1ce869" = "Block Office communication application from creating child processes"
+    "d1e49aac-8f56-4280-b9ba-993a6d77406c" = "Block process creations originating from PSExec and WMI commands"
+    "33ddedf1-c6e0-47cb-833e-de6133960387" = "Block rebooting machine in Safe Mode"
+    "b2b3f03d-6a65-4f7b-a9c7-1c7ef74a9ba4" = "Block untrusted and unsigned processes that run from USB"
+    "c0033c00-d16d-4114-a5a0-dc9b3a7d2ceb" = "Block use of copied or impersonated system tools"
+    "a8f5898e-1dc8-49a9-9878-85004b8a61e6" = "Block Webshell creation for Servers"
+    "92e97fa1-2edf-4476-bdd6-9dd0b4dddc7b" = "Block Win32 API calls from Office macros"
+    "c1db55ab-c21a-4637-bb3f-a12568109d35" = "Use advanced protection against ransomware"
+}
+
+# Event sources that third-party antivirus products write to the Application
+# log (exact names: the event log's XPath has no wildcards). Symantec
+# AntiVirus, McLogEvent and Sophos Anti-Virus are documented sources; the
+# others are the products' names as they register them. A name that is not
+# in the log costs nothing.
+$script:ThirdPartyAvProviders = @(
+    "Symantec AntiVirus", "Symantec Endpoint Protection", "Symantec Endpoint Protection Client", "Norton AntiVirus", "Norton Security",
+    "McLogEvent", "McAfee Endpoint Security", "Trellix Endpoint Security",
+    "Sophos Anti-Virus", "Sophos Endpoint Defense",
+    "ESET", "ESET Security",
+    "Trend Micro OfficeScan", "OfficeScan NT", "Trend Micro Apex One", "Deep Security Agent",
+    "Bitdefender", "Bitdefender Endpoint Security Tools",
+    "Kaspersky Endpoint Security", "Kaspersky Security",
+    "Malwarebytes", "MBAMService",
+    "Webroot", "WRSVC",
+    "CrowdStrike", "CSFalconService"
+)
+
+# "DOMAIN\name" from an event's domain and account fields; empty and "-"
+# parts are left out
+function Join-EvtxAccountName {
+    param([string]$Domain, [string]$Name)
+    return ((@($Domain, $Name) | ForEach-Object { "$_".Trim() } | Where-Object { $_ -and $_ -ne "-" }) -join "\")
+}
+
+# First non-empty value among the named event fields, trimmed ("-" counts as
+# empty). Lets a parser list a field's name and its param<n> position, for
+# records that store the same fields unnamed (older Windows, ReportEvent).
+function Get-EvtxFieldValue {
+    param([hashtable]$Fields, [string[]]$Names)
+    foreach ($n in $Names) {
+        $v = "$($Fields[$n])".Trim()
+        if ($v -and $v -ne "-") { return $v }
+    }
+    return ""
+}
+
+# "0x10" -> "0x10 (own process)" from a code -> name table; other text as is
+function Format-EvtxCodeText {
+    param([string]$Text, [hashtable]$Names)
+    $t = "$Text".Trim()
+    $value = 0
+    if ($t -match '^0x([0-9A-Fa-f]{1,8})$') {
+        if (-not [int]::TryParse($Matches[1], [System.Globalization.NumberStyles]::HexNumber, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$value)) { return $t }
+    }
+    elseif (-not [int]::TryParse($t, [ref]$value)) { return $t }
+    if ($Names.ContainsKey($value)) { return "$t ($($Names[$value]))" }
+    return $t
+}
+
+# "%%8274" or "%%8448, %%8450" from event 4719 -> "Object Access" or
+# "Success removed, Failure removed"; unknown references are kept as they are
+function ConvertFrom-AuditPolicyText {
+    param([string]$Text)
+    $names = @()
+    foreach ($part in ($Text -split ',')) {
+        $name = $part.Trim()
+        if (-not $name) { continue }
+        # At most 9 digits, so that a malformed reference cannot overflow [int]
+        if ($name -match '^%%(\d{1,9})$') {
+            $n = [int]$Matches[1]
+            if ($n -ge 8272 -and $n -le 8280) { $name = $script:AuditCategoryNames[$n - 8272] }
+            elseif ($script:AuditChangeNames.ContainsKey($n)) { $name = $script:AuditChangeNames[$n] }
+            elseif ($n -ge 12288) {
+                $category = [int][Math]::Floor(($n - 12288) / 256)
+                $index = ($n - 12288) % 256
+                if ($category -lt $script:AuditSubcategoryNames.Count -and $index -lt $script:AuditSubcategoryNames[$category].Count) {
+                    $name = $script:AuditSubcategoryNames[$category][$index]
+                }
+            }
+        }
+        $names += $name
+    }
+    return ($names -join ", ")
+}
+
+# Action and run-as account of the task XML in events 4698-4702 (TaskContent /
+# TaskContentNew). A single Exec action gives Command and Arguments; anything
+# else gives Actions, one "<command> <arguments>" or "ComHandler <ClassId>"
+# per action joined with "; " (as in the task XML rows), so that arguments
+# always stay with their command. Empty if there is no readable XML.
+function Get-TaskContentSummary {
+    param([string]$TaskXml)
+    $summary = [ordered]@{}
+    if (-not $TaskXml -or -not $TaskXml.Trim()) { return $summary }
+    $doc = New-Object System.Xml.XmlDocument
+    try { $doc.LoadXml($TaskXml.Trim()) }
+    catch {
+        Write-Verbose "Task XML in a scheduled task event is not readable: $($_.Exception.Message)"
+        return $summary
+    }
+    $taskNode = $doc.DocumentElement
+    $actions = @()
+    $exec = $null
+    foreach ($node in $taskNode.SelectNodes("*[local-name()='Actions']/*")) {
+        if ($node.LocalName -eq "Exec") {
+            $exec = $node
+            $actions += ((Get-TaskXmlText $node "Command") + " " + (Get-TaskXmlText $node "Arguments")).Trim()
+        }
+        elseif ($node.LocalName -eq "ComHandler") {
+            $actions += "ComHandler " + (Get-TaskXmlText $node "ClassId")
+        }
+    }
+    if ($actions.Count -eq 1 -and $null -ne $exec) {
+        $summary["Command"] = Get-TaskXmlText $exec "Command"
+        $summary["Arguments"] = Get-TaskXmlText $exec "Arguments"
+    }
+    else {
+        $summary["Actions"] = (@($actions | Where-Object { $_ }) -join "; ")
+    }
+    $runAs = Get-TaskXmlText $taskNode "Principals/Principal/UserId"
+    if (-not $runAs) { $runAs = Get-TaskXmlText $taskNode "Principals/Principal/GroupId" }
+    $summary["RunAs"] = $runAs
+    return $summary
+}
+
+# SID -> @{ Name = "DOMAIN\name"; EventId = <id> } from the Security events
+# that carry both: the target of 4720 / 4724 / 4726 (account created, reset,
+# deleted), the account of 4624 logons and the subject of these and 4648.
+# Names the member of a group add (4728 / 4732 / 4756), which gives only the
+# SID of a local account. Account management events win over logons.
+function Get-SecuritySidNames {
+    param([object[]]$Records)
+    $names = @{}
+    foreach ($record in @($Records | Where-Object { $_.Id -in @(4720, 4724, 4726, 4624, 4648) })) {
+        $f = Get-EvtxEventFields $record
+        $id = [int]$record.Id
+        # @(SID, name, rank): lower rank wins
+        $accounts = @(, @($f["SubjectUserSid"], (Join-EvtxAccountName $f["SubjectDomainName"] $f["SubjectUserName"]), 2))
+        if ($id -in @(4720, 4724, 4726)) { $accounts += , @($f["TargetSid"], (Join-EvtxAccountName $f["TargetDomainName"] $f["TargetUserName"]), 1) }
+        elseif ($id -eq 4624) { $accounts += , @($f["TargetUserSid"], (Join-EvtxAccountName $f["TargetDomainName"] $f["TargetUserName"]), 2) }
+        foreach ($account in $accounts) {
+            $sid = "$($account[0])".Trim()
+            if ($sid -notmatch '^S-1-' -or $sid -eq "S-1-0-0" -or -not $account[1]) { continue }
+            $known = $names[$sid]
+            if ($null -eq $known -or $account[2] -lt $known.Rank) {
+                $names[$sid] = @{ Name = $account[1]; EventId = $id; Rank = $account[2] }
+            }
+        }
+    }
+    return $names
+}
+
+# "4624 x805, 4672 x786": events per ID (and provider, with -ByProvider) for the log
+function Format-EvtxEventCounts {
+    param([object[]]$Records, [switch]$ByProvider)
+    # Read the switch here: PSReviewUnusedParameter does not look inside the script block
+    $perProvider = $ByProvider.IsPresent
+    $groups = @($Records | Group-Object { if ($perProvider) { "$($_.ProviderName) $($_.Id)" } else { "$($_.Id)" } } | Sort-Object Name)
+    return (($groups | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ", ")
+}
+
+# Security.evtx events other than logons and process creation (field names
+# from the Microsoft-Windows-Security-Auditing templates; 1102 is written by
+# Microsoft-Windows-Eventlog as UserData):
+#   1102                 audit log cleared                        SecurityAlert
+#   4719                 system audit policy changed              SecurityAlert
+#   4697                 service installed                        PersistenceChange
+#   4698-4702            scheduled task registered/deleted/enabled/
+#                        disabled/updated (+ action from the XML) ScheduledTaskChange
+#   4728/4732/4756       member added to a global/local/universal
+#                        security group                           AccountChange
+#   4724 / 4740          password reset attempt / account locked  AccountChange
+#   4778 / 4779          session reconnected / disconnected       Logon
+# $SidNames (Get-SecuritySidNames) names a group member given only by SID.
+function Add-SecurityEventEntry {
+    param($Record, [string]$FileName, [string]$FilePath, [hashtable]$SidNames)
+    $f = Get-EvtxEventFields $Record
+    $id = [int]$Record.Id
+    $subject = Join-EvtxAccountName $f["SubjectDomainName"] $f["SubjectUserName"]
+    $user = $subject
+    $type = "AccountChange"
+    $desc = $null
+    $details = [ordered]@{ EventID = $id }
+    switch ($id) {
+        1102 {
+            $type = "SecurityAlert"
+            $desc = "Security audit log cleared"
+            $details["ClearedBy"] = $subject
+            $details["SubjectSID"] = $f["SubjectUserSid"]
+            $details["LogonID"] = $f["SubjectLogonId"]
+            $details["ClientProcessId"] = $f["ClientProcessId"]
+        }
+        4719 {
+            $type = "SecurityAlert"
+            $category = ConvertFrom-AuditPolicyText $f["CategoryId"]
+            $subcategory = ConvertFrom-AuditPolicyText $f["SubcategoryId"]
+            $changes = ConvertFrom-AuditPolicyText $f["AuditPolicyChanges"]
+            $desc = "System audit policy changed: $category\$subcategory ($changes)"
+            $details["Category"] = $category
+            $details["Subcategory"] = $subcategory
+            $details["SubcategoryGuid"] = $f["SubcategoryGuid"]
+            $details["Changes"] = $changes
+        }
+        4697 {
+            $type = "PersistenceChange"
+            $desc = "New service installed: $($f['ServiceName'])"
+            $details["ServiceName"] = $f["ServiceName"]
+            # ServiceFileName, under the key System 7045 rows use
+            $details["ImagePath"] = $f["ServiceFileName"]
+            $details["ServiceType"] = Format-EvtxCodeText $f["ServiceType"] $script:ServiceTypeNames
+            $details["StartType"] = Format-EvtxCodeText $f["ServiceStartType"] $script:ServiceStartTypeNames
+            $details["Account"] = $f["ServiceAccount"]
+            $details["ClientProcessId"] = $f["ClientProcessId"]
+        }
+        { $_ -in @(4698, 4699, 4700, 4701, 4702) } {
+            $type = "ScheduledTaskChange"
+            # Same verbs as the TaskScheduler 106 / 140 / 141 rows
+            $what = @{ 4698 = "registered"; 4699 = "deleted"; 4700 = "enabled"; 4701 = "disabled"; 4702 = "updated" }[$id]
+            $desc = "Scheduled task ${what}: $($f['TaskName'])"
+            $details["TaskName"] = $f["TaskName"]
+            $taskXml = Get-EvtxFieldValue $f @("TaskContentNew", "TaskContent")
+            $task = Get-TaskContentSummary $taskXml
+            foreach ($key in $task.Keys) { $details[$key] = $task[$key] }
+            $details["ClientProcessId"] = $f["ClientProcessId"]
+        }
+        { $_ -in @(4728, 4732, 4756) } {
+            $scope = @{ 4728 = "global"; 4732 = "local"; 4756 = "universal" }[$id]
+            # MemberName is a domain account's DN, and "-" for a local account:
+            # then the name comes from another event with the same SID
+            $member = Get-EvtxFieldValue $f @("MemberName")
+            $memberSid = Get-EvtxFieldValue $f @("MemberSid")
+            $memberFrom = ""
+            if (-not $member -and $memberSid -and $SidNames -and $SidNames.ContainsKey($memberSid)) {
+                $member = $SidNames[$memberSid].Name
+                $memberFrom = "event $($SidNames[$memberSid].EventId)"
+            }
+            $desc = "Member added to security-enabled $scope group: $($f['TargetUserName'])"
+            $shown = if ($member) { $member } else { $memberSid }
+            if ($shown) { $desc += " (member $shown)" }
+            $details["Group"] = Join-EvtxAccountName $f["TargetDomainName"] $f["TargetUserName"]
+            $details["GroupSID"] = $f["TargetSid"]
+            $details["Member"] = $member
+            $details["MemberSID"] = $memberSid
+            $details["MemberNameFrom"] = $memberFrom
+        }
+        4724 {
+            $target = Join-EvtxAccountName $f["TargetDomainName"] $f["TargetUserName"]
+            $desc = "Password reset attempted for account: $target"
+            $details["Account"] = $target
+            $details["AccountSID"] = $f["TargetSid"]
+        }
+        4740 {
+            # TargetDomainName holds the caller computer name in this event; the
+            # subject is the machine (or DC) that reports it, so User is the
+            # locked-out account
+            $desc = "User account locked out: $($f['TargetUserName'])"
+            $user = Get-EvtxFieldValue $f @("TargetUserName", "TargetSid")
+            $details["Account"] = $f["TargetUserName"]
+            $details["AccountSID"] = $f["TargetSid"]
+            $details["CallerComputer"] = $f["TargetDomainName"]
+            $details["ReportedBy"] = $subject
+        }
+        { $_ -in @(4778, 4779) } {
+            $type = "Logon"
+            $user = Join-EvtxAccountName $f["AccountDomain"] $f["AccountName"]
+            $clientName = Get-EvtxFieldValue $f @("ClientName")
+            $clientAddress = Get-EvtxFieldValue $f @("ClientAddress")
+            $client = (@($clientName, $clientAddress) | Where-Object { $_ }) -join ", "
+            $desc = if ($id -eq 4778) { "Session reconnected to window station" } else { "Session disconnected from window station" }
+            if ($client) { $desc += " (client $client)" }
+            $details["Account"] = $user
+            $details["ClientName"] = $clientName
+            $details["ClientAddress"] = $clientAddress
+            $details["SessionName"] = $f["SessionName"]
+            $details["LogonID"] = $f["LogonID"]
+        }
+    }
+    if (-not $desc) { return }
+    Add-TimelineEntry -Timestamp $Record.TimeCreated -Source $FileName -EventType $type `
+        -Description $desc -User $user -Details (Format-ArtifactDetails $details) `
+        -Artifact "EventLogs" -RawPath $FilePath
+}
+
+# System.evtx: event log cleared (104, Microsoft-Windows-Eventlog; SecurityAlert)
+# and the event log service started / stopped (6005 / 6006, EventLog), the
+# markers of a boot and of a clean shutdown (ServiceChange)
+function Add-SystemEventEntry {
+    param($Record, [string]$FileName, [string]$FilePath)
+    $id = [int]$Record.Id
+    if ($id -eq 104 -and $Record.ProviderName -eq "Microsoft-Windows-Eventlog") {
+        $f = Get-EvtxEventFields $Record
+        $by = Join-EvtxAccountName $f["SubjectDomainName"] $f["SubjectUserName"]
+        Add-TimelineEntry -Timestamp $Record.TimeCreated -Source $FileName -EventType "SecurityAlert" `
+            -Description "Event log cleared: $($f['Channel'])" -User $by `
+            -Details (Format-ArtifactDetails ([ordered]@{ EventID = $id; Channel = $f["Channel"]; ClearedBy = $by; BackupPath = $f["BackupPath"]; ClientProcessId = $f["ClientProcessId"] })) `
+            -Artifact "EventLogs" -RawPath $FilePath
+    }
+    elseif ($id -in @(6005, 6006) -and $Record.ProviderName -eq "EventLog") {
+        $desc = if ($id -eq 6005) { "Event log service started (system startup)" } else { "Event log service stopped (clean shutdown)" }
+        Add-TimelineEntry -Timestamp $Record.TimeCreated -Source $FileName -EventType "ServiceChange" `
+            -Description $desc -Details (Format-ArtifactDetails ([ordered]@{ EventID = $id })) `
+            -Artifact "EventLogs" -RawPath $FilePath
+    }
+}
+
+# Defender Operational: malware history deleted (1013) and attack surface
+# reduction rule blocked / audited (1121 / 1122), all SecurityAlert. $Fields
+# are the record's Get-EvtxEventFields (read here if not given). $Count and
+# $LastSeen describe a row that stands for several 1122 events (see
+# Add-DefenderAsrAuditEntries).
+function Add-DefenderEventEntry {
+    param($Record, [hashtable]$Fields, [string]$FileName, [string]$FilePath, [int]$Count = 1, $LastSeen = $null)
+    $f = $Fields
+    if ($null -eq $f) { $f = Get-EvtxEventFields $Record }
+    $id = [int]$Record.Id
+    if ($id -eq 1013) {
+        # Timestamp: history older than this was removed (UTC). The service
+        # itself purges old items every day as SYSTEM (ScanPurgeItemsAfterDelay,
+        # 15 days by default), so its cutoff lies whole days before the event;
+        # a deletion by a user removes the history up to about now.
+        $by = Join-EvtxAccountName $f["Domain"] $f["User"]
+        $cutoff = ConvertFrom-UtcText $f["Timestamp"]
+        $retention = $f["SID"] -eq "S-1-5-18" -and $null -ne $cutoff -and ($Record.TimeCreated.ToUniversalTime() - $cutoff).TotalHours -ge 23
+        if ($retention) {
+            $desc = "Defender malware detection history purged by retention (items before $($f['Timestamp']))"
+        }
+        else {
+            $desc = "Defender malware detection history deleted"
+            if ($by) { $desc += " by $by" }
+        }
+        Add-TimelineEntry -Timestamp $Record.TimeCreated -Source $FileName -EventType "SecurityAlert" `
+            -Description $desc -User $by `
+            -Details (Format-ArtifactDetails ([ordered]@{ EventID = $id; Trigger = $(if ($retention) { "Retention" } else { "User" }); DeletedBefore = $f["Timestamp"]; DeletedBy = $by; SID = $f["SID"] })) `
+            -Artifact "EventLogs" -RawPath $FilePath
+    }
+    elseif ($id -in @(1121, 1122)) {
+        $ruleId = "$($f['ID'])".Trim().Trim('{', '}')
+        $rule = $script:AsrRuleNames[$ruleId.ToLowerInvariant()]
+        if (-not $rule) { $rule = $ruleId }
+        $what = if ($id -eq 1121) { "blocked" } else { "audited" }
+        $details = [ordered]@{
+            EventID           = $id
+            RuleID            = $ruleId
+            Path              = $f["Path"]
+            Process           = $f["Process Name"]
+            TargetCommandline = $f["Target Commandline"]
+            ParentCommandline = $f["Parent Commandline"]
+            InvolvedFile      = $f["Involved File"]
+        }
+        if ($Count -gt 1) {
+            $details["Count"] = $Count
+            $details["LastSeen"] = ([datetime]$LastSeen).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture)
+        }
+        Add-TimelineEntry -Timestamp $Record.TimeCreated -Source $FileName -EventType "SecurityAlert" `
+            -Description "Defender attack surface reduction rule ${what}: $rule" -User $f["User"] `
+            -Details (Format-ArtifactDetails $details) `
+            -Artifact "EventLogs" -RawPath $FilePath
+    }
+}
+
+# Defender 1122 (attack surface reduction rule audited), folded per rule, path,
+# process and UTC day: audit mode can log large numbers of benign events
+# (Microsoft says so of the LSASS rule). One row at the first event of each
+# group, with Count and LastSeen when it stands for more than one. $Items are
+# @{ Record; Fields } pairs. Blocks (1121) are not folded.
+function Add-DefenderAsrAuditEntries {
+    param([object[]]$Items, [string]$FileName, [string]$FilePath)
+    $groups = [ordered]@{}
+    foreach ($item in @($Items | Sort-Object { $_.Record.TimeCreated.ToUniversalTime() }, { $_.Record.RecordId })) {
+        $f = $item.Fields
+        $key = (@("$($f['ID'])".Trim().Trim('{', '}'), "$($f['Path'])", "$($f['Process Name'])",
+            $item.Record.TimeCreated.ToUniversalTime().ToString("yyyy-MM-dd", [System.Globalization.CultureInfo]::InvariantCulture)) -join "`t").ToLowerInvariant()
+        if (-not $groups.Contains($key)) { $groups[$key] = New-Object System.Collections.Generic.List[object] }
+        $groups[$key].Add($item)
+    }
+    foreach ($key in $groups.Keys) {
+        $group = $groups[$key]
+        Add-DefenderEventEntry -Record $group[0].Record -Fields $group[0].Fields -FileName $FileName -FilePath $FilePath `
+            -Count $group.Count -LastSeen $group[$group.Count - 1].Record.TimeCreated
+    }
+    $folded = @($Items).Count - $groups.Count
+    if ($folded -gt 0) {
+        Log "    Folded $folded attack surface reduction audit event(s) (1122) into $($groups.Count) row(s)"
+    }
+}
+
+# Application.evtx. Message layouts were checked against the providers'
+# message files (msimsg.dll, wer.dll, wersvc.dll, wscsvc.dll, esent.dll):
+#   MsiInstaller 1033/1034    installed / removed: product, version,
+#                             manufacturer, status              Installation
+#   MsiInstaller 11707/11724  only when there is no 1033/1034 for the
+#                             same product within a minute      Installation
+#   Application Error 1000    crash: app, version, faulting
+#                             module, exception code, path      Execution
+#   Application Hang 1002     hang: app, version, path          Execution
+#   SecurityCenter 15         security product state (ON, OFF, SNOOZED,
+#                             EXPIRED): the first per product
+#                             and each change                   SecurityAlert
+#   SecurityCenter 16         a state update that failed        SecurityAlert
+#   ESENT 216, 325-327        database location changed /
+#                             created / attached / detached
+#                             (shows copies of ntds.dit)        FileAccess
+#   $script:ThirdPartyAvProviders, any ID: the message text,
+#                             trimmed; Critical, Error and Warning
+#                             events, and Information events
+#                             whose text reports a detection    SecurityAlert
+# Windows Error Reporting 1001 is not read: its application crashes and hangs
+# repeat 1000 / 1002, and the rest (LiveKernelEvent, Store and update
+# failures) is routine and can number in the hundreds.
+function Add-ApplicationEventEntries {
+    param([object[]]$Records, [string]$FileName, [string]$FilePath)
+    $items = @($Records | Sort-Object TimeCreated, RecordId | ForEach-Object { [PSCustomObject]@{ Record = $_; Fields = Get-EvtxEventFields $_ } })
+    $msiStatusNames = @{ "0" = "success"; "3010" = "success, restart required"; "1641" = "success, restart started"; "1602" = "cancelled by the user"; "1603" = "fatal error" }
+    $levelNames = @{ 1 = "Critical"; 2 = "Error"; 3 = "Warning"; 4 = "Information" }
+    # Antivirus Information events are mostly routine (definitions loaded, scan
+    # started or finished, update done); keep those that name a threat and
+    # what happened to it ("Virus Found", "Security Risk Found", "... Trojan
+    # ... deleted")
+    $avDetectionPattern = '\b(virus|threat|malware|trojan|worm|ransomware|spyware|infected|infection|security risk)\b.*\b(found|detected|quarantined|blocked|cleaned|removed|deleted)\b'
+    $eseActions = @{ 325 = "created"; 326 = "attached"; 327 = "detached" }
+
+    # Product name -> times of its 1033 (installed) / 1034 (removed) events
+    $msiTimes = @{}
+    foreach ($item in $items) {
+        if ($item.Record.ProviderName -eq "MsiInstaller" -and $item.Record.Id -in @(1033, 1034)) {
+            $key = "$($item.Record.Id)`t" + (Get-EvtxFieldValue $item.Fields @("param1"))
+            if (-not $msiTimes.ContainsKey($key)) { $msiTimes[$key] = @() }
+            $msiTimes[$key] += $item.Record.TimeCreated
+        }
+    }
+
+    $productStates = @{}
+    $rowCounts = [ordered]@{}
+    $skipped = [ordered]@{}
+    foreach ($item in $items) {
+        $r = $item.Record
+        $f = $item.Fields
+        $provider = $r.ProviderName
+        $id = [int]$r.Id
+        $type = $null
+        $desc = $null
+        $user = ""
+        $details = [ordered]@{ EventID = $id }
+
+        if ($provider -eq "MsiInstaller") {
+            $type = "Installation"
+            if ($id -in @(1033, 1034)) {
+                # %1 product, %2 version, %3 language, %4 status, %5 manufacturer
+                $product = Get-EvtxFieldValue $f @("param1")
+                $version = Get-EvtxFieldValue $f @("param2")
+                $status = Get-EvtxFieldValue $f @("param4")
+                $ok = @("0", "3010", "1641") -contains $status
+                $what = if ($id -eq 1033) { $(if ($ok) { "Software installed" } else { "Software installation failed" }) } else { $(if ($ok) { "Software removed" } else { "Software removal failed" }) }
+                $desc = "${what}: $product $version".TrimEnd()
+                if (-not $ok -and $status) { $desc += " (status $status)" }
+                $details["Product"] = $product
+                $details["Version"] = $version
+                $details["Manufacturer"] = Get-EvtxFieldValue $f @("param5")
+                $details["Status"] = $(if ($msiStatusNames.ContainsKey($status)) { "$status ($($msiStatusNames[$status]))" } else { $status })
+            }
+            else {
+                # "Product: <name> -- Installation completed successfully."
+                $message = Get-EvtxFieldValue $f @("param1")
+                $product = if ($message -match '^\S+:\s*(.+?)\s+--\s') { $Matches[1] } else { "" }
+                $pair = if ($id -eq 11707) { 1033 } else { 1034 }
+                $twin = @($msiTimes["$pair`t$product"] | Where-Object { $null -ne $_ -and [Math]::Abs(($_ - $r.TimeCreated).TotalSeconds) -le 60 })
+                if ($product -and $twin.Count -gt 0) {
+                    $skipped["MsiInstaller $id (same install as $pair)"] = 1 + [int]$skipped["MsiInstaller $id (same install as $pair)"]
+                    continue
+                }
+                $what = if ($id -eq 11707) { "Software installed" } else { "Software removed" }
+                $desc = if ($product) { "${what}: $product" } else { "${what}: $message" }
+                $details["Product"] = $product
+                $details["Message"] = $message
+            }
+            # The product code is the start of the binary data, as ASCII text
+            if ($r.ToXml() -match '<Binary>((?:[0-9A-Fa-f]{2}){38})') {
+                $hex = $Matches[1]
+                $code = -join (0..37 | ForEach-Object { [char][Convert]::ToByte($hex.Substring($_ * 2, 2), 16) })
+                if ($code -match '^\{[0-9A-Fa-f-]{36}\}$') { $details["ProductCode"] = $code }
+            }
+            # The account that ran the install (SYSTEM for most updates)
+            $user = Resolve-BamUser -Sid "$($r.UserId)" -SidNames @{}
+            $details["UserSID"] = "$($r.UserId)"
+        }
+        elseif ($provider -eq "Application Error") {
+            # Named fields; %1-%15 in the same order in older unnamed records
+            $type = "Execution"
+            $app = Get-EvtxFieldValue $f @("AppName", "param1")
+            $module = Get-EvtxFieldValue $f @("ModuleName", "param4")
+            $code = Get-EvtxFieldValue $f @("ExceptionCode", "param7")
+            if ($code -and $code -notmatch '^0x') { $code = "0x$code" }
+            $offset = Get-EvtxFieldValue $f @("FaultingOffset", "param8")
+            if ($offset -and $offset -notmatch '^0x') { $offset = "0x$offset" }
+            $desc = "Application crashed: $app (exception $code in $module)"
+            $details["Application"] = $app
+            $details["Version"] = Get-EvtxFieldValue $f @("AppVersion", "param2")
+            $details["Module"] = $module
+            $details["ModuleVersion"] = Get-EvtxFieldValue $f @("ModuleVersion", "param5")
+            $details["ExceptionCode"] = $code
+            $details["FaultOffset"] = $offset
+            $details["Path"] = Get-EvtxFieldValue $f @("AppPath", "param11")
+            $details["ModulePath"] = Get-EvtxFieldValue $f @("ModulePath", "param12")
+        }
+        elseif ($provider -eq "Application Hang") {
+            # %1 app, %2 version, %3 process ID, %6 path, %10 hang type
+            $type = "Execution"
+            $app = Get-EvtxFieldValue $f @("AppName", "param1")
+            $desc = "Application hung and was closed: $app"
+            $details["Application"] = $app
+            $details["Version"] = Get-EvtxFieldValue $f @("AppVersion", "param2")
+            $details["Path"] = Get-EvtxFieldValue $f @("ExeFileName", "param6")
+            $details["HangType"] = Get-EvtxFieldValue $f @("HangType", "param10")
+        }
+        elseif ($provider -eq "SecurityCenter") {
+            # %1 product, %2 state (SECURITY_PRODUCT_STATE_ON / OFF / SNOOZED / EXPIRED).
+            # A product that is ON is context, not an alert.
+            $product = Get-EvtxFieldValue $f @("param1")
+            $state = (Get-EvtxFieldValue $f @("param2")) -replace '^SECURITY_PRODUCT_STATE_', ''
+            $type = if ($state -eq "ON") { "Snapshot" } else { "SecurityAlert" }
+            if (-not $product) { continue }
+            $details["Product"] = $product
+            $details["State"] = $state
+            if ($id -eq 15) {
+                # Each start of the service reports every product again
+                $previous = $productStates[$product]
+                if ($previous -eq $state) {
+                    $skipped["SecurityCenter 15 (state unchanged)"] = 1 + [int]$skipped["SecurityCenter 15 (state unchanged)"]
+                    continue
+                }
+                $productStates[$product] = $state
+                $desc = "Security product state: $product $state"
+                $details["PreviousState"] = $previous
+            }
+            else {
+                $desc = "Security Center could not update product state: $product $state"
+            }
+        }
+        elseif ($provider -eq "ESENT") {
+            # %1 process, %2 "PID,...", %3 instance; 216: %4 old and %5 new
+            # location; 325-327: %4 database ID, %5 database path
+            $type = "FileAccess"
+            if ($id -eq 216) {
+                $desc = "ESE database location changed: $(Get-EvtxFieldValue $f @('param4')) -> $(Get-EvtxFieldValue $f @('param5'))"
+                $details["OldPath"] = Get-EvtxFieldValue $f @("param4")
+                $details["NewPath"] = Get-EvtxFieldValue $f @("param5")
+            }
+            else {
+                $desc = "ESE database $($eseActions[$id]): $(Get-EvtxFieldValue $f @('param5'))"
+                $details["Database"] = Get-EvtxFieldValue $f @("param5")
+            }
+            $details["Process"] = Get-EvtxFieldValue $f @("param1")
+            $details["ProcessId"] = ((Get-EvtxFieldValue $f @("param2")) -split ',')[0]
+            $details["Instance"] = (Get-EvtxFieldValue $f @("param3")) -replace '\s*:\s*$', ''
+        }
+        elseif ($script:ThirdPartyAvProviders -contains $provider) {
+            # The vendor's message text when its message file is on this
+            # machine, else the event's values
+            $type = "SecurityAlert"
+            $text = "$($r.Message)"
+            if (-not $text.Trim()) {
+                $text = (@($r.Properties | ForEach-Object { "$($_.Value)".Trim() } | Where-Object { $_ -and $_ -ne "(NULL)" }) -join " | ")
+            }
+            $text = ($text -replace '\s+', ' ').Trim()
+            if ([int]$r.Level -notin @(1, 2, 3) -and $text -notmatch $avDetectionPattern) {
+                $skipped["antivirus Information events that report no detection"] = 1 + [int]$skipped["antivirus Information events that report no detection"]
+                continue
+            }
+            $short = if ($text.Length -gt 200) { $text.Substring(0, 200) + "..." } else { $text }
+            $desc = "Antivirus event ($provider $id): $short"
+            $details["Provider"] = $provider
+            $details["Level"] = $(if ($levelNames.ContainsKey([int]$r.Level)) { $levelNames[[int]$r.Level] } else { "$($r.Level)" })
+            $details["Message"] = $(if ($text.Length -gt 1000) { $text.Substring(0, 1000) + "..." } else { $text })
+            $details["UserSID"] = "$($r.UserId)"
+        }
+        if (-not $desc) { continue }
+
+        Add-TimelineEntry -Timestamp $r.TimeCreated -Source $FileName -EventType $type `
+            -Description $desc -User $user -Details (Format-ArtifactDetails $details) `
+            -Artifact "EventLogs" -RawPath $FilePath
+        $rowCounts["$provider $id"] = 1 + [int]$rowCounts["$provider $id"]
+    }
+    if ($rowCounts.Count -gt 0) {
+        Log "    Rows by event: $((@($rowCounts.Keys | ForEach-Object { "$_ x$($rowCounts[$_])" })) -join ', ')"
+    }
+    foreach ($reason in $skipped.Keys) {
+        Log "    Skipped $($skipped[$reason]) event(s): $reason"
+    }
+}
+
 function Parse-EventLogs {
     Log "--- Parsing Event Logs ---"
     $evtxFiles = Find-ArtifactFiles -BasePath $InputPath -Extensions @(".evtx")
@@ -976,19 +1631,15 @@ function Parse-EventLogs {
             # Determine which events to look for based on the log name
             $events = @()
 
-            # Security log events
+            # Security log events (the IDs after 4726 are handled by Add-SecurityEventEntry)
             if ($logName -eq "Security") {
-                $targetIds = @(4624, 4625, 4648, 4672, 4688, 4720, 4726, 4732)
-                try {
-                    $events = Get-WinEvent -Path $filePath -FilterXPath (
-                        "*[System[(" + (($targetIds | ForEach-Object { "EventID=$_" }) -join " or ") + ")]]"
-                    ) -ErrorAction Stop
-                }
-                catch [Exception] {
-                    if ($_.Exception.Message -notmatch "No events were found") {
-                        Log-Warning "    Error reading Security events from $fileName : $($_.Exception.Message)"
-                    }
-                }
+                $targetIds = @(4624, 4625, 4648, 4672, 4688, 4720, 4726,
+                    1102, 4697, 4698, 4699, 4700, 4701, 4702, 4719, 4724, 4728, 4732, 4740, 4756, 4778, 4779)
+                $events = @(Get-EvtxEventsById -Path $filePath -Ids $targetIds -Label "Security")
+                if ($events.Count -gt 0) { Log "    Events read: $(Format-EvtxEventCounts $events)" }
+                # Group adds give a local member's SID only: name it from the other events
+                $sidNames = @{}
+                if (@($events | Where-Object { $_.Id -in @(4728, 4732, 4756) }).Count -gt 0) { $sidNames = Get-SecuritySidNames -Records $events }
 
                 foreach ($evt in $events) {
                     $xmlData = [xml]$evt.ToXml()
@@ -1052,40 +1703,28 @@ function Parse-EventLogs {
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "AccountChange" `
                                 -Description "User account created: $($eventData['TargetUserName'])" `
                                 -User "$($eventData['SubjectDomainName'])\$($eventData['SubjectUserName'])" `
-                                -Details "NewAccount=$($eventData['TargetDomainName'])\$($eventData['TargetUserName'])" `
+                                -Details (Format-ArtifactDetails ([ordered]@{ NewAccount = "$($eventData['TargetDomainName'])\$($eventData['TargetUserName'])"; AccountSID = $eventData['TargetSid'] })) `
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
                         4726 {
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "AccountChange" `
                                 -Description "User account deleted: $($eventData['TargetUserName'])" `
                                 -User "$($eventData['SubjectDomainName'])\$($eventData['SubjectUserName'])" `
-                                -Details "DeletedAccount=$($eventData['TargetDomainName'])\$($eventData['TargetUserName'])" `
+                                -Details (Format-ArtifactDetails ([ordered]@{ DeletedAccount = "$($eventData['TargetDomainName'])\$($eventData['TargetUserName'])"; AccountSID = $eventData['TargetSid'] })) `
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
-                        4732 {
-                            Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "AccountChange" `
-                                -Description "Member added to security-enabled local group" `
-                                -User "$($eventData['SubjectDomainName'])\$($eventData['SubjectUserName'])" `
-                                -Details "MemberSID=$($eventData['MemberSid']) Group=$($eventData['TargetUserName'])" `
-                                -Artifact "EventLogs" -RawPath $filePath
+                        default {
+                            Add-SecurityEventEntry -Record $evt -FileName $fileName -FilePath $filePath -SidNames $sidNames
                         }
                     }
                 }
             }
 
-            # System log events
+            # System log events (104, 6005 and 6006 are handled by Add-SystemEventEntry)
             if ($logName -eq "System") {
-                $targetIds = @(7034, 7036, 7040, 7045, 1074, 6008)
-                try {
-                    $events = Get-WinEvent -Path $filePath -FilterXPath (
-                        "*[System[(" + (($targetIds | ForEach-Object { "EventID=$_" }) -join " or ") + ")]]"
-                    ) -ErrorAction Stop
-                }
-                catch [Exception] {
-                    if ($_.Exception.Message -notmatch "No events were found") {
-                        Log-Warning "    Error reading System events from $fileName : $($_.Exception.Message)"
-                    }
-                }
+                $targetIds = @(7034, 7036, 7040, 7045, 1074, 6008, 104, 6005, 6006)
+                $events = @(Get-EvtxEventsById -Path $filePath -Ids $targetIds -Label "System")
+                if ($events.Count -gt 0) { Log "    Events read: $(Format-EvtxEventCounts $events)" }
 
                 foreach ($evt in $events) {
                     $xmlData = [xml]$evt.ToXml()
@@ -1110,16 +1749,17 @@ function Parse-EventLogs {
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
                         7040 {
+                            # param1 display name, param2/param3 old/new start type, param4 service (key) name
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "ServiceChange" `
                                 -Description "Service start type changed: $($eventData['param1'])" `
-                                -Details "OldType=$($eventData['param2']) NewType=$($eventData['param3'])" `
+                                -Details (Format-ArtifactDetails ([ordered]@{ Service = $eventData['param4']; OldType = $eventData['param2']; NewType = $eventData['param3'] })) `
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
                         7045 {
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "PersistenceChange" `
                                 -Description "New service installed: $($eventData['ServiceName'])" `
                                 -User $eventData['AccountName'] `
-                                -Details "ImagePath=$($eventData['ImagePath']) StartType=$($eventData['StartType'])" `
+                                -Details (Format-ArtifactDetails ([ordered]@{ ImagePath = $eventData['ImagePath']; StartType = $eventData['StartType'] })) `
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
                         1074 {
@@ -1133,6 +1773,9 @@ function Parse-EventLogs {
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "ServiceChange" `
                                 -Description "Unexpected shutdown detected" `
                                 -Artifact "EventLogs" -RawPath $filePath
+                        }
+                        default {
+                            Add-SystemEventEntry -Record $evt -FileName $fileName -FilePath $filePath
                         }
                     }
                 }
@@ -1336,12 +1979,18 @@ function Parse-EventLogs {
 
             # Windows Defender Operational log: detections and protection tampering
             if ($logName -eq "Microsoft-Windows-Windows Defender/Operational") {
-                $events = @(Get-EvtxEventsById -Path $filePath -Ids @(1006, 1007, 1008, 1116, 1117, 1118, 1119, 5001, 5007, 5010, 5012, 5013) -Label "Defender")
+                $events = @(Get-EvtxEventsById -Path $filePath -Ids @(1006, 1007, 1008, 1116, 1117, 1118, 1119, 5001, 5007, 5010, 5012, 5013, 1013, 1121, 1122) -Label "Defender")
+                if ($events.Count -gt 0) { Log "    Events read: $(Format-EvtxEventCounts $events)" }
                 $routineConfig = 0
+                $asrAudits = New-Object System.Collections.Generic.List[object]
                 foreach ($evt in $events) {
                     $f = Get-EvtxEventFields $evt
                     $id = $evt.Id
-                    if ($id -eq 5007) {
+                    if ($id -eq 1122) {
+                        # Attack surface reduction audits are folded after the loop
+                        $asrAudits.Add([PSCustomObject]@{ Record = $evt; Fields = $f })
+                    }
+                    elseif ($id -eq 5007) {
                         $old = ("$($f['Old Value'])".Trim()) -replace '\s+', ' '
                         $new = ("$($f['New Value'])".Trim()) -replace '\s+', ' '
                         if ("$old $new" -notmatch $defenderTamperPattern) { $routineConfig++; continue }
@@ -1378,6 +2027,10 @@ function Parse-EventLogs {
                             -Details (Format-ArtifactDetails ([ordered]@{ EventID = $id; Setting = $f["Value"] })) `
                             -Artifact "EventLogs" -RawPath $filePath
                     }
+                    elseif ($id -in @(1013, 1121)) {
+                        # Malware history deleted, attack surface reduction rule blocked
+                        Add-DefenderEventEntry -Record $evt -Fields $f -FileName $fileName -FilePath $filePath
+                    }
                     else {
                         # Detections (1006/1116), actions taken (1007/1117) and failures (1008/1118/1119)
                         $threat = $f["Threat Name"]
@@ -1406,6 +2059,9 @@ function Parse-EventLogs {
                             })) `
                             -Artifact "EventLogs" -RawPath $filePath
                     }
+                }
+                if ($asrAudits.Count -gt 0) {
+                    Add-DefenderAsrAuditEntries -Items $asrAudits.ToArray() -FileName $fileName -FilePath $filePath
                 }
                 if ($routineConfig -gt 0) {
                     Log "    Skipped $routineConfig routine Defender configuration change(s) (event 5007)"
@@ -1436,6 +2092,28 @@ function Parse-EventLogs {
                             -Artifact "EventLogs" -RawPath $filePath
                     }
                 }
+            }
+
+            # Application log: installs, crashes, Security Center, ESE databases
+            # and third-party antivirus (see Add-ApplicationEventEntries). The
+            # log is large, so only these providers and IDs are read.
+            if ($logName -eq "Application") {
+                $queries = @(
+                    @{ Label = "MsiInstaller"; Providers = @("MsiInstaller"); Ids = @(1033, 1034, 11707, 11724) },
+                    @{ Label = "Application Error"; Providers = @("Application Error"); Ids = @(1000) },
+                    @{ Label = "Application Hang"; Providers = @("Application Hang"); Ids = @(1002) },
+                    @{ Label = "SecurityCenter"; Providers = @("SecurityCenter"); Ids = @(15, 16) },
+                    @{ Label = "ESENT"; Providers = @("ESENT"); Ids = @(216, 325, 326, 327) },
+                    @{ Label = "antivirus"; Providers = $script:ThirdPartyAvProviders; Ids = @() }
+                )
+                $events = @()
+                # A damaged file is reported once, not once per query
+                $readState = @{ Failed = $false }
+                foreach ($query in $queries) {
+                    $events += @(Get-EvtxEventsById -Path $filePath -Ids $query.Ids -Providers $query.Providers -Label $query.Label -State $readState)
+                }
+                if ($events.Count -gt 0) { Log "    Events read: $(Format-EvtxEventCounts $events -ByProvider)" }
+                Add-ApplicationEventEntries -Records $events -FileName $fileName -FilePath $filePath
             }
 
         }
@@ -2695,8 +3373,10 @@ function Get-Utf16ZString {
 }
 
 # Parse the user artifacts in one loaded NTUSER.DAT (root key of the hive):
-# TypedPaths, TypedURLs, RunMRU, UserAssist, RecentDocs and the per-user Run
-# keys. MRU-style keys record only one time -- the key's last write, which
+# TypedPaths, TypedURLs, RunMRU, UserAssist, RecentDocs, the per-user Run
+# keys, WordWheelQuery, Office (Read-OfficeUserKeys), the Remote Desktop
+# client (Read-RdpClientHistory) and Open/Save dialogs (Read-ComDlg32Mru).
+# MRU-style keys record only one time -- the key's last write, which
 # belongs to the most recent entry. Returns $true if any of the keys exist.
 function Read-NtUserHive {
     param(
@@ -2966,6 +3646,44 @@ function Read-NtUserHive {
         catch { Log-Warning "    Failed to parse $runPath : $($_.Exception.Message)" }
     }
 
+    # --- WordWheelQuery (Explorer search box terms; MRUListEx, values are
+    #     UTF-16 text) ---
+    try {
+        $wordWheelPath = "Software\Microsoft\Windows\CurrentVersion\Explorer\WordWheelQuery"
+        $key = $HiveRoot.OpenSubKey($wordWheelPath)
+        if ($key) {
+            try {
+                $found = $true
+                $keyTime = Get-RegistryKeyLastWriteUtc $key
+                $order = @(Get-RegistryMruOrder $key)
+                foreach ($val in $key.GetValueNames()) {
+                    if ($val -notmatch '^\d+$') { continue }
+                    $data = $key.GetValue($val)
+                    if (-not ($data -is [byte[]])) { continue }
+                    $term = Get-Utf16ZString $data
+                    if (-not $term) { $term = [System.Text.Encoding]::Unicode.GetString($data).TrimEnd([char]0) }
+                    if (-not $term) { continue }
+                    $t = Get-MruEntryTime -KeyTime $keyTime -FallbackTime $FallbackTime -Position ([array]::IndexOf($order, $val) + 1)
+                    Add-TimelineEntry -Timestamp $t.Time -Source "Registry-WordWheelQuery" -EventType "FileAccess" `
+                        -Description "Explorer search: $term" `
+                        -User $User `
+                        -Details (Format-ArtifactDetails ([ordered]@{ MRUIndex = $val; Key = "HKCU\$wordWheelPath"; Time = ($t.Note -replace '^Time=', '') })) `
+                        -Artifact "Registry" -RawPath $RawPath
+                }
+            }
+            finally { $key.Close() }
+        }
+    }
+    catch { Log-Warning "    Failed to parse WordWheelQuery: $($_.Exception.Message)" }
+
+    # --- Office (trusted documents, File/Place MRU, Outlook attachment
+    #     folder), Remote Desktop client and Open/Save dialog history ---
+    try { if (Read-OfficeUserKeys -HiveRoot $HiveRoot -User $User -RawPath $RawPath -FallbackTime $FallbackTime) { $found = $true } }
+    catch { Log-Warning "    Failed to parse Office keys: $($_.Exception.Message)" }
+    try { if (Read-RdpClientHistory -HiveRoot $HiveRoot -User $User -RawPath $RawPath -FallbackTime $FallbackTime) { $found = $true } }
+    catch { Log-Warning "    Failed to parse Terminal Server Client: $($_.Exception.Message)" }
+    if (Read-ComDlg32Mru -HiveRoot $HiveRoot -User $User -RawPath $RawPath -FallbackTime $FallbackTime) { $found = $true }
+
     return $found
 }
 
@@ -3028,7 +3746,7 @@ function Get-ShellItemName {
 
     # 0xBEEF0004 extension block (bytes 04 00 EF BE, 4 bytes into the block):
     # long name after a version-dependent header
-    $i = [Array]::IndexOf($Data, [byte]0xEF, 6)
+    $i = if ($Data.Length -gt 6) { [Array]::IndexOf($Data, [byte]0xEF, 6) } else { -1 }
     while ($i -ge 6 -and $i + 1 -lt $Data.Length) {
         if ($Data[$i + 1] -eq 0xBE -and $Data[$i - 1] -eq 0x00 -and $Data[$i - 2] -eq 0x04) {
             $ext = $i - 6
@@ -3153,6 +3871,1198 @@ function Read-ShellBags {
     finally { $bagMru.Close() }
 }
 
+# Text of a registry value for Description/Details: REG_MULTI_SZ entries
+# joined with "; ", binary data as hex, %variables% not expanded, anything
+# after an embedded NUL dropped. "" if the value does not exist.
+function Get-RegistryValueText {
+    param([Microsoft.Win32.RegistryKey]$Key, [string]$Name)
+    $value = $Key.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    if ($null -eq $value) { return "" }
+    if ($value -is [byte[]]) { return [BitConverter]::ToString($value).Replace("-", "") }
+    if ($value -is [string[]]) { return ((@($value) | ForEach-Object { $_.Split([char]0)[0].Trim() } | Where-Object { $_ }) -join "; ") }
+    return "$value".Split([char]0)[0].Trim()
+}
+
+# Number from DWORD/QWORD data or from text such as "0x200" or "512" (some
+# tools write GlobalFlag as a string); $null otherwise
+function ConvertTo-RegistryNumber {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [int] -or $Value -is [long]) { return [long]$Value }
+    $text = "$Value".Split([char]0)[0].Trim()
+    if ($text -match '^0x([0-9A-Fa-f]{1,16})$') { return [Convert]::ToInt64($Matches[1], 16) }
+    $number = 0L
+    if ([long]::TryParse($text, [ref]$number)) { return $number }
+    return $null
+}
+
+# FILETIME stored in value data -> UTC [datetime]; $null when 0, invalid or
+# later than $Latest (when given)
+function ConvertFrom-RegistryFileTime {
+    param([long]$FileTime, $Latest)
+    if ($FileTime -le 0) { return $null }
+    try { $t = [datetime]::FromFileTimeUtc($FileTime) }
+    catch {
+        Write-Verbose "Invalid FILETIME $FileTime : $($_.Exception.Message)"
+        return $null
+    }
+    if ($null -ne $Latest -and $t -gt $Latest) { return $null }
+    return $t
+}
+
+# Timestamp + Details note for a value that has no time of its own: the
+# key's last-write time (when the key last changed; the value may be older),
+# else the hive file time
+function Get-RegistryKeyTime {
+    param([Microsoft.Win32.RegistryKey]$Key, [datetime]$FallbackTime, [string]$KeyLabel = "key")
+    $keyTime = Get-RegistryKeyLastWriteUtc $Key
+    if ($null -eq $keyTime) {
+        return [PSCustomObject]@{ Time = $FallbackTime; Note = "hive file time ($KeyLabel last-write time unavailable)" }
+    }
+    return [PSCustomObject]@{ Time = $keyTime; Note = "$KeyLabel last write (key last changed; this value may be older)" }
+}
+
+# Path of an absolute shell item ID list (PIDL) in binary registry data,
+# from the given offset: items are [uint16 size][data] up to a size of 0.
+# Names come from Get-ShellItemName and are joined like ShellBags paths (a
+# drive item starts the path again). "" if no item could be read.
+function ConvertFrom-ShellItemIdList {
+    param([byte[]]$Data, [int]$Offset = 0)
+    $path = ""
+    if ($null -eq $Data) { return $path }
+    $pos = $Offset
+    $items = 0
+    while ($pos + 2 -le $Data.Length -and $items -lt 64) {
+        $size = [int][BitConverter]::ToUInt16($Data, $pos)
+        if ($size -lt 3 -or $pos + $size -gt $Data.Length) { break }
+        try { $item = Get-ShellItemName ([byte[]]$Data[$pos..($pos + $size - 1)]) }
+        catch {
+            Write-Verbose "Unreadable shell item at offset $pos, path cut there: $($_.Exception.Message)"
+            break
+        }
+        if ($item.IsVolume -or -not $path) { $path = $item.Name }
+        else { $path = $path.TrimEnd('\') + '\' + $item.Name }
+        $pos += $size
+        $items++
+    }
+    return $path
+}
+
+# Rows for one Office TrustRecords key (see Read-OfficeUserKeys). Returns
+# the number of rows added.
+function Add-OfficeTrustRecordRows {
+    param([Microsoft.Win32.RegistryKey]$Key, [string]$KeyPath, [string]$App, [string]$Version, [string]$User, [string]$RawPath, [datetime]$FallbackTime)
+    $added = 0
+    $keyTime = Get-RegistryKeyTime -Key $Key -FallbackTime $FallbackTime -KeyLabel "TrustRecords key"
+    foreach ($doc in $Key.GetValueNames()) {
+        $data = $Key.GetValue($doc)
+        if ($doc -eq "" -or -not ($data -is [byte[]]) -or $data.Length -lt 8) { continue }
+        $n = $data.Length
+        $macros = ($n -ge 12 -and $data[$n - 4] -eq 0xFF -and $data[$n - 3] -eq 0xFF -and $data[$n - 2] -eq 0xFF -and $data[$n - 1] -eq 0x7F)
+        $t = $keyTime
+        $trusted = ConvertFrom-RegistryFileTime -FileTime ([BitConverter]::ToInt64($data, 0))
+        if ($trusted) { $t = [PSCustomObject]@{ Time = $trusted; Note = "TrustRecords FILETIME (when the user trusted the document)" } }
+        # Office records local documents with "/" (e.g. %USERPROFILE%/Downloads/x.docm):
+        # Path uses "\" like other rows; URLs (https://...) are kept as they are
+        $path = if ($doc -match '^[A-Za-z][A-Za-z0-9+.-]*://') { $doc } else { $doc.Replace('/', '\') }
+        $details = Format-ArtifactDetails ([ordered]@{
+            App      = $App
+            Version  = $Version
+            Path     = $path
+            Document = $doc
+            Trust    = $(if ($macros) { "macros (active content) enabled" } else { "editing enabled" })
+            Data     = [BitConverter]::ToString($data).Replace("-", "")
+            Key      = $KeyPath
+            Time     = $t.Note
+        })
+        if ($macros) {
+            Add-TimelineEntry -Timestamp $t.Time -Source "Registry-TrustRecords" -EventType "Execution" `
+                -Description "Office macros enabled on document ($App): $path" `
+                -User $User -Details $details -Artifact "Registry" -RawPath $RawPath
+        }
+        else {
+            Add-TimelineEntry -Timestamp $t.Time -Source "Registry-TrustRecords" -EventType "FileAccess" `
+                -Description "Office editing enabled on document ($App): $path" `
+                -User $User -Details $details -Artifact "Registry" -RawPath $RawPath
+        }
+        $added++
+    }
+    return $added
+}
+
+# Rows for one Office File MRU / Place MRU key (see Read-OfficeUserKeys).
+# $Seen holds the items already added for this app, so an item listed in
+# both the per-account and the older list is added once. Returns the number
+# of rows added.
+function Add-OfficeMruRows {
+    param(
+        [Microsoft.Win32.RegistryKey]$Key,
+        [string]$KeyPath,
+        [string]$App,
+        [string]$Version,
+        [string]$Account,
+        [string]$Kind,
+        [hashtable]$Seen,
+        [string]$User,
+        [string]$RawPath,
+        [datetime]$FallbackTime
+    )
+    $added = 0
+    $keyTime = Get-RegistryKeyLastWriteUtc $Key
+    foreach ($val in $Key.GetValueNames()) {
+        if ($val -notmatch '^Item (\d+)$') { continue }
+        $pos = [int]$Matches[1]
+        $text = Get-RegistryValueText $Key $val
+        if (-not $text) { continue }
+        $fields = ""
+        $itemPath = $text
+        if ($text -match '^((?:\[[^\]]*\])+)\*(.+)$') {
+            $fields = $Matches[1]
+            $itemPath = $Matches[2]
+        }
+        $flags = if ($fields -match '\[F([0-9A-Fa-f]+)\]') { $Matches[1] } else { "" }
+        $t = $null
+        if ($fields -match '\[T([0-9A-Fa-f]{16})\]') {
+            $opened = ConvertFrom-RegistryFileTime -FileTime ([Convert]::ToInt64($Matches[1], 16))
+            if ($opened) { $t = [PSCustomObject]@{ Time = $opened; Note = "MRU item time (when the item was last opened)" } }
+        }
+        if (-not $t) {
+            $mru = Get-MruEntryTime -KeyTime $keyTime -FallbackTime $FallbackTime -Position $pos
+            $t = [PSCustomObject]@{ Time = $mru.Time; Note = $mru.Note -replace '^Time=', '' }
+        }
+        $seenKey = "$Kind`t$itemPath`t$($t.Time.Ticks)"
+        if ($Seen.ContainsKey($seenKey)) { continue }
+        $Seen[$seenKey] = $true
+        Add-TimelineEntry -Timestamp $t.Time -Source "Registry-OfficeMRU" -EventType "FileAccess" `
+            -Description "Office recent $Kind ($App): $itemPath" `
+            -User $User `
+            -Details (Format-ArtifactDetails ([ordered]@{ App = $App; Version = $Version; Item = $val; Flags = $flags; Account = $Account; Key = $KeyPath; Time = $t.Note })) `
+            -Artifact "Registry" -RawPath $RawPath
+        $added++
+    }
+    return $added
+}
+
+# Office keys of one loaded NTUSER.DAT (Software\Microsoft\Office\<version>
+# \<app>, e.g. 16.0\Word):
+#   Security\Trusted Documents\TrustRecords  documents the user trusted.
+#       Value name = the document as Office recorded it (often
+#       "%USERPROFILE%/Downloads/x.docm"). The data starts with a FILETIME
+#       (UTC: when it was trusted) and ends with FF FF FF 7F when macros
+#       (active content) were enabled; otherwise only editing was enabled
+#       (the document left Protected View).
+#   User MRU\<account>\File MRU and Place MRU, and the older File MRU and
+#       Place MRU: "Item N" = "[F<flags>][T<FILETIME hex>][O<...>]*<path>",
+#       T = when the item was last opened (UTC). Place MRU lists folders.
+#   Outlook\Security OutlookSecureTempFolder: the folder Outlook copies
+#       opened attachments to (Content.Outlook); one Snapshot row.
+# Returns $true if the Office key exists.
+function Read-OfficeUserKeys {
+    param([Microsoft.Win32.RegistryKey]$HiveRoot, [string]$User, [string]$RawPath, [datetime]$FallbackTime)
+    $officeKey = $HiveRoot.OpenSubKey("Software\Microsoft\Office")
+    if (-not $officeKey) { return $false }
+    try {
+        foreach ($version in $officeKey.GetSubKeyNames()) {
+            if ($version -notmatch '^\d+\.\d+$') { continue }
+            $versionKey = $officeKey.OpenSubKey($version)
+            if (-not $versionKey) { continue }
+            try {
+                foreach ($app in $versionKey.GetSubKeyNames()) {
+                    $appPath = "HKCU\Software\Microsoft\Office\$version\$app"
+                    try {
+                        $key = $versionKey.OpenSubKey("$app\Security\Trusted Documents\TrustRecords")
+                        if ($key) {
+                            try {
+                                $null = Add-OfficeTrustRecordRows -Key $key -KeyPath "$appPath\Security\Trusted Documents\TrustRecords" `
+                                    -App $app -Version $version -User $User -RawPath $RawPath -FallbackTime $FallbackTime
+                            }
+                            finally { $key.Close() }
+                        }
+                    }
+                    catch { Log-Warning "    Failed to parse Office TrustRecords ($version\$app): $($_.Exception.Message)" }
+
+                    try {
+                        # Per-account lists (Office 2013+) first, then the older lists
+                        $mruKeys = @()
+                        $userMru = $versionKey.OpenSubKey("$app\User MRU")
+                        if ($userMru) {
+                            try {
+                                foreach ($account in $userMru.GetSubKeyNames()) {
+                                    $mruKeys += , @("$app\User MRU\$account\File MRU", $account, "file")
+                                    $mruKeys += , @("$app\User MRU\$account\Place MRU", $account, "folder")
+                                }
+                            }
+                            finally { $userMru.Close() }
+                        }
+                        $mruKeys += , @("$app\File MRU", "", "file")
+                        $mruKeys += , @("$app\Place MRU", "", "folder")
+                        $seen = @{}
+                        foreach ($mru in $mruKeys) {
+                            $key = $versionKey.OpenSubKey($mru[0])
+                            if (-not $key) { continue }
+                            try {
+                                $null = Add-OfficeMruRows -Key $key -KeyPath "HKCU\Software\Microsoft\Office\$version\$($mru[0])" `
+                                    -App $app -Version $version -Account $mru[1] -Kind $mru[2] -Seen $seen `
+                                    -User $User -RawPath $RawPath -FallbackTime $FallbackTime
+                            }
+                            finally { $key.Close() }
+                        }
+                    }
+                    catch { Log-Warning "    Failed to parse Office File/Place MRU ($version\$app): $($_.Exception.Message)" }
+
+                    if ($app -ne "Outlook") { continue }
+                    try {
+                        $key = $versionKey.OpenSubKey("Outlook\Security")
+                        if ($key) {
+                            try {
+                                $folder = Get-RegistryValueText $key "OutlookSecureTempFolder"
+                                if ($folder) {
+                                    $t = Get-RegistryKeyTime -Key $key -FallbackTime $FallbackTime -KeyLabel "Outlook\Security key"
+                                    Add-TimelineEntry -Timestamp $t.Time -Source "Registry-OutlookSecureTemp" -EventType "Snapshot" `
+                                        -Description "Outlook attachment temp folder (OutlookSecureTempFolder): $folder" `
+                                        -User $User `
+                                        -Details (Format-ArtifactDetails ([ordered]@{ Version = $version; Folder = $folder; Key = "$appPath\Security"; Time = $t.Note })) `
+                                        -Artifact "Registry" -RawPath $RawPath
+                                }
+                            }
+                            finally { $key.Close() }
+                        }
+                    }
+                    catch { Log-Warning "    Failed to parse OutlookSecureTempFolder ($version): $($_.Exception.Message)" }
+                }
+            }
+            finally { $versionKey.Close() }
+        }
+    }
+    finally { $officeKey.Close() }
+    return $true
+}
+
+# Remote Desktop client (mstsc) history of one loaded NTUSER.DAT: Terminal
+# Server Client\Default MRU0..MRU9 (MRU0 = most recent; the key's last-write
+# time belongs to MRU0) and Servers\<host> (UsernameHint = the account saved
+# for that host; the key's last-write time is the last connection that
+# updated it). Returns $true if the key exists.
+function Read-RdpClientHistory {
+    param([Microsoft.Win32.RegistryKey]$HiveRoot, [string]$User, [string]$RawPath, [datetime]$FallbackTime)
+    $tscPath = "Software\Microsoft\Terminal Server Client"
+    $tsc = $HiveRoot.OpenSubKey($tscPath)
+    if (-not $tsc) { return $false }
+    try {
+        $key = $tsc.OpenSubKey("Default")
+        if ($key) {
+            try {
+                $keyTime = Get-RegistryKeyLastWriteUtc $key
+                foreach ($val in $key.GetValueNames()) {
+                    if ($val -notmatch '^MRU(\d+)$') { continue }
+                    $pos = [int]$Matches[1] + 1
+                    $target = Get-RegistryValueText $key $val
+                    if (-not $target) { continue }
+                    $t = Get-MruEntryTime -KeyTime $keyTime -FallbackTime $FallbackTime -Position $pos -KeyLabel "Terminal Server Client\Default key"
+                    Add-TimelineEntry -Timestamp $t.Time -Source "Registry-RDPClient" -EventType "NetworkConnection" `
+                        -Description "Outbound RDP target (Remote Desktop MRU): $target" `
+                        -User $User `
+                        -Details (Format-ArtifactDetails ([ordered]@{ Target = $target; MRU = $val; Key = "HKCU\$tscPath\Default"; Time = ($t.Note -replace '^Time=', '') })) `
+                        -Artifact "Registry" -RawPath $RawPath
+                }
+            }
+            finally { $key.Close() }
+        }
+
+        $servers = $tsc.OpenSubKey("Servers")
+        if ($servers) {
+            try {
+                foreach ($server in $servers.GetSubKeyNames()) {
+                    $serverKey = $servers.OpenSubKey($server)
+                    if (-not $serverKey) { continue }
+                    try {
+                        $hint = Get-RegistryValueText $serverKey "UsernameHint"
+                        $ts = Get-RegistryKeyLastWriteUtc $serverKey
+                        $timeNote = "Servers\<host> key last write (last connection that saved the user hint or certificate)"
+                        if ($null -eq $ts) {
+                            $ts = $FallbackTime
+                            $timeNote = "hive file time (key last-write time unavailable)"
+                        }
+                        $desc = if ($hint) { "Outbound RDP target (saved server, user $hint): $server" } else { "Outbound RDP target (saved server): $server" }
+                        Add-TimelineEntry -Timestamp $ts -Source "Registry-RDPClient" -EventType "NetworkConnection" `
+                            -Description $desc `
+                            -User $User `
+                            -Details (Format-ArtifactDetails ([ordered]@{ Target = $server; UsernameHint = $hint; Key = "HKCU\$tscPath\Servers\$server"; Time = $timeNote })) `
+                            -Artifact "Registry" -RawPath $RawPath
+                    }
+                    finally { $serverKey.Close() }
+                }
+            }
+            finally { $servers.Close() }
+        }
+    }
+    finally { $tsc.Close() }
+    return $true
+}
+
+# Files and folders picked in Open/Save dialogs, from ComDlg32 in one loaded
+# NTUSER.DAT:
+#   OpenSavePidlMRU\<extension>  values are PIDLs of the items; "*" lists
+#       every extension. As for RecentDocs, an extension subkey's last-write
+#       time is exact for its newest item and a tighter bound for the others.
+#   LastVisitedPidlMRU  values are a UTF-16 program name followed by the
+#       PIDL of the folder that program's dialog last used.
+# Both keep their order in MRUListEx. Returns $true if either key exists.
+function Read-ComDlg32Mru {
+    param([Microsoft.Win32.RegistryKey]$HiveRoot, [string]$User, [string]$RawPath, [datetime]$FallbackTime)
+    $found = $false
+    $comDlgPath = "Software\Microsoft\Windows\CurrentVersion\Explorer\ComDlg32"
+
+    try {
+        $key = $HiveRoot.OpenSubKey("$comDlgPath\OpenSavePidlMRU")
+        if ($key) {
+            $found = $true
+            try {
+                # Items of every subkey: path -> subkey, value, position, subkey time
+                $entries = @()
+                foreach ($ext in $key.GetSubKeyNames()) {
+                    $sub = $key.OpenSubKey($ext)
+                    if (-not $sub) { continue }
+                    try {
+                        $subTime = Get-RegistryKeyLastWriteUtc $sub
+                        $order = @(Get-RegistryMruOrder $sub)
+                        foreach ($val in $sub.GetValueNames()) {
+                            if ($val -notmatch '^\d+$') { continue }
+                            $data = $sub.GetValue($val)
+                            if (-not ($data -is [byte[]])) { continue }
+                            $itemPath = ConvertFrom-ShellItemIdList $data
+                            if (-not $itemPath) { continue }
+                            $entries += [PSCustomObject]@{
+                                SubKey    = $ext
+                                ValueName = $val
+                                Position  = [array]::IndexOf($order, $val) + 1
+                                Time      = $subTime
+                                Path      = $itemPath
+                            }
+                        }
+                    }
+                    finally { $sub.Close() }
+                }
+
+                $byExtension = @{}
+                foreach ($e in $entries) {
+                    if ($e.SubKey -ne "*" -and -not $byExtension.ContainsKey($e.Path)) { $byExtension[$e.Path] = $e }
+                }
+                $listedInStar = @{}
+                foreach ($e in $entries) {
+                    if ($e.SubKey -ne "*") { continue }
+                    $listedInStar[$e.Path] = $true
+                    $t = Get-MruEntryTime -KeyTime $e.Time -FallbackTime $FallbackTime -Position $e.Position -KeyLabel "OpenSavePidlMRU\* key"
+                    $note = $t.Note
+                    $ext = $byExtension[$e.Path]
+                    if ($e.Position -ne 1 -and $ext -and $null -ne $ext.Time) {
+                        $t = Get-MruEntryTime -KeyTime $ext.Time -FallbackTime $FallbackTime -Position $ext.Position -KeyLabel "OpenSavePidlMRU\$($ext.SubKey) key"
+                        $note = "$($t.Note); overall MRU position $($e.Position)"
+                    }
+                    Add-TimelineEntry -Timestamp $t.Time -Source "Registry-OpenSaveMRU" -EventType "FileAccess" `
+                        -Description "Open/Save dialog item: $($e.Path)" `
+                        -User $User `
+                        -Details (Format-ArtifactDetails ([ordered]@{ Extension = $(if ($ext) { $ext.SubKey } else { "" }); MRUIndex = "*\$($e.ValueName)"; Key = "HKCU\$comDlgPath\OpenSavePidlMRU"; Time = ($note -replace '^Time=', '') })) `
+                        -Artifact "Registry" -RawPath $RawPath
+                }
+                # Items only left in an extension subkey
+                foreach ($e in $entries) {
+                    if ($e.SubKey -eq "*" -or $listedInStar.ContainsKey($e.Path)) { continue }
+                    $listedInStar[$e.Path] = $true
+                    $t = Get-MruEntryTime -KeyTime $e.Time -FallbackTime $FallbackTime -Position $e.Position -KeyLabel "OpenSavePidlMRU\$($e.SubKey) key"
+                    Add-TimelineEntry -Timestamp $t.Time -Source "Registry-OpenSaveMRU" -EventType "FileAccess" `
+                        -Description "Open/Save dialog item: $($e.Path)" `
+                        -User $User `
+                        -Details (Format-ArtifactDetails ([ordered]@{ Extension = $e.SubKey; MRUIndex = "$($e.SubKey)\$($e.ValueName)"; Key = "HKCU\$comDlgPath\OpenSavePidlMRU"; Time = ($t.Note -replace '^Time=', '') })) `
+                        -Artifact "Registry" -RawPath $RawPath
+                }
+            }
+            finally { $key.Close() }
+        }
+    }
+    catch { Log-Warning "    Failed to parse OpenSavePidlMRU: $($_.Exception.Message)" }
+
+    try {
+        $key = $HiveRoot.OpenSubKey("$comDlgPath\LastVisitedPidlMRU")
+        if ($key) {
+            $found = $true
+            try {
+                $keyTime = Get-RegistryKeyLastWriteUtc $key
+                $order = @(Get-RegistryMruOrder $key)
+                foreach ($val in $key.GetValueNames()) {
+                    if ($val -notmatch '^\d+$') { continue }
+                    $data = $key.GetValue($val)
+                    if (-not ($data -is [byte[]])) { continue }
+                    $program = Get-Utf16ZString $data
+                    if (-not $program) { continue }
+                    $folder = ConvertFrom-ShellItemIdList -Data $data -Offset (($program.Length + 1) * 2)
+                    if (-not $folder) { continue }
+                    $t = Get-MruEntryTime -KeyTime $keyTime -FallbackTime $FallbackTime -Position ([array]::IndexOf($order, $val) + 1) -KeyLabel "LastVisitedPidlMRU key"
+                    Add-TimelineEntry -Timestamp $t.Time -Source "Registry-LastVisitedMRU" -EventType "FileAccess" `
+                        -Description "Open/Save dialog folder last used by ${program}: $folder" `
+                        -User $User `
+                        -Details (Format-ArtifactDetails ([ordered]@{ Program = $program; MRUIndex = $val; Key = "HKCU\$comDlgPath\LastVisitedPidlMRU"; Time = ($t.Note -replace '^Time=', '') })) `
+                        -Artifact "Registry" -RawPath $RawPath
+                }
+            }
+            finally { $key.Close() }
+        }
+    }
+    catch { Log-Warning "    Failed to parse LastVisitedPidlMRU: $($_.Exception.Message)" }
+
+    return $found
+}
+
+# Accessibility programs that can be started from the logon screen: a
+# Debugger set for one of them starts that program (e.g. cmd.exe) as SYSTEM
+# before anyone logs on
+$script:AccessibilityPrograms = @("sethc.exe", "utilman.exe", "osk.exe", "narrator.exe", "magnify.exe", "displayswitch.exe", "atbroker.exe")
+
+# One IFEO Debugger row for an Image File Execution Options key (the exe's
+# own key or one of its UseFilter subkeys, which also name FilterFullPath).
+# Returns the number of rows added (0 or 1).
+function Add-IfeoDebuggerRow {
+    param([Microsoft.Win32.RegistryKey]$Key, [string]$Program, [string]$KeyPath, [string]$RawPath, [datetime]$FallbackTime)
+    $debugger = Get-RegistryValueText $Key "Debugger"
+    if (-not $debugger) { return 0 }
+    $accessibility = $script:AccessibilityPrograms -contains $Program
+    $label = if ($accessibility) { "$Program (accessibility program)" } else { $Program }
+    $t = Get-RegistryKeyTime -Key $Key -FallbackTime $FallbackTime
+    Add-TimelineEntry -Timestamp $t.Time -Source "Registry-IFEO" -EventType "PersistenceChange" `
+        -Description "IFEO Debugger set for ${label}: $debugger" `
+        -Details (Format-ArtifactDetails ([ordered]@{
+            Program              = $Program
+            Debugger             = $debugger
+            FilterFullPath       = Get-RegistryValueText $Key "FilterFullPath"
+            AccessibilityProgram = $(if ($accessibility) { "yes" } else { "" })
+            Key                  = $KeyPath
+            Time                 = $t.Note
+        })) `
+        -Artifact "Registry" -RawPath $RawPath
+    return 1
+}
+
+# Image File Execution Options hijacks in one loaded SOFTWARE hive:
+#   IFEO\<exe> Debugger  starts another program instead of the exe (also in
+#       UseFilter subkeys, for one FilterFullPath)
+#   SilentProcessExit\<exe>  when the exe exits, ReportingMode bit 0x1
+#       launches MonitorProcess and bit 0x2 writes a dump (to
+#       LocalDumpFolder; 0x4 = notification). Only active when the exe's
+#       IFEO GlobalFlag has 0x200 (FLG_MONITOR_SILENT_PROCESS_EXIT); a
+#       MonitorProcess without bit 0x1 is configured but never launched.
+# Returns the number of rows added.
+function Read-IfeoHijacks {
+    param([Microsoft.Win32.RegistryKey]$HiveRoot, [string]$RawPath, [datetime]$FallbackTime)
+    $added = 0
+    $denied = @()
+    $globalFlags = @{}
+    $ifeoPath = "Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+    $ifeo = $HiveRoot.OpenSubKey($ifeoPath)
+    if ($ifeo) {
+        try {
+            foreach ($exe in $ifeo.GetSubKeyNames()) {
+                # Keys whose ACL denies administrators are skipped (counted below)
+                $exeKey = $null
+                try { $exeKey = $ifeo.OpenSubKey($exe) }
+                catch { $denied += "IFEO\$exe" }
+                if (-not $exeKey) { continue }
+                try {
+                    $flag = ConvertTo-RegistryNumber ($exeKey.GetValue("GlobalFlag"))
+                    if ($null -ne $flag) { $globalFlags[$exe.ToLowerInvariant()] = $flag }
+                    $added += Add-IfeoDebuggerRow -Key $exeKey -Program $exe -KeyPath "HKLM\SOFTWARE\$ifeoPath\$exe" -RawPath $RawPath -FallbackTime $FallbackTime
+                    foreach ($filterName in $exeKey.GetSubKeyNames()) {
+                        $filterKey = $null
+                        try { $filterKey = $exeKey.OpenSubKey($filterName) }
+                        catch { $denied += "IFEO\$exe\$filterName" }
+                        if (-not $filterKey) { continue }
+                        try {
+                            $added += Add-IfeoDebuggerRow -Key $filterKey -Program $exe -KeyPath "HKLM\SOFTWARE\$ifeoPath\$exe\$filterName" -RawPath $RawPath -FallbackTime $FallbackTime
+                        }
+                        finally { $filterKey.Close() }
+                    }
+                }
+                finally { $exeKey.Close() }
+            }
+        }
+        finally { $ifeo.Close() }
+    }
+
+    $spePath = "Microsoft\Windows NT\CurrentVersion\SilentProcessExit"
+    $spe = $HiveRoot.OpenSubKey($spePath)
+    if ($spe) {
+        try {
+            foreach ($exe in $spe.GetSubKeyNames()) {
+                $exeKey = $null
+                try { $exeKey = $spe.OpenSubKey($exe) }
+                catch { $denied += "SilentProcessExit\$exe" }
+                if (-not $exeKey) { continue }
+                try {
+                    $monitor = Get-RegistryValueText $exeKey "MonitorProcess"
+                    $mode = ConvertTo-RegistryNumber ($exeKey.GetValue("ReportingMode"))
+                    $dumpFolder = Get-RegistryValueText $exeKey "LocalDumpFolder"
+                    if (-not $monitor -and -not $mode -and -not $dumpFolder) { continue }
+                    $modeText = "not set"
+                    if ($null -ne $mode) {
+                        $modeNames = @()
+                        if ($mode -band 1) { $modeNames += "launch monitor process" }
+                        if ($mode -band 2) { $modeNames += "local dump" }
+                        if ($mode -band 4) { $modeNames += "notification" }
+                        $modeText = "$mode"
+                        if ($modeNames.Count -gt 0) { $modeText += " ($($modeNames -join ', '))" }
+                    }
+                    # The description follows what ReportingMode makes Windows
+                    # do: launch MonitorProcess (0x1) or write a dump (0x2)
+                    $launches = ($null -ne $mode -and ($mode -band 1) -ne 0 -and $monitor)
+                    $dumps = ($null -ne $mode -and ($mode -band 2) -ne 0)
+                    $flag = $globalFlags[$exe.ToLowerInvariant()]
+                    $flagSet = ($null -ne $flag -and ($flag -band 0x200) -ne 0)
+                    if ($launches) { $desc = "SilentProcessExit monitor process for ${exe}: $monitor" }
+                    elseif ($dumps) { $desc = "SilentProcessExit dump on exit for ${exe}: $(if ($dumpFolder) { $dumpFolder } else { '%TEMP%\Silent Process Exit (default folder)' })" }
+                    elseif ($monitor) { $desc = "SilentProcessExit monitor process configured for ${exe}, not launched (ReportingMode lacks 0x1): $monitor" }
+                    elseif ($dumpFolder) { $desc = "SilentProcessExit dump folder configured for ${exe}, no dump (ReportingMode lacks 0x2): $dumpFolder" }
+                    else { $desc = "SilentProcessExit reporting set for ${exe}: ReportingMode=$modeText" }
+                    if (-not $flagSet) { $activeText = "no (IFEO GlobalFlag lacks 0x200)" }
+                    elseif ($launches -or $dumps) { $activeText = "yes (IFEO GlobalFlag has 0x200, ReportingMode has 0x1 or 0x2)" }
+                    else { $activeText = "no (ReportingMode has neither 0x1 nor 0x2)" }
+                    $t = Get-RegistryKeyTime -Key $exeKey -FallbackTime $FallbackTime
+                    Add-TimelineEntry -Timestamp $t.Time -Source "Registry-SilentProcessExit" -EventType "PersistenceChange" `
+                        -Description $desc `
+                        -Details (Format-ArtifactDetails ([ordered]@{
+                            Program         = $exe
+                            MonitorProcess  = $monitor
+                            ReportingMode   = $modeText
+                            LocalDumpFolder = $dumpFolder
+                            DumpType        = Get-RegistryValueText $exeKey "DumpType"
+                            GlobalFlag      = $(if ($null -ne $flag) { "0x{0:X8}" -f $flag } else { "not set" })
+                            Active          = $activeText
+                            Key             = "HKLM\SOFTWARE\$spePath\$exe"
+                            Time            = $t.Note
+                        })) `
+                        -Artifact "Registry" -RawPath $RawPath
+                    $added++
+                }
+                finally { $exeKey.Close() }
+            }
+        }
+        finally { $spe.Close() }
+    }
+    if ($denied.Count -gt 0) { Log-Warning "    $($denied.Count) IFEO/SilentProcessExit key(s) could not be opened (access denied): $($denied -join ', ')" }
+    return $added
+}
+
+# Winlogon values that start the user's session, compared with the Windows
+# defaults (case-insensitive):
+#   Shell     explorer.exe
+#   Userinit  C:\Windows\system32\userinit.exe,  (the trailing comma is normal)
+#   Taskman   not set
+# Rows only for values that differ. Returns the number of rows added.
+function Read-WinlogonHijacks {
+    param([Microsoft.Win32.RegistryKey]$HiveRoot, [string]$RawPath, [datetime]$FallbackTime)
+    $added = 0
+    $winlogonPath = "Microsoft\Windows NT\CurrentVersion\Winlogon"
+    $key = $HiveRoot.OpenSubKey($winlogonPath)
+    if (-not $key) { return 0 }
+    try {
+        $defaults = [ordered]@{
+            Shell    = @('^explorer\.exe,?$', "explorer.exe")
+            Userinit = @('^(?:(?:[A-Za-z]:\\Windows|%SystemDrive%\\Windows|%SystemRoot%|%windir%)\\System32\\)?userinit\.exe,?$', "C:\Windows\system32\userinit.exe,")
+            Taskman  = @('^$', "(not set)")
+        }
+        foreach ($name in $defaults.Keys) {
+            $data = Get-RegistryValueText $key $name
+            if ($data -match $defaults[$name][0]) { continue }
+            if ($name -ne "Taskman" -and -not $data) { continue }
+            $t = Get-RegistryKeyTime -Key $key -FallbackTime $FallbackTime -KeyLabel "Winlogon key"
+            Add-TimelineEntry -Timestamp $t.Time -Source "Registry-Winlogon" -EventType "PersistenceChange" `
+                -Description "Non-default Winlogon ${name}: $data" `
+                -Details (Format-ArtifactDetails ([ordered]@{ Value = $name; Data = $data; Default = $defaults[$name][1]; Key = "HKLM\SOFTWARE\$winlogonPath"; Time = $t.Note })) `
+                -Artifact "Registry" -RawPath $RawPath
+            $added++
+        }
+    }
+    finally { $key.Close() }
+    return $added
+}
+
+# AppInit_DLLs (DLLs loaded into every process that loads user32.dll) in the
+# native and the 32-bit (Wow6432Node) view of one loaded SOFTWARE hive: a row
+# when the list is not empty. Windows 8 and later ignore it when Secure Boot
+# is on. Returns the number of rows added.
+function Read-AppInitDlls {
+    param([Microsoft.Win32.RegistryKey]$HiveRoot, [string]$RawPath, [datetime]$FallbackTime)
+    $added = 0
+    foreach ($windowsPath in @("Microsoft\Windows NT\CurrentVersion\Windows", "Wow6432Node\Microsoft\Windows NT\CurrentVersion\Windows")) {
+        $key = $HiveRoot.OpenSubKey($windowsPath)
+        if (-not $key) { continue }
+        try {
+            $dlls = Get-RegistryValueText $key "AppInit_DLLs"
+            if (-not ($dlls -replace '[\s,;]', '')) { continue }
+            $load = ConvertTo-RegistryNumber ($key.GetValue("LoadAppInit_DLLs"))
+            if ($load) { $state = "loading enabled" }
+            elseif ($null -eq $load) { $state = "loading disabled, LoadAppInit_DLLs not set" }
+            else { $state = "loading disabled, LoadAppInit_DLLs=0" }
+            $t = Get-RegistryKeyTime -Key $key -FallbackTime $FallbackTime -KeyLabel "Windows key"
+            Add-TimelineEntry -Timestamp $t.Time -Source "Registry-AppInitDLLs" -EventType "PersistenceChange" `
+                -Description "AppInit_DLLs set ($state): $dlls" `
+                -Details (Format-ArtifactDetails ([ordered]@{
+                    AppInit_DLLs              = $dlls
+                    LoadAppInit_DLLs          = $(if ($null -ne $load) { "$load" } else { "not set" })
+                    RequireSignedAppInit_DLLs = Get-RegistryValueText $key "RequireSignedAppInit_DLLs"
+                    Key                       = "HKLM\SOFTWARE\$windowsPath"
+                    Note                      = "ignored when Secure Boot is on (Windows 8 and later)"
+                    Time                      = $t.Note
+                })) `
+                -Artifact "Registry" -RawPath $RawPath
+            $added++
+        }
+        finally { $key.Close() }
+    }
+    return $added
+}
+
+# UTF-16 string stored as [uint32 byte count][bytes] at an offset of binary
+# data: Text and Next (the offset after it), or $null if it does not fit
+function Get-SizedUtf16String {
+    param([byte[]]$Data, [int]$Offset)
+    if ($Offset -lt 0 -or $Offset + 4 -gt $Data.Length) { return $null }
+    $size = [long][BitConverter]::ToUInt32($Data, $Offset)
+    if (($size % 2) -ne 0 -or $Offset + 4 + $size -gt $Data.Length) { return $null }
+    return [PSCustomObject]@{
+        Text = [System.Text.Encoding]::Unicode.GetString($Data, $Offset + 4, [int]$size).TrimEnd([char]0)
+        Next = $Offset + 4 + [int]$size
+    }
+}
+
+# Command lines of a TaskCache Actions value (layout in Read-TaskCache),
+# joined with "; "; "" when the data is not in the expected format
+function ConvertFrom-TaskCacheActions {
+    param($Data)
+    if (-not ($Data -is [byte[]]) -or $Data.Length -lt 6 -or [BitConverter]::ToUInt16($Data, 0) -ne 3) { return "" }
+    $context = Get-SizedUtf16String -Data $Data -Offset 2
+    if (-not $context) { return "" }
+    $actions = @()
+    $pos = $context.Next
+    while ($pos + 2 -le $Data.Length -and $actions.Count -lt 32) {
+        $type = [BitConverter]::ToUInt16($Data, $pos)
+        $id = Get-SizedUtf16String -Data $Data -Offset ($pos + 2)
+        if (-not $id) { break }
+        if ($type -eq 0x6666) {
+            $command = Get-SizedUtf16String -Data $Data -Offset $id.Next
+            if (-not $command) { break }
+            $arguments = Get-SizedUtf16String -Data $Data -Offset $command.Next
+            if (-not $arguments) { break }
+            $workDir = Get-SizedUtf16String -Data $Data -Offset $arguments.Next
+            if (-not $workDir) { break }
+            $actions += ("$($command.Text) $($arguments.Text)").Trim()
+            $pos = $workDir.Next + 2
+        }
+        elseif ($type -eq 0x7777) {
+            if ($id.Next + 20 -gt $Data.Length) { break }
+            $clsid = New-Object System.Guid (,[byte[]]$Data[$id.Next..($id.Next + 15)])
+            $actions += "COM handler {$($clsid.ToString().ToUpper())}"
+            # The data size is a uint32: check it before using it as an offset
+            $size = [long][BitConverter]::ToUInt32($Data, $id.Next + 16)
+            if ($id.Next + 20 + $size -gt $Data.Length) { break }
+            $pos = $id.Next + 20 + [int]$size
+        }
+        else { break }
+    }
+    return ($actions -join "; ")
+}
+
+# Walk TaskCache\Tree: every key with an Id value is a task, every other key
+# below Tree a task folder (which has only an SD value). Fills $Tasks (task
+# GUID in upper case -> Path, HasSD, Index, KeyTime, KeyPath) and $Folders
+# (folder path -> HasSD, KeyTime, KeyPath).
+function Read-TaskCacheTreeNode {
+    param([Microsoft.Win32.RegistryKey]$Key, [string]$TaskPath, [string]$KeyPath, [hashtable]$Tasks, [hashtable]$Folders, [int]$Depth)
+    if ($Depth -gt 32) { return }
+    foreach ($name in $Key.GetSubKeyNames()) {
+        $child = $null
+        try { $child = $Key.OpenSubKey($name) }
+        catch { Log-Warning "    Cannot open $KeyPath\$name : $($_.Exception.Message)" }
+        if (-not $child) { continue }
+        try {
+            $sd = $child.GetValue("SD")
+            $node = [PSCustomObject]@{
+                Path    = "$TaskPath\$name"
+                HasSD   = ($sd -is [byte[]] -and $sd.Length -gt 0)
+                Index   = Get-RegistryValueText $child "Index"
+                KeyTime = Get-RegistryKeyLastWriteUtc $child
+                KeyPath = "$KeyPath\$name"
+            }
+            $id = Get-RegistryValueText $child "Id"
+            if ($id) { $Tasks[$id.Trim('{', '}').ToUpperInvariant()] = $node }
+            else { $Folders[$node.Path] = $node }
+            Read-TaskCacheTreeNode -Key $child -TaskPath "$TaskPath\$name" -KeyPath "$KeyPath\$name" -Tasks $Tasks -Folders $Folders -Depth ($Depth + 1)
+        }
+        finally { $child.Close() }
+    }
+}
+
+# Scheduled tasks that the collection's task list already puts on the
+# timeline (Parse-ScheduledTasks): scheduled_tasks.csv (live collections;
+# HasLastRun = the CSV gives a last run time, read like Get-ScheduledTaskInfo
+# from the same scheduler state as TaskCache DynamicInfo) and
+# ScheduledTasks_XML (mounted images; no run times). Task path in lower case
+# -> HasLastRun. Empty when the ScheduledTasks source is not selected.
+function Get-CollectedTaskNames {
+    $listed = @{}
+    if ($Sources -notcontains "ScheduledTasks") { return $listed }
+    foreach ($csv in @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("scheduled_tasks.csv") | Where-Object { -not $_.PSIsContainer })) {
+        try {
+            foreach ($task in (Import-Csv -Path $csv.FullName -ErrorAction Stop)) {
+                $taskName = Get-ArtifactRowValue $task @("TaskName", "Name")
+                if (-not $taskName) { continue }
+                $taskPath = Get-ArtifactRowValue $task @("TaskPath")
+                $fullName = if ($taskPath) { $taskPath.TrimEnd('\') + "\" + $taskName } else { "\" + $taskName }
+                $lastRun = ConvertFrom-UtcText (Get-ArtifactRowValue $task @("LastRunTimeUtc"))
+                $listed[$fullName.ToLowerInvariant()] = ($null -ne $lastRun -and $lastRun.Year -ge 2000)
+            }
+        }
+        catch { Log-Warning "    Could not read $($csv.FullName) for the TaskCache comparison: $($_.Exception.Message)" }
+    }
+    foreach ($dir in @(Get-ChildItem -Path $InputPath -Directory -Recurse -Filter "ScheduledTasks_XML" -ErrorAction SilentlyContinue)) {
+        foreach ($tf in @(Get-ChildItem -Path $dir.FullName -File -Recurse -ErrorAction SilentlyContinue)) {
+            try {
+                $doc = New-Object System.Xml.XmlDocument
+                $doc.Load($tf.FullName)
+                if (-not $doc.DocumentElement -or $doc.DocumentElement.LocalName -ne "Task") { continue }
+                $uri = Get-TaskXmlText $doc.DocumentElement "RegistrationInfo/URI"
+                $fullName = if ($uri) { $uri } else { "\" + $tf.Name }
+                if (-not $listed.ContainsKey($fullName.ToLowerInvariant())) { $listed[$fullName.ToLowerInvariant()] = $false }
+            }
+            catch { Write-Verbose "Not a readable task XML file: $($tf.FullName): $($_.Exception.Message)" }
+        }
+    }
+    return $listed
+}
+
+# The first of $Folders (task folder paths) that contains the task or
+# folder $Path, or ""
+function Get-TaskCacheParentFolder {
+    param([string]$Path, [string[]]$Folders)
+    foreach ($folder in $Folders) {
+        if ($Path.StartsWith("$folder\", [System.StringComparison]::OrdinalIgnoreCase)) { return $folder }
+    }
+    return ""
+}
+
+# Scheduled tasks in the TaskCache of one loaded SOFTWARE hive
+# (Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache):
+#   Tree\<folder>\<task>  Id (task GUID), Index and SD (security
+#       descriptor); a folder key has only SD. A task or folder whose SD
+#       value is missing is hidden from schtasks and the Task Scheduler UI,
+#       but its tasks still run (G DATA, "Windows Registry Analysis -
+#       Today's Episode: Tasks", cyber.wtf, 2022).
+#   Tasks\{GUID}  Path, Author, Actions, DynamicInfo.
+# DynamicInfo, 28 bytes (Windows 7) or 36 bytes (Windows 8 and later), as
+# documented by plaso's task cache parser and G DATA's winreg-tasks; other
+# sizes are skipped:
+#   0  uint32    magic (3)           20 uint32    task state (no longer used)
+#   4  FILETIME  created/registered  24 uint32    last error code
+#   12 FILETIME  last run (launch)   28 FILETIME  last successful run (36 bytes)
+# Times later than the hive file time + 1 day are treated as invalid.
+# "Scheduled task registered" / "last run" rows are only added where they
+# are new to the timeline: a task that scheduled_tasks.csv or
+# ScheduledTasks_XML lists (Get-CollectedTaskNames) gets its rows from the
+# ScheduledTasks source, so only its last run is added, and only when the
+# list has no run time for it. Hidden tasks are never in scheduled_tasks.csv.
+# Actions (format version 3; older versions are not parsed): uint16 version,
+# uint32 size + UTF-16 context, then per action uint16 type, uint32 size +
+# UTF-16 id and for type 0x6666 (exec) command, arguments and working
+# directory (uint32 size + UTF-16 each) plus uint16 flags; for type 0x7777
+# (COM handler) a 16-byte CLSID and uint32 size + data. Parsing stops at
+# any other type.
+# Returns the number of rows added.
+function Read-TaskCache {
+    param([Microsoft.Win32.RegistryKey]$HiveRoot, [string]$RawPath, [datetime]$FallbackTime, [hashtable]$ListedTasks = @{})
+    $cachePath = "Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache"
+    $added = 0
+    $tree = @{}
+    $folders = @{}
+    $treeKey = $HiveRoot.OpenSubKey("$cachePath\Tree")
+    if ($treeKey) {
+        try { Read-TaskCacheTreeNode -Key $treeKey -TaskPath "" -KeyPath "HKLM\SOFTWARE\$cachePath\Tree" -Tasks $tree -Folders $folders -Depth 0 }
+        finally { $treeKey.Close() }
+    }
+
+    # Hidden folders (no SD value). Only reported when other folders of this
+    # hive have one, so a Windows version that keeps no SD on folder keys
+    # does not turn every folder into a finding.
+    $hiddenFolders = @()
+    $noSdFolders = @($folders.Keys | Where-Object { -not $folders[$_].HasSD } | Sort-Object)
+    if ($noSdFolders.Count -gt 0 -and $noSdFolders.Count -lt $folders.Count) { $hiddenFolders = $noSdFolders }
+    elseif ($noSdFolders.Count -gt 0) { Log-Warning "    $($noSdFolders.Count) TaskCache\Tree folder(s) without an SD value not reported: no folder in this hive has one" }
+
+    $latest = $FallbackTime.AddDays(1)
+    $actionsById = @{}
+    $taskCount = 0
+    $badDynamicInfo = 0
+    $leftToList = 0
+    $tasksKey = $HiveRoot.OpenSubKey("$cachePath\Tasks")
+    if ($tasksKey) {
+        try {
+            foreach ($guidName in $tasksKey.GetSubKeyNames()) {
+                $taskKey = $null
+                try { $taskKey = $tasksKey.OpenSubKey($guidName) }
+                catch { Log-Warning "    Cannot open TaskCache\Tasks\$guidName : $($_.Exception.Message)" }
+                if (-not $taskKey) { continue }
+                # One bad task is skipped; the others and the hidden-task
+                # check below still run
+                try {
+                    $taskCount++
+                    $id = $guidName.Trim('{', '}').ToUpperInvariant()
+                    $treeEntry = $tree[$id]
+                    $taskPath = Get-RegistryValueText $taskKey "Path"
+                    if (-not $taskPath -and $treeEntry) { $taskPath = $treeEntry.Path }
+                    if (-not $taskPath) { $taskPath = $guidName }
+                    $actions = ConvertFrom-TaskCacheActions ($taskKey.GetValue("Actions"))
+                    $actionsById[$id] = $actions
+                    $dynamicInfo = $taskKey.GetValue("DynamicInfo")
+                    if (-not ($dynamicInfo -is [byte[]]) -or ($dynamicInfo.Length -ne 28 -and $dynamicInfo.Length -ne 36)) {
+                        if ($null -ne $dynamicInfo) { $badDynamicInfo++ }
+                        continue
+                    }
+
+                    # Listed by the collection (by its Path value or its Tree location)?
+                    $names = @($taskPath.ToLowerInvariant())
+                    if ($treeEntry) { $names += $treeEntry.Path.ToLowerInvariant() }
+                    $isListed = $false
+                    $listedRun = $false
+                    foreach ($name in $names) {
+                        if (-not $ListedTasks.ContainsKey($name)) { continue }
+                        $isListed = $true
+                        if ($ListedTasks[$name]) { $listedRun = $true }
+                    }
+
+                    $hidden = ""
+                    if ($treeEntry -and -not $treeEntry.HasSD) { $hidden = "yes (no SD value in TaskCache\Tree)" }
+                    else {
+                        $hiddenFolder = Get-TaskCacheParentFolder -Path $(if ($treeEntry) { $treeEntry.Path } else { $taskPath }) -Folders $hiddenFolders
+                        if ($hiddenFolder) { $hidden = "yes (folder $hiddenFolder has no SD value in TaskCache\Tree)" }
+                    }
+                    $lastSuccess = $null
+                    if ($dynamicInfo.Length -eq 36) { $lastSuccess = ConvertFrom-RegistryFileTime -FileTime ([BitConverter]::ToInt64($dynamicInfo, 28)) -Latest $latest }
+                    $times = [ordered]@{
+                        "registered" = ConvertFrom-RegistryFileTime -FileTime ([BitConverter]::ToInt64($dynamicInfo, 4)) -Latest $latest
+                        "last run"   = ConvertFrom-RegistryFileTime -FileTime ([BitConverter]::ToInt64($dynamicInfo, 12)) -Latest $latest
+                    }
+                    foreach ($what in $times.Keys) {
+                        if (-not $times[$what]) { continue }
+                        if (($what -eq "registered" -and $isListed) -or ($what -eq "last run" -and $listedRun)) {
+                            $leftToList++
+                            continue
+                        }
+                        $isRun = ($what -eq "last run")
+                        $details = Format-ArtifactDetails ([ordered]@{
+                            Id                   = $guidName
+                            Actions              = $actions
+                            Author               = Get-RegistryValueText $taskKey "Author"
+                            Hidden               = $hidden
+                            LastErrorCode        = $(if ($isRun) { "0x{0:X8}" -f [BitConverter]::ToUInt32($dynamicInfo, 24) } else { "" })
+                            LastSuccessfulRunUtc = $(if ($isRun -and $lastSuccess) { $lastSuccess.ToString("yyyy-MM-dd HH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture) } else { "" })
+                            Listed               = $(if ($isListed) { "yes (scheduled task list of the collection, without a run time)" } else { "" })
+                            Key                  = "HKLM\SOFTWARE\$cachePath\Tasks\$guidName"
+                            Time                 = $(if ($isRun) { "TaskCache DynamicInfo last run time" } else { "TaskCache DynamicInfo created (registered) time" })
+                        })
+                        $eventType = if ($isRun) { "Execution" } else { "ScheduledTaskChange" }
+                        Add-TimelineEntry -Timestamp $times[$what] -Source "Registry-TaskCache" -EventType $eventType `
+                            -Description "Scheduled task ${what}: $taskPath" `
+                            -Details $details -Artifact "Registry" -RawPath $RawPath
+                        $added++
+                    }
+                }
+                catch { Log-Warning "    Failed to parse TaskCache\Tasks\$guidName : $($_.Exception.Message)" }
+                finally { $taskKey.Close() }
+            }
+        }
+        finally { $tasksKey.Close() }
+    }
+
+    # Hidden tasks and folders: Tree key without SD. The key's last-write
+    # time is when the SD value was removed (or the key last changed).
+    $hiddenCount = 0
+    $hiddenEntries = @()
+    foreach ($id in @($tree.Keys)) {
+        if (-not $tree[$id].HasSD) { $hiddenEntries += , @($id, $tree[$id]) }
+    }
+    foreach ($folder in $hiddenFolders) { $hiddenEntries += , @("", $folders[$folder]) }
+    foreach ($hiddenEntry in $hiddenEntries) {
+        $id = $hiddenEntry[0]
+        $entry = $hiddenEntry[1]
+        $ts = $entry.KeyTime
+        $timeNote = "TaskCache\Tree key last write (when the SD value was removed, or the key last changed)"
+        if ($null -eq $ts) {
+            $ts = $FallbackTime
+            $timeNote = "hive file time (key last-write time unavailable)"
+        }
+        if ($id) {
+            $description = "Hidden scheduled task (no SD value in TaskCache\Tree): $($entry.Path)"
+            $details = [ordered]@{ Id = "{$id}"; Index = $entry.Index; Actions = $actionsById[$id]; Key = $entry.KeyPath; Time = $timeNote }
+        }
+        else {
+            $description = "Hidden scheduled task folder (no SD value in TaskCache\Tree): $($entry.Path)"
+            $inside = @($tree.Values | Where-Object { $_.Path.StartsWith("$($entry.Path)\", [System.StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { $_.Path } | Sort-Object)
+            $details = [ordered]@{ Tasks = ($inside -join "; "); Key = $entry.KeyPath; Time = $timeNote }
+        }
+        Add-TimelineEntry -Timestamp $ts -Source "Registry-TaskCache" -EventType "ScheduledTaskChange" `
+            -Description $description -Details (Format-ArtifactDetails $details) -Artifact "Registry" -RawPath $RawPath
+        $added++
+        $hiddenCount++
+    }
+    Log "    TaskCache: $taskCount task(s), $hiddenCount hidden task(s)/folder(s) (no SD value), $leftToList time(s) already on the timeline from the ScheduledTasks source"
+    if ($badDynamicInfo -gt 0) { Log-Warning "    $badDynamicInfo TaskCache DynamicInfo value(s) skipped: size is not 28 or 36 bytes" }
+    return $added
+}
+
+# Lines of a text file written by the triage collector with Add-Content
+# (collection_log.txt): ANSI in Windows PowerShell 5.1, UTF-8 without BOM in
+# PowerShell 7, whichever edition reads it. Strict UTF-8 first, else the
+# system ANSI code page.
+function Read-CollectorTextLines {
+    param([string]$Path)
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    try { $text = (New-Object System.Text.UTF8Encoding($false, $true)).GetString($bytes) }
+    catch {
+        Write-Verbose "$Path is not UTF-8, reading it as ANSI: $($_.Exception.Message)"
+        $text = [System.Text.Encoding]::GetEncoding(0).GetString($bytes)
+    }
+    return ($text.TrimStart([char]0xFEFF) -split "`r?`n")
+}
+
+# Output folder the triage collector excluded from Defender while it ran,
+# from collection_log.txt: the "Output directory:" line (Path), the name of
+# the collection folder (Name; the zip's top folder is the output folder)
+# and whether the cleanup at the end of the run logged that the exclusion
+# was removed (Removed = "yes", "no" or "" when not logged). "" when unknown.
+function Get-CollectorOutputFolder {
+    $result = [PSCustomObject]@{ Path = ""; Name = ""; Removed = "" }
+    $collLog = Get-ChildItem -Path $InputPath -Filter "collection_log.txt" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $collLog) { return $result }
+    $result.Name = Split-Path $collLog.DirectoryName -Leaf
+    try {
+        foreach ($line in (Read-CollectorTextLines $collLog.FullName)) {
+            if (-not $result.Path -and $line -match '^\[[^\]]+\] Output directory: (.+?)\s*$') { $result.Path = $Matches[1].TrimEnd('\') }
+            elseif ($line -match '^\[[^\]]+\] OK: Defender exclusion removed\.') { $result.Removed = "yes" }
+            elseif ($line -match '^\[[^\]]+\] WARNING: Could not remove the temporary Defender exclusion') { $result.Removed = "no" }
+        }
+    }
+    catch { Log-Warning "  Could not read collection_log.txt: $($_.Exception.Message)" }
+    return $result
+}
+
+# How a Defender path exclusion relates to the triage collector: "this" (the
+# output folder of this collection), "other" (a collector output folder of
+# another collection, so that run did not remove its exclusion) or "".
+# Non-ASCII characters are compared loosely: a log written on a machine
+# with another ANSI code page decodes them differently. The folder name
+# alone identifies this collection when the log has no path, or when it is
+# the collector's default name (TriageCollection_<date>_<minute>).
+function Get-CollectorExclusionKind {
+    param([string]$Exclusion, $CollectorFolder)
+    $path = $Exclusion.Trim().TrimEnd('\')
+    $leaf = $path -replace '^.*\\', ''
+    $defaultName = '^TriageCollection_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}$'
+    if ($CollectorFolder) {
+        if ($CollectorFolder.Path) {
+            if ($path -eq $CollectorFolder.Path) { return "this" }
+            if (($path -replace '[^\x20-\x7E]+', '?') -eq ($CollectorFolder.Path -replace '[^\x20-\x7E]+', '?')) { return "this" }
+        }
+        if ($CollectorFolder.Name -and $leaf -eq $CollectorFolder.Name -and (-not $CollectorFolder.Path -or $leaf -match $defaultName)) { return "this" }
+    }
+    if ($leaf -match $defaultName) { return "other" }
+    return ""
+}
+
+# Defender exclusions in one loaded SOFTWARE hive: Microsoft\Windows
+# Defender\Exclusions\<type> (local settings, e.g. Add-MpPreference) and
+# Policies\Microsoft\Windows Defender\Exclusions\<type> (Group Policy). Each
+# value name is one exclusion; types are Paths, Extensions, Processes,
+# IpAddresses (and TemporaryPaths). One SecurityAlert row per exclusion,
+# timed with its type key's last-write time. When Group Policy sets
+# DisableLocalAdminMerge, only the Group Policy lists are used: local
+# exclusions are then "ignored by policy" instead of "in effect". The
+# triage collector excludes its own output folder while it runs and the
+# hive is saved during the run, so that exclusion is a Snapshot row
+# labelled as the collector's own (a SecurityAlert if collection_log.txt
+# says the collector could not remove it).
+# Returns the number of rows added.
+function Read-DefenderExclusionKeys {
+    param([Microsoft.Win32.RegistryKey]$HiveRoot, [string]$RawPath, [datetime]$FallbackTime, $CollectorFolder)
+    $added = 0
+    $merge = $null
+    try {
+        $policyKey = $HiveRoot.OpenSubKey("Policies\Microsoft\Windows Defender")
+        if ($policyKey) {
+            try { $merge = ConvertTo-RegistryNumber ($policyKey.GetValue("DisableLocalAdminMerge")) }
+            finally { $policyKey.Close() }
+        }
+    }
+    catch { Log-Warning "    Could not read Defender DisableLocalAdminMerge (local exclusions are reported as in effect): $($_.Exception.Message)" }
+    $localIgnored = ($null -ne $merge -and $merge -ne 0)
+    $removed = if ($CollectorFolder) { $CollectorFolder.Removed } else { "" }
+    foreach ($basePath in @("Microsoft\Windows Defender\Exclusions", "Policies\Microsoft\Windows Defender\Exclusions")) {
+        $isPolicy = $basePath -like "Policies\*"
+        $state = if ($localIgnored -and -not $isPolicy) { "ignored by policy" } else { "in effect" }
+        $baseKey = $HiveRoot.OpenSubKey($basePath)
+        if (-not $baseKey) { continue }
+        try {
+            foreach ($type in $baseKey.GetSubKeyNames()) {
+                $typeKey = $baseKey.OpenSubKey($type)
+                if (-not $typeKey) { continue }
+                try {
+                    $keyTime = Get-RegistryKeyLastWriteUtc $typeKey
+                    $exclusions = @($typeKey.GetValueNames() | Where-Object { $_ -ne "" })
+                    $kinds = @{}
+                    foreach ($exclusion in $exclusions) {
+                        $kinds[$exclusion] = if ($type -like "*Paths") { Get-CollectorExclusionKind -Exclusion $exclusion -CollectorFolder $CollectorFolder } else { "" }
+                    }
+                    $collectorAdded = @($kinds.Values) -contains "this"
+                    foreach ($exclusion in $exclusions) {
+                        $kind = $kinds[$exclusion]
+                        $ts = $keyTime
+                        if ($null -eq $ts) {
+                            $ts = $FallbackTime
+                            $timeNote = "hive file time (key last-write time unavailable)"
+                        }
+                        elseif ($kind -eq "this") { $timeNote = "Exclusions\$type key last write (when the triage collector added this exclusion)" }
+                        elseif ($collectorAdded) { $timeNote = "Exclusions\$type key last write, when the triage collector added its own exclusion during the collection; this exclusion is older" }
+                        else { $timeNote = "Exclusions\$type key last write (key last changed; this exclusion may be older)" }
+                        $details = [ordered]@{
+                            Type        = $type
+                            Exclusion   = $exclusion
+                            Policy      = $(if ($isPolicy) { "yes (Group Policy)" } else { "" })
+                            NotInEffect = $(if ($state -ne "in effect") { "local exclusion lists are ignored (Group Policy DisableLocalAdminMerge=$merge)" } else { "" })
+                            Origin      = ""
+                            Key         = "HKLM\SOFTWARE\$basePath\$type"
+                            Time        = $timeNote
+                        }
+                        $eventType = "SecurityAlert"
+                        $description = "Defender exclusion $state ($type): $exclusion"
+                        if ($kind -eq "this" -and $removed -eq "no") {
+                            $details["Origin"] = "triage collector: output folder of this collection; collection_log.txt records that the collector could not remove it at the end of the collection, so it was left in place"
+                            $description += " (triage collector's own exclusion, not removed after the collection)"
+                        }
+                        elseif ($kind -eq "this") {
+                            $details["Origin"] = "triage collector: output folder of this collection, excluded while the collector ran; " +
+                                $(if ($removed -eq "yes") { "collection_log.txt records that it was removed at the end of the collection" } else { "its removal is not recorded in collection_log.txt" })
+                            $eventType = "Snapshot"
+                            $description += " (triage collector's own temporary exclusion)"
+                        }
+                        elseif ($kind -eq "other") { $details["Origin"] = "triage collector output folder of another collection; the collector removes its exclusion when it finishes, so this one was left behind" }
+                        Add-TimelineEntry -Timestamp $ts -Source "Registry-DefenderExclusions" -EventType $eventType `
+                            -Description $description `
+                            -Details (Format-ArtifactDetails $details) -Artifact "Registry" -RawPath $RawPath
+                        $added++
+                    }
+                }
+                finally { $typeKey.Close() }
+            }
+        }
+        finally { $baseKey.Close() }
+    }
+    return $added
+}
+
+# Machine-wide autostart hijacks, scheduled tasks (TaskCache) and Defender
+# exclusions from one loaded SOFTWARE hive (root = HKLM\SOFTWARE). Returns
+# the number of rows added.
+function Read-SoftwareHive {
+    param([Microsoft.Win32.RegistryKey]$HiveRoot, [string]$RawPath, [datetime]$FallbackTime, $CollectorFolder, [hashtable]$ListedTasks = @{})
+    $added = 0
+    try { $added += Read-IfeoHijacks -HiveRoot $HiveRoot -RawPath $RawPath -FallbackTime $FallbackTime }
+    catch { Log-Warning "    Failed to parse Image File Execution Options / SilentProcessExit: $($_.Exception.Message)" }
+    try { $added += Read-WinlogonHijacks -HiveRoot $HiveRoot -RawPath $RawPath -FallbackTime $FallbackTime }
+    catch { Log-Warning "    Failed to parse Winlogon: $($_.Exception.Message)" }
+    try { $added += Read-AppInitDlls -HiveRoot $HiveRoot -RawPath $RawPath -FallbackTime $FallbackTime }
+    catch { Log-Warning "    Failed to parse AppInit_DLLs: $($_.Exception.Message)" }
+    try { $added += Read-TaskCache -HiveRoot $HiveRoot -RawPath $RawPath -FallbackTime $FallbackTime -ListedTasks $ListedTasks }
+    catch { Log-Warning "    Failed to parse TaskCache: $($_.Exception.Message)" }
+    try { $added += Read-DefenderExclusionKeys -HiveRoot $HiveRoot -RawPath $RawPath -FallbackTime $FallbackTime -CollectorFolder $CollectorFolder }
+    catch { Log-Warning "    Failed to parse Defender exclusions: $($_.Exception.Message)" }
+    return $added
+}
+
+# LSA packages that ship with Windows (lower case, without ".dll"); rows are
+# added only for other entries. Windows 10/11 defaults:
+#   Lsa\Authentication Packages     msv1_0
+#   Lsa\Notification Packages       scecli (servers with RRAS: also rassfm)
+#   Lsa\Security Packages           "" (Windows 7: kerberos msv1_0 schannel
+#                                   wdigest tspkg pku2u)
+#   Lsa\OSConfig\Security Packages  kerberos msv1_0 schannel wdigest tspkg
+#                                   pku2u cloudap (when present)
+# negoexts and livessp are also Windows security packages.
+$script:LsaDefaultPackages = @{
+    "Authentication Packages" = @("msv1_0")
+    "Notification Packages"   = @("scecli", "rassfm")
+    "Security Packages"       = @("kerberos", "msv1_0", "schannel", "wdigest", "tspkg", "pku2u", "cloudap", "negoexts", "livessp")
+}
+
+# LSA packages (non-default entries, PersistenceChange) and WDigest
+# UseLogonCredential (clear-text credential caching, SecurityAlert) from one
+# loaded SYSTEM hive (root = HKLM\SYSTEM). Returns the number of rows added.
+function Read-SystemHive {
+    param([Microsoft.Win32.RegistryKey]$HiveRoot, [string]$RawPath, [datetime]$FallbackTime)
+    $controlSet = Get-OfflineControlSetName $HiveRoot
+    if (-not $controlSet) {
+        Log-Warning "    No control set found in the SYSTEM hive"
+        return 0
+    }
+    $added = 0
+    $noExpand = [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames
+    $checks = @(
+        @("Control\Lsa", "Authentication Packages", "LSA Authentication Package"),
+        @("Control\Lsa", "Notification Packages", "LSA Notification Package (password filter)"),
+        @("Control\Lsa", "Security Packages", "LSA Security Package"),
+        @("Control\Lsa\OSConfig", "Security Packages", "LSA Security Package (OSConfig)")
+    )
+    foreach ($check in $checks) {
+        try {
+            $key = $HiveRoot.OpenSubKey("$controlSet\$($check[0])")
+            if (-not $key) { continue }
+            try {
+                $raw = $key.GetValue($check[1], $null, $noExpand)
+                if ($null -eq $raw) { continue }
+                $entries = @(@($raw) | ForEach-Object { "$_".Split([char]0) } | ForEach-Object { $_.Trim().Trim('"').Trim() } | Where-Object { $_ })
+                $defaults = $script:LsaDefaultPackages[$check[1]]
+                $t = Get-RegistryKeyTime -Key $key -FallbackTime $FallbackTime -KeyLabel "$($check[0] -replace '^Control\\', '') key"
+                foreach ($entry in $entries) {
+                    if ($defaults -contains ($entry -replace '\.dll$', '').ToLowerInvariant()) { continue }
+                    Add-TimelineEntry -Timestamp $t.Time -Source "Registry-LSA" -EventType "PersistenceChange" `
+                        -Description "Non-default $($check[2]): $entry" `
+                        -Details (Format-ArtifactDetails ([ordered]@{ Value = $check[1]; Entry = $entry; AllEntries = ($entries -join "; "); Key = "HKLM\SYSTEM\$controlSet\$($check[0])"; Time = $t.Note })) `
+                        -Artifact "Registry" -RawPath $RawPath
+                    $added++
+                }
+            }
+            finally { $key.Close() }
+        }
+        catch { Log-Warning "    Failed to parse $($check[0])\$($check[1]): $($_.Exception.Message)" }
+    }
+
+    try {
+        $wdigestPath = "$controlSet\Control\SecurityProviders\WDigest"
+        $key = $HiveRoot.OpenSubKey($wdigestPath)
+        if ($key) {
+            try {
+                $useLogonCredential = ConvertTo-RegistryNumber ($key.GetValue("UseLogonCredential"))
+                if ($null -ne $useLogonCredential -and $useLogonCredential -ne 0) {
+                    $t = Get-RegistryKeyTime -Key $key -FallbackTime $FallbackTime -KeyLabel "WDigest key"
+                    Add-TimelineEntry -Timestamp $t.Time -Source "Registry-WDigest" -EventType "SecurityAlert" `
+                        -Description "WDigest UseLogonCredential=${useLogonCredential}: Windows keeps clear-text passwords in LSASS memory" `
+                        -Details (Format-ArtifactDetails ([ordered]@{ UseLogonCredential = $useLogonCredential; Key = "HKLM\SYSTEM\$wdigestPath"; Time = $t.Note })) `
+                        -Artifact "Registry" -RawPath $RawPath
+                    $added++
+                }
+            }
+            finally { $key.Close() }
+        }
+    }
+    catch { Log-Warning "    Failed to parse WDigest: $($_.Exception.Message)" }
+    return $added
+}
+
 function Parse-Registry {
     Log "--- Parsing Registry Artifacts ---"
 
@@ -3161,7 +5071,7 @@ function Parse-Registry {
     # Try to find offline registry hives in the input path
     $ntUserFiles = @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("NTUSER.DAT") | Where-Object { -not $_.PSIsContainer })
 
-    # Parse NTUSER.DAT hives (RecentDocs, RunMRU, TypedPaths, TypedURLs, UserAssist, Run keys)
+    # Parse NTUSER.DAT hives (see Read-NtUserHive for the keys)
     foreach ($ntuser in $ntUserFiles) {
         $mount = $null
         try {
@@ -3207,6 +5117,43 @@ function Parse-Registry {
         }
         catch {
             Log-Warning "  Failed to process UsrClass.dat at $($usrClass.FullName) : $($_.Exception.Message)"
+        }
+        finally {
+            Dismount-TimelineHive $mount
+        }
+    }
+
+    # Machine-wide keys from Registry\SOFTWARE (IFEO / SilentProcessExit,
+    # Winlogon, AppInit_DLLs, TaskCache, Defender exclusions) and
+    # Registry\SYSTEM (LSA packages, WDigest). reg save output has no
+    # original file times, so the fallback time is the collected file's.
+    foreach ($hiveName in @("SOFTWARE", "SYSTEM")) {
+        $hiveFile = Find-OfflineHiveFile $hiveName
+        if (-not $hiveFile) {
+            Log "  No $hiveName hive in the collection."
+            continue
+        }
+        $mount = $null
+        try {
+            $hiveTime = $hiveFile.LastWriteTimeUtc
+            $srcTimes = Get-SourceFileTimes $hiveFile.FullName
+            if ($srcTimes -and $srcTimes.Modified) { $hiveTime = $srcTimes.Modified }
+
+            $mount = Mount-TimelineHive -HiveFile $hiveFile -Prefix $(if ($hiveName -eq "SOFTWARE") { "TEMP_TLSW" } else { "TEMP_TLSYS" })
+            if ($mount -and $mount.Root) {
+                if ($hiveName -eq "SOFTWARE") {
+                    $rowCount = Read-SoftwareHive -HiveRoot $mount.Root -RawPath $hiveFile.FullName -FallbackTime $hiveTime `
+                        -CollectorFolder (Get-CollectorOutputFolder) -ListedTasks (Get-CollectedTaskNames)
+                }
+                else {
+                    $rowCount = Read-SystemHive -HiveRoot $mount.Root -RawPath $hiveFile.FullName -FallbackTime $hiveTime
+                }
+                Log "  Added $rowCount row(s) from the $hiveName hive."
+                $registryParsed = $true
+            }
+        }
+        catch {
+            Log-Warning "  Failed to process $hiveName hive at $($hiveFile.FullName) : $($_.Exception.Message)"
         }
         finally {
             Dismount-TimelineHive $mount
@@ -3282,16 +5229,20 @@ function Find-Sqlite3Exe {
 }
 
 # Run a query with sqlite3 against a temp copy of the database (plus its -wal
-# file, so recent history not yet checkpointed is included). Returns the CSV
-# output lines, decoded as UTF-8.
+# file, so recent history not yet checkpointed is included, and its rollback
+# -journal, so a copy taken mid-transaction is rolled back to its last
+# committed state instead of being read half-written). Returns the CSV output
+# lines, decoded as UTF-8.
 function Invoke-Sqlite3Query {
     param([string]$Sqlite3Exe, [string]$DbPath, [string]$Query)
     $tempDb = Join-Path $env:TEMP "timeline_browser_$(Get-Random).db"
     $prevEncoding = $null
     try {
         Copy-Item -LiteralPath $DbPath -Destination $tempDb -Force -ErrorAction Stop
-        if (Test-Path -LiteralPath "$DbPath-wal") {
-            Copy-Item -LiteralPath "$DbPath-wal" -Destination "$tempDb-wal" -Force -ErrorAction SilentlyContinue
+        foreach ($companion in @("-wal", "-journal")) {
+            if (Test-Path -LiteralPath "$DbPath$companion") {
+                Copy-Item -LiteralPath "$DbPath$companion" -Destination "$tempDb$companion" -Force -ErrorAction SilentlyContinue
+            }
         }
         # sqlite3 writes UTF-8; without this, titles are decoded with the OEM code page
         try { $prevEncoding = [Console]::OutputEncoding; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 }
@@ -3341,11 +5292,12 @@ function Get-ChromiumBrowserName {
     return "Chrome"
 }
 
-# Browser profile folder (e.g. "Default") from the collection layout, or ""
+# Browser profile folder (e.g. "Default") from the collection layout, or "".
+# <profile>\Network\Cookies (current Chromium versions) belongs to <profile>.
 function Get-BrowserProfileName {
     param([string]$FullPath)
     $rel = Get-RelativeCollectionPath $FullPath
-    if ($rel -and $rel -match '^Browser\\[^\\]+\\[^\\]+\\(.+)\\[^\\]+$') { return $Matches[1] }
+    if ($rel -and $rel -match '^Browser\\[^\\]+\\[^\\]+\\(.+)\\[^\\]+$') { return ($Matches[1] -replace '(?:^|\\)Network$', '') }
     return ""
 }
 
@@ -3457,6 +5409,667 @@ function Add-ChromiumBookmarkRows {
     return $count
 }
 
+# ----- Downloads and the credential, cookie and form stores -----
+# Metadata only: sites, user names, form field names and times. Saved
+# passwords, cookie values, autofill and form values, payment cards and
+# addresses are never selected, so they never reach the timeline.
+
+# Column names of the given tables in a SQLite database: hashtable of table
+# name -> string[] (tables that do not exist are left out). The queries are
+# built from the columns present, as they differ between browser versions.
+# Plain PRAGMA table_info works with any sqlite3 version (pragma_table_info()
+# needs 3.16, and an older sqlite3 on PATH is used first); a row with cid -1
+# names the table whose columns follow.
+function Get-Sqlite3TableColumns {
+    param([string]$Sqlite3Exe, [string]$DbPath, [string[]]$Tables)
+    $query = ($Tables | ForEach-Object {
+        "SELECT -1, '" + $_.Replace("'", "''") + "'; PRAGMA table_info(""" + $_.Replace('"', '""') + """);"
+    }) -join " "
+    $columns = @{}
+    $table = ""
+    $rows = @(Invoke-Sqlite3Query -Sqlite3Exe $Sqlite3Exe -DbPath $DbPath -Query $query)
+    # table_info rows: cid, name, type, notnull, dflt_value, pk
+    foreach ($r in ($rows | ConvertFrom-Csv -Header "Cid", "Name")) {
+        if ($r.Cid -eq "-1") { $table = $r.Name; continue }
+        if (-not $table) { continue }
+        if (-not $columns.ContainsKey($table)) { $columns[$table] = @() }
+        $columns[$table] += $r.Name
+    }
+    return $columns
+}
+
+# SQL select expressions for columns that older versions may not have: the
+# column (text with line breaks replaced by spaces, so each row stays on one
+# CSV line; numbers as 0 when NULL), or '' / 0 when the column is missing
+function Get-SqliteColumnSql {
+    param([string[]]$Columns, [string[]]$Names, [string]$Alias = "", [switch]$Number)
+    foreach ($name in $Names) {
+        $ref = if ($Alias) { "$Alias.$name" } else { $name }
+        if ($Columns -notcontains $name) { if ($Number) { "0" } else { "''" } }
+        elseif ($Number) { "coalesce($ref, 0)" }
+        else { "replace(replace(coalesce($ref, ''), char(13), ' '), char(10), ' ')" }
+    }
+}
+
+# Unix time (since 1970-01-01 UTC, as text or a number) in the given unit ->
+# UTC [datetime], or $null when zero or out of range. Firefox stores PRTime
+# (microseconds) or milliseconds; Chromium autofill stores seconds.
+function ConvertFrom-UnixTime {
+    param($Value, [ValidateSet("Seconds", "Milliseconds", "Microseconds")][string]$Unit = "Seconds")
+    $n = 0L
+    if (-not [long]::TryParse([string]$Value, [ref]$n) -or $n -le 0) { return $null }
+    $ticksPerUnit = switch ($Unit) { "Seconds" { 10000000L } "Milliseconds" { 10000L } default { 10L } }
+    $epochTicks = 621355968000000000L
+    if ($n -gt ([datetime]::MaxValue.Ticks - $epochTicks) / $ticksPerUnit) { return $null }
+    return [datetime]::new($epochTicks + $n * $ticksPerUnit, [System.DateTimeKind]::Utc)
+}
+
+# UTC time as Details text ("yyyy-MM-dd HH:mm:ss"), or "" for $null
+function Format-UtcDetailTime {
+    param($Time)
+    if ($null -eq $Time) { return "" }
+    return ([datetime]$Time).ToString("yyyy-MM-dd HH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+# Chromium downloads.state, danger_type and interrupt_reason
+# (components/history download_constants.h, download_interrupt_reason_values.h)
+$script:ChromiumDownloadStates = @{ "0" = "IN_PROGRESS"; "1" = "COMPLETE"; "2" = "CANCELLED"; "3" = "INTERRUPTED"; "4" = "INTERRUPTED" }
+$script:ChromiumDangerTypes = @{
+    "0" = "NOT_DANGEROUS"; "1" = "DANGEROUS_FILE"; "2" = "DANGEROUS_URL"; "3" = "DANGEROUS_CONTENT"
+    "4" = "MAYBE_DANGEROUS_CONTENT"; "5" = "UNCOMMON_CONTENT"; "6" = "USER_VALIDATED"; "7" = "DANGEROUS_HOST"
+    "8" = "POTENTIALLY_UNWANTED"; "9" = "ALLOWLISTED_BY_POLICY"; "10" = "ASYNC_SCANNING"; "11" = "BLOCKED_PASSWORD_PROTECTED"
+    "12" = "BLOCKED_TOO_LARGE"; "13" = "SENSITIVE_CONTENT_WARNING"; "14" = "SENSITIVE_CONTENT_BLOCK"; "15" = "DEEP_SCANNED_SAFE"
+    "16" = "DEEP_SCANNED_OPENED_DANGEROUS"; "17" = "PROMPT_FOR_SCANNING"; "18" = "BLOCKED_UNSUPPORTED_FILETYPE"
+    "19" = "DANGEROUS_ACCOUNT_COMPROMISE"; "20" = "DEEP_SCANNED_FAILED"; "21" = "PROMPT_FOR_LOCAL_PASSWORD_SCANNING"
+    "22" = "ASYNC_LOCAL_PASSWORD_SCANNING"; "23" = "BLOCKED_SCAN_FAILED"; "24" = "FORCED_SAVE_TO_GDRIVE"; "25" = "FORCED_SAVE_TO_ONEDRIVE"
+}
+$script:ChromiumInterruptReasons = @{
+    "1" = "FILE_FAILED"; "2" = "FILE_ACCESS_DENIED"; "3" = "FILE_NO_SPACE"; "5" = "FILE_NAME_TOO_LONG"; "6" = "FILE_TOO_LARGE"
+    "7" = "FILE_VIRUS_INFECTED"; "10" = "FILE_TRANSIENT_ERROR"; "11" = "FILE_BLOCKED"; "12" = "FILE_SECURITY_CHECK_FAILED"
+    "13" = "FILE_TOO_SHORT"; "14" = "FILE_HASH_MISMATCH"; "15" = "FILE_SAME_AS_SOURCE"; "20" = "NETWORK_FAILED"
+    "21" = "NETWORK_TIMEOUT"; "22" = "NETWORK_DISCONNECTED"; "23" = "NETWORK_SERVER_DOWN"; "24" = "NETWORK_INVALID_REQUEST"
+    "30" = "SERVER_FAILED"; "31" = "SERVER_NO_RANGE"; "33" = "SERVER_BAD_CONTENT"; "34" = "SERVER_UNAUTHORIZED"
+    "35" = "SERVER_CERT_PROBLEM"; "36" = "SERVER_FORBIDDEN"; "37" = "SERVER_UNREACHABLE"; "38" = "SERVER_CONTENT_LENGTH_MISMATCH"
+    "39" = "SERVER_CROSS_ORIGIN_REDIRECT"; "40" = "USER_CANCELED"; "41" = "USER_SHUTDOWN"; "50" = "CRASH"; "51" = "LOCAL_DOWNLOAD_BLOCKED"
+}
+# Firefox downloads/metaData state (DownloadHistory.sys.mjs), and the
+# Chromium state name used for it in Details (State=; the Firefox name is
+# kept in FirefoxState=). Paused = stopped with partial data, which Chromium
+# stores as interrupted. BLOCKED: blocked by parental controls, the
+# reputation check (DIRTY) or content analysis.
+$script:FirefoxDownloadStates = @{ "1" = "FINISHED"; "2" = "FAILED"; "3" = "CANCELED"; "4" = "PAUSED"; "6" = "BLOCKED_PARENTAL"; "8" = "DIRTY"; "9" = "BLOCKED_CONTENT_ANALYSIS" }
+$script:FirefoxDownloadStateNames = @{
+    FINISHED = "COMPLETE"; FAILED = "INTERRUPTED"; CANCELED = "CANCELLED"; PAUSED = "INTERRUPTED"
+    BLOCKED_PARENTAL = "BLOCKED"; DIRTY = "BLOCKED"; BLOCKED_CONTENT_ANALYSIS = "BLOCKED"
+}
+# Verb of the row at a download's end time, by state (no row for other states)
+$script:DownloadEndVerbs = @{ COMPLETE = "completed"; CANCELLED = "cancelled"; INTERRUPTED = "interrupted"; BLOCKED = "blocked" }
+# Firefox moz_perms.permission and expireType (nsIPermissionManager)
+$script:FirefoxPermissionValues = @{ "0" = "UNKNOWN"; "1" = "ALLOW"; "2" = "DENY"; "3" = "PROMPT"; "8" = "ALLOW_SESSION" }
+$script:FirefoxPermissionExpiry = @{ "0" = "NEVER"; "1" = "SESSION"; "2" = "TIME"; "3" = "POLICY" }
+
+# Rows for one download: started; ended (completed, cancelled, ...) when that
+# is at least a minute after the start -- a quicker end is only in Details;
+# and opened from the browser. FileAccess: a download writes a file to disk.
+# Returns the number of rows added.
+function Add-BrowserDownloadRows {
+    param(
+        [string]$Source,
+        [string]$User,
+        [string]$RawPath,
+        [string]$Path,
+        [string]$Url,
+        $StartTime,
+        $EndTime,
+        $OpenedTime,
+        [string]$State,
+        [System.Collections.IDictionary]$Details
+    )
+    $label = if ($Path -and $Url) { "$Path ($Url)" } elseif ($Path) { $Path } else { $Url }
+    $verb = $script:DownloadEndVerbs[$State]
+    $rows = @(, @($StartTime, "Download started: $label"))
+    if ($verb -and $EndTime -and (-not $StartTime -or ($EndTime - $StartTime).TotalSeconds -ge 60)) {
+        $rows += , @($EndTime, "Download $($verb): $label")
+    }
+    $rows += , @($OpenedTime, "Download opened: $label")
+    $detailText = Format-ArtifactDetails $Details
+    $count = 0
+    foreach ($row in $rows) {
+        if ($null -eq $row[0]) { continue }
+        Add-TimelineEntry -Timestamp $row[0] -Source $Source -EventType "FileAccess" `
+            -Description $row[1] `
+            -User $User -Details $detailText `
+            -Artifact "Browser" -RawPath $RawPath
+        $count++
+    }
+    return $count
+}
+
+# Chromium downloads (History): the downloads table with the first and last
+# URL of each download's redirect chain (the link followed, the file's URL).
+# Times are Chromium times. Returns the number of rows added.
+function Add-ChromiumDownloadRows {
+    param([string]$Sqlite3Exe, [System.IO.FileInfo]$File)
+    $schema = Get-Sqlite3TableColumns -Sqlite3Exe $Sqlite3Exe -DbPath $File.FullName -Tables @("downloads", "downloads_url_chains")
+    $c = $schema["downloads"]
+    if (-not $c -or $c -notcontains "target_path" -or $c -notcontains "start_time") { return 0 }
+    $urls = @("''", "''")
+    if ($schema["downloads_url_chains"]) {
+        $chainUrl = "(SELECT replace(replace(u.url, char(13), ' '), char(10), ' ') FROM downloads_url_chains u " +
+                    "WHERE u.id = d.id ORDER BY u.chain_index {0} LIMIT 1)"
+        $urls = @(($chainUrl -f "ASC"), ($chainUrl -f "DESC"))
+    }
+    $sha256 = if ($c -contains "hash") { "CASE WHEN length(d.hash) = 32 THEN lower(hex(d.hash)) ELSE '' END" } else { "''" }
+    $text = @(Get-SqliteColumnSql -Columns $c -Alias "d" -Names @("target_path", "current_path", "referrer", "site_url", "tab_url", "tab_referrer_url", "mime_type", "by_ext_name"))
+    $numbers = @(Get-SqliteColumnSql -Columns $c -Alias "d" -Number -Names @("start_time", "end_time", "last_access_time", "received_bytes", "total_bytes", "state", "danger_type", "interrupt_reason", "opened"))
+    $query = "SELECT " + (($text + $urls + $sha256 + $numbers) -join ", ") + " FROM downloads d ORDER BY d.start_time;"
+    $rows = @(Invoke-Sqlite3Query -Sqlite3Exe $Sqlite3Exe -DbPath $File.FullName -Query $query)
+
+    $source = "$(Get-ChromiumBrowserName $File.FullName) Downloads"
+    $user = Get-CollectionUser $File.FullName
+    $profileName = Get-BrowserProfileName $File.FullName
+    $header = @("Path", "CurrentPath", "Referrer", "SiteUrl", "TabUrl", "TabReferrer", "MimeType", "Extension", "FirstUrl", "Url", "Sha256",
+                "Start", "End", "LastAccess", "Received", "Total", "State", "Danger", "Interrupt", "Opened")
+    $count = 0
+    foreach ($r in ($rows | ConvertFrom-Csv -Header $header)) {
+        $start = ConvertFrom-ChromiumTime $r.Start
+        $end = ConvertFrom-ChromiumTime $r.End
+        $opened = ConvertFrom-ChromiumTime $r.LastAccess
+        $state = Get-AntiVirusCodeName -Names $script:ChromiumDownloadStates -Code $r.State
+        $details = [ordered]@{
+            Path            = $r.Path
+            URL             = $r.Url
+            OriginalURL     = $(if ($r.FirstUrl -ne $r.Url) { $r.FirstUrl } else { "" })
+            Referrer        = $r.Referrer
+            TabURL          = $r.TabUrl
+            TabReferrer     = $r.TabReferrer
+            SiteURL         = $r.SiteUrl
+            MimeType        = $r.MimeType
+            State           = $state
+            DangerType      = Get-AntiVirusCodeName -Names $script:ChromiumDangerTypes -Code $r.Danger
+            InterruptReason = $(if ($r.Interrupt -ne "0") { Get-AntiVirusCodeName -Names $script:ChromiumInterruptReasons -Code $r.Interrupt } else { "" })
+            Bytes           = $r.Received
+            TotalBytes      = $(if ($r.Total -ne $r.Received -and $r.Total -ne "0") { $r.Total } else { "" })
+            Opened          = $(if ($r.Opened -eq "1") { "Yes" } else { "No" })
+            StartUtc        = Format-UtcDetailTime $start
+            EndUtc          = Format-UtcDetailTime $end
+            LastOpenedUtc   = Format-UtcDetailTime $opened
+            CurrentPath     = $(if ($r.CurrentPath -ne $r.Path) { $r.CurrentPath } else { "" })
+            Extension       = $r.Extension
+            SHA256          = $r.Sha256
+            Profile         = $profileName
+        }
+        $count += Add-BrowserDownloadRows -Source $source -User $user -RawPath $File.FullName -Path $r.Path -Url $r.Url `
+            -StartTime $start -EndTime $end -OpenedTime $opened -State $state -Details $details
+    }
+    return $count
+}
+
+# Firefox downloads (places.sqlite): the downloads/destinationFileURI
+# annotation on the download's URL (added when the download starts; PRTime)
+# and the downloads/metaData JSON (state, endTime in milliseconds, fileSize,
+# reputationCheckVerdict). Firefox keeps the URL the download started from
+# (before any redirect); the referrer is the page of the download visit's
+# from_visit (visit_type 7 = DOWNLOAD). Returns the number of rows added.
+function Add-FirefoxDownloadRows {
+    param([string]$Sqlite3Exe, [System.IO.FileInfo]$File)
+    $query = "SELECT replace(replace(p.url, char(13), ' '), char(10), ' '), replace(replace(d.content, char(13), ' '), char(10), ' '), d.dateAdded, " +
+             "coalesce((SELECT replace(replace(m.content, char(13), ' '), char(10), ' ') FROM moz_annos m " +
+             "JOIN moz_anno_attributes ma ON ma.id = m.anno_attribute_id WHERE m.place_id = d.place_id AND ma.name = 'downloads/metaData' LIMIT 1), ''), " +
+             "coalesce((SELECT replace(replace(rp.url, char(13), ' '), char(10), ' ') FROM moz_historyvisits v " +
+             "JOIN moz_historyvisits rv ON rv.id = v.from_visit JOIN moz_places rp ON rp.id = rv.place_id " +
+             "WHERE v.place_id = d.place_id AND v.visit_type = 7 ORDER BY v.visit_date DESC LIMIT 1), '') " +
+             "FROM moz_annos d JOIN moz_anno_attributes a ON a.id = d.anno_attribute_id JOIN moz_places p ON p.id = d.place_id " +
+             "WHERE a.name = 'downloads/destinationFileURI' ORDER BY d.dateAdded;"
+    $rows = @(Invoke-Sqlite3Query -Sqlite3Exe $Sqlite3Exe -DbPath $File.FullName -Query $query)
+    $user = Get-CollectionUser $File.FullName
+    $profileName = Get-BrowserProfileName $File.FullName
+    $count = 0
+    foreach ($r in ($rows | ConvertFrom-Csv -Header "Url", "FileUri", "Added", "MetaData", "Referrer")) {
+        $path = $r.FileUri
+        try {
+            $uri = New-Object System.Uri($r.FileUri)
+            if ($uri.IsFile) { $path = $uri.LocalPath }
+        }
+        catch { Write-Verbose "Download destination is not a file URI: $($r.FileUri)" }
+        $meta = $null
+        if ($r.MetaData) {
+            try { $meta = $r.MetaData | ConvertFrom-Json -ErrorAction Stop }
+            catch { Write-Verbose "Could not read download metadata for $($r.Url): $($_.Exception.Message)" }
+        }
+        $start = ConvertFrom-UnixTime $r.Added -Unit Microseconds
+        $end = $null
+        $firefoxState = ""
+        if ($meta) {
+            $end = ConvertFrom-UnixTime $meta.endTime -Unit Milliseconds
+            if ($null -ne $meta.state) { $firefoxState = Get-AntiVirusCodeName -Names $script:FirefoxDownloadStates -Code $meta.state }
+        }
+        $state = $script:FirefoxDownloadStateNames[$firefoxState]
+        if (-not $state) { $state = $firefoxState }
+        $details = [ordered]@{
+            Path         = $path
+            URL          = $r.Url
+            Referrer     = $r.Referrer
+            State        = $state
+            FirefoxState = $firefoxState
+            DangerType   = $(if ($meta) { $meta.reputationCheckVerdict } else { "" })
+            Bytes        = $(if ($meta) { $meta.fileSize } else { "" })
+            StartUtc     = Format-UtcDetailTime $start
+            EndUtc       = Format-UtcDetailTime $end
+            Deleted      = $(if ($meta -and $meta.deleted -eq $true) { "Yes" } else { "" })
+            Profile      = $profileName
+        }
+        $count += Add-BrowserDownloadRows -Source "Firefox Downloads" -User $user -RawPath $File.FullName -Path $path -Url $r.Url `
+            -StartTime $start -EndTime $end -OpenedTime $null -State $state -Details $details
+    }
+    return $count
+}
+
+# Rows for one saved login: created; last used, when at least a minute after
+# created (both browsers set the last-used time when a login is saved --
+# Chromium at the form submit, seconds before the user clicks Save -- so an
+# earlier or equal time is not a use and is only in Details); and password
+# changed (-Changed, when later than created). A "never save" entry gets one
+# row when it was added. -AccountName is the site user name, if known.
+# Returns the number of rows added.
+function Add-BrowserLoginRows {
+    param(
+        [string]$Source,
+        [string]$User,
+        [string]$RawPath,
+        [string]$Url,
+        [string]$AccountName,
+        $Created,
+        $LastUsed,
+        $Changed,
+        [bool]$NeverSave,
+        [string]$Details
+    )
+    $label = if ($AccountName) { "$Url (user: $AccountName)" } else { $Url }
+    if ($NeverSave) {
+        $rows = @(, @($Created, "Saved login declined: $Url (never save for this site)"))
+    }
+    else {
+        $rows = @(, @($Created, "Saved login created: $label"))
+        if ($LastUsed -and (-not $Created -or ($LastUsed - $Created).TotalSeconds -ge 60)) {
+            $rows += , @($LastUsed, "Saved login last used: $label")
+        }
+        if ($Changed -and (-not $Created -or ($Changed - $Created).TotalSeconds -ge 1)) {
+            $rows += , @($Changed, "Saved password changed: $label")
+        }
+    }
+    $count = 0
+    foreach ($row in $rows) {
+        if ($null -eq $row[0]) { continue }
+        Add-TimelineEntry -Timestamp $row[0] -Source $Source -EventType "NetworkConnection" `
+            -Description $row[1] `
+            -User $User -Details $Details `
+            -Artifact "Browser" -RawPath $RawPath
+        $count++
+    }
+    return $count
+}
+
+# Chromium "Login Data" (logins table): saved logins per site with the user
+# name. Times are Chromium times. Returns the number of rows added.
+function Add-ChromiumLoginRows {
+    param([string]$Sqlite3Exe, [System.IO.FileInfo]$File)
+    $c = (Get-Sqlite3TableColumns -Sqlite3Exe $Sqlite3Exe -DbPath $File.FullName -Tables @("logins"))["logins"]
+    if (-not $c -or $c -notcontains "origin_url" -or $c -notcontains "date_created") { return 0 }
+    # Never add password_value (or any other secret column) to these lists
+    $text = @(Get-SqliteColumnSql -Columns $c -Names @("origin_url", "action_url", "signon_realm", "username_value"))
+    $numbers = @(Get-SqliteColumnSql -Columns $c -Number -Names @("date_created", "date_last_used", "date_password_modified", "times_used", "blacklisted_by_user"))
+    $query = "SELECT " + (($text + $numbers) -join ", ") + " FROM logins ORDER BY date_created;"
+    $rows = @(Invoke-Sqlite3Query -Sqlite3Exe $Sqlite3Exe -DbPath $File.FullName -Query $query)
+
+    $source = "$(Get-ChromiumBrowserName $File.FullName) Logins"
+    $user = Get-CollectionUser $File.FullName
+    $profileName = Get-BrowserProfileName $File.FullName
+    $count = 0
+    foreach ($r in ($rows | ConvertFrom-Csv -Header "Url", "Action", "Realm", "Username", "Created", "LastUsed", "PasswordChanged", "TimesUsed", "NeverSave")) {
+        $created = ConvertFrom-ChromiumTime $r.Created
+        $lastUsed = ConvertFrom-ChromiumTime $r.LastUsed
+        $changed = ConvertFrom-ChromiumTime $r.PasswordChanged
+        $neverSave = $r.NeverSave -eq "1"
+        $details = Format-ArtifactDetails ([ordered]@{
+            URL                = $r.Url
+            Action             = $r.Action
+            Realm              = $r.Realm
+            Username           = $r.Username
+            TimesUsed          = $r.TimesUsed
+            NeverSave          = $(if ($neverSave) { "Yes" } else { "" })
+            CreatedUtc         = Format-UtcDetailTime $created
+            LastUsedUtc        = Format-UtcDetailTime $lastUsed
+            PasswordChangedUtc = Format-UtcDetailTime $changed
+            Profile            = $profileName
+        })
+        $count += Add-BrowserLoginRows -Source $source -User $user -RawPath $File.FullName -Url $r.Url -AccountName $r.Username `
+            -Created $created -LastUsed $lastUsed -Changed $changed -NeverSave $neverSave -Details $details
+    }
+    return $count
+}
+
+# Firefox logins.json: saved logins per site. Times are milliseconds since
+# 1970 UTC. User names and passwords are stored encrypted; they are blanked
+# in the text before it is parsed, so they are never read -- also when the
+# file ends inside one (a partial copy). The JSON parser's error is not
+# passed on: in Windows PowerShell it quotes the text it could not parse.
+function Add-FirefoxLoginRows {
+    param([System.IO.FileInfo]$File)
+    $text = Get-Content -LiteralPath $File.FullName -Raw -Encoding UTF8 -ErrorAction Stop
+    $text = $text -replace '"(encryptedUsername|encryptedPassword)"\s*:\s*"(?:[^"\\]|\\.?)*(?:"|$)', '"$1":""'
+    if ([string]::IsNullOrWhiteSpace($text)) { return 0 }
+    try { $json = $text | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw "not valid JSON (damaged or incomplete file)" }
+    if (-not $json -or -not $json.PSObject.Properties["logins"]) { return 0 }
+    $user = Get-CollectionUser $File.FullName
+    $profileName = Get-BrowserProfileName $File.FullName
+    $count = 0
+    foreach ($login in @($json.logins)) {
+        if ($null -eq $login) { continue }
+        $created = ConvertFrom-UnixTime $login.timeCreated -Unit Milliseconds
+        $lastUsed = ConvertFrom-UnixTime $login.timeLastUsed -Unit Milliseconds
+        $changed = ConvertFrom-UnixTime $login.timePasswordChanged -Unit Milliseconds
+        $details = Format-ArtifactDetails ([ordered]@{
+            URL                = $login.hostname
+            Action             = $login.formSubmitURL
+            Realm              = $login.httpRealm
+            UsernameField      = $login.usernameField
+            TimesUsed          = $login.timesUsed
+            CreatedUtc         = Format-UtcDetailTime $created
+            LastUsedUtc        = Format-UtcDetailTime $lastUsed
+            PasswordChangedUtc = Format-UtcDetailTime $changed
+            Profile            = $profileName
+        })
+        $count += Add-BrowserLoginRows -Source "Firefox Logins" -User $user -RawPath $File.FullName -Url $login.hostname -AccountName "" `
+            -Created $created -LastUsed $lastUsed -Changed $changed -NeverSave $false -Details $details
+    }
+    return $count
+}
+
+# Cookie rows aggregated per host (a profile holds thousands of cookies):
+# one at the host's oldest cookie creation and one at its latest access
+# (when later), with the cookie count and names. Each host object has Host,
+# Cookies, Names (tab-separated), FirstSet, LastAccess, LatestExpiry,
+# Persistent, Secure and HttpOnly. Returns the number of rows added.
+function Add-BrowserCookieHostRows {
+    param([string]$Source, [string]$User, [string]$ProfileName, [string]$RawPath, [object[]]$Hosts)
+    $count = 0
+    foreach ($cookieHost in $Hosts) {
+        # Names sorted and de-duplicated (case-sensitive), cut at 200 characters
+        $nameSet = [System.Collections.Generic.SortedSet[string]]::new([System.StringComparer]::Ordinal)
+        foreach ($n in ("$($cookieHost.Names)" -split "`t")) { if ($n) { [void]$nameSet.Add($n) } }
+        $names = @($nameSet) -join ", "
+        if ($names.Length -gt 200) { $names = $names.Substring(0, 200) + "... ($($nameSet.Count) names)" }
+        $label = "$($cookieHost.Host) ($($cookieHost.Cookies) cookie$(if ($cookieHost.Cookies -ne '1') { 's' }))"
+        $details = Format-ArtifactDetails ([ordered]@{
+            Host            = $cookieHost.Host
+            Cookies         = $cookieHost.Cookies
+            Names           = $names
+            Persistent      = $cookieHost.Persistent
+            Secure          = $cookieHost.Secure
+            HttpOnly        = $cookieHost.HttpOnly
+            FirstSetUtc     = Format-UtcDetailTime $cookieHost.FirstSet
+            LastAccessUtc   = Format-UtcDetailTime $cookieHost.LastAccess
+            LatestExpiryUtc = Format-UtcDetailTime $cookieHost.LatestExpiry
+            Profile         = $ProfileName
+        })
+        $rows = @(, @($cookieHost.FirstSet, "Cookies first set: $label"))
+        if ($cookieHost.LastAccess -and (-not $cookieHost.FirstSet -or ($cookieHost.LastAccess - $cookieHost.FirstSet).TotalSeconds -ge 1)) {
+            $rows += , @($cookieHost.LastAccess, "Cookies last accessed: $label")
+        }
+        foreach ($row in $rows) {
+            if ($null -eq $row[0]) { continue }
+            Add-TimelineEntry -Timestamp $row[0] -Source $Source -EventType "NetworkConnection" `
+                -Description $row[1] `
+                -User $User -Details $details `
+                -Artifact "Browser" -RawPath $RawPath
+            $count++
+        }
+    }
+    return $count
+}
+
+# Chromium cookies (<profile>\Network\Cookies, or the older <profile>\Cookies):
+# aggregated per host_key. Times are Chromium times. Returns the row count.
+function Add-ChromiumCookieRows {
+    param([string]$Sqlite3Exe, [System.IO.FileInfo]$File)
+    $c = (Get-Sqlite3TableColumns -Sqlite3Exe $Sqlite3Exe -DbPath $File.FullName -Tables @("cookies"))["cookies"]
+    if (-not $c -or $c -notcontains "host_key" -or $c -notcontains "name" -or $c -notcontains "creation_utc") { return 0 }
+    # Flag counts; older versions name the flags persistent/secure/httponly
+    $flagSums = foreach ($names in @(@("is_persistent", "persistent"), @("is_secure", "secure"), @("is_httponly", "httponly"))) {
+        $flag = $names | Where-Object { $c -contains $_ } | Select-Object -First 1
+        if ($flag) { "SUM(coalesce($flag, 0))" } else { "''" }
+    }
+    # Never add value or encrypted_value to this query
+    $query = "SELECT replace(replace(host_key, char(13), ' '), char(10), ' '), COUNT(*), MIN(CASE WHEN creation_utc > 0 THEN creation_utc END), " +
+             "MAX($(Get-SqliteColumnSql -Columns $c -Names 'last_access_utc' -Number)), MAX($(Get-SqliteColumnSql -Columns $c -Names 'expires_utc' -Number)), " +
+             ($flagSums -join ", ") + ", group_concat(replace(replace(name, char(13), ' '), char(10), ' '), char(9)) " +
+             "FROM cookies GROUP BY host_key ORDER BY host_key;"
+    $rows = @(Invoke-Sqlite3Query -Sqlite3Exe $Sqlite3Exe -DbPath $File.FullName -Query $query)
+    $hosts = foreach ($r in ($rows | ConvertFrom-Csv -Header "Host", "Cookies", "FirstSet", "LastAccess", "Expiry", "Persistent", "Secure", "HttpOnly", "Names")) {
+        [PSCustomObject]@{
+            Host         = $r.Host
+            Cookies      = $r.Cookies
+            Names        = $r.Names
+            FirstSet     = ConvertFrom-ChromiumTime $r.FirstSet
+            LastAccess   = ConvertFrom-ChromiumTime $r.LastAccess
+            LatestExpiry = ConvertFrom-ChromiumTime $r.Expiry
+            Persistent   = $r.Persistent
+            Secure       = $r.Secure
+            HttpOnly     = $r.HttpOnly
+        }
+    }
+    return Add-BrowserCookieHostRows -Source "$(Get-ChromiumBrowserName $File.FullName) Cookies" -User (Get-CollectionUser $File.FullName) `
+        -ProfileName (Get-BrowserProfileName $File.FullName) -RawPath $File.FullName -Hosts @($hosts)
+}
+
+# Firefox cookies.sqlite (moz_cookies): aggregated per host. creationTime and
+# lastAccessed are PRTime. Returns the number of rows added.
+function Add-FirefoxCookieRows {
+    param([string]$Sqlite3Exe, [System.IO.FileInfo]$File)
+    # Never add value to this query
+    $query = "SELECT replace(replace(host, char(13), ' '), char(10), ' '), COUNT(*), MIN(CASE WHEN creationTime > 0 THEN creationTime END), MAX(lastAccessed), " +
+             "SUM(coalesce(isSecure, 0)), SUM(coalesce(isHttpOnly, 0)), group_concat(replace(replace(name, char(13), ' '), char(10), ' '), char(9)) " +
+             "FROM moz_cookies GROUP BY host ORDER BY host;"
+    $rows = @(Invoke-Sqlite3Query -Sqlite3Exe $Sqlite3Exe -DbPath $File.FullName -Query $query)
+    $hosts = foreach ($r in ($rows | ConvertFrom-Csv -Header "Host", "Cookies", "FirstSet", "LastAccess", "Secure", "HttpOnly", "Names")) {
+        [PSCustomObject]@{
+            Host         = $r.Host
+            Cookies      = $r.Cookies
+            Names        = $r.Names
+            FirstSet     = ConvertFrom-UnixTime $r.FirstSet -Unit Microseconds
+            LastAccess   = ConvertFrom-UnixTime $r.LastAccess -Unit Microseconds
+            LatestExpiry = $null
+            Persistent   = ""
+            Secure       = $r.Secure
+            HttpOnly     = $r.HttpOnly
+        }
+    }
+    return Add-BrowserCookieHostRows -Source "Firefox Cookies" -User (Get-CollectionUser $File.FullName) `
+        -ProfileName (Get-BrowserProfileName $File.FullName) -RawPath $File.FullName -Hosts @($hosts)
+}
+
+# Form entry rows (Chromium autofill, Firefox form history): when an entry
+# was saved and when it was last used (when later). Only the field name is
+# kept; the value typed is never read. Each entry has Total (entries in the
+# database), Field, TimesUsed, FirstUsed and LastUsed; the caller passes the
+# newest MaxRows. Returns the number of rows added.
+function Add-BrowserFormEntryRows {
+    param([string]$Source, [string]$User, [string]$ProfileName, [string]$RawPath, [object[]]$Entries, [int]$MaxRows)
+    $count = 0
+    $total = 0
+    foreach ($entry in $Entries) {
+        if ($total -eq 0) { [void][int]::TryParse([string]$entry.Total, [ref]$total) }
+        $details = Format-ArtifactDetails ([ordered]@{
+            Field        = $entry.Field
+            TimesUsed    = $entry.TimesUsed
+            FirstUsedUtc = Format-UtcDetailTime $entry.FirstUsed
+            LastUsedUtc  = Format-UtcDetailTime $entry.LastUsed
+            Profile      = $ProfileName
+        })
+        $rows = @(, @($entry.FirstUsed, "Form entry saved: field $($entry.Field)"))
+        if ($entry.LastUsed -and (-not $entry.FirstUsed -or ($entry.LastUsed - $entry.FirstUsed).TotalSeconds -ge 1)) {
+            $rows += , @($entry.LastUsed, "Form entry last used: field $($entry.Field)")
+        }
+        foreach ($row in $rows) {
+            if ($null -eq $row[0]) { continue }
+            Add-TimelineEntry -Timestamp $row[0] -Source $Source -EventType "NetworkConnection" `
+                -Description $row[1] `
+                -User $User -Details $details `
+                -Artifact "Browser" -RawPath $RawPath
+            $count++
+        }
+    }
+    if ($total -gt $MaxRows) {
+        Log-Warning "    $total form entries in database; only the newest $MaxRows were added (cap)."
+    }
+    return $count
+}
+
+# Chromium "Web Data" autofill table: form field names with the times they
+# were first and last used (seconds since 1970 UTC). Returns the row count.
+function Add-ChromiumAutofillRows {
+    param([string]$Sqlite3Exe, [System.IO.FileInfo]$File, [int]$MaxRows = 20000)
+    $c = (Get-Sqlite3TableColumns -Sqlite3Exe $Sqlite3Exe -DbPath $File.FullName -Tables @("autofill"))["autofill"]
+    if (-not $c -or $c -notcontains "name" -or $c -notcontains "date_created") { return 0 }
+    # Field names only: never add value or value_lower to this query
+    $numbers = @(Get-SqliteColumnSql -Columns $c -Number -Names @("date_created", "date_last_used", "count"))
+    $orderBy = if ($c -contains "date_last_used") { "date_last_used DESC, date_created DESC" } else { "date_created DESC" }
+    $query = "SELECT (SELECT COUNT(*) FROM autofill), replace(replace(name, char(13), ' '), char(10), ' '), " + ($numbers -join ", ") +
+             " FROM autofill ORDER BY $orderBy LIMIT $MaxRows;"
+    $rows = @(Invoke-Sqlite3Query -Sqlite3Exe $Sqlite3Exe -DbPath $File.FullName -Query $query)
+    $entries = foreach ($r in ($rows | ConvertFrom-Csv -Header "Total", "Field", "Created", "LastUsed", "TimesUsed")) {
+        [PSCustomObject]@{
+            Total     = $r.Total
+            Field     = $r.Field
+            TimesUsed = $r.TimesUsed
+            FirstUsed = ConvertFrom-UnixTime $r.Created -Unit Seconds
+            LastUsed  = ConvertFrom-UnixTime $r.LastUsed -Unit Seconds
+        }
+    }
+    return Add-BrowserFormEntryRows -Source "$(Get-ChromiumBrowserName $File.FullName) Autofill" -User (Get-CollectionUser $File.FullName) `
+        -ProfileName (Get-BrowserProfileName $File.FullName) -RawPath $File.FullName -Entries @($entries) -MaxRows $MaxRows
+}
+
+# Firefox formhistory.sqlite (moz_formhistory): form field names with first
+# and last use (PRTime). Returns the number of rows added.
+function Add-FirefoxFormHistoryRows {
+    param([string]$Sqlite3Exe, [System.IO.FileInfo]$File, [int]$MaxRows = 20000)
+    # Field names only: never add value to this query
+    $query = "SELECT (SELECT COUNT(*) FROM moz_formhistory), replace(replace(fieldname, char(13), ' '), char(10), ' '), " +
+             "firstUsed, lastUsed, timesUsed FROM moz_formhistory ORDER BY lastUsed DESC, firstUsed DESC LIMIT $MaxRows;"
+    $rows = @(Invoke-Sqlite3Query -Sqlite3Exe $Sqlite3Exe -DbPath $File.FullName -Query $query)
+    $entries = foreach ($r in ($rows | ConvertFrom-Csv -Header "Total", "Field", "FirstUsed", "LastUsed", "TimesUsed")) {
+        [PSCustomObject]@{
+            Total     = $r.Total
+            Field     = $r.Field
+            TimesUsed = $r.TimesUsed
+            FirstUsed = ConvertFrom-UnixTime $r.FirstUsed -Unit Microseconds
+            LastUsed  = ConvertFrom-UnixTime $r.LastUsed -Unit Microseconds
+        }
+    }
+    return Add-BrowserFormEntryRows -Source "Firefox Form History" -User (Get-CollectionUser $File.FullName) `
+        -ProfileName (Get-BrowserProfileName $File.FullName) -RawPath $File.FullName -Entries @($entries) -MaxRows $MaxRows
+}
+
+# Chromium "Web Data" keywords table: the search engines the browser knows,
+# with when each was added, modified and last used (the last two when later
+# than added; Chromium times). An engine added or changed outside the
+# browser's own sources is a known hijack. Kind: Prepopulated (built in),
+# Policy, StarterPack (@bookmarks, ...), AutoGenerated (from a site's search
+# form) or Custom (added or edited by the user -- or by software writing to
+# Web Data). Returns the row count.
+function Add-ChromiumSearchEngineRows {
+    param([string]$Sqlite3Exe, [System.IO.FileInfo]$File)
+    $c = (Get-Sqlite3TableColumns -Sqlite3Exe $Sqlite3Exe -DbPath $File.FullName -Tables @("keywords"))["keywords"]
+    if (-not $c -or $c -notcontains "url" -or $c -notcontains "date_created") { return 0 }
+    $text = @(Get-SqliteColumnSql -Columns $c -Names @("short_name", "keyword", "url", "originating_url"))
+    $numbers = @(Get-SqliteColumnSql -Columns $c -Number -Names @("date_created", "last_modified", "last_visited", "prepopulate_id", "safe_for_autoreplace", "created_by_policy", "starter_pack_id", "usage_count"))
+    # Numbers first: a site picks the name of an engine made from its search
+    # form, and ConvertFrom-Csv drops a line that starts with '#' (a comment)
+    $query = "SELECT " + (($numbers + $text) -join ", ") + " FROM keywords ORDER BY date_created;"
+    $rows = @(Invoke-Sqlite3Query -Sqlite3Exe $Sqlite3Exe -DbPath $File.FullName -Query $query)
+
+    $source = "$(Get-ChromiumBrowserName $File.FullName) Search Engines"
+    $user = Get-CollectionUser $File.FullName
+    $profileName = Get-BrowserProfileName $File.FullName
+    $header = @("Created", "Modified", "LastUsed", "Prepopulated", "AutoReplace", "Policy", "StarterPack", "UsageCount", "Name", "Keyword", "Url", "OriginatingUrl")
+    $count = 0
+    foreach ($r in ($rows | ConvertFrom-Csv -Header $header)) {
+        $created = ConvertFrom-ChromiumTime $r.Created
+        $modified = ConvertFrom-ChromiumTime $r.Modified
+        $lastUsed = ConvertFrom-ChromiumTime $r.LastUsed
+        $kind = "Custom"
+        if ($r.Policy -ne "0") { $kind = "Policy" }
+        elseif ($r.Prepopulated -ne "0") { $kind = "Prepopulated" }
+        elseif ($r.StarterPack -ne "0") { $kind = "StarterPack" }
+        elseif ($r.AutoReplace -eq "1") { $kind = "AutoGenerated" }
+        $label = if ($r.Name) { "$($r.Name) ($($r.Url))" } else { $r.Url }
+        $details = Format-ArtifactDetails ([ordered]@{
+            Name           = $r.Name
+            Keyword        = $r.Keyword
+            URL            = $r.Url
+            Kind           = $kind
+            OriginatingURL = $r.OriginatingUrl
+            UsageCount     = $r.UsageCount
+            CreatedUtc     = Format-UtcDetailTime $created
+            ModifiedUtc    = Format-UtcDetailTime $modified
+            LastUsedUtc    = Format-UtcDetailTime $lastUsed
+            Profile        = $profileName
+        })
+        $rowList = @(, @($created, "Search engine added: $label"))
+        if ($modified -and (-not $created -or ($modified - $created).TotalSeconds -ge 1)) {
+            $rowList += , @($modified, "Search engine modified: $label")
+        }
+        if ($lastUsed -and (-not $created -or ($lastUsed - $created).TotalSeconds -ge 1)) {
+            $rowList += , @($lastUsed, "Search engine last used: $label")
+        }
+        foreach ($row in $rowList) {
+            if ($null -eq $row[0]) { continue }
+            Add-TimelineEntry -Timestamp $row[0] -Source $source -EventType "NetworkConnection" `
+                -Description $row[1] `
+                -User $user -Details $details `
+                -Artifact "Browser" -RawPath $File.FullName
+            $count++
+        }
+    }
+    return $count
+}
+
+# Firefox permissions.sqlite (moz_perms): site permissions (notifications,
+# camera, microphone, location, pop-ups, add-on installs, ...) at the time
+# they were last set (milliseconds since 1970 UTC). Returns the row count.
+function Add-FirefoxPermissionRows {
+    param([string]$Sqlite3Exe, [System.IO.FileInfo]$File)
+    $query = "SELECT replace(replace(origin, char(13), ' '), char(10), ' '), replace(replace(type, char(13), ' '), char(10), ' '), " +
+             "permission, expireType, expireTime, modificationTime FROM moz_perms WHERE modificationTime > 0 ORDER BY modificationTime;"
+    $rows = @(Invoke-Sqlite3Query -Sqlite3Exe $Sqlite3Exe -DbPath $File.FullName -Query $query)
+    $user = Get-CollectionUser $File.FullName
+    $profileName = Get-BrowserProfileName $File.FullName
+    $count = 0
+    foreach ($r in ($rows | ConvertFrom-Csv -Header "Origin", "Type", "Permission", "ExpireType", "ExpireTime", "Modified")) {
+        $ts = ConvertFrom-UnixTime $r.Modified -Unit Milliseconds
+        if ($null -eq $ts) { continue }
+        $value = Get-AntiVirusCodeName -Names $script:FirefoxPermissionValues -Code $r.Permission
+        $expires = if ($r.ExpireType -eq "2") { ConvertFrom-UnixTime $r.ExpireTime -Unit Milliseconds } else { $null }
+        Add-TimelineEntry -Timestamp $ts -Source "Firefox Permissions" -EventType "NetworkConnection" `
+            -Description "Site permission set: $($r.Origin) $($r.Type)=$value" `
+            -User $user `
+            -Details (Format-ArtifactDetails ([ordered]@{
+                Origin     = $r.Origin
+                Type       = $r.Type
+                Permission = $value
+                Expiry     = Get-AntiVirusCodeName -Names $script:FirefoxPermissionExpiry -Code $r.ExpireType
+                ExpiresUtc = Format-UtcDetailTime $expires
+                Profile    = $profileName
+            })) `
+            -Artifact "Browser" -RawPath $File.FullName
+        $count++
+    }
+    return $count
+}
+
 function Parse-BrowserHistory {
     Log "--- Parsing Browser History ---"
 
@@ -3486,8 +6099,31 @@ function Parse-BrowserHistory {
     }
     $bookmarkFiles = @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("Bookmarks") | Where-Object { -not $_.PSIsContainer })
 
-    $totalBrowserFiles = $chromeHistoryPaths.Count + $firefoxHistoryPaths.Count + $chromeShortcutPaths.Count + $chromeTopSitesPaths.Count
-    if ($totalBrowserFiles + $bookmarkFiles.Count -eq 0) {
+    # Credential, cookie, form and permission stores (metadata only, see above)
+    $chromeLoginPaths = @()
+    $chromeCookiePaths = @()
+    $chromeWebDataPaths = @()
+    $firefoxCookiePaths = @()
+    $firefoxFormHistoryPaths = @()
+    $firefoxPermissionPaths = @()
+    foreach ($f in (Find-ArtifactFiles -BasePath $InputPath -FileNames @("Login Data", "Cookies", "Web Data", "cookies.sqlite", "formhistory.sqlite", "permissions.sqlite"))) {
+        if ($f.PSIsContainer) { continue }
+        if (-not (Test-FileSignature -Path $f.FullName -Signature "SQLite format 3")) { continue }
+        switch ($f.Name) {
+            "Login Data"         { $chromeLoginPaths += $f }
+            "Cookies"            { $chromeCookiePaths += $f }
+            "Web Data"           { $chromeWebDataPaths += $f }
+            "cookies.sqlite"     { $firefoxCookiePaths += $f }
+            "formhistory.sqlite" { $firefoxFormHistoryPaths += $f }
+            "permissions.sqlite" { $firefoxPermissionPaths += $f }
+        }
+    }
+    $firefoxLoginFiles = @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("logins.json") | Where-Object { -not $_.PSIsContainer })
+
+    $totalBrowserFiles = $chromeHistoryPaths.Count + $firefoxHistoryPaths.Count + $chromeShortcutPaths.Count + $chromeTopSitesPaths.Count +
+        $chromeLoginPaths.Count + $chromeCookiePaths.Count + $chromeWebDataPaths.Count +
+        $firefoxCookiePaths.Count + $firefoxFormHistoryPaths.Count + $firefoxPermissionPaths.Count
+    if ($totalBrowserFiles + $bookmarkFiles.Count + $firefoxLoginFiles.Count -eq 0) {
         Log-Warning "No browser history databases found. Skipping."
         Log ""
         return
@@ -3502,6 +6138,16 @@ function Parse-BrowserHistory {
             if ($added -gt 0) { $browserParsed = $true }
         }
         catch { Log-Warning "    Could not read bookmarks $($bm.FullName): $($_.Exception.Message)" }
+    }
+    # Firefox saved logins (JSON, no sqlite3 needed)
+    foreach ($lj in $firefoxLoginFiles) {
+        Log "  Parsing: Firefox Logins ($(Get-CollectionUser $lj.FullName))"
+        try {
+            $added = Add-FirefoxLoginRows -File $lj
+            Log "    $added saved login row(s) added."
+            if ($added -gt 0) { $browserParsed = $true }
+        }
+        catch { Log-Warning "    Could not read saved logins $($lj.FullName): $($_.Exception.Message)" }
     }
     if ($totalBrowserFiles -eq 0) {
         Log "  Browser history parsing complete."
@@ -3636,6 +6282,34 @@ function Parse-BrowserHistory {
         }
         Log "    $sites top site(s) added (snapshot)."
         if ($sites -gt 0) { $browserParsed = $true }
+    }
+
+    # Downloads and the credential, cookie, form and permission stores: files,
+    # the Add-* function that parses one, the Source suffix, and whether the
+    # browser name comes from the Chromium layout (else Firefox). Web Data
+    # holds both autofill and the search engines.
+    $storeParsers = @(
+        @{ Files = $chromeHistoryPaths;      Parser = "Add-ChromiumDownloadRows";     Label = "Downloads";      Chromium = $true }
+        @{ Files = $firefoxHistoryPaths;     Parser = "Add-FirefoxDownloadRows";      Label = "Downloads";      Chromium = $false }
+        @{ Files = $chromeLoginPaths;        Parser = "Add-ChromiumLoginRows";        Label = "Logins";         Chromium = $true }
+        @{ Files = $chromeCookiePaths;       Parser = "Add-ChromiumCookieRows";       Label = "Cookies";        Chromium = $true }
+        @{ Files = $chromeWebDataPaths;      Parser = "Add-ChromiumAutofillRows";     Label = "Autofill";       Chromium = $true }
+        @{ Files = $chromeWebDataPaths;      Parser = "Add-ChromiumSearchEngineRows"; Label = "Search Engines"; Chromium = $true }
+        @{ Files = $firefoxCookiePaths;      Parser = "Add-FirefoxCookieRows";        Label = "Cookies";        Chromium = $false }
+        @{ Files = $firefoxFormHistoryPaths; Parser = "Add-FirefoxFormHistoryRows";   Label = "Form History";   Chromium = $false }
+        @{ Files = $firefoxPermissionPaths;  Parser = "Add-FirefoxPermissionRows";    Label = "Permissions";    Chromium = $false }
+    )
+    foreach ($store in $storeParsers) {
+        foreach ($db in $store.Files) {
+            $storeName = if ($store.Chromium) { "$(Get-ChromiumBrowserName $db.FullName) $($store.Label)" } else { "Firefox $($store.Label)" }
+            Log "  Parsing: $storeName ($(Get-CollectionUser $db.FullName))"
+            try {
+                $added = & $store.Parser -Sqlite3Exe $sqlite3Exe -File $db
+                Log "    $added row(s) added."
+                if ($added -gt 0) { $browserParsed = $true }
+            }
+            catch { Log-Warning "    Could not parse $storeName from $($db.FullName): $($_.Exception.Message)" }
+        }
     }
 
     if (-not $browserParsed) {
@@ -3909,6 +6583,15 @@ function Parse-Services {
 # number does not match (record reused), gives an "<orphan>\" prefix. NTFS
 # increments the sequence number when a record is freed, so a deleted parent
 # also matches a reference one lower.
+# Mark of the Web: a downloaded file has a named 0x80 $DATA stream
+# "Zone.Identifier" (attribute name length 0x09, name offset 0x0A, UTF-16)
+# holding INI text ([ZoneTransfer] ZoneId=3, ReferrerUrl=, HostUrl=). It is
+# small, so it is almost always resident (non-resident flag 0x08 = 0) and the
+# text is in the record itself. Attributes in an extension record (one an
+# $ATTRIBUTE_LIST points to) count for its base record, names and this stream
+# alike (the stream only from an in-use extension record when the file is in
+# use). A non-resident stream's text is in clusters outside the $MFT: such a
+# file still gets a row, with the zone unknown.
 function Initialize-MftParser {
     if ($null -ne $script:mftParserReady) { return $script:mftParserReady }
     $script:mftParserReady = $false
@@ -3930,11 +6613,16 @@ namespace TimelineNtfs
         public string Description { get; set; }
         public string User { get; set; }
         public string Details { get; set; }
+        public bool MarkOfTheWeb { get; set; }
     }
 
     public sealed class MftResult
     {
-        public MftResult() { Rows = new List<MftRow>(); }
+        public MftResult()
+        {
+            Rows = new List<MftRow>();
+            ZoneCounts = new SortedDictionary<string, long>(StringComparer.Ordinal);
+        }
         public List<MftRow> Rows { get; private set; }
         public int RecordSize { get; set; }
         public long RecordsRead { get; set; }
@@ -3956,6 +6644,18 @@ namespace TimelineNtfs
         public DateTime ReferenceUtc { get; set; }
         public bool HasWindow { get; set; }
         public DateTime WindowStartUtc { get; set; }
+        // Zone.Identifier (Mark of the Web) streams, after extension records are applied
+        public long ZoneStreams { get; set; }
+        public long ZoneResident { get; set; }
+        public long ZoneNonResident { get; set; }
+        public long ZoneFolders { get; set; }
+        public long ZoneRows { get; set; }
+        public long ZoneExtracted { get; set; }
+        public long ZoneDeleted { get; set; }
+        public long ZoneFnTime { get; set; }
+        public long ZoneOutsideWindow { get; set; }
+        public long ZoneNoTime { get; set; }
+        public SortedDictionary<string, long> ZoneCounts { get; private set; }
     }
 
     public sealed class MftParser
@@ -3971,8 +6671,16 @@ namespace TimelineNtfs
         const byte StDir = 4;
         const byte StHasSI = 8;
         const byte StVisiting = 16;
+        const byte StZone = 32;              // resident Zone.Identifier (text in zoneTexts)
+        const byte StZoneNonResident = 64;   // non-resident Zone.Identifier (text not in the $MFT)
+        const string ZoneStreamName = "zone.identifier";
         static readonly long MaxFileTime = DateTime.MaxValue.ToFileTimeUtc();
+        // Add-TimelineEntry drops times before 1980
+        static readonly long MinRowTime = new DateTime(1980, 1, 1, 0, 0, 0, DateTimeKind.Utc).ToFileTimeUtc();
         static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
+        static readonly Encoding StrictUtf8 = new UTF8Encoding(false, true);
+        static readonly Encoding Ansi = GetAnsiEncoding();
+        static readonly char[] LineBreaks = { '\r', '\n' };
 
         // $FILE_NAME / $DATA found in an extension record, applied to its base record
         sealed class ExtensionPart
@@ -3985,6 +6693,9 @@ namespace TimelineNtfs
             public ushort ParentSeq;
             public long FnCreated;
             public long Size;
+            public string Zone;
+            public bool ZoneNonResident;
+            public bool InUse;
         }
 
         readonly MftResult result = new MftResult();
@@ -4007,6 +6718,8 @@ namespace TimelineNtfs
         int[] parents;
         ushort[] parentSeqs;
         string[] dirPaths;
+        // Zone.Identifier text by record (few records have one)
+        readonly Dictionary<int, string> zoneTexts = new Dictionary<int, string>();
 
         // Attributes of the record being read
         bool curHasSI;
@@ -4020,6 +6733,8 @@ namespace TimelineNtfs
         ushort curParentSeq;
         long curFnCreated;
         long curSize;
+        string curZone;
+        bool curZoneNonResident;
 
         MftParser() { }
 
@@ -4049,6 +6764,11 @@ namespace TimelineNtfs
         static bool IsValidTime(long fileTime)
         {
             return fileTime > 0 && fileTime <= MaxFileTime;
+        }
+
+        static bool IsRowTime(long fileTime)
+        {
+            return fileTime >= MinRowTime && fileTime <= MaxFileTime;
         }
 
         void ReadFile(string path)
@@ -4143,7 +6863,7 @@ namespace TimelineNtfs
             if (baseRecord != 0)
             {
                 result.Extension++;
-                if (baseRecord < count && baseRecord != rec && (curName != null || curSize >= 0))
+                if (baseRecord < count && baseRecord != rec && (curName != null || curSize >= 0 || curZone != null || curZoneNonResident))
                 {
                     ExtensionPart part = new ExtensionPart();
                     part.BaseRecord = (int)baseRecord;
@@ -4154,6 +6874,9 @@ namespace TimelineNtfs
                     part.ParentSeq = curParentSeq;
                     part.FnCreated = curFnCreated;
                     part.Size = curSize;
+                    part.Zone = curZone;
+                    part.ZoneNonResident = curZoneNonResident;
+                    part.InUse = (flags & 0x01) != 0;
                     extensions.Add(part);
                 }
                 return;
@@ -4163,6 +6886,8 @@ namespace TimelineNtfs
             if ((flags & 0x01) != 0) st |= StInUse;
             if ((flags & 0x02) != 0) st |= StDir;
             if (curHasSI) st |= StHasSI;
+            if (curZone != null) { st |= StZone; zoneTexts[rec] = curZone; }
+            if (curZoneNonResident) st |= StZoneNonResident;
             state[rec] = st;
             seq[rec] = sequence;
             siCreated[rec] = curSiCreated;
@@ -4185,6 +6910,7 @@ namespace TimelineNtfs
             curSiCreated = 0; curSiModified = 0; curSiChanged = 0; curSiAccessed = 0;
             curName = null; curPriority = 0; curParent = -1; curParentSeq = 0;
             curFnCreated = 0; curSize = -1;
+            curZone = null; curZoneNonResident = false;
 
             int a = first;
             while (a + 4 <= used)
@@ -4232,6 +6958,10 @@ namespace TimelineNtfs
                     {
                         curSize = contentLength;
                     }
+                    else if (type == 0x80 && IsZoneIdentifier(b, o + a, len, nameLength))
+                    {
+                        curZone = DecodeZoneText(b, c, (int)contentLength);
+                    }
                 }
                 else if (type == 0x80 && nameLength == 0)
                 {
@@ -4239,9 +6969,65 @@ namespace TimelineNtfs
                     if (len < 0x40) return false;
                     if (BitConverter.ToInt64(b, o + a + 0x10) == 0) curSize = BitConverter.ToInt64(b, o + a + 0x30);
                 }
+                else if (type == 0x80 && IsZoneIdentifier(b, o + a, len, nameLength))
+                {
+                    curZoneNonResident = true;
+                }
                 a += len;
             }
             return true;
+        }
+
+        // Attribute name (UTF-16 at the name offset 0x0A) is "Zone.Identifier",
+        // ignoring ASCII case, compared in place: this runs for every named $DATA
+        static bool IsZoneIdentifier(byte[] b, int attribute, int len, int nameLength)
+        {
+            if (nameLength != ZoneStreamName.Length) return false;
+            int nameOffset = BitConverter.ToUInt16(b, attribute + 0x0A);
+            if (nameOffset + nameLength * 2 > len) return false;
+            int p = attribute + nameOffset;
+            for (int i = 0; i < nameLength; i++)
+            {
+                int ch = b[p + 2 * i] | (b[p + 2 * i + 1] << 8);
+                if (ch >= 'A' && ch <= 'Z') ch += 32;
+                if (ch != ZoneStreamName[i]) return false;
+            }
+            return true;
+        }
+
+        // Windows-1252, or Latin-1 (the same but for 0x80-0x9F) where the .NET
+        // runtime has no code-page encodings registered
+        static Encoding GetAnsiEncoding()
+        {
+            try { return Encoding.GetEncoding(1252); }
+            catch (NotSupportedException) { return Encoding.GetEncoding(28591); }
+            catch (ArgumentException) { return Encoding.GetEncoding(28591); }
+        }
+
+        // Zone.Identifier text: UTF-16 with a BOM (or little-endian without one,
+        // seen as a 0 second byte), UTF-8 with or without a BOM, else ANSI
+        static string DecodeZoneText(byte[] b, int start, int length)
+        {
+            string text;
+            if (length >= 2 && b[start] == 0xFF && b[start + 1] == 0xFE)
+            {
+                text = Encoding.Unicode.GetString(b, start + 2, (length - 2) & ~1);
+            }
+            else if (length >= 2 && b[start] == 0xFE && b[start + 1] == 0xFF)
+            {
+                text = Encoding.BigEndianUnicode.GetString(b, start + 2, (length - 2) & ~1);
+            }
+            else if (length >= 4 && b[start] != 0 && b[start + 1] == 0 && b[start + 3] == 0)
+            {
+                text = Encoding.Unicode.GetString(b, start, length & ~1);
+            }
+            else
+            {
+                if (length >= 3 && b[start] == 0xEF && b[start + 1] == 0xBB && b[start + 2] == 0xBF) { start += 3; length -= 3; }
+                try { text = StrictUtf8.GetString(b, start, length); }
+                catch (DecoderFallbackException) { text = Ansi.GetString(b, start, length); }
+            }
+            return text.Trim('\0', ' ', '\t', '\r', '\n');
         }
 
         // Sequence check; a freed record's number was incremented when it was freed
@@ -4269,6 +7055,15 @@ namespace TimelineNtfs
                     fnCreated[r] = part.FnCreated;
                 }
                 if (part.Size >= 0 && dataSize[r] < 0) dataSize[r] = part.Size;
+                // A freed extension record keeps the stream an in-use file has
+                // since lost (Unblock-File): only a deleted file takes it
+                if (!part.InUse && (state[r] & StInUse) != 0) continue;
+                if (part.Zone != null && (state[r] & StZone) == 0)
+                {
+                    zoneTexts[r] = part.Zone;
+                    state[r] |= StZone;
+                }
+                if (part.ZoneNonResident) state[r] |= StZoneNonResident;
             }
             extensions.Clear();
         }
@@ -4371,11 +7166,16 @@ namespace TimelineNtfs
             sb.Append(" | ").Append(label).Append('=').Append(DateTime.FromFileTimeUtc(fileTime).ToString(TimeFormat, Inv));
         }
 
+        void AppendRecord(StringBuilder sb, int r)
+        {
+            sb.Append("MftRecord=").Append(r.ToString(Inv)).Append(" | Seq=").Append(seq[r].ToString(Inv));
+            if ((state[r] & StDir) == 0 && dataSize[r] >= 0) sb.Append(" | Size=").Append(dataSize[r].ToString(Inv));
+        }
+
         string Details(int r, bool createdRow, string stomp)
         {
             StringBuilder sb = new StringBuilder(256);
-            sb.Append("MftRecord=").Append(r.ToString(Inv)).Append(" | Seq=").Append(seq[r].ToString(Inv));
-            if ((state[r] & StDir) == 0 && dataSize[r] >= 0) sb.Append(" | Size=").Append(dataSize[r].ToString(Inv));
+            AppendRecord(sb, r);
             if (createdRow) AppendTime(sb, "SI.Modified", siModified[r]);
             else AppendTime(sb, "SI.Created", siCreated[r]);
             AppendTime(sb, "SI.MftChanged", siChanged[r]);
@@ -4385,7 +7185,179 @@ namespace TimelineNtfs
             return sb.ToString();
         }
 
-        void AddRow(long fileTime, string description, string user, string details)
+        // key=value lines of a Zone.Identifier ([ZoneTransfer] ZoneId=3,
+        // ReferrerUrl=, HostUrl=, sometimes LastWriterPackageFamilyName,
+        // AppZoneId). Section and comment lines and empty values are skipped,
+        // the first of a repeated key is kept, the three usual keys come first
+        // with their usual spelling, then the others in file order. The text is
+        // written by whatever saved the file, so keys not known here get a
+        // "Zone." prefix (a stream line cannot pose as MftRecord, SI.Created and
+        // so on) and "|" becomes %7C (Details stay splittable on " | ").
+        static readonly string[] ZoneKeys = { "ZoneId", "HostUrl", "ReferrerUrl" };
+        static readonly string[] OtherZoneKeys = { "LastWriterPackageFamilyName", "AppZoneId", "AppDefinedZoneId", "HostIpAddress" };
+
+        static string ZoneField(string text)
+        {
+            return text.IndexOf('|') < 0 ? text : text.Replace("|", "%7C");
+        }
+
+        static string ZoneKey(string key)
+        {
+            foreach (string known in ZoneKeys)
+            {
+                if (string.Equals(key, known, StringComparison.OrdinalIgnoreCase)) return known;
+            }
+            foreach (string known in OtherZoneKeys)
+            {
+                if (string.Equals(key, known, StringComparison.OrdinalIgnoreCase)) return known;
+            }
+            return "Zone." + ZoneField(key);
+        }
+
+        static List<KeyValuePair<string, string>> ParseZoneText(string text)
+        {
+            List<KeyValuePair<string, string>> found = new List<KeyValuePair<string, string>>();
+            foreach (string rawLine in text.Split(LineBreaks, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string line = rawLine.Trim();
+                if (line.Length == 0 || line[0] == '[' || line[0] == ';') continue;
+                int eq = line.IndexOf('=');
+                if (eq <= 0) continue;
+                string key = line.Substring(0, eq).Trim();
+                string value = line.Substring(eq + 1).Trim();
+                if (key.Length == 0 || value.Length == 0) continue;
+                key = ZoneKey(key);
+                if (ZoneValue(found, key) != null) continue;
+                found.Add(new KeyValuePair<string, string>(key, ZoneField(value)));
+            }
+            List<KeyValuePair<string, string>> pairs = new List<KeyValuePair<string, string>>(found.Count);
+            foreach (string known in ZoneKeys)
+            {
+                string value = ZoneValue(found, known);
+                if (value != null) pairs.Add(new KeyValuePair<string, string>(known, value));
+            }
+            foreach (KeyValuePair<string, string> pair in found)
+            {
+                if (Array.IndexOf(ZoneKeys, pair.Key) < 0) pairs.Add(pair);
+            }
+            return pairs;
+        }
+
+        static string ZoneValue(List<KeyValuePair<string, string>> pairs, string key)
+        {
+            if (pairs == null) return null;
+            foreach (KeyValuePair<string, string> pair in pairs)
+            {
+                if (string.Equals(pair.Key, key, StringComparison.OrdinalIgnoreCase)) return pair.Value;
+            }
+            return null;
+        }
+
+        // URLZONE names as Internet Options shows them; null pairs = non-resident stream
+        static string ZoneLabel(List<KeyValuePair<string, string>> pairs)
+        {
+            int zone;
+            if (!int.TryParse(ZoneValue(pairs, "ZoneId"), NumberStyles.Integer, Inv, out zone)) return "zone unknown";
+            switch (zone)
+            {
+                case 0: return "Local machine zone";
+                case 1: return "Local intranet zone";
+                case 2: return "Trusted sites zone";
+                case 3: return "Internet zone";
+                case 4: return "Restricted sites zone";
+                default: return "zone " + zone.ToString(Inv);
+            }
+        }
+
+        // Appended to the Details of the file's "File created" row: ZoneId and
+        // HostUrl, or ReferrerUrl when there is no HostUrl (an extracted file)
+        static string ZoneSuffix(List<KeyValuePair<string, string>> pairs)
+        {
+            if (pairs == null) return "";
+            StringBuilder sb = new StringBuilder(128);
+            string zoneId = ZoneValue(pairs, "ZoneId");
+            string hostUrl = ZoneValue(pairs, "HostUrl");
+            string referrerUrl = ZoneValue(pairs, "ReferrerUrl");
+            if (zoneId != null) sb.Append(" | ZoneId=").Append(zoneId);
+            if (hostUrl != null) sb.Append(" | HostUrl=").Append(hostUrl);
+            else if (referrerUrl != null) sb.Append(" | ReferrerUrl=").Append(referrerUrl);
+            return sb.ToString();
+        }
+
+        // Explorer (and other unzip tools) give each file extracted from an
+        // archive with Mark of the Web the archive's ZoneId and its local or
+        // network path as ReferrerUrl, with no HostUrl
+        static bool IsExtracted(List<KeyValuePair<string, string>> pairs)
+        {
+            if (ZoneValue(pairs, "HostUrl") != null) return false;
+            string referrer = ZoneValue(pairs, "ReferrerUrl");
+            if (referrer == null) return false;
+            if (referrer.Length >= 3 && referrer[1] == ':' && (referrer[2] == '\\' || referrer[2] == '/'))
+            {
+                char drive = char.ToUpperInvariant(referrer[0]);
+                if (drive >= 'A' && drive <= 'Z') return true;
+            }
+            return referrer.StartsWith("\\\\", StringComparison.Ordinal) || referrer.StartsWith("file:", StringComparison.OrdinalIgnoreCase);
+        }
+
+        string ZoneDetails(int r, List<KeyValuePair<string, string>> pairs, bool fnTime, string stomp)
+        {
+            StringBuilder sb = new StringBuilder(512);
+            if (pairs == null) sb.Append("ZoneIdentifier=non-resident (its text is not in the $MFT)");
+            else if (pairs.Count == 0) sb.Append("ZoneIdentifier=no key=value lines");
+            else
+            {
+                foreach (KeyValuePair<string, string> pair in pairs)
+                {
+                    if (sb.Length > 0) sb.Append(" | ");
+                    sb.Append(pair.Key).Append('=').Append(pair.Value);
+                }
+            }
+            sb.Append(" | ");
+            AppendRecord(sb, r);
+            AppendTime(sb, "SI.Created", siCreated[r]);
+            AppendTime(sb, "SI.Modified", siModified[r]);
+            AppendTime(sb, "SI.MftChanged", siChanged[r]);
+            AppendTime(sb, "SI.Accessed", siAccessed[r]);
+            AppendTime(sb, "FN.Created", fnCreated[r]);
+            if (fnTime) sb.Append(" | RowTime=FN.Created");
+            if (stomp != null) sb.Append(" | Timestomp=").Append(stomp);
+            return sb.ToString();
+        }
+
+        // "Downloaded file (Mark of the Web, <zone>): <path>", or "Extracted
+        // file (...)" (see IsExtracted), "; record deleted" in the brackets for
+        // a record no longer in use. The row is at SI Created, or at FN Created
+        // (RowTime=FN.Created in Details) when SI Created is missing, before 1980
+        // or more than 1 s earlier: backdating tools, and extraction (which sets
+        // the archive entry's time), change SI Created, while FN Created is when
+        // the file arrived on the volume. [SI<FN] as on the file's other rows,
+        // but not for an extracted file, whose earlier SI Created the stream
+        // explains. Added whatever the -MftDays window. False if the file has no
+        // time from 1980 on.
+        bool AddZoneRow(int r, string path, string user, List<KeyValuePair<string, string>> pairs, string stomp, long windowStart)
+        {
+            long time = siCreated[r];
+            bool fnTime = IsRowTime(fnCreated[r]) && (!IsRowTime(time) || time < fnCreated[r] - TicksPerSecond);
+            if (fnTime) time = fnCreated[r];
+            if (!IsRowTime(time)) { result.ZoneNoTime++; return false; }
+            string zone = ZoneLabel(pairs);
+            long seen;
+            result.ZoneCounts.TryGetValue(zone, out seen);
+            result.ZoneCounts[zone] = seen + 1;
+            if (fnTime) result.ZoneFnTime++;
+            if (time < windowStart) result.ZoneOutsideWindow++;
+            string noun = "Downloaded file";
+            if (IsExtracted(pairs)) { noun = "Extracted file"; stomp = null; result.ZoneExtracted++; }
+            string qualifier = zone;
+            if ((state[r] & StInUse) == 0) { qualifier += "; record deleted"; result.ZoneDeleted++; }
+            string marker = stomp != null ? " [SI<FN]" : "";
+            AddRow(time, noun + " (Mark of the Web, " + qualifier + "): " + path + marker, user, ZoneDetails(r, pairs, fnTime, stomp)).MarkOfTheWeb = true;
+            result.ZoneRows++;
+            return true;
+        }
+
+        MftRow AddRow(long fileTime, string description, string user, string details)
         {
             MftRow row = new MftRow();
             row.Time = DateTime.FromFileTimeUtc(fileTime);
@@ -4393,6 +7365,7 @@ namespace TimelineNtfs
             row.User = user;
             row.Details = details;
             result.Rows.Add(row);
+            return row;
         }
 
         static long Newer(long newest, long fileTime, long limit)
@@ -4412,6 +7385,13 @@ namespace TimelineNtfs
                 if ((st & StInUse) != 0) result.InUse++;
                 else if ((st & StHasSI) != 0 || names[r] != null) result.Deleted++;
                 else result.Unused++;
+                if ((st & (StZone | StZoneNonResident)) != 0)
+                {
+                    result.ZoneStreams++;
+                    if ((st & StZone) != 0) result.ZoneResident++;
+                    else result.ZoneNonResident++;
+                    if ((st & StDir) != 0) result.ZoneFolders++;
+                }
                 if ((st & StHasSI) == 0) continue;
                 newest = Newer(newest, siCreated[r], limit);
                 newest = Newer(newest, siModified[r], limit);
@@ -4440,7 +7420,11 @@ namespace TimelineNtfs
             for (int r = 0; r < count; r++)
             {
                 byte st = state[r];
-                if ((st & StValid) == 0 || (st & StHasSI) == 0) continue;
+                if ((st & StValid) == 0) continue;
+                // Mark of the Web rows are for files; a record without
+                // $STANDARD_INFORMATION (SI times all 0) gets only that row
+                bool hasZone = (st & StDir) == 0 && (st & (StZone | StZoneNonResident)) != 0;
+                if ((st & StHasSI) == 0 && !hasZone) continue;
                 long created = siCreated[r];
                 long modified = siModified[r];
                 string stomp = null;
@@ -4467,19 +7451,23 @@ namespace TimelineNtfs
                     else if (keepFlagged) { modifiedRow = true; result.KeptForTimestomp++; }
                     else result.OutsideWindow++;
                 }
-                if (!createdRow && !modifiedRow) continue;
+                if (!createdRow && !modifiedRow && !hasZone) continue;
 
                 string path = FullPath(r);
-                if (path.StartsWith(OrphanPrefix, StringComparison.Ordinal)) result.OrphanPaths++;
                 bool isDir = (st & StDir) != 0;
                 string noun;
                 if ((st & StInUse) == 0) noun = isDir ? "Deleted folder" : "Deleted file";
                 else noun = isDir ? "Folder" : "File";
                 string marker = stomp != null ? " [SI<FN]" : "";
                 string user = UserFromPath(path);
-                if (createdRow) AddRow(created, noun + " created: " + path + marker, user, Details(r, true, stomp));
+                List<KeyValuePair<string, string>> zonePairs = null;
+                if (hasZone && (st & StZone) != 0) zonePairs = ParseZoneText(zoneTexts[r]);
+                // The origin URL also goes on the file's created row (Details only)
+                if (createdRow) AddRow(created, noun + " created: " + path + marker, user, Details(r, true, stomp) + ZoneSuffix(zonePairs));
                 if (modifiedRow) AddRow(modified, noun + " modified: " + path + marker, user, Details(r, false, stomp));
                 if (stomp != null) result.TimestompRows += (createdRow ? 1 : 0) + (modifiedRow ? 1 : 0);
+                bool zoneRow = hasZone && AddZoneRow(r, path, user, zonePairs, stomp, windowStart);
+                if ((createdRow || modifiedRow || zoneRow) && path.StartsWith(OrphanPrefix, StringComparison.Ordinal)) result.OrphanPaths++;
             }
         }
     }
@@ -4499,6 +7487,15 @@ namespace TimelineNtfs
 # collection start (the newest $MFT time if that is unknown); later times are
 # kept. Records flagged [SI<FN] (possible timestomping) are also kept when
 # their FN Created time is in the window, as backdating moves SI times out of it.
+# A file with a Zone.Identifier stream (Mark of the Web) also gets a
+# "Downloaded file (Mark of the Web, <zone>): <path>" row ("Extracted file"
+# when the stream names the archive it came from instead of a URL) with ZoneId,
+# HostUrl, ReferrerUrl and any other key=value of the stream in Details, at SI
+# Created, or at FN Created when SI Created is earlier (backdated, or the
+# archive entry time). These rows are added whatever -MftDays: there are few of
+# them and they tie a file to the URL it came from. The file's "File created"
+# row, when in the window, gets ZoneId and HostUrl (or ReferrerUrl) appended to
+# its Details.
 function Add-MftTimelineEntries {
     param([System.IO.FileInfo]$File)
     if (-not (Initialize-MftParser)) { return }
@@ -4539,10 +7536,13 @@ function Add-MftTimelineEntries {
 
     $before = $script:timelineEntries.Count
     $rawPath = $File.FullName
+    $zoneAdded = 0
     foreach ($row in $mftResult.Rows) {
+        $entryCount = $script:timelineEntries.Count
         Add-TimelineEntry -Timestamp $row.Time -Source "MFT" -EventType "FileAccess" `
             -Description $row.Description -User $row.User -Details $row.Details `
             -Artifact "FileSystem" -RawPath $rawPath
+        if ($row.MarkOfTheWeb -and $script:timelineEntries.Count -gt $entryCount) { $zoneAdded++ }
     }
     $added = $script:timelineEntries.Count - $before
     $summary = "  Added $added row(s); $($mftResult.OutsideWindow) time(s) outside the window skipped"
@@ -4550,6 +7550,28 @@ function Add-MftTimelineEntries {
     Log "$summary."
     if ($mftResult.TimestompRecords -gt 0) {
         Log "  $($mftResult.TimestompRecords) record(s) flagged [SI<FN] (possible timestomping; see Details): $($mftResult.TimestompRows) row(s), $($mftResult.KeptForTimestomp) of them outside the window."
+    }
+    if ($mftResult.ZoneStreams -gt 0) {
+        $zoneSummary = @($mftResult.ZoneCounts.GetEnumerator() | ForEach-Object { "$($_.Value) $($_.Key)" }) -join ", "
+        Log ("  Mark of the Web: $($mftResult.ZoneStreams) Zone.Identifier stream(s), $($mftResult.ZoneResident) resident (text read from the `$MFT), " +
+            "$($mftResult.ZoneNonResident) non-resident (text not in the `$MFT; their rows say 'zone unknown').")
+        if ($mftResult.ZoneRows -gt 0) {
+            Log ("  Mark of the Web: $($mftResult.ZoneRows) row(s) ($zoneSummary): $($mftResult.ZoneExtracted) 'Extracted file', " +
+                "$($mftResult.ZoneDeleted) with the record deleted, $($mftResult.ZoneFnTime) at FN Created (RowTime=FN.Created); " +
+                "added regardless of -MftDays, $($mftResult.ZoneOutsideWindow) of them dated before its window.")
+        }
+        if ($mftResult.ZoneRows -gt $zoneAdded) {
+            Log "  Mark of the Web: $($mftResult.ZoneRows - $zoneAdded) of these row(s) dropped by -StartDate/-EndDate."
+        }
+        if ($mftResult.ZoneFolders -gt 0) {
+            Log "  Mark of the Web: $($mftResult.ZoneFolders) folder(s) with a Zone.Identifier stream skipped (rows are for files)."
+        }
+        if ($mftResult.ZoneNoTime -gt 0) {
+            Log-Warning "  Mark of the Web: $($mftResult.ZoneNoTime) file(s) with a Zone.Identifier stream skipped: no SI or FN Created time from 1980 on."
+        }
+    }
+    else {
+        Log "  Mark of the Web: no Zone.Identifier streams in this `$MFT."
     }
     if ($mftResult.OrphanPaths -gt 0) {
         Log "  $($mftResult.OrphanPaths) record(s) with rows have a missing or reused parent folder (path starts with <orphan>)."

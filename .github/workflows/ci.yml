@@ -60,6 +60,27 @@ jobs:
       - name: Run parser tests
         run: ./tests/Test-Parsers.ps1
 
+      # The steps below run even if an earlier one failed, so one run
+      # reports every failing parser
+      - name: Run $MFT parser test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-MftParser.ps1
+
+      - name: Run browser parser tests
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-BrowserParsers.ps1
+
+      # These two change the runner (audit policy, a temporary user, task,
+      # service and event log; temporary registry keys saved with reg save)
+      # and undo it afterwards; they do that only when GITHUB_ACTIONS is set
+      - name: Run event log parser tests
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-EventLogParsers.ps1
+
+      - name: Run registry parser tests
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-RegistryParsers.ps1
+
   analyze:
     name: PSScriptAnalyzer
     runs-on: windows-latest
