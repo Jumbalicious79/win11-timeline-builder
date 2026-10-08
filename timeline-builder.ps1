@@ -29,7 +29,7 @@ param(
     # is how powershell.exe -File passes -Sources A,B; it is split after binding.
     [Parameter(Mandatory = $false)]
     [ValidateScript({
-        $validSources = @("EventLogs", "Prefetch", "RecentFiles", "Registry", "FileSystem", "Browser", "ScheduledTasks", "Services", "Network", "USB", "Persistence", "UsnJournal", "Amcache", "PowerShellHistory", "SystemInfo", "AntiVirus", "Memory")
+        $validSources = @("EventLogs", "Prefetch", "RecentFiles", "Registry", "FileSystem", "Browser", "ScheduledTasks", "Services", "Network", "USB", "Persistence", "UsnJournal", "Amcache", "PowerShellHistory", "SystemInfo", "AntiVirus", "Email", "SRUM", "Memory")
         foreach ($name in ("$_" -split ',')) {
             if ($name.Trim() -and $validSources -notcontains $name.Trim()) {
                 throw "Unknown source '$($name.Trim())'. Valid sources: $($validSources -join ', ')"
@@ -37,7 +37,7 @@ param(
         }
         $true
     })]
-    [string[]]$Sources = @("EventLogs", "Prefetch", "RecentFiles", "Registry", "FileSystem", "Browser", "ScheduledTasks", "Services", "Network", "USB", "Persistence", "UsnJournal", "Amcache", "PowerShellHistory", "SystemInfo", "AntiVirus"),
+    [string[]]$Sources = @("EventLogs", "Prefetch", "RecentFiles", "Registry", "FileSystem", "Browser", "ScheduledTasks", "Services", "Network", "USB", "Persistence", "UsnJournal", "Amcache", "PowerShellHistory", "SystemInfo", "AntiVirus", "Email", "SRUM"),
 
     [Parameter(Mandatory = $false)]
     [string[]]$Keywords,
@@ -7903,6 +7903,13 @@ function ConvertFrom-FormatTableText {
     return $objects
 }
 
+# Email artifacts (Phase 2): replaced by the email parser
+function Parse-Email {
+    Log "--- Parsing Email Artifacts ---"
+    Log "  No email parser yet."
+    Log ""
+}
+
 function Parse-Network {
     Log "--- Parsing Network Artifacts ---"
 
@@ -8640,6 +8647,13 @@ function Parse-Persistence {
 # ----------------------------------------------------------
 # 13. Amcache Parser
 # ----------------------------------------------------------
+# SRUM (Phase 2): replaced by the SRUM parser
+function Parse-Srum {
+    Log "--- Parsing SRUM ---"
+    Log "  No SRUM parser yet."
+    Log ""
+}
+
 function Parse-Amcache {
     Log "--- Parsing Amcache ---"
 
@@ -10267,6 +10281,8 @@ if ($Sources -contains "Amcache")          { Parse-Amcache }
 if ($Sources -contains "PowerShellHistory") { Parse-PowerShellHistory }
 if ($Sources -contains "SystemInfo")       { Parse-SystemInfo }
 if ($Sources -contains "AntiVirus")        { Parse-AntiVirus }
+if ($Sources -contains "Email")            { Parse-Email }
+if ($Sources -contains "SRUM")             { Parse-Srum }
 if ($Sources -contains "Memory")           { Parse-Memory }
 
 # =============================================================
