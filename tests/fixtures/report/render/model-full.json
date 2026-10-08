@@ -1,0 +1,403 @@
+{
+  "SchemaVersion": 1,
+  "GeneratedUtc": "2026-10-08T15:02:47Z",
+  "Collection": {
+    "ComputerName": "WIN11-LAB01",
+    "OS": "Windows 11 Pro 24H2 (build 26100.6584)",
+    "Users": [ "alice", "bob", "Administrator", "svc_backup" ],
+    "Mode": "Live",
+    "TargetTimeZoneId": "Pacific Standard Time",
+    "CollectionStartUtc": "2026-10-08T14:20:05Z",
+    "CollectorUser": "WIN11-LAB01\\analyst",
+    "SecretsIncluded": false,
+    "ThunderbirdIndexIncluded": false
+  },
+  "TimeSpan": { "FirstUtc": "2025-03-14T02:11:08Z", "LastUtc": "2026-10-08T14:28:36Z", "Rows": 245243 },
+  "Counts": { "High": 3, "Medium": 6, "Info": 5 },
+  "TopFindings": [ "F001", "F002", "F003", "F004", "F005" ],
+  "Findings": [
+    {
+      "Id": "F001", "RuleId": "R1-AV-DETECTION", "Title": "Antivirus detection that was not removed", "Category": "Antivirus", "Severity": "High",
+      "Why": "Microsoft Defender found a malicious file and could not remove it, so the file may still be on the computer.",
+      "Technical": "Defender 1116 (detection) followed by 1118/1119: remediation started and failed for the same threat. The threat name and path are in the evidence rows.",
+      "NextSteps": "Check whether the file still exists and whether it ran (Prefetch, BAM, Amcache rows near the detection time). Look at what happened in the minutes before the detection.",
+      "FalsePositives": "Test files and security tools sometimes trigger detections; a failed removal can also mean the file was locked or already gone.",
+      "References": [ "MITRE ATT&CK T1204", "Microsoft Defender event IDs 1116-1119" ],
+      "GroupKey": "Trojan:Win32/Synthetic.A!test", "Count": 3,
+      "FirstSeenUtc": "2026-10-01T09:12:03.412Z", "LastSeenUtc": "2026-10-01T09:12:05.730Z",
+      "Evidence": [
+        { "RowNumber": 74550, "Timestamp": "2026-10-01 09:12:03.412", "Source": "Microsoft-Windows-Windows Defender%4Operational.evtx", "EventType": "SecurityAlert", "Description": "Defender detected Trojan:Win32/Synthetic.A!test (Severe) in C:\\Users\\alice\\Downloads\\Invoice_2291\\setup.exe", "User": "alice", "Details": "EventID=1116 | Threat=Trojan:Win32/Synthetic.A!test | Severity=Severe | Path=file:_C:\\Users\\alice\\Downloads\\Invoice_2291\\setup.exe | Process=C:\\Windows\\explorer.exe", "Artifact": "EventLog", "RawPath": "C:\\collection\\EventLogs\\Microsoft-Windows-Windows Defender%4Operational.evtx" },
+        { "RowNumber": 74552, "Timestamp": "2026-10-01 09:12:04.001", "Source": "Microsoft-Windows-Windows Defender%4Operational.evtx", "EventType": "SecurityAlert", "Description": "Defender remediation started for Trojan:Win32/Synthetic.A!test", "User": "SYSTEM", "Details": "EventID=1118 | Action=Quarantine", "Artifact": "EventLog", "RawPath": "C:\\collection\\EventLogs\\Microsoft-Windows-Windows Defender%4Operational.evtx" },
+        { "RowNumber": 74553, "Timestamp": "2026-10-01 09:12:05.730", "Source": "Microsoft-Windows-Windows Defender%4Operational.evtx", "EventType": "SecurityAlert", "Description": "Defender remediation FAILED for Trojan:Win32/Synthetic.A!test", "User": "SYSTEM", "Details": "EventID=1119 | Action=Quarantine | Error=0x80508023 The file could not be found", "Artifact": "EventLog", "RawPath": "C:\\collection\\EventLogs\\Microsoft-Windows-Windows Defender%4Operational.evtx" }
+      ],
+      "EvidenceTruncated": false, "Escalated": true, "AllowlistedCount": 0
+    },
+    {
+      "Id": "F002", "RuleId": "R2-DEFENDER-RTP-OFF", "Title": "Antivirus real-time protection turned off", "Category": "Antivirus", "Severity": "High",
+      "Why": "The antivirus stopped watching files as they were opened, which attackers often do before running their tools.",
+      "Technical": "Defender 5001 (real-time protection disabled). Check whether it was turned back on (5000) and by whom; Tamper Protection changes appear as 5013.",
+      "NextSteps": "Find who or what turned it off: look at PowerShell, registry and service rows in the minutes before. Check how long protection stayed off.",
+      "FalsePositives": "An administrator troubleshooting, or another antivirus product taking over.",
+      "References": [ "MITRE ATT&CK T1562.001" ],
+      "GroupKey": "R2-DEFENDER-RTP-OFF", "Count": 1,
+      "FirstSeenUtc": "2026-09-30T13:53:10.215Z", "LastSeenUtc": "2026-09-30T13:53:10.215Z",
+      "Evidence": [
+        { "RowNumber": 70392, "Timestamp": "2026-09-30 13:53:10.215", "Source": "Microsoft-Windows-Windows Defender%4Operational.evtx", "EventType": "SecurityAlert", "Description": "Defender real-time protection was disabled", "User": "SYSTEM", "Details": "EventID=5001", "Artifact": "EventLog", "RawPath": "C:\\collection\\EventLogs\\Microsoft-Windows-Windows Defender%4Operational.evtx" }
+      ],
+      "EvidenceTruncated": false, "Escalated": false, "AllowlistedCount": 0
+    },
+    {
+      "Id": "F003", "RuleId": "P1-LOG-CLEARED", "Title": "Security event log cleared", "Category": "Integrity", "Severity": "High",
+      "Why": "Someone erased the Windows security log, which removes the record of who signed in and what they did before that moment.",
+      "Technical": "Security 1102 (the audit log was cleared). The account in the event is the one that cleared it. Events before this time are missing from the Security log.",
+      "NextSteps": "Note the account and time. Look for other evidence of the missing period (Prefetch, registry, file system, other logs).",
+      "FalsePositives": "Some administrators clear logs during maintenance or imaging; test labs often do.",
+      "References": [ "MITRE ATT&CK T1070.001" ],
+      "GroupKey": "P1-LOG-CLEARED", "Count": 1,
+      "FirstSeenUtc": "2026-10-01T09:20:44Z", "LastSeenUtc": "2026-10-01T09:20:44Z",
+      "Evidence": [
+        { "RowNumber": 74620, "Timestamp": "2026-10-01 09:20:44.000", "Source": "Security.evtx", "EventType": "SecurityAlert", "Description": "The Security event log was cleared", "User": "WIN11-LAB01\\alice", "Details": "EventID=1102 | SubjectUserName=alice | SubjectDomainName=WIN11-LAB01 | SubjectLogonId=0x3E7A21", "Artifact": "EventLog", "RawPath": "C:\\collection\\EventLogs\\Security.evtx" }
+      ],
+      "EvidenceTruncated": false, "Escalated": false, "AllowlistedCount": 0
+    },
+    {
+      "Id": "F004", "RuleId": "R2-DEFENDER-EXCLUSION", "Title": "Antivirus exclusion added", "Category": "Antivirus", "Severity": "Medium",
+      "Why": "Someone told the antivirus to ignore a folder, so files placed there are no longer scanned.",
+      "Technical": "Defender 5007 configuration change adding a path under Exclusions\\Paths. The new value is in Details.",
+      "NextSteps": "Check whether the excluded folder holds programs, and who added the exclusion. Compare with the organisation's approved exclusions.",
+      "FalsePositives": "Backup, database and developer tools often need exclusions set by IT.",
+      "References": [ "MITRE ATT&CK T1562.001" ],
+      "GroupKey": "C:\\ProgramData\\SyncHelper", "Count": 2,
+      "FirstSeenUtc": "2026-09-30T13:52:40.870Z", "LastSeenUtc": "2026-10-01T09:05:13.002Z",
+      "Evidence": [
+        { "RowNumber": 70388, "Timestamp": "2026-09-30 13:52:40.870", "Source": "Microsoft-Windows-Windows Defender%4Operational.evtx", "EventType": "SecurityAlert", "Description": "Defender configuration changed: exclusion path added", "User": "SYSTEM", "Details": "EventID=5007 | Old= | New=HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Paths\\C:\\ProgramData\\SyncHelper = 0x0", "Artifact": "EventLog", "RawPath": "C:\\collection\\EventLogs\\Microsoft-Windows-Windows Defender%4Operational.evtx" },
+        { "RowNumber": 74410, "Timestamp": "2026-10-01 09:05:13.002", "Source": "MPLog-20250918-142147.log", "EventType": "SecurityAlert", "Description": "MPLog: exclusion list changed", "User": "", "Details": "Added=C:\\ProgramData\\SyncHelper", "Artifact": "AntiVirus", "RawPath": "C:\\collection\\AntiVirus\\Defender\\MPLog-20250918-142147.log" }
+      ],
+      "EvidenceTruncated": false, "Escalated": false, "AllowlistedCount": 1
+    },
+    {
+      "Id": "F005", "RuleId": "R4-FAILED-LOGON-BURST", "Title": "Burst of failed sign-ins from one address", "Category": "Access", "Severity": "Medium",
+      "Why": "Many wrong passwords were tried from one network address within a few minutes, which is how password-guessing looks.",
+      "Technical": "40 Security 4625 events (logon type 3) from 10.0.4.27 within 3 minutes against several account names. No 4624 from that address followed within the window, so the rule did not escalate.",
+      "NextSteps": "Identify the computer at 10.0.4.27 and check whether any later sign-in (4624) came from it. Check the targeted account names for lockouts.",
+      "FalsePositives": "A service or mapped drive with an old saved password retries quickly and looks the same.",
+      "References": [ "MITRE ATT&CK T1110.001" ],
+      "GroupKey": "10.0.4.27", "Count": 40,
+      "FirstSeenUtc": "2026-10-01T08:55:01.100Z", "LastSeenUtc": "2026-10-01T08:57:40.880Z",
+      "Evidence": [
+        { "RowNumber": 74001, "Timestamp": "2026-10-01 08:55:01.100", "Source": "Security.evtx", "EventType": "Logon", "Description": "Failed logon (type 3) for administrator", "User": "administrator", "Details": "EventID=4625 | LogonType=3 | IpAddress=10.0.4.27 | Status=0xC000006D | SubStatus=0xC000006A", "Artifact": "EventLog", "RawPath": "C:\\collection\\EventLogs\\Security.evtx" },
+        { "RowNumber": 74002, "Timestamp": "2026-10-01 08:55:05.412", "Source": "Security.evtx", "EventType": "Logon", "Description": "Failed logon (type 3) for admin", "User": "admin", "Details": "EventID=4625 | LogonType=3 | IpAddress=10.0.4.27 | Status=0xC000006D | SubStatus=0xC0000064", "Artifact": "EventLog", "RawPath": "C:\\collection\\EventLogs\\Security.evtx" },
+        { "RowNumber": 74003, "Timestamp": "2026-10-01 08:55:09.020", "Source": "Security.evtx", "EventType": "Logon", "Description": "Failed logon (type 3) for alice", "User": "alice", "Details": "EventID=4625 | LogonType=3 | IpAddress=10.0.4.27 | Status=0xC000006D | SubStatus=0xC000006A", "Artifact": "EventLog", "RawPath": "C:\\collection\\EventLogs\\Security.evtx" },
+        { "RowNumber": 74004, "Timestamp": "2026-10-01 08:55:13.777", "Source": "Security.evtx", "EventType": "Logon", "Description": "Failed logon (type 3) for bob", "User": "bob", "Details": "EventID=4625 | LogonType=3 | IpAddress=10.0.4.27 | Status=0xC000006D | SubStatus=0xC000006A", "Artifact": "EventLog", "RawPath": "C:\\collection\\EventLogs\\Security.evtx" },
+        { "RowNumber": 74005, "Timestamp": "2026-10-01 08:55:18.230", "Source": "Security.evtx", "EventType": "Logon", "Description": "Failed logon (type 3) for svc_backup", "User": "svc_backup", "Details": "EventID=4625 | LogonType=3 | IpAddress=10.0.4.27 | Status=0xC000006D | SubStatus=0xC000006A", "Artifact": "EventLog", "RawPath": "C:\\collection\\EventLogs\\Security.evtx" },
+        { "RowNumber": 74006, "Timestamp": "2026-10-01 08:55:22.901", "Source": "Security.evtx", "EventType": "Logon", "Description": "Failed logon (type 3) for administrator", "User": "administrator", "Details": "EventID=4625 | LogonType=3 | IpAddress=10.0.4.27 | Status=0xC000006D | SubStatus=0xC000006A", "Artifact": "EventLog", "RawPath": "C:\\collection\\EventLogs\\Security.evtx" },
+        { "RowNumber": 74007, "Timestamp": "2026-10-01 08:55:27.345", "Source": "Security.evtx", "EventType": "Logon", "Description": "Failed logon (type 3) for guest", "User": "guest", "Details": "EventID=4625 | LogonType=3 | IpAddress=10.0.4.27 | Status=0xC000006E", "Artifact": "EventLog", "RawPath": "C:\\collection\\EventLogs\\Security.evtx" },
+        { "RowNumber": 74008, "Timestamp": "2026-10-01 08:55:31.890", "Source": "Security.evtx", "EventType": "Logon", "Description": "Failed logon (type 3) for alice", "User": "alice", "Details": "EventID=4625 | LogonType=3 | IpAddress=10.0.4.27 | Status=0xC000006D | SubStatus=0xC000006A", "Artifact": "EventLog", "RawPath": "C:\\collection\\EventLogs\\Security.evtx" },
+        { "RowNumber": 74009, "Timestamp": "2026-10-01 08:55:36.004", "Source": "Security.evtx", "EventType": "Logon", "Description": "Failed logon (type 3) for administrator", "User": "administrator", "Details": "EventID=4625 | LogonType=3 | IpAddress=10.0.4.27 | Status=0xC000006D | SubStatus=0xC000006A", "Artifact": "EventLog", "RawPath": "C:\\collection\\EventLogs\\Security.evtx" },
+        { "RowNumber": 74010, "Timestamp": "2026-10-01 08:55:40.618", "Source": "Security.evtx", "EventType": "Logon", "Description": "Failed logon (type 3) for backup", "User": "backup", "Details": "EventID=4625 | LogonType=3 | IpAddress=10.0.4.27 | Status=0xC000006D | SubStatus=0xC0000064", "Artifact": "EventLog", "RawPath": "C:\\collection\\EventLogs\\Security.evtx" },
+        { "RowNumber": 74011, "Timestamp": "2026-10-01 08:55:44.132", "Source": "Security.evtx", "EventType": "Logon", "Description": "Failed logon (type 3) for bob", "User": "bob", "Details": "EventID=4625 | LogonType=3 | IpAddress=10.0.4.27 | Status=0xC000006D | SubStatus=0xC000006A", "Artifact": "EventLog", "RawPath": "C:\\collection\\EventLogs\\Security.evtx" },
+        { "RowNumber": 74012, "Timestamp": "2026-10-01 08:55:48.556", "Source": "Security.evtx", "EventType": "Logon", "Description": "Failed logon (type 3) for administrator", "User": "administrator", "Details": "EventID=4625 | LogonType=3 | IpAddress=10.0.4.27 | Status=0xC000006D | SubStatus=0xC000006A", "Artifact": "EventLog", "RawPath": "C:\\collection\\EventLogs\\Security.evtx" }
+      ],
+      "EvidenceTruncated": true, "Escalated": false, "AllowlistedCount": 0
+    },
+    {
+      "Id": "F006", "RuleId": "R7-TASK-USER-FOLDER", "Title": "Scheduled task runs a program from a user-writable folder", "Category": "Persistence", "Severity": "Medium",
+      "Why": "A new scheduled task starts a program from a folder any user can write to, a common way for unwanted software to keep running.",
+      "Technical": "TaskScheduler 106 registration plus the task XML snapshot. Action: C:\\ProgramData\\SyncHelper\\synchelper.exe, trigger at logon, runs as SYSTEM.",
+      "NextSteps": "Hash and examine the program; check its Amcache and Prefetch rows; see who registered the task.",
+      "FalsePositives": "Some legitimate updaters install into ProgramData.",
+      "References": [ "MITRE ATT&CK T1053.005" ],
+      "GroupKey": "\\Microsoft\\Windows\\Update\\SyncHelper", "Count": 2,
+      "FirstSeenUtc": "2026-09-30T13:47:02Z", "LastSeenUtc": "2026-09-30T13:47:02.115Z",
+      "Evidence": [
+        { "RowNumber": 70300, "Timestamp": "2026-09-30 13:47:02.000", "Source": "ScheduledTasks", "EventType": "ScheduledTaskChange", "Description": "Task registered: \\Microsoft\\Windows\\Update\\SyncHelper", "User": "SYSTEM", "Details": "Action=C:\\ProgramData\\SyncHelper\\synchelper.exe | Trigger=Logon | RunAs=SYSTEM | Author=WIN11-LAB01\\alice", "Artifact": "ScheduledTasks", "RawPath": "C:\\collection\\ScheduledTasks_XML\\SyncHelper" },
+        { "RowNumber": 70301, "Timestamp": "2026-09-30 13:47:02.115", "Source": "Microsoft-Windows-TaskScheduler%4Operational.evtx", "EventType": "ScheduledTaskChange", "Description": "Task registered (106): \\Microsoft\\Windows\\Update\\SyncHelper", "User": "WIN11-LAB01\\alice", "Details": "EventID=106 | TaskName=\\Microsoft\\Windows\\Update\\SyncHelper", "Artifact": "EventLog", "RawPath": "C:\\collection\\EventLogs\\Microsoft-Windows-TaskScheduler%4Operational.evtx" }
+      ],
+      "EvidenceTruncated": false, "Escalated": false, "AllowlistedCount": 0
+    },
+    {
+      "Id": "F007", "RuleId": "R10-PS-ENCODED", "Title": "Encoded PowerShell command", "Category": "Execution", "Severity": "Medium",
+      "Why": "PowerShell ran a command that was deliberately scrambled so it cannot be read at a glance; attackers use this to hide what they run.",
+      "Technical": "PowerShell 4104 script block and 400 engine start with -EncodedCommand. Decode the Base64 (UTF-16LE) in Details to read the command.",
+      "NextSteps": "Decode the command and check what it downloaded or started. Look for network and file rows right after it.",
+      "FalsePositives": "Management tools (SCCM, Intune, some installers) run encoded commands routinely.",
+      "References": [ "MITRE ATT&CK T1059.001", "MITRE ATT&CK T1027" ],
+      "GroupKey": "alice", "Count": 2,
+      "FirstSeenUtc": "2026-09-30T13:45:31.020Z", "LastSeenUtc": "2026-09-30T13:45:31.388Z",
+      "Evidence": [
+        { "RowNumber": 70240, "Timestamp": "2026-09-30 13:45:31.020", "Source": "Windows PowerShell.evtx", "EventType": "Execution", "Description": "PowerShell engine started: powershell.exe -NoProfile -WindowStyle Hidden -EncodedCommand RwBlAHQALQBEAGEAdABlADsAIABXAHIAaQB0AGUALQBPAHUAdABwAHUAdAAgACcAcwB5AG4AdABoAGUAdABpAGMAIAByAGUAcABvAHIAdAAgAGYAaQB4AHQAdQByAGUAJwA=", "User": "alice", "Details": "EventID=400 | HostApplication=powershell.exe -NoProfile -WindowStyle Hidden -EncodedCommand RwBlAHQALQBEAGEAdABlADsAIABXAHIAaQB0AGUALQBPAHUAdABwAHUAdAAgACcAcwB5AG4AdABoAGUAdABpAGMAIAByAGUAcABvAHIAdAAgAGYAaQB4AHQAdQByAGUAJwA= | EngineVersion=5.1.26100.6584", "Artifact": "EventLog", "RawPath": "C:\\collection\\EventLogs\\Windows PowerShell.evtx" },
+        { "RowNumber": 70241, "Timestamp": "2026-09-30 13:45:31.388", "Source": "Microsoft-Windows-PowerShell%4Operational.evtx", "EventType": "Execution", "Description": "Script block: <script>alert('x')</script> \"><img src=x onerror=alert(1)> & more", "User": "alice", "Details": "EventID=4104 | Level=Warning | Caf\u00e9 na\u00efve \u2013 \u00fc\u00f1\u00ee\u00e7\u00f8d\u00e9 \ud83d\ude00 | Line one\nLine two\r\nLine three | ScriptBlockId=7f3c2a10-0b4e-4c55-9d5e-1a2b3c4d5e6f", "Artifact": "EventLog", "RawPath": "C:\\collection\\EventLogs\\Microsoft-Windows-PowerShell%4Operational.evtx" }
+      ],
+      "EvidenceTruncated": false, "Escalated": false, "AllowlistedCount": 0
+    },
+    {
+      "Id": "F008", "RuleId": "P9-RISKY-DOWNLOAD", "Title": "Risky file type downloaded", "Category": "InitialAccess", "Severity": "Medium",
+      "Why": "A disk-image file was downloaded from a webmail site; such files are a common way to deliver malware past email filters.",
+      "Technical": "Edge downloads table: .iso saved to the Downloads folder, referrer is a webmail attachment host. The Mark of the Web zone is in Details.",
+      "NextSteps": "Check whether the image was opened (mounted volume, LNK and jump list rows) and whether anything inside it ran.",
+      "FalsePositives": "Software and operating system images are distributed as .iso files.",
+      "References": [ "MITRE ATT&CK T1566.001", "MITRE ATT&CK T1553.005" ],
+      "GroupKey": "Invoice_2291.iso", "Count": 1,
+      "FirstSeenUtc": "2026-09-30T13:40:12.508Z", "LastSeenUtc": "2026-09-30T13:40:12.508Z",
+      "Evidence": [
+        { "RowNumber": 70112, "Timestamp": "2026-09-30 13:40:12.508", "Source": "Edge Downloads", "EventType": "NetworkConnection", "Description": "Downloaded Invoice_2291.iso (2.1 MB) to C:\\Users\\alice\\Downloads\\Invoice_2291.iso", "User": "alice", "Details": "URL=https://attachments.mail.example.net/dl/7f3c2a10 | Referrer=https://mail.example.net/inbox | ZoneId=3 | State=Complete", "Artifact": "Browser", "RawPath": "C:\\collection\\Browser\\alice\\Edge\\Default\\History" }
+      ],
+      "EvidenceTruncated": false, "Escalated": false, "AllowlistedCount": 0
+    },
+    {
+      "Id": "F009", "RuleId": "C4-SRUM-UPLOAD", "Title": "Large upload by a scripting program", "Category": "Other", "Severity": "Medium",
+      "Why": "A scripting program sent an unusually large amount of data out to the network in one hour.",
+      "Technical": "SRUM network usage: powershell.exe sent 412 MB in the hour starting 10:00 UTC. SRUM records totals per hour, not destinations.",
+      "NextSteps": "Look at network, browser and PowerShell rows in that hour for a destination; check what files were read just before.",
+      "FalsePositives": "Backup or sync scripts can upload large amounts.",
+      "References": [ "MITRE ATT&CK T1048" ],
+      "GroupKey": "powershell.exe", "Count": 1,
+      "FirstSeenUtc": "2026-10-01T10:00:00Z", "LastSeenUtc": "2026-10-01T10:00:00Z",
+      "Evidence": [
+        { "RowNumber": 75010, "Timestamp": "2026-10-01 10:00:00.000", "Source": "SRUM-Network", "EventType": "NetworkConnection", "Description": "powershell.exe sent 412.3 MB, received 1.2 MB", "User": "alice", "Details": "App=\\Device\\HarddiskVolume3\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe | BytesSent=432328704 | BytesRecvd=1258291 | Interface=Ethernet", "Artifact": "SRUM", "RawPath": "C:\\collection\\SRUM\\SRUDB.dat" }
+      ],
+      "EvidenceTruncated": false, "Escalated": false, "AllowlistedCount": 0
+    }
+  ],
+  "InfoFindings": [
+    {
+      "Id": "F010", "RuleId": "I-UNEXPECTED-SHUTDOWN", "Title": "Unexpected shutdown", "Category": "Integrity", "Severity": "Info",
+      "Why": "The computer turned off without a normal shutdown.", "Technical": "System 6008.", "NextSteps": "", "FalsePositives": "Power loss, crashes.", "References": [],
+      "GroupKey": "I-UNEXPECTED-SHUTDOWN", "Count": 1, "FirstSeenUtc": "2026-09-14T07:02:33Z", "LastSeenUtc": "2026-09-14T07:02:33Z",
+      "Evidence": [ { "RowNumber": 41230, "Timestamp": "2026-09-14 07:02:33.000", "Source": "System.evtx", "EventType": "Snapshot", "Description": "The previous system shutdown was unexpected", "User": "", "Details": "EventID=6008", "Artifact": "EventLog", "RawPath": "" } ],
+      "EvidenceTruncated": false, "Escalated": false, "AllowlistedCount": 0
+    },
+    {
+      "Id": "F011", "RuleId": "I-RDP-INTERNAL", "Title": "Remote desktop sign-in from an internal address", "Category": "Access", "Severity": "Info",
+      "Why": "Someone signed in over remote desktop from inside the network.", "Technical": "LocalSessionManager 21/25 and Security 4624 type 10 from 10.0.4.0/24.", "NextSteps": "", "FalsePositives": "IT support.", "References": [ "MITRE ATT&CK T1021.001" ],
+      "GroupKey": "10.0.4.15", "Count": 3, "FirstSeenUtc": "2026-09-02T16:10:05Z", "LastSeenUtc": "2026-10-06T18:03:11Z",
+      "Evidence": [
+        { "RowNumber": 25881, "Timestamp": "2026-09-02 16:10:05.000", "Source": "Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx", "EventType": "Logon", "Description": "RDP session logon from 10.0.4.15", "User": "bob", "Details": "EventID=21", "Artifact": "EventLog", "RawPath": "" },
+        { "RowNumber": 52740, "Timestamp": "2026-09-21 17:44:52.000", "Source": "Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx", "EventType": "Logon", "Description": "RDP session logon from 10.0.4.15", "User": "bob", "Details": "EventID=21", "Artifact": "EventLog", "RawPath": "" },
+        { "RowNumber": 83322, "Timestamp": "2026-10-06 18:03:11.000", "Source": "Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx", "EventType": "Logon", "Description": "RDP session reconnect from 10.0.4.15", "User": "bob", "Details": "EventID=25", "Artifact": "EventLog", "RawPath": "" }
+      ],
+      "EvidenceTruncated": false, "Escalated": false, "AllowlistedCount": 0
+    },
+    {
+      "Id": "F012", "RuleId": "I-SERVICE-INSTALLED", "Title": "Service installed", "Category": "Persistence", "Severity": "Info",
+      "Why": "New Windows services were installed.", "Technical": "System 7045 with ordinary image paths.", "NextSteps": "", "FalsePositives": "Software installs and updates.", "References": [ "MITRE ATT&CK T1543.003" ],
+      "GroupKey": "I-SERVICE-INSTALLED", "Count": 2, "FirstSeenUtc": "2026-08-12T15:31:20Z", "LastSeenUtc": "2026-10-07T22:10:09Z",
+      "Evidence": [
+        { "RowNumber": 12045, "Timestamp": "2026-08-12 15:31:20.000", "Source": "System.evtx", "EventType": "ServiceChange", "Description": "Service installed: Example Update Service", "User": "SYSTEM", "Details": "EventID=7045 | ImagePath=\"C:\\Program Files\\Example\\update.exe\" | StartType=auto start", "Artifact": "EventLog", "RawPath": "" },
+        { "RowNumber": 89003, "Timestamp": "2026-10-07 22:10:09.000", "Source": "System.evtx", "EventType": "ServiceChange", "Description": "Service installed: Contoso Print Helper", "User": "SYSTEM", "Details": "EventID=7045 | ImagePath=C:\\Windows\\System32\\spool\\drivers\\x64\\3\\helper.exe | StartType=demand start", "Artifact": "EventLog", "RawPath": "" }
+      ],
+      "EvidenceTruncated": false, "Escalated": false, "AllowlistedCount": 0
+    },
+    {
+      "Id": "F013", "RuleId": "R1-AV-PUA", "Title": "Potentially unwanted application detected", "Category": "Antivirus", "Severity": "Info",
+      "Why": "The antivirus flagged an unwanted (but not malicious) program.", "Technical": "Defender 1116 with a PUA: threat name.", "NextSteps": "", "FalsePositives": "Bundled toolbars, coin miners installed on purpose.", "References": [],
+      "GroupKey": "PUA:Win32/Synthetic", "Count": 1, "FirstSeenUtc": "2026-09-03T19:22:41Z", "LastSeenUtc": "2026-09-03T19:22:41Z",
+      "Evidence": [ { "RowNumber": 27110, "Timestamp": "2026-09-03 19:22:41.000", "Source": "Microsoft-Windows-Windows Defender%4Operational.evtx", "EventType": "SecurityAlert", "Description": "Defender detected PUA:Win32/Synthetic (Low)", "User": "bob", "Details": "EventID=1116", "Artifact": "EventLog", "RawPath": "" } ],
+      "EvidenceTruncated": false, "Escalated": false, "AllowlistedCount": 0
+    },
+    {
+      "Id": "F014", "RuleId": "I-USB-DEVICE", "Title": "USB storage device connected", "Category": "Other", "Severity": "Info",
+      "Why": "A USB storage device was plugged in.", "Technical": "USBSTOR and Partition/Diagnostic 1006.", "NextSteps": "", "FalsePositives": "Everyday use.", "References": [ "MITRE ATT&CK T1052.001" ],
+      "GroupKey": "Disk&Ven_Example&Prod_Flash_Drive", "Count": 1, "FirstSeenUtc": "2026-10-02T16:41:07Z", "LastSeenUtc": "2026-10-02T16:41:07Z",
+      "Evidence": [ { "RowNumber": 77502, "Timestamp": "2026-10-02 16:41:07.000", "Source": "USB", "EventType": "USBDevice", "Description": "USB storage connected: Example Flash Drive", "User": "", "Details": "Serial=0123456789AB", "Artifact": "Registry", "RawPath": "" } ],
+      "EvidenceTruncated": false, "Escalated": false, "AllowlistedCount": 0
+    }
+  ],
+  "Coverage": {
+    "Sources": [
+      { "Source": "Amcache", "Rows": 669, "FirstUtc": "2025-03-14T02:11:08Z", "LastUtc": "2026-10-08T13:58:41Z" },
+      { "Source": "AppCompatCache", "Rows": 687, "FirstUtc": "2025-03-14T02:15:40Z", "LastUtc": "2026-10-08T14:01:12Z" },
+      { "Source": "Application.evtx", "Rows": 223, "FirstUtc": "2026-07-28T10:02:11Z", "LastUtc": "2026-10-08T14:19:58Z" },
+      { "Source": "BAM", "Rows": 49, "FirstUtc": "2026-09-01T08:00:13Z", "LastUtc": "2026-10-08T14:20:01Z" },
+      { "Source": "Edge Downloads", "Rows": 22, "FirstUtc": "2026-08-03T17:21:40Z", "LastUtc": "2026-10-07T20:15:09Z" },
+      { "Source": "Edge History", "Rows": 56, "FirstUtc": "2026-09-08T15:00:22Z", "LastUtc": "2026-10-08T13:40:55Z" },
+      { "Source": "MFT", "Rows": 61062, "FirstUtc": "2026-10-01T14:20:05Z", "LastUtc": "2026-10-08T14:28:36Z" },
+      { "Source": "Microsoft-Windows-Bits-Client%4Operational.evtx", "Rows": 642, "FirstUtc": "2026-08-20T09:12:00Z", "LastUtc": "2026-10-08T12:00:41Z" },
+      { "Source": "Microsoft-Windows-PowerShell%4Operational.evtx", "Rows": 478, "FirstUtc": "2026-10-03T06:41:19Z", "LastUtc": "2026-10-08T14:20:44Z" },
+      { "Source": "Microsoft-Windows-TaskScheduler%4Operational.evtx", "Rows": 310, "FirstUtc": "2026-09-20T00:00:03Z", "LastUtc": "2026-10-08T14:00:00Z" },
+      { "Source": "Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx", "Rows": 82, "FirstUtc": "2026-07-26T11:30:00Z", "LastUtc": "2026-10-08T14:18:30Z" },
+      { "Source": "Microsoft-Windows-Windows Defender%4Operational.evtx", "Rows": 45, "FirstUtc": "2026-09-03T19:22:41Z", "LastUtc": "2026-10-08T14:20:09Z" },
+      { "Source": "MPLog-20250918-142147.log", "Rows": 46, "FirstUtc": "2025-09-18T14:21:47Z", "LastUtc": "2026-10-08T14:20:10Z" },
+      { "Source": "Prefetch", "Rows": 2089, "FirstUtc": "2026-07-25T09:10:44Z", "LastUtc": "2026-10-08T14:20:05Z" },
+      { "Source": "Registry-UserAssist", "Rows": 56, "FirstUtc": "2026-07-30T16:44:00Z", "LastUtc": "2026-10-08T13:59:10Z" },
+      { "Source": "ScheduledTasks", "Rows": 283, "FirstUtc": "2025-03-14T02:30:00Z", "LastUtc": "2026-10-07T22:10:00Z" },
+      { "Source": "Security.evtx", "Rows": 2222, "FirstUtc": "2026-10-01T09:20:44Z", "LastUtc": "2026-10-08T14:21:03Z" },
+      { "Source": "Services", "Rows": 296, "FirstUtc": "2025-03-14T02:28:51Z", "LastUtc": "2026-10-07T22:10:09Z" },
+      { "Source": "SRUM-AppUsage", "Rows": 647, "FirstUtc": "2026-09-08T00:00:00Z", "LastUtc": "2026-10-08T14:00:00Z" },
+      { "Source": "SRUM-Network", "Rows": 283, "FirstUtc": "2026-09-08T00:00:00Z", "LastUtc": "2026-10-08T14:00:00Z" },
+      { "Source": "System.evtx", "Rows": 413, "FirstUtc": "2026-08-01T07:00:12Z", "LastUtc": "2026-10-08T14:19:40Z" },
+      { "Source": "USB", "Rows": 23, "FirstUtc": "2025-11-20T12:01:09Z", "LastUtc": "2026-10-02T16:41:07Z" },
+      { "Source": "UsnJournal", "Rows": 172524, "FirstUtc": "2026-10-06T21:14:51Z", "LastUtc": "2026-10-08T14:28:36Z" },
+      { "Source": "Windows PowerShell.evtx", "Rows": 1178, "FirstUtc": "2026-08-15T08:30:00Z", "LastUtc": "2026-10-08T14:20:40Z" }
+    ],
+    "LogClears": [
+      { "RowNumber": 74620, "Timestamp": "2026-10-01 09:20:44.000", "Source": "Security.evtx", "EventType": "SecurityAlert", "Description": "The Security event log was cleared", "User": "WIN11-LAB01\\alice", "Details": "EventID=1102", "Artifact": "EventLog", "RawPath": "C:\\collection\\EventLogs\\Security.evtx" }
+    ],
+    "Boots": [
+      { "Utc": "2026-08-01T07:00:12Z", "Kind": "Boot" },
+      { "Utc": "2026-08-29T18:22:40Z", "Kind": "Shutdown" },
+      { "Utc": "2026-08-31T07:58:03Z", "Kind": "Boot" },
+      { "Utc": "2026-09-14T07:02:33Z", "Kind": "Unexpected shutdown" },
+      { "Utc": "2026-09-14T07:03:10Z", "Kind": "Boot" },
+      { "Utc": "2026-09-26T19:40:00Z", "Kind": "Shutdown" },
+      { "Utc": "2026-09-28T07:31:55Z", "Kind": "Boot" },
+      { "Utc": "2026-10-03T06:40:58Z", "Kind": "Boot" }
+    ],
+    "AuditNotes": [
+      "No process creation events (Security 4688) in the timeline: process command lines were not audited.",
+      "No PowerShell script block events with Verbose level: script block logging is only partly on (warnings only).",
+      "The USN journal covers 2026-10-06 21:14 to 2026-10-08 14:28 UTC (1.7 days); older file changes have rolled out of it."
+    ],
+    "CollectorErrors": {
+      "Count": 2,
+      "Lines": [
+        "[2026-10-08 14:21:12] ERROR: Could not copy C:\\Windows\\System32\\winevt\\Logs\\Microsoft-Windows-Sysmon%4Operational.evtx: file not found",
+        "[2026-10-08 14:24:55] ERROR: Browser profile locked: C:\\Users\\bob\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\History (copied with raw read)"
+      ]
+    },
+    "Notes": [
+      "$MFT file-system rows are limited to the 7 days before the collection (-MftDays 7); downloaded-file (Mark of the Web) rows are always included.",
+      "The Security log starts at its clear on 2026-10-01 09:20 UTC."
+    ]
+  },
+  "Activity": {
+    "PerDay": [
+      { "Day": "2025-03-14", "Rows": 1184 },
+      { "Day": "2025-06-02", "Rows": 312 },
+      { "Day": "2025-11-20", "Rows": 847 },
+      { "Day": "2026-01-15", "Rows": 41 },
+      { "Day": "2026-04-02", "Rows": 2215 },
+      { "Day": "2026-06-11", "Rows": 96 },
+      { "Day": "2026-07-25", "Rows": 95 },
+      { "Day": "2026-07-26", "Rows": 175 },
+      { "Day": "2026-07-27", "Rows": 1018 },
+      { "Day": "2026-07-28", "Rows": 1337 },
+      { "Day": "2026-07-29", "Rows": 1656 },
+      { "Day": "2026-07-30", "Rows": 1975 },
+      { "Day": "2026-07-31", "Rows": 394 },
+      { "Day": "2026-08-01", "Rows": 178 },
+      { "Day": "2026-08-02", "Rows": 258 },
+      { "Day": "2026-08-03", "Rows": 1351 },
+      { "Day": "2026-08-04", "Rows": 1670 },
+      { "Day": "2026-08-05", "Rows": 1989 },
+      { "Day": "2026-08-06", "Rows": 408 },
+      { "Day": "2026-08-07", "Rows": 727 },
+      { "Day": "2026-08-08", "Rows": 262 },
+      { "Day": "2026-08-09", "Rows": 341 },
+      { "Day": "2026-08-10", "Rows": 1684 },
+      { "Day": "2026-08-11", "Rows": 2003 },
+      { "Day": "2026-08-12", "Rows": 422 },
+      { "Day": "2026-08-13", "Rows": 741 },
+      { "Day": "2026-08-14", "Rows": 1060 },
+      { "Day": "2026-08-15", "Rows": 345 },
+      { "Day": "2026-08-16", "Rows": 424 },
+      { "Day": "2026-08-17", "Rows": 2017 },
+      { "Day": "2026-08-18", "Rows": 436 },
+      { "Day": "2026-08-19", "Rows": 755 },
+      { "Day": "2026-08-20", "Rows": 1074 },
+      { "Day": "2026-08-21", "Rows": 1393 },
+      { "Day": "2026-08-22", "Rows": 428 },
+      { "Day": "2026-08-23", "Rows": 508 },
+      { "Day": "2026-08-24", "Rows": 450 },
+      { "Day": "2026-08-25", "Rows": 769 },
+      { "Day": "2026-08-26", "Rows": 1088 },
+      { "Day": "2026-08-27", "Rows": 1407 },
+      { "Day": "2026-08-28", "Rows": 1726 },
+      { "Day": "2026-08-29", "Rows": 511 },
+      { "Day": "2026-08-30", "Rows": 116 },
+      { "Day": "2026-08-31", "Rows": 783 },
+      { "Day": "2026-09-01", "Rows": 1102 },
+      { "Day": "2026-09-02", "Rows": 1421 },
+      { "Day": "2026-09-03", "Rows": 1740 },
+      { "Day": "2026-09-04", "Rows": 2059 },
+      { "Day": "2026-09-05", "Rows": 120 },
+      { "Day": "2026-09-06", "Rows": 199 },
+      { "Day": "2026-09-07", "Rows": 1116 },
+      { "Day": "2026-09-08", "Rows": 1435 },
+      { "Day": "2026-09-09", "Rows": 1754 },
+      { "Day": "2026-09-10", "Rows": 2073 },
+      { "Day": "2026-09-11", "Rows": 492 },
+      { "Day": "2026-09-12", "Rows": 203 },
+      { "Day": "2026-09-13", "Rows": 282 },
+      { "Day": "2026-09-14", "Rows": 1449 },
+      { "Day": "2026-09-15", "Rows": 1768 },
+      { "Day": "2026-09-16", "Rows": 2087 },
+      { "Day": "2026-09-17", "Rows": 506 },
+      { "Day": "2026-09-18", "Rows": 825 },
+      { "Day": "2026-09-19", "Rows": 286 },
+      { "Day": "2026-09-20", "Rows": 366 },
+      { "Day": "2026-09-21", "Rows": 1782 },
+      { "Day": "2026-09-22", "Rows": 2101 },
+      { "Day": "2026-09-23", "Rows": 520 },
+      { "Day": "2026-09-24", "Rows": 839 },
+      { "Day": "2026-09-25", "Rows": 1158 },
+      { "Day": "2026-09-26", "Rows": 369 },
+      { "Day": "2026-09-27", "Rows": 449 },
+      { "Day": "2026-09-28", "Rows": 2115 },
+      { "Day": "2026-09-29", "Rows": 534 },
+      { "Day": "2026-09-30", "Rows": 6120 },
+      { "Day": "2026-10-01", "Rows": 9874 },
+      { "Day": "2026-10-02", "Rows": 1491 },
+      { "Day": "2026-10-03", "Rows": 452 },
+      { "Day": "2026-10-04", "Rows": 532 },
+      { "Day": "2026-10-05", "Rows": 548 },
+      { "Day": "2026-10-06", "Rows": 867 },
+      { "Day": "2026-10-07", "Rows": 4310 },
+      { "Day": "2026-10-08", "Rows": 151230 }
+    ],
+    "PerHourUtc": [ 812, 655, 430, 301, 288, 270, 315, 402, 520, 690, 1105, 2210, 4870, 9810, 140000, 15950, 14320, 12880, 11240, 9870, 7460, 4560, 2310, 3975 ],
+    "TopSources": [
+      { "Source": "UsnJournal", "Rows": 172524 },
+      { "Source": "MFT", "Rows": 61062 },
+      { "Source": "Security.evtx", "Rows": 2222 },
+      { "Source": "Prefetch", "Rows": 2089 },
+      { "Source": "Windows PowerShell.evtx", "Rows": 1178 },
+      { "Source": "AppCompatCache", "Rows": 687 },
+      { "Source": "Amcache", "Rows": 669 },
+      { "Source": "SRUM-AppUsage", "Rows": 647 },
+      { "Source": "Microsoft-Windows-Bits-Client%4Operational.evtx", "Rows": 642 },
+      { "Source": "Microsoft-Windows-PowerShell%4Operational.evtx", "Rows": 478 }
+    ],
+    "PerUser": [
+      { "User": "", "Rows": 212118 },
+      { "User": "alice", "Rows": 18450 },
+      { "User": "SYSTEM", "Rows": 11653 },
+      { "User": "bob", "Rows": 2210 },
+      { "User": "LOCAL SERVICE", "Rows": 812 }
+    ]
+  },
+  "Caveats": [
+    "Much useful logging is off by default: process command lines (4688), scheduled-task events (4698-4702), session reconnects (4778/4779), full script-block logging and file-share access (5140/5145). A missing event proves nothing.",
+    "Domain sign-ins are checked by the domain controller, so their Kerberos and NTLM events (4768/4769/4776) are not on this computer.",
+    "Logs roll over: each source starts only as far back as its oldest kept record (section 2).",
+    "All times are UTC. Clock changes and altered file times can put events in the wrong order.",
+    "ShimCache and Amcache show that a file existed, not that it ran; Prefetch shows that a program ran, not what it did.",
+    "Private browser windows leave nothing behind, clearing history is not logged, and Chrome does its own DNS lookups.",
+    "Email headers can be forged; mailbox and cloud sign-in logs (such as Microsoft 365) are not on this computer.",
+    "$MFT file-system rows cover only the 7 days before the collection (-MftDays 7)."
+  ],
+  "Rules": [
+    { "Id": "R1-AV-DETECTION", "Title": "Antivirus detection", "Severity": "High", "Category": "Antivirus" },
+    { "Id": "R1-AV-PUA", "Title": "Potentially unwanted application detected", "Severity": "Info", "Category": "Antivirus" },
+    { "Id": "R2-DEFENDER-RTP-OFF", "Title": "Antivirus real-time protection turned off", "Severity": "High", "Category": "Antivirus" },
+    { "Id": "R2-DEFENDER-EXCLUSION", "Title": "Antivirus exclusion added", "Severity": "Medium", "Category": "Antivirus" },
+    { "Id": "P1-LOG-CLEARED", "Title": "Event log cleared", "Severity": "High", "Category": "Integrity" },
+    { "Id": "I-UNEXPECTED-SHUTDOWN", "Title": "Unexpected shutdown", "Severity": "Info", "Category": "Integrity" },
+    { "Id": "R3-ADMIN-GROUP-ADD", "Title": "Account added to Administrators", "Severity": "High", "Category": "Access" },
+    { "Id": "R4-FAILED-LOGON-BURST", "Title": "Burst of failed sign-ins", "Severity": "Medium", "Category": "Access" },
+    { "Id": "R5-RDP-PUBLIC", "Title": "Remote desktop from a public address", "Severity": "High", "Category": "Access" },
+    { "Id": "I-RDP-INTERNAL", "Title": "Remote desktop from an internal address", "Severity": "Info", "Category": "Access" },
+    { "Id": "R6-SERVICE-SUSPICIOUS", "Title": "Service with a suspicious command", "Severity": "High", "Category": "Persistence" },
+    { "Id": "R7-TASK-USER-FOLDER", "Title": "Scheduled task runs from a user-writable folder", "Severity": "Medium", "Category": "Persistence" },
+    { "Id": "I-SERVICE-INSTALLED", "Title": "Service installed", "Severity": "Info", "Category": "Persistence" },
+    { "Id": "R10-PS-ENCODED", "Title": "Encoded PowerShell command", "Severity": "Medium", "Category": "Execution" },
+    { "Id": "R13-STAGING-FOLDER", "Title": "Program run from a staging folder", "Severity": "Medium", "Category": "Execution" },
+    { "Id": "P9-RISKY-DOWNLOAD", "Title": "Risky file type downloaded", "Severity": "Medium", "Category": "InitialAccess" },
+    { "Id": "R14-TIMESTOMP", "Title": "File times altered on a program", "Severity": "Medium", "Category": "FileSystem" },
+    { "Id": "P17-MASS-RENAME", "Title": "Mass rename to one new extension", "Severity": "High", "Category": "FileSystem" },
+    { "Id": "C4-SRUM-UPLOAD", "Title": "Large upload by a scripting program", "Severity": "Medium", "Category": "Other" },
+    { "Id": "I-USB-DEVICE", "Title": "USB storage device connected", "Severity": "Info", "Category": "Other" }
+  ],
+  "Workbook": { "FileName": "timeline.xlsx", "Available": true, "TimelineSheet": "Timeline", "FindingsSheet": "Findings" },
+  "Files": { "TimelineCsv": "timeline.csv", "FindingsCsv": "findings.csv" }
+}
