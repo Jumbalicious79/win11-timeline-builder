@@ -10138,7 +10138,8 @@ function Read-EsetVirlog {
 # (e.g. a copied ProgramData tree). Defender's event log, Get-MpThreatDetection
 # and support log rows (Parse-EventLogs) can describe the same detection:
 # these rows have their own Source (Defender-DetectionHistory,
-# Defender-Quarantine), and their DetectionID / threat name match those rows.
+# Defender-Quarantine), and their DetectionID, ThreatID, threat name and path
+# link them to those rows (quarantine entries have no DetectionID).
 
 # Values of a DetectionHistory file (format: see Read-DefenderDetectionHistory)
 # as objects with Type, Offset and Size of the data, and the decoded Value:
@@ -10179,6 +10180,16 @@ function Get-DefenderHistorySetValue {
     param([object[]]$Set, [int]$Index, [int[]]$Types)
     if ($Index -lt $Set.Count -and $Types -contains $Set[$Index].Type) { return $Set[$Index].Value }
     return $null
+}
+
+# FILETIME of a Defender file -> UTC [datetime], or $null when zero, out of
+# range or before 1980: Add-TimelineEntry drops such times, so a damaged
+# value must not win over a fallback time
+function ConvertFrom-DefenderFileTime {
+    param([long]$FileTime)
+    $utc = ConvertFrom-JumpListFileTime $FileTime
+    if ($null -ne $utc -and $utc.Year -lt 1980) { return $null }
+    return $utc
 }
 
 # Threat tracking data of a DetectionHistory resource (bytes Start to
@@ -10254,9 +10265,19 @@ function Read-DefenderThreatTracking {
 #              the samples bear out)
 # Values are only used when they have the expected type. One row per file,
 # at the initial detection time, else ThreatTrackingStartTime, else the
-# status change time, else the file's original creation time (manifest).
-# Returns the number of rows added (0: no time found), or -1 if the file is
-# not a DetectionHistory file.
+# status change time, else the file's original creation time (manifest);
+# times before 1980 count as missing.
+# The path (Description "on <path>", Details Path) is the location of the
+# first file resource, else containerfile, else webfile (its location is
+# "<path>|<url>|..."), else the threat tracking value CONTEXT_DATA_FILENAME
+# (plaso uses it for detections without a file resource), else the location
+# of a registry, run key, startup, service or scheduled task resource.
+# Process, behavior, command line and other resources have no path: their
+# locations (e.g. "pid:...") are only listed in Resources.
+# Defender deletes these files after ScanPurgeItemsAfterDelay days (default
+# 15): a missing file does not prove there was no detection.
+# Returns the number of rows passed to Add-TimelineEntry (0: no time found),
+# or -1 if the file is not a DetectionHistory file.
 function Read-DefenderDetectionHistory {
     param([System.IO.FileInfo]$File)
     $numberTypes = @(0x00, 0x05, 0x06, 0x08)
@@ -10283,7 +10304,7 @@ function Read-DefenderDetectionHistory {
     $categoryId = Get-DefenderHistorySetValue -Set $sets[1] -Index 4 -Types $numberTypes
     $statusId = Get-DefenderHistorySetValue -Set $sets[1] -Index 7 -Types $numberTypes
 
-    # Resources; the main one is the first "file" resource, else the first
+    # Resources (the path: see above)
     $resources = @()
     for ($i = 2; $i -lt $sets.Count; $i++) {
         $resourceType = Get-DefenderHistorySetValue -Set $sets[$i] -Index 1 -Types 0x15
@@ -10295,16 +10316,29 @@ function Read-DefenderDetectionHistory {
         }
         $resources += [PSCustomObject]@{ Type = "$resourceType"; Location = "$location"; Tracking = $tracking }
     }
-    $ordered = @(@($resources | Where-Object { $_.Type -eq "file" }) + @($resources))
     $path = ""
-    if ($ordered.Count -gt 0) { $path = ($ordered[0].Location -split '\|')[0] }
-    # SHA-256 and tracking start time: from the main resource, else the first that has them
+    foreach ($pathType in @("file", "containerfile", "webfile")) {
+        $match = @($resources | Where-Object { $_.Type -eq $pathType -and $_.Location } | Select-Object -First 1)
+        if ($match.Count -gt 0) { $path = ($match[0].Location -split '\|')[0]; break }
+    }
+    if (-not $path) {
+        foreach ($resource in $resources) {
+            $contextFile = $resource.Tracking["CONTEXT_DATA_FILENAME"]
+            if ($contextFile -is [string] -and $contextFile) { $path = $contextFile; break }
+        }
+    }
+    if (-not $path) {
+        $match = @($resources | Where-Object { $_.Location -and @("regkey", "regkeyvalue", "runkey", "startup", "service", "taskscheduler") -contains $_.Type } | Select-Object -First 1)
+        if ($match.Count -gt 0) { $path = $match[0].Location }
+    }
+    # SHA-256 and tracking start time: from the first file resource, else the first that has them
+    $ordered = @(@($resources | Where-Object { $_.Type -eq "file" }) + @($resources))
     $sha256 = ""
     $trackingStart = $null
     foreach ($resource in $ordered) {
         if (-not $sha256 -and $resource.Tracking["ThreatTrackingSha256"]) { $sha256 = "$($resource.Tracking['ThreatTrackingSha256'])" }
         if ($null -eq $trackingStart -and $resource.Tracking["ThreatTrackingStartTime"] -is [long]) {
-            $trackingStart = ConvertFrom-JumpListFileTime $resource.Tracking["ThreatTrackingStartTime"]
+            $trackingStart = ConvertFrom-DefenderFileTime $resource.Tracking["ThreatTrackingStartTime"]
         }
     }
 
@@ -10314,18 +10348,18 @@ function Read-DefenderDetectionHistory {
         $last = $sets[$sets.Count - 1]
         $user = "$(Get-DefenderHistorySetValue -Set $last -Index 12 -Types 0x15)"
         $process = "$(Get-DefenderHistorySetValue -Set $last -Index 14 -Types 0x15)"
-        $initial = ConvertFrom-JumpListFileTime ([long](Get-DefenderHistorySetValue -Set $last -Index 18 -Types 0x0A))
-        $statusChange = ConvertFrom-JumpListFileTime ([long](Get-DefenderHistorySetValue -Set $last -Index 6 -Types 0x0A))
-        $remediation = ConvertFrom-JumpListFileTime ([long](Get-DefenderHistorySetValue -Set $last -Index 20 -Types 0x0A))
+        $initial = ConvertFrom-DefenderFileTime ([long](Get-DefenderHistorySetValue -Set $last -Index 18 -Types 0x0A))
+        $statusChange = ConvertFrom-DefenderFileTime ([long](Get-DefenderHistorySetValue -Set $last -Index 6 -Types 0x0A))
+        $remediation = ConvertFrom-DefenderFileTime ([long](Get-DefenderHistorySetValue -Set $last -Index 20 -Types 0x0A))
     }
 
     $timeNote = ""
     $time = $initial
-    if ($null -eq $time -and $null -ne $trackingStart) { $time = $trackingStart; $timeNote = "ThreatTrackingStartTime (no initial detection time in the file)" }
-    if ($null -eq $time -and $null -ne $statusChange) { $time = $statusChange; $timeNote = "last threat status change (no detection time in the file)" }
+    if ($null -eq $time -and $null -ne $trackingStart) { $time = $trackingStart; $timeNote = "ThreatTrackingStartTime (no valid initial detection time in the file)" }
+    if ($null -eq $time -and $null -ne $statusChange) { $time = $statusChange; $timeNote = "last threat status change (no valid detection time in the file)" }
     if ($null -eq $time) {
         $fileTimes = Get-SourceFileTimes $File.FullName
-        if ($fileTimes -and $fileTimes.Created) { $time = $fileTimes.Created; $timeNote = "DetectionHistory file created (no time in the file)" }
+        if ($fileTimes -and $fileTimes.Created -and $fileTimes.Created.Year -ge 1980) { $time = $fileTimes.Created; $timeNote = "DetectionHistory file created (no valid time in the file)" }
     }
     if ($null -eq $time) { return 0 }
 
@@ -10346,6 +10380,7 @@ function Read-DefenderDetectionHistory {
             Severity        = $severity
             CategoryID      = $categoryId
             Status          = $status
+            Path            = $path
             Resources       = ($resourceTexts -join "; ")
             User            = $user
             Process         = $process
@@ -10393,6 +10428,46 @@ function ConvertFrom-DefenderRc4 {
     return , $out
 }
 
+# Path without its \\?\ or \\?\UNC\ prefix
+function ConvertFrom-DefenderLongPath {
+    param([string]$Path)
+    if ($Path.StartsWith("\\?\UNC\", [System.StringComparison]::OrdinalIgnoreCase)) { return "\\" + $Path.Substring(8) }
+    if ($Path.StartsWith("\\?\", [System.StringComparison]::Ordinal)) { return $Path.Substring(4) }
+    return $Path
+}
+
+# Fields of a quarantine entry resource: Count fields from Start in part 2
+# (Data), each at a 4-byte boundary of part 2: uint16 data size, uint16
+# identifier (low 12 bits) and data type (high 4 bits), the data. The layout
+# is in ERNW's quarantine-formats and Fox-IT's write-up; the identifiers are
+# Fox-IT's (dissect.target). Returns a hashtable of the fields read here:
+# ResourceID (0x02: the ID of the quarantined copy, as hex; the copy itself
+# is not read), PhysicalPath (0x0C, UTF-16LE), Created and Modified (0x0F,
+# 0x11: the original file's creation and last write FILETIMEs, UTC) and
+# FileSize (0x12). Other fields are skipped; reading stops at a field that
+# runs past the end of part 2.
+function Read-DefenderQuarantineFields {
+    param([byte[]]$Data, [int]$Start, [int]$Count)
+    $result = @{}
+    $p = $Start
+    for ($n = 0; $n -lt $Count -and $n -lt 64; $n++) {
+        if ($p % 4 -ne 0) { $p += 4 - ($p % 4) }
+        if ($p + 4 -gt $Data.Length) { break }
+        $size = [int][BitConverter]::ToUInt16($Data, $p)
+        $id = [int][BitConverter]::ToUInt16($Data, $p + 2) -band 0x0FFF
+        $d = $p + 4
+        if ($d + $size -gt $Data.Length) { break }
+        if ($id -eq 0x02 -and $size -gt 0 -and $size -le 64) { $result["ResourceID"] = [BitConverter]::ToString($Data, $d, $size).Replace("-", "") }
+        elseif ($id -eq 0x0C -and $size -ge 2) { $result["PhysicalPath"] = [System.Text.Encoding]::Unicode.GetString($Data, $d, $size - ($size % 2)).Split([char]0)[0] }
+        elseif ($id -eq 0x0F -and $size -eq 8) { $result["Created"] = ConvertFrom-DefenderFileTime ([BitConverter]::ToInt64($Data, $d)) }
+        elseif ($id -eq 0x11 -and $size -eq 8) { $result["Modified"] = ConvertFrom-DefenderFileTime ([BitConverter]::ToInt64($Data, $d)) }
+        elseif ($id -eq 0x12 -and $size -eq 4) { $result["FileSize"] = [long][BitConverter]::ToUInt32($Data, $d) }
+        elseif ($id -eq 0x12 -and $size -eq 8) { $result["FileSize"] = [BitConverter]::ToUInt64($Data, $d) }
+        $p = $d + $size
+    }
+    return $result
+}
+
 # Defender quarantine entry (Quarantine\Entries\{GUID}): the metadata of one
 # quarantined threat. Format from the public write-ups (Fox-IT / NCC Group
 # "Reverse, Reveal, Recover: Windows Defender Quarantine Forensics", ERNW
@@ -10401,16 +10476,19 @@ function ConvertFrom-DefenderRc4 {
 #   header  0x3C bytes: magic DB E8 C5 01, ..., uint32 size of part 1 at
 #           0x28, uint32 size of part 2 at 0x2C
 #   part 1  entry GUID, scan GUID, FILETIME (UTC) of the quarantine at 0x20,
-#           ..., threat name at 0x34 (NUL-terminated UTF-8)
+#           uint64 threat ID at 0x28, ..., threat name at 0x34
+#           (NUL-terminated UTF-8)
 #   part 2  uint32 resource count, then a uint32 offset (from the start of
 #           part 2) per resource. A resource: original path (NUL-terminated
 #           UTF-16LE, may start with \\?\), uint16 field count, type
-#           (NUL-terminated ASCII: "file", "regkey", ...), then fields that
-#           are not read here
-# One row per resource. Only these metadata files are read: the quarantined
-# files themselves (Quarantine\ResourceData) are never read or decrypted.
-# Returns the number of rows added (0: no time found), or -1 if the file is
-# not a quarantine entry.
+#           (NUL-terminated ASCII: "file", "regkey", ...), then the fields
+#           (see Read-DefenderQuarantineFields)
+# One row per resource, at the quarantine time (a time before 1980 counts as
+# missing: the entry file's original creation time from the manifest is used
+# instead). Only these metadata files are read: the quarantined files
+# themselves (Quarantine\ResourceData) are never read or decrypted.
+# Returns the number of rows passed to Add-TimelineEntry (0: no time found),
+# or -1 if the file is not a quarantine entry.
 function Read-DefenderQuarantineEntry {
     param([System.IO.FileInfo]$File)
     $bytes = [System.IO.File]::ReadAllBytes($File.FullName)
@@ -10427,11 +10505,12 @@ function Read-DefenderQuarantineEntry {
     if ($nameEnd -lt 0) { $nameEnd = $part1.Length }
     $threat = [System.Text.Encoding]::UTF8.GetString($part1, 0x34, $nameEnd - 0x34)
     if (-not $threat) { $threat = "unknown threat" }
-    $time = ConvertFrom-JumpListFileTime ([BitConverter]::ToInt64($part1, 0x20))
+    $threatId = [BitConverter]::ToUInt64($part1, 0x28)
+    $time = ConvertFrom-DefenderFileTime ([BitConverter]::ToInt64($part1, 0x20))
     $timeNote = ""
     if ($null -eq $time) {
         $fileTimes = Get-SourceFileTimes $File.FullName
-        if ($fileTimes -and $fileTimes.Created) { $time = $fileTimes.Created; $timeNote = "quarantine entry file created (no time in the entry)" }
+        if ($fileTimes -and $fileTimes.Created -and $fileTimes.Created.Year -ge 1980) { $time = $fileTimes.Created; $timeNote = "quarantine entry file created (no valid time in the entry)" }
     }
     if ($null -eq $time) { return 0 }
 
@@ -10449,33 +10528,44 @@ function Read-DefenderQuarantineEntry {
             $q = [int]$start
             while ($q + 1 -lt $size2 -and ($part2[$q] -ne 0 -or $part2[$q + 1] -ne 0)) { $q += 2 }
             if ($q + 1 -ge $size2) { continue }
-            $path = [System.Text.Encoding]::Unicode.GetString($part2, [int]$start, $q - [int]$start)
-            if ($path.StartsWith("\\?\UNC\", [System.StringComparison]::OrdinalIgnoreCase)) { $path = "\\" + $path.Substring(8) }
-            elseif ($path.StartsWith("\\?\", [System.StringComparison]::Ordinal)) { $path = $path.Substring(4) }
-            # Type: after the NUL and the uint16 field count
+            $path = ConvertFrom-DefenderLongPath ([System.Text.Encoding]::Unicode.GetString($part2, [int]$start, $q - [int]$start))
+            # Type: after the NUL and the uint16 field count; then the fields
             $typeStart = $q + 4
             $resourceType = ""
+            $fields = @{}
             if ($typeStart -lt $size2) {
+                $fieldCount = [int][BitConverter]::ToUInt16($part2, $q + 2)
                 $typeEnd = [Array]::IndexOf($part2, [byte]0, $typeStart)
                 if ($typeEnd -lt 0) { $typeEnd = [int]$size2 }
                 $resourceType = [System.Text.Encoding]::ASCII.GetString($part2, $typeStart, $typeEnd - $typeStart)
+                $fields = Read-DefenderQuarantineFields -Data $part2 -Start ($typeEnd + 1) -Count $fieldCount
             }
-            if ($path) { $resources += [PSCustomObject]@{ Path = $path; Type = $resourceType } }
+            if ($path) { $resources += [PSCustomObject]@{ Path = $path; Type = $resourceType; Fields = $fields } }
         }
     }
-    if ($resources.Count -eq 0) { $resources = @([PSCustomObject]@{ Path = ""; Type = "" }) }
+    if ($resources.Count -eq 0) { $resources = @([PSCustomObject]@{ Path = ""; Type = ""; Fields = @{} }) }
 
     foreach ($resource in $resources) {
         $shown = $resource.Path
         if (-not $shown) { $shown = "(no path recorded)" }
+        # The physical path only when it differs from the detection path
+        $physicalPath = ""
+        if ($resource.Fields["PhysicalPath"]) { $physicalPath = ConvertFrom-DefenderLongPath $resource.Fields["PhysicalPath"] }
+        if ($physicalPath -and [string]::Equals($physicalPath, $resource.Path, [System.StringComparison]::OrdinalIgnoreCase)) { $physicalPath = "" }
         Add-TimelineEntry -Timestamp $time -Source "Defender-Quarantine" -EventType "SecurityAlert" `
             -Description "Defender quarantined: $shown ($threat)" `
             -Details (Format-ArtifactDetails ([ordered]@{
-                ThreatName    = $threat
-                Path          = $resource.Path
-                ResourceType  = $resource.Type
-                ResourceCount = $(if ($resources.Count -gt 1) { $resources.Count } else { "" })
-                TimeNote      = $timeNote
+                ThreatName      = $threat
+                ThreatID        = $threatId
+                Path            = $resource.Path
+                PhysicalPath    = $physicalPath
+                ResourceType    = $resource.Type
+                ResourceID      = $resource.Fields["ResourceID"]
+                FileSize        = $resource.Fields["FileSize"]
+                FileCreatedUtc  = Format-UtcDetailTime $resource.Fields["Created"]
+                FileModifiedUtc = Format-UtcDetailTime $resource.Fields["Modified"]
+                ResourceCount   = $(if ($resources.Count -gt 1) { $resources.Count } else { "" })
+                TimeNote        = $timeNote
             })) `
             -Artifact "AntiVirus" -RawPath $File.FullName
     }
@@ -10497,7 +10587,9 @@ function Read-DefenderDetectionFiles {
     foreach ($kind in $kinds) {
         if ($kind.Files.Count -eq 0) { continue }
         Log "  Parsing: $($kind.Files.Count) $($kind.Label)"
-        $added = 0; $unreadable = 0; $noTime = 0; $tooLarge = 0
+        # Rows really added (Add-TimelineEntry drops rows outside -StartDate / -EndDate)
+        $entriesBefore = $script:timelineEntries.Count
+        $unreadable = 0; $noTime = 0; $tooLarge = 0
         foreach ($file in $kind.Files) {
             if ($file.Length -gt 1MB) { $tooLarge++; continue }
             try {
@@ -10505,7 +10597,6 @@ function Read-DefenderDetectionFiles {
                 else { $result = Read-DefenderDetectionHistory -File $file }
                 if ($result -lt 0) { $unreadable++ }
                 elseif ($result -eq 0) { $noTime++ }
-                else { $added += $result }
             }
             catch {
                 $unreadable++
@@ -10518,7 +10609,7 @@ function Read-DefenderDetectionFiles {
         if ($tooLarge -gt 0) { $notes += "$tooLarge over 1 MB not read" }
         $note = ""
         if ($notes.Count -gt 0) { $note = " (skipped: $($notes -join ', '))" }
-        Log "    Added $added timeline entries$note"
+        Log "    Added $($script:timelineEntries.Count - $entriesBefore) timeline entries$note"
         $parsed += $kind.Files.Count
     }
     return $parsed

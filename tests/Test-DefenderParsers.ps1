@@ -5,13 +5,15 @@
 # threats, paths and hashes; no real detections, no malware), lays them out
 # like a triage collection, runs timeline-builder.ps1 -Sources AntiVirus and
 # checks every row, its time and its Details: detections with file, webfile,
-# container and registry resources, the fallback times (threat tracking
-# start time, the manifest's file creation time), unknown value types,
-# damaged and oversize files, quarantine entries with one and several
-# resources (\\?\ and \\?\UNC\ paths), and entries with a wrong header or
-# sizes. Files under Quarantine\ResourceData and Quarantine\Resources, and an
-# "Entries" folder outside Quarantine, hold valid entries with a canary
-# threat name that must not reach the timeline.
+# container, registry, behavior, process and command line resources (the
+# path, or none), the fallback times (threat tracking start time, the
+# manifest's file creation time; times before 1980 count as missing),
+# unknown value types, damaged and oversize files, quarantine entries with
+# one and several resources (\\?\ and \\?\UNC\ paths, the resource fields:
+# ID, physical path, original file times and size), and entries with a wrong
+# header or sizes. Files under Quarantine\ResourceData and
+# Quarantine\Resources, and an "Entries" folder outside Quarantine, hold
+# valid entries with a canary threat name that must not reach the timeline.
 # The quarantine entries are RC4-encrypted here with this test's own RC4 code
 # and its own copy of the published key (checked against the key's SHA-256
 # and a standard RC4 test vector), so the builder's decryption is checked
@@ -197,29 +199,42 @@ function Invoke-TestRc4 {
     return , $out
 }
 
+# A quarantine entry resource field: uint16 data size, uint16 identifier
+# (low 12 bits) and data type (high 4 bits), the data, zero padding to 4
+# bytes. -Size: the data size written (default: the data's length)
+function New-QuarantineField {
+    param([int]$Id, [int]$Type, [byte[]]$Data, [int]$Size = -1)
+    if ($Size -lt 0) { $Size = $Data.Length }
+    $field = Join-Bytes @((Get-UInt16Bytes $Size), (Get-UInt16Bytes (($Type -shl 12) -bor $Id)), $Data)
+    return , (Join-Bytes @($field, (New-Object byte[] ((4 - ($field.Length % 4)) % 4))))
+}
+
 # A quarantine entry: header, part 1 and part 2, each RC4-encrypted on its own.
-# $Resources: @(path, type) pairs. -Magic: first header bytes; -SizeAdjust:
-# added to the part 2 size written in the header (a size past the end)
+# $Resources: @(path, type) or @(path, type, fields) (fields: the bytes from
+# New-QuarantineField; default: a flags DWORD and a detection context
+# string, which the builder does not read). -Magic: first header bytes;
+# -SizeAdjust: added to the part 2 size written in the header (a size past
+# the end)
 function New-QuarantineEntry {
-    param([string]$Threat, $Time, [object[]]$Resources, [byte[]]$Magic = @(0xDB, 0xE8, 0xC5, 0x01, 0x01, 0x00, 0x01, 0x00), [int]$SizeAdjust = 0)
+    param([string]$Threat, $Time, [object[]]$Resources, [long]$ThreatId = 2147700001,
+          [byte[]]$Magic = @(0xDB, 0xE8, 0xC5, 0x01, 0x01, 0x00, 0x01, 0x00), [int]$SizeAdjust = 0)
     $key = ConvertFrom-HexText $script:QuarantineKeyHex
     $fileTime = 0L
     if ($null -ne $Time) { $fileTime = ([datetime]$Time).ToFileTimeUtc() }
     $part1 = Join-Bytes @((New-Object System.Guid "0000A1B2-0000-4C3D-8E4F-5A6B7C8D9E0F").ToByteArray(), [guid]::NewGuid().ToByteArray(),
-        [BitConverter]::GetBytes([long]$fileTime), [BitConverter]::GetBytes([long]2147700001), (Get-UInt32Bytes 1),
+        [BitConverter]::GetBytes([long]$fileTime), [BitConverter]::GetBytes([long]$ThreatId), (Get-UInt32Bytes 1),
         [System.Text.Encoding]::UTF8.GetBytes($Threat + [char]0))
 
     # Part 2: count, offsets, then each resource (path, field count, type,
-    # padding to 4 bytes, two fields: a 20-byte id and a UTF-16 string)
+    # padding to 4 bytes, the fields)
     $bodies = @()
     foreach ($resource in $Resources) {
-        $body = Join-Bytes @([System.Text.Encoding]::Unicode.GetBytes($resource[0] + [char]0), (Get-UInt16Bytes 2), [System.Text.Encoding]::ASCII.GetBytes($resource[1] + [char]0))
+        $fields = @((New-QuarantineField -Id 0x0A -Type 3 -Data (Get-UInt32Bytes 0)),
+            (New-QuarantineField -Id 0x0D -Type 2 -Data ([System.Text.Encoding]::Unicode.GetBytes("ctx" + [char]0))))
+        if ($resource.Count -gt 2) { $fields = @($resource[2]) }
+        $body = Join-Bytes @([System.Text.Encoding]::Unicode.GetBytes($resource[0] + [char]0), (Get-UInt16Bytes $fields.Count), [System.Text.Encoding]::ASCII.GetBytes($resource[1] + [char]0))
         $body = Join-Bytes @($body, (New-Object byte[] ((4 - ($body.Length % 4)) % 4)))
-        $idField = Join-Bytes @((Get-UInt16Bytes 20), (Get-UInt16Bytes (0x4000 -bor 0x02)), (New-Object byte[] 20))
-        $text = [System.Text.Encoding]::Unicode.GetBytes("ctx" + [char]0)
-        $textField = Join-Bytes @((Get-UInt16Bytes $text.Length), (Get-UInt16Bytes (0x2000 -bor 0x0D)), $text)
-        $textField = Join-Bytes @($textField, (New-Object byte[] ((4 - ($textField.Length % 4)) % 4)))
-        $bodies += , (Join-Bytes @($body, $idField, $textField))
+        $bodies += , (Join-Bytes (@(, $body) + $fields))
     }
     $offset = 4 + 4 * $bodies.Count
     $offsets = @()
@@ -244,15 +259,24 @@ $t = @{
     D2Status    = Get-Utc "2026-03-02 11:31:00.000"
     D3Initial   = Get-Utc "2026-03-03 08:15:30.500"
     D6Created   = Get-Utc "2026-03-04 07:00:00.000"
+    D9Initial   = Get-Utc "2026-03-06 14:20:00.000"
+    D10Tracking = Get-Utc "2026-03-07 09:45:10.750"
     Q1          = Get-Utc "2026-03-01 10:00:05.000"
+    Q1Created   = Get-Utc "2026-02-28 18:12:44.000"
+    Q1Modified  = Get-Utc "2026-02-28 18:12:45.000"
     Q2          = Get-Utc "2026-03-02 11:31:00.000"
     Q5Created   = Get-Utc "2026-03-05 06:00:00.000"
+    Q6Created   = Get-Utc "2026-03-08 16:30:00.000"
+    # A damaged FILETIME: not zero, but before 1980
+    Bogus       = Get-Utc "1601-01-02 00:00:00.000"
 }
 $did1 = "11111111-2222-4333-8444-555555555551"
 $did2 = "11111111-2222-4333-8444-555555555552"
 $did3 = "11111111-2222-4333-8444-555555555553"
 $did6 = "11111111-2222-4333-8444-555555555556"
 $did7 = "11111111-2222-4333-8444-555555555557"
+$did9 = "11111111-2222-4333-8444-555555555559"
+$did10 = "11111111-2222-4333-8444-55555555555A"
 $canary = "Canary:Win32/MustNotBeRead"
 
 $workDir = Join-Path ([System.IO.Path]::GetTempPath()) ("defender-parser-test-" + [guid]::NewGuid().ToString("N"))
@@ -329,7 +353,8 @@ try {
 
     # D6: a value whose size runs past the end of the file right after the
     # threat values (no resources, no times): the time comes from the
-    # manifest's original creation time. D7: the same without a manifest row
+    # manifest's original creation time. D7: the same, but the manifest's
+    # creation time is before 1980 (no time)
     $broken = Join-Bytes @((New-HistoryNumber64 2147700006), (New-HistoryGuid $did6), (New-HistoryText "Magic.Version:1.2"),
         (New-HistoryText "Trojan:Win32/TimelineTest.D"), (New-HistoryNumber 0), (New-HistoryNumber 5), (New-HistoryNumber 8),
         (Get-UInt32Bytes 0x7FFFFFF0), (Get-UInt32Bytes 0x06), (New-Object byte[] 8))
@@ -340,22 +365,66 @@ try {
     # D8: over 1 MB, not read
     [System.IO.File]::WriteAllBytes((Join-Path $historyDir "03\{11111111-2222-4333-8444-555555555558}"), (Join-Bytes @($full, (New-Object byte[] (1MB)))))
 
-    # Quarantine entries: Q1 one resource with a \\?\ path; Q2 three
-    # resources (file, \\?\UNC\ file, registry key); Q3 wrong header magic;
-    # Q4 part 2 size past the end of the file; Q5 no time (manifest time used)
+    # D9: behavior and process resources (no file resource): the path is the
+    # threat tracking's CONTEXT_DATA_FILENAME, not a "pid:" location
+    $tracking9 = New-ThreatTracking ([ordered]@{
+        ThreatTrackingStartTime = @(4, $t.D9Initial.ToFileTimeUtc())
+        CONTEXT_DATA_FILENAME   = @(6, "C:\Users\dave\AppData\Local\Temp\helper.dll")
+        CONTEXT_DATA_PROCESS_PPID = @(6, "5120")
+    })
+    $behaviorLocation = "pid:7312:111594416347043"
+    $processLocation = "pid:7312,ProcessStart:133700000000000000"
+    [System.IO.File]::WriteAllBytes((Join-Path $historyDir "03\{$($did9.ToUpperInvariant())}"), (New-DetectionHistoryFile -ThreatId 2147700009 -DetectionId $did9 `
+        -Threat "Behavior:Win32/TimelineTest.I" -Severity 5 -Category 46 -Status 3 -Resources @(
+            [PSCustomObject]@{ Type = "behavior"; Location = $behaviorLocation; Tracking = $tracking9 },
+            [PSCustomObject]@{ Type = "process"; Location = $processLocation; Tracking = (New-ThreatTracking -HeaderOnly) }) `
+        -Own ([PSCustomObject]@{ StatusChange = $null; User = "CONTOSO\dave"; Process = "C:\Windows\System32\rundll32.exe"; Initial = $t.D9Initial; Remediation = $null })))
+
+    # D10: process and command line resources only (no path at all); a
+    # damaged initial detection time (before 1980): the threat tracking start
+    # time is used instead
+    $cmdLocation = "C:\Windows\System32\cmd.exe /c timelinetest.cmd"
+    [System.IO.File]::WriteAllBytes((Join-Path $historyDir "03\{$($did10.ToUpperInvariant())}"), (New-DetectionHistoryFile -ThreatId 2147700010 -DetectionId $did10 `
+        -Threat "Behavior:Win32/TimelineTest.J" -Severity 4 -Category 46 -Status 1 -Resources @(
+            [PSCustomObject]@{ Type = "process"; Location = $processLocation; Tracking = (New-ThreatTracking ([ordered]@{ ThreatTrackingStartTime = @(4, $t.D10Tracking.ToFileTimeUtc()) })) },
+            [PSCustomObject]@{ Type = "CmdLine"; Location = $cmdLocation; Tracking = (New-ThreatTracking -HeaderOnly) }) `
+        -Own ([PSCustomObject]@{ StatusChange = $t.Bogus; User = "CONTOSO\erin"; Process = "Unknown"; Initial = $t.Bogus; Remediation = $null })))
+
+    # Quarantine entries: Q1 one resource with a \\?\ path and the fields the
+    # builder reads (resource ID, physical path, original file times and
+    # size) among others, one of odd size; Q2 three resources (file, \\?\UNC\
+    # file whose physical path is the same, registry key whose last field
+    # runs past the end); Q3 wrong header magic; Q4 part 2 size past the end
+    # of the file; Q5 no time and Q6 a time before 1980 (manifest time used)
+    $resourceId = [byte[]](0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18, 0x29, 0x3A, 0x4B, 0x5C, 0x6D, 0x7E, 0x8F, 0x90, 0x01, 0x12, 0x23, 0x34)
+    $q1Fields = @(
+        (New-QuarantineField -Id 0x02 -Type 4 -Data $resourceId),
+        (New-QuarantineField -Id 0x0A -Type 3 -Data (Get-UInt32Bytes 1)),
+        (New-QuarantineField -Id 0x0D -Type 5 -Data ([byte[]](1, 2, 3, 4, 5))),
+        (New-QuarantineField -Id 0x0C -Type 2 -Data ([System.Text.Encoding]::Unicode.GetBytes("\\?\C:\Users\alice\AppData\Local\Temp\invoice.exe" + [char]0))),
+        (New-QuarantineField -Id 0x0F -Type 6 -Data ([BitConverter]::GetBytes($t.Q1Created.ToFileTimeUtc()))),
+        (New-QuarantineField -Id 0x10 -Type 6 -Data ([BitConverter]::GetBytes($t.Q1.ToFileTimeUtc()))),
+        (New-QuarantineField -Id 0x11 -Type 6 -Data ([BitConverter]::GetBytes($t.Q1Modified.ToFileTimeUtc()))),
+        (New-QuarantineField -Id 0x12 -Type 6 -Data ([BitConverter]::GetBytes([long]33280))))
     [System.IO.File]::WriteAllBytes((Join-Path $entriesDir "{0000A1B2-0000-0000-0000-000000000001}"),
-        (New-QuarantineEntry -Threat "Trojan:Win32/TimelineTest.A" -Time $t.Q1 -Resources @(, @("\\?\C:\Users\alice\Downloads\invoice.exe", "file"))))
+        (New-QuarantineEntry -Threat "Trojan:Win32/TimelineTest.A" -Time $t.Q1 -Resources @(, @("\\?\C:\Users\alice\Downloads\invoice.exe", "file", $q1Fields))))
+    $uncFields = @((New-QuarantineField -Id 0x0C -Type 2 -Data ([System.Text.Encoding]::Unicode.GetBytes("\\?\UNC\fileserver\share\drop.exe" + [char]0))),
+        (New-QuarantineField -Id 0x12 -Type 3 -Data (Get-UInt32Bytes 4096)))
+    $cutFields = @((New-QuarantineField -Id 0x0A -Type 3 -Data (Get-UInt32Bytes 0)),
+        (New-QuarantineField -Id 0x0F -Type 6 -Data ([BitConverter]::GetBytes($t.Q1Created.ToFileTimeUtc())) -Size 0x7FFF))
     [System.IO.File]::WriteAllBytes((Join-Path $entriesDir "{0000A1B2-0000-0000-0000-000000000002}"),
-        (New-QuarantineEntry -Threat "Backdoor:Win32/TimelineTest.B" -Time $t.Q2 -Resources @(
+        (New-QuarantineEntry -Threat "Backdoor:Win32/TimelineTest.B" -ThreatId 2147700002 -Time $t.Q2 -Resources @(
             @("C:\Users\bob\AppData\Roaming\agent.exe", "file"),
-            @("\\?\UNC\fileserver\share\drop.exe", "file"),
-            @("HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\\agent", "regkeyvalue"))))
+            @("\\?\UNC\fileserver\share\drop.exe", "file", $uncFields),
+            @("HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\\agent", "regkeyvalue", $cutFields))))
     [System.IO.File]::WriteAllBytes((Join-Path $entriesDir "{0000A1B2-0000-0000-0000-000000000003}"),
         (New-QuarantineEntry -Threat "Trojan:Win32/TimelineTest.F" -Time $t.Q1 -Resources @(, @("C:\x.exe", "file")) -Magic ([byte[]](0x01, 0x02, 0x03, 0x04))))
     [System.IO.File]::WriteAllBytes((Join-Path $entriesDir "{0000A1B2-0000-0000-0000-000000000004}"),
         (New-QuarantineEntry -Threat "Trojan:Win32/TimelineTest.G" -Time $t.Q1 -Resources @(, @("C:\y.exe", "file")) -SizeAdjust 64))
     [System.IO.File]::WriteAllBytes((Join-Path $entriesDir "{0000A1B2-0000-0000-0000-000000000005}"),
-        (New-QuarantineEntry -Threat "Trojan:Win32/TimelineTest.H" -Time $null -Resources @(, @("C:\Users\carol\Desktop\setup.exe", "file"))))
+        (New-QuarantineEntry -Threat "Trojan:Win32/TimelineTest.H" -ThreatId 2147700008 -Time $null -Resources @(, @("C:\Users\carol\Desktop\setup.exe", "file"))))
+    [System.IO.File]::WriteAllBytes((Join-Path $entriesDir "{0000A1B2-0000-0000-0000-000000000006}"),
+        (New-QuarantineEntry -Threat "Trojan:Win32/TimelineTest.K" -ThreatId 2147700011 -Time $t.Bogus -Resources @(, @("C:\Users\frank\Desktop\tool.exe", "file"))))
 
     # Valid entries in places that must never be read
     $canaryEntry = New-QuarantineEntry -Threat $canary -Time $t.Q1 -Resources @(, @("C:\canary.exe", "file"))
@@ -364,10 +433,13 @@ try {
         [System.IO.File]::WriteAllBytes((Join-Path $collection "$place\AB0123456789ABCDEF0123456789ABCDEF012345"), $canaryEntry)
     }
 
-    # Manifest: original creation times of D6 and Q5
+    # Manifest: original creation times of D6, Q5 and Q6, and of D7 one before
+    # 1980 (not used: D7 stays without a time)
     $manifest = @('"SHA256","SourcePath","DestPath","SizeBytes","CollectedAt","RelativePath","SourceCreatedUtc","SourceModifiedUtc","SourceAccessedUtc"')
     foreach ($row in @(@("AntiVirus\Defender\DetectionHistory\03\{$($did6.ToUpperInvariant())}", $t.D6Created),
-                       @("AntiVirus\Defender\Quarantine\Entries\{0000A1B2-0000-0000-0000-000000000005}", $t.Q5Created))) {
+                       @("AntiVirus\Defender\DetectionHistory\03\{$($did7.ToUpperInvariant())}", (Get-Utc "1975-06-01 00:00:00.000")),
+                       @("AntiVirus\Defender\Quarantine\Entries\{0000A1B2-0000-0000-0000-000000000005}", $t.Q5Created),
+                       @("AntiVirus\Defender\Quarantine\Entries\{0000A1B2-0000-0000-0000-000000000006}", $t.Q6Created))) {
         $created = $row[1].ToString("o")
         $manifest += '"00","C:\ProgramData\x","C:\out\x","1","2026-09-01 12:00:00","' + $row[0] + '","' + $created + '","' + $created + '","' + $created + '"'
     }
@@ -404,62 +476,83 @@ try {
         Assert-Equal -Name "$Name details" -Expected $Details -Actual $match[0].Details
     }
 
-    Assert-Equal -Name "row count" -Expected 9 -Actual $rows.Count
-    Assert-Equal -Name "DetectionHistory rows" -Expected 4 -Actual @($rows | Where-Object { $_.Source -eq "Defender-DetectionHistory" }).Count
-    Assert-Equal -Name "quarantine rows" -Expected 5 -Actual @($rows | Where-Object { $_.Source -eq "Defender-Quarantine" }).Count
+    Assert-Equal -Name "row count" -Expected 12 -Actual $rows.Count
+    Assert-Equal -Name "DetectionHistory rows" -Expected 6 -Actual @($rows | Where-Object { $_.Source -eq "Defender-DetectionHistory" }).Count
+    Assert-Equal -Name "quarantine rows" -Expected 6 -Actual @($rows | Where-Object { $_.Source -eq "Defender-Quarantine" }).Count
 
     Test-Row -Name "D1 (file + webfile)" -Source "Defender-DetectionHistory" -Timestamp "2026-03-01 10:00:00.123" -User "CONTOSO\alice" `
         -Description "Defender detection (DetectionHistory): Trojan:Win32/TimelineTest.A on C:\Users\alice\Downloads\invoice.exe" `
         -Details ("ThreatName=Trojan:Win32/TimelineTest.A | ThreatID=2147700001 | Severity=Severe (5) | CategoryID=8 | Status=Quarantined | " +
-            "Resources=file:_C:\Users\alice\Downloads\invoice.exe; webfile:_$webLocation | User=CONTOSO\alice | " +
+            "Path=C:\Users\alice\Downloads\invoice.exe | Resources=file:_C:\Users\alice\Downloads\invoice.exe; webfile:_$webLocation | User=CONTOSO\alice | " +
             "Process=C:\Program Files\Mozilla Firefox\firefox.exe | SHA256=$sha1 | StatusChangeUtc=2026-03-01 10:00:05 | " +
             "RemediationUtc=2026-03-01 10:00:05 | DetectionID={$($did1.ToUpperInvariant())}")
     Test-Row -Name "D2 (container, tracking start time)" -Source "Defender-DetectionHistory" -Timestamp "2026-03-02 11:30:00.250" -User "CONTOSO\bob" `
         -Description "Defender detection (DetectionHistory): Backdoor:Win32/TimelineTest.B on C:\Users\bob\Downloads\tools.zip->agent.exe" `
         -Details ("ThreatName=Backdoor:Win32/TimelineTest.B | ThreatID=2147700002 | Severity=High (4) | CategoryID=6 | Status=Detected | " +
+            "Path=C:\Users\bob\Downloads\tools.zip->agent.exe | " +
             "Resources=containerfile:_C:\Users\bob\Downloads\tools.zip; file:_C:\Users\bob\Downloads\tools.zip->agent.exe | User=CONTOSO\bob | " +
             "Process=Unknown | SHA256=$sha2 | StatusChangeUtc=2026-03-02 11:31:00 | " +
-            "TimeNote=ThreatTrackingStartTime (no initial detection time in the file) | DetectionID={$($did2.ToUpperInvariant())}")
+            "TimeNote=ThreatTrackingStartTime (no valid initial detection time in the file) | DetectionID={$($did2.ToUpperInvariant())}")
     Test-Row -Name "D3 (registry resource)" -Source "Defender-DetectionHistory" -Timestamp "2026-03-03 08:15:30.500" -User "NT AUTHORITY\SYSTEM" `
         -Description "Defender detection (DetectionHistory): PUA:Win32/TimelineTest.C on HKLM\SOFTWARE\Contoso\Toolbar" `
         -Details ("ThreatName=PUA:Win32/TimelineTest.C | ThreatID=2147700003 | Severity=Low (1) | CategoryID=27 | Status=Blocked | " +
-            "Resources=regkey:_HKLM\SOFTWARE\Contoso\Toolbar | User=NT AUTHORITY\SYSTEM | Process=Unknown | DetectionID={$($did3.ToUpperInvariant())}")
+            "Path=HKLM\SOFTWARE\Contoso\Toolbar | Resources=regkey:_HKLM\SOFTWARE\Contoso\Toolbar | User=NT AUTHORITY\SYSTEM | Process=Unknown | " +
+            "DetectionID={$($did3.ToUpperInvariant())}")
     Test-Row -Name "D6 (damaged after the threat, manifest time)" -Source "Defender-DetectionHistory" -Timestamp "2026-03-04 07:00:00.000" -User "" `
         -Description "Defender detection (DetectionHistory): Trojan:Win32/TimelineTest.D" `
         -Details ("ThreatName=Trojan:Win32/TimelineTest.D | ThreatID=2147700006 | Severity=Severe (5) | CategoryID=8 | " +
-            "TimeNote=DetectionHistory file created (no time in the file) | DetectionID={$($did6.ToUpperInvariant())}")
+            "TimeNote=DetectionHistory file created (no valid time in the file) | DetectionID={$($did6.ToUpperInvariant())}")
+    Test-Row -Name "D9 (behavior + process, CONTEXT_DATA_FILENAME path)" -Source "Defender-DetectionHistory" -Timestamp "2026-03-06 14:20:00.000" -User "CONTOSO\dave" `
+        -Description "Defender detection (DetectionHistory): Behavior:Win32/TimelineTest.I on C:\Users\dave\AppData\Local\Temp\helper.dll" `
+        -Details ("ThreatName=Behavior:Win32/TimelineTest.I | ThreatID=2147700009 | Severity=Severe (5) | CategoryID=46 | Status=Quarantined | " +
+            "Path=C:\Users\dave\AppData\Local\Temp\helper.dll | Resources=behavior:_$behaviorLocation; process:_$processLocation | User=CONTOSO\dave | " +
+            "Process=C:\Windows\System32\rundll32.exe | DetectionID={$($did9.ToUpperInvariant())}")
+    Test-Row -Name "D10 (no path, initial time before 1980)" -Source "Defender-DetectionHistory" -Timestamp "2026-03-07 09:45:10.750" -User "CONTOSO\erin" `
+        -Description "Defender detection (DetectionHistory): Behavior:Win32/TimelineTest.J" `
+        -Details ("ThreatName=Behavior:Win32/TimelineTest.J | ThreatID=2147700010 | Severity=High (4) | CategoryID=46 | Status=Detected | " +
+            "Resources=process:_$processLocation; CmdLine:_$cmdLocation | User=CONTOSO\erin | Process=Unknown | " +
+            "TimeNote=ThreatTrackingStartTime (no valid initial detection time in the file) | DetectionID={$($did10.ToUpperInvariant())}")
 
-    Test-Row -Name "Q1 (\\?\ path)" -Source "Defender-Quarantine" -Timestamp "2026-03-01 10:00:05.000" -User "" `
+    $resourceIdHex = [BitConverter]::ToString($resourceId).Replace("-", "")
+    Test-Row -Name "Q1 (\\?\ path, resource fields)" -Source "Defender-Quarantine" -Timestamp "2026-03-01 10:00:05.000" -User "" `
         -Description "Defender quarantined: C:\Users\alice\Downloads\invoice.exe (Trojan:Win32/TimelineTest.A)" `
-        -Details "ThreatName=Trojan:Win32/TimelineTest.A | Path=C:\Users\alice\Downloads\invoice.exe | ResourceType=file"
+        -Details ("ThreatName=Trojan:Win32/TimelineTest.A | ThreatID=2147700001 | Path=C:\Users\alice\Downloads\invoice.exe | " +
+            "PhysicalPath=C:\Users\alice\AppData\Local\Temp\invoice.exe | ResourceType=file | ResourceID=$resourceIdHex | FileSize=33280 | " +
+            "FileCreatedUtc=2026-02-28 18:12:44 | FileModifiedUtc=2026-02-28 18:12:45")
     Test-Row -Name "Q2 resource 1" -Source "Defender-Quarantine" -Timestamp "2026-03-02 11:31:00.000" -User "" `
         -Description "Defender quarantined: C:\Users\bob\AppData\Roaming\agent.exe (Backdoor:Win32/TimelineTest.B)" `
-        -Details "ThreatName=Backdoor:Win32/TimelineTest.B | Path=C:\Users\bob\AppData\Roaming\agent.exe | ResourceType=file | ResourceCount=3"
-    Test-Row -Name "Q2 resource 2 (\\?\UNC\ path)" -Source "Defender-Quarantine" -Timestamp "2026-03-02 11:31:00.000" -User "" `
+        -Details "ThreatName=Backdoor:Win32/TimelineTest.B | ThreatID=2147700002 | Path=C:\Users\bob\AppData\Roaming\agent.exe | ResourceType=file | ResourceCount=3"
+    Test-Row -Name "Q2 resource 2 (\\?\UNC\ path, same physical path)" -Source "Defender-Quarantine" -Timestamp "2026-03-02 11:31:00.000" -User "" `
         -Description "Defender quarantined: \\fileserver\share\drop.exe (Backdoor:Win32/TimelineTest.B)" `
-        -Details "ThreatName=Backdoor:Win32/TimelineTest.B | Path=\\fileserver\share\drop.exe | ResourceType=file | ResourceCount=3"
-    Test-Row -Name "Q2 resource 3 (registry)" -Source "Defender-Quarantine" -Timestamp "2026-03-02 11:31:00.000" -User "" `
+        -Details "ThreatName=Backdoor:Win32/TimelineTest.B | ThreatID=2147700002 | Path=\\fileserver\share\drop.exe | ResourceType=file | FileSize=4096 | ResourceCount=3"
+    Test-Row -Name "Q2 resource 3 (registry, field past the end)" -Source "Defender-Quarantine" -Timestamp "2026-03-02 11:31:00.000" -User "" `
         -Description "Defender quarantined: HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\\agent (Backdoor:Win32/TimelineTest.B)" `
-        -Details "ThreatName=Backdoor:Win32/TimelineTest.B | Path=HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\\agent | ResourceType=regkeyvalue | ResourceCount=3"
+        -Details "ThreatName=Backdoor:Win32/TimelineTest.B | ThreatID=2147700002 | Path=HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\\agent | ResourceType=regkeyvalue | ResourceCount=3"
     Test-Row -Name "Q5 (no time, manifest time)" -Source "Defender-Quarantine" -Timestamp "2026-03-05 06:00:00.000" -User "" `
         -Description "Defender quarantined: C:\Users\carol\Desktop\setup.exe (Trojan:Win32/TimelineTest.H)" `
-        -Details "ThreatName=Trojan:Win32/TimelineTest.H | Path=C:\Users\carol\Desktop\setup.exe | ResourceType=file | TimeNote=quarantine entry file created (no time in the entry)"
+        -Details ("ThreatName=Trojan:Win32/TimelineTest.H | ThreatID=2147700008 | Path=C:\Users\carol\Desktop\setup.exe | ResourceType=file | " +
+            "TimeNote=quarantine entry file created (no valid time in the entry)")
+    Test-Row -Name "Q6 (time before 1980, manifest time)" -Source "Defender-Quarantine" -Timestamp "2026-03-08 16:30:00.000" -User "" `
+        -Description "Defender quarantined: C:\Users\frank\Desktop\tool.exe (Trojan:Win32/TimelineTest.K)" `
+        -Details ("ThreatName=Trojan:Win32/TimelineTest.K | ThreatID=2147700011 | Path=C:\Users\frank\Desktop\tool.exe | ResourceType=file | " +
+            "TimeNote=quarantine entry file created (no valid time in the entry)")
+    Assert-Equal -Name "no 'pid:' location as a path" -Expected 0 -Actual @($rows | Where-Object { $_.Description -match ' on pid:' -or $_.Details -match '(^| )Path=pid:' }).Count
 
     Assert-Equal -Name "no row from ResourceData, Resources or an Entries folder outside Quarantine" -Expected 0 -Actual @($rows | Where-Object {
         "$($_.Description) $($_.Details)".Contains($canary) }).Count
     Assert-Equal -Name "no row for a wrong header or sizes" -Expected 0 -Actual @($rows | Where-Object { $_.Description -match 'TimelineTest\.[FG]\)' }).Count
     $parseLines = (@($builderOutput | Where-Object { $_ -match 'Parsing: |Added \d+ timeline' }) -join "`n")
     Write-TestResult -Name "log: DetectionHistory files and skips" -Message $parseLines -Passed (
-        $log -match "Parsing: 8 Defender DetectionHistory file\(s\)\s*\n[^\n]*Added 4 timeline entries \(skipped: 2 not in the expected format, 1 without a time, 1 over 1 MB not read\)")
+        $log -match "Parsing: 10 Defender DetectionHistory file\(s\)\s*\n[^\n]*Added 6 timeline entries \(skipped: 2 not in the expected format, 1 without a time, 1 over 1 MB not read\)")
     Write-TestResult -Name "log: quarantine entries and skips" -Message $parseLines -Passed (
-        $log -match "Parsing: 5 Defender quarantine entry file\(s\)\s*\n[^\n]*Added 5 timeline entries \(skipped: 2 not in the expected format\)")
+        $log -match "Parsing: 6 Defender quarantine entry file\(s\)\s*\n[^\n]*Added 6 timeline entries \(skipped: 2 not in the expected format\)")
     $warnings = @($builderOutput | Where-Object { $_ -match 'WARNING:|ERROR:' })
     Write-TestResult -Name "log: no warnings or errors" -Passed ($warnings.Count -eq 0) -Message ($warnings -join "`n")
     Assert-Equal -Name "log: ResourceData never named" -Expected $false -Actual ($log -match 'ResourceData')
 
     # --- Damaged files, read with the builder's functions in this process ---
     # Every truncation (every byte up to 600, then every 5th) and 200 random
-    # corruptions of D1, D2 and Q2 must be read without an exception
+    # corruptions of D1, D2, D9, Q1 and Q2 must be read without an exception
     Write-Host "Reading truncated and corrupted copies with the builder's functions ..."
     $parseErrors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($builder, [ref]$null, [ref]$parseErrors)
@@ -483,6 +576,8 @@ try {
     $samples = @(
         @{ Name = "D1"; Quarantine = $false; Bytes = $full },
         @{ Name = "D2"; Quarantine = $false; Bytes = [System.IO.File]::ReadAllBytes((Join-Path $copiedHistoryDir "05\{$($did2.ToUpperInvariant())}")) },
+        @{ Name = "D9"; Quarantine = $false; Bytes = [System.IO.File]::ReadAllBytes((Join-Path $historyDir "03\{$($did9.ToUpperInvariant())}")) },
+        @{ Name = "Q1"; Quarantine = $true; Bytes = [System.IO.File]::ReadAllBytes((Join-Path $entriesDir "{0000A1B2-0000-0000-0000-000000000001}")) },
         @{ Name = "Q2"; Quarantine = $true; Bytes = [System.IO.File]::ReadAllBytes((Join-Path $entriesDir "{0000A1B2-0000-0000-0000-000000000002}")) }
     )
     foreach ($sample in $samples) {
