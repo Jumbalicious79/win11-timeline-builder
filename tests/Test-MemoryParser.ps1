@@ -160,7 +160,6 @@ function Format-TestTime {
 function Invoke-MemoryPluginRows {
     param([string]$Plugin, [string]$Source, [string]$Json)
     $script:timelineEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
-    $script:artifactStats = @{}
     $entries = $Json | ConvertFrom-Json
     $counts = Add-MemoryPluginRows -Plugin $Plugin -Source $Source -Entries $entries `
         -CaptureTimeUtc $captureUtc -AcquisitionEndUtc $endUtc -DumpPath $rowDump
@@ -524,7 +523,6 @@ try {
     try {
         Set-TestRunState -Collection (Join-Path $reports $nameC) -DumpPath $rowDump
         $script:timelineEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
-        $script:artifactStats = @{}
         Parse-Memory | Out-Null
         $log = Get-TestLog
         $left = @(Get-ChildItem -LiteralPath $script:runScratchDir -Force).Count

@@ -98,6 +98,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: ./tests/Test-ShimCacheParser.ps1
 
+      - name: Run summary counts test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-SummaryCounts.ps1
+
   analyze:
     name: PSScriptAnalyzer
     runs-on: windows-latest

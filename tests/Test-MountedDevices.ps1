@@ -277,7 +277,6 @@ try {
         $script:collectionInfo = $null
         $script:collectionManifest = $null
         $script:shortenedNames = @{}
-        $script:artifactStats = @{}
         $script:logFile = Join-Path $workDir "$Name.log"
         $script:timelineEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
         Parse-USB 6>$null | Out-Null

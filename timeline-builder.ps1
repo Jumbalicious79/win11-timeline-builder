@@ -809,7 +809,6 @@ Log ""
 # Timeline Entry Collection
 # =============================================================
 $script:timelineEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
-$script:artifactStats = @{}
 
 # Characters that are not allowed in XML 1.0 (and so break the .xlsx):
 # control characters other than tab/LF/CR, U+FFFE/U+FFFF, and unpaired
@@ -860,12 +859,6 @@ function Add-TimelineEntry {
     }
 
     $script:timelineEntries.Add($entry)
-
-    # Track stats
-    if (-not $script:artifactStats.ContainsKey($Artifact)) {
-        $script:artifactStats[$Artifact] = 0
-    }
-    $script:artifactStats[$Artifact]++
 }
 
 # =============================================================
@@ -11723,6 +11716,23 @@ if (-not $skipExcel -and (Get-Module -ListAvailable -Name ImportExcel)) {
 # =============================================================
 # Summary Statistics
 # =============================================================
+
+# Rows per Artifact for "Events by artifact source". Pass the rows of the
+# finished timeline (after deduplication, as written to the CSV), so the
+# counts add up to the total. Returns Name/Count objects, the largest count
+# first and equal counts in name order.
+function Get-ArtifactRowCounts {
+    param([object[]]$Rows)
+    $counts = @{}
+    foreach ($row in $Rows) {
+        $artifact = [string]$row.Artifact
+        if ($counts.ContainsKey($artifact)) { $counts[$artifact]++ } else { $counts[$artifact] = 1 }
+    }
+    $counts.GetEnumerator() |
+        Sort-Object @{ Expression = "Value"; Descending = $true }, @{ Expression = "Key"; Descending = $false } |
+        ForEach-Object { [PSCustomObject]@{ Name = $_.Key; Count = $_.Value } }
+}
+
 $totalTimer.Stop()
 Log ""
 Log "============================================================="
@@ -11743,10 +11753,11 @@ Log "                   : $($latest.ToString('yyyy-MM-dd HH:mm:ss')) UTC"
 Log "  Span             : $(($latest - $earliest).Days) days"
 Log ""
 
-# Per-source breakdown
+# Per-source breakdown of the rows in the timeline: counted after
+# deduplication, so the counts add up to "Total events"
 Log "  Events by artifact source:"
-foreach ($artifact in ($script:artifactStats.GetEnumerator() | Sort-Object Value -Descending)) {
-    Log "    $($artifact.Key.PadRight(25)) : $($artifact.Value)"
+foreach ($artifact in (Get-ArtifactRowCounts -Rows $sorted)) {
+    Log "    $($artifact.Name.PadRight(25)) : $($artifact.Count)"
 }
 
 if ($Keywords -and $Keywords.Count -gt 0) {
