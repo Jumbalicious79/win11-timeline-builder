@@ -1399,6 +1399,39 @@ function Add-DefenderAsrAuditEntries {
     }
 }
 
+# A third-party antivirus event: from the Application log (the sources in
+# $script:ThirdPartyAvProviders) or from a product's own event log collected
+# under AntiVirus\. The text is the vendor's message when its message file
+# is on this machine, else the event's values, with whitespace collapsed.
+# Critical, Error and Warning events are kept, and Information events whose
+# text names a threat and what happened to it ("Virus Found", "Security Risk
+# Found", "... Trojan ... deleted"); the other Information events are
+# routine (definitions loaded, scan started or finished, update done), and
+# for them this returns $null. Otherwise: Description and the Details
+# fields that follow EventID.
+function Get-AntiVirusEventRow {
+    param($Record)
+    $detectionPattern = '\b(virus|threat|malware|trojan|worm|ransomware|spyware|infected|infection|security risk)\b.*\b(found|detected|quarantined|blocked|cleaned|removed|deleted)\b'
+    $levelNames = @{ 1 = "Critical"; 2 = "Error"; 3 = "Warning"; 4 = "Information" }
+    $text = "$($Record.Message)"
+    if (-not $text.Trim()) {
+        $text = (@($Record.Properties | ForEach-Object { "$($_.Value)".Trim() } | Where-Object { $_ -and $_ -ne "(NULL)" }) -join " | ")
+    }
+    $text = ($text -replace '\s+', ' ').Trim()
+    $level = [int]$Record.Level
+    if ($level -notin @(1, 2, 3) -and $text -notmatch $detectionPattern) { return $null }
+    $short = if ($text.Length -gt 200) { $text.Substring(0, 200) + "..." } else { $text }
+    return [PSCustomObject]@{
+        Description = "Antivirus event ($($Record.ProviderName) $($Record.Id)): $short"
+        Details     = [ordered]@{
+            Provider = $Record.ProviderName
+            Level    = $(if ($levelNames.ContainsKey($level)) { $levelNames[$level] } else { "$($Record.Level)" })
+            Message  = $(if ($text.Length -gt 1000) { $text.Substring(0, 1000) + "..." } else { $text })
+            UserSID  = "$($Record.UserId)"
+        }
+    }
+}
+
 # Application.evtx. Message layouts were checked against the providers'
 # message files (msimsg.dll, wer.dll, wersvc.dll, wscsvc.dll, esent.dll):
 #   MsiInstaller 1033/1034    installed / removed: product, version,
@@ -1418,7 +1451,8 @@ function Add-DefenderAsrAuditEntries {
 #   $script:ThirdPartyAvProviders, any ID: the message text,
 #                             trimmed; Critical, Error and Warning
 #                             events, and Information events
-#                             whose text reports a detection    SecurityAlert
+#                             whose text reports a detection
+#                             (Get-AntiVirusEventRow)           SecurityAlert
 # Windows Error Reporting 1001 is not read: its application crashes and hangs
 # repeat 1000 / 1002, and the rest (LiveKernelEvent, Store and update
 # failures) is routine and can number in the hundreds.
@@ -1426,12 +1460,6 @@ function Add-ApplicationEventEntries {
     param([object[]]$Records, [string]$FileName, [string]$FilePath)
     $items = @($Records | Sort-Object TimeCreated, RecordId | ForEach-Object { [PSCustomObject]@{ Record = $_; Fields = Get-EvtxEventFields $_ } })
     $msiStatusNames = @{ "0" = "success"; "3010" = "success, restart required"; "1641" = "success, restart started"; "1602" = "cancelled by the user"; "1603" = "fatal error" }
-    $levelNames = @{ 1 = "Critical"; 2 = "Error"; 3 = "Warning"; 4 = "Information" }
-    # Antivirus Information events are mostly routine (definitions loaded, scan
-    # started or finished, update done); keep those that name a threat and
-    # what happened to it ("Virus Found", "Security Risk Found", "... Trojan
-    # ... deleted")
-    $avDetectionPattern = '\b(virus|threat|malware|trojan|worm|ransomware|spyware|infected|infection|security risk)\b.*\b(found|detected|quarantined|blocked|cleaned|removed|deleted)\b'
     $eseActions = @{ 325 = "created"; 326 = "attached"; 327 = "detached" }
 
     # Product name -> times of its 1033 (installed) / 1034 (removed) events
@@ -1569,24 +1597,14 @@ function Add-ApplicationEventEntries {
             $details["Instance"] = (Get-EvtxFieldValue $f @("param3")) -replace '\s*:\s*$', ''
         }
         elseif ($script:ThirdPartyAvProviders -contains $provider) {
-            # The vendor's message text when its message file is on this
-            # machine, else the event's values
             $type = "SecurityAlert"
-            $text = "$($r.Message)"
-            if (-not $text.Trim()) {
-                $text = (@($r.Properties | ForEach-Object { "$($_.Value)".Trim() } | Where-Object { $_ -and $_ -ne "(NULL)" }) -join " | ")
-            }
-            $text = ($text -replace '\s+', ' ').Trim()
-            if ([int]$r.Level -notin @(1, 2, 3) -and $text -notmatch $avDetectionPattern) {
+            $avRow = Get-AntiVirusEventRow -Record $r
+            if ($null -eq $avRow) {
                 $skipped["antivirus Information events that report no detection"] = 1 + [int]$skipped["antivirus Information events that report no detection"]
                 continue
             }
-            $short = if ($text.Length -gt 200) { $text.Substring(0, 200) + "..." } else { $text }
-            $desc = "Antivirus event ($provider $id): $short"
-            $details["Provider"] = $provider
-            $details["Level"] = $(if ($levelNames.ContainsKey([int]$r.Level)) { $levelNames[[int]$r.Level] } else { "$($r.Level)" })
-            $details["Message"] = $(if ($text.Length -gt 1000) { $text.Substring(0, 1000) + "..." } else { $text })
-            $details["UserSID"] = "$($r.UserId)"
+            $desc = $avRow.Description
+            foreach ($key in $avRow.Details.Keys) { $details[$key] = $avRow.Details[$key] }
         }
         if (-not $desc) { continue }
 
@@ -1601,6 +1619,906 @@ function Add-ApplicationEventEntries {
     foreach ($reason in $skipped.Keys) {
         Log "    Skipped $($skipped[$reason]) event(s): $reason"
     }
+}
+
+# Text cut to at most $Max characters, with "..." when it was longer
+function Get-EvtxShortText {
+    param([string]$Text, [int]$Max)
+    if ($Text.Length -le $Max) { return $Text }
+    return $Text.Substring(0, $Max) + "..."
+}
+
+# ActivityID (System\Correlation, which ties the events of one operation
+# together; lower case, no braces) and ProcessId (System\Execution, the
+# process that wrote the event) of an event record; "" when missing
+function Get-EvtxSystemIds {
+    param($Record)
+    $xml = $Record.ToXml()
+    $ids = @{ ActivityId = ""; ProcessId = "" }
+    if ($xml -match '<Correlation\s[^>]*ActivityID=[''"]\{?([0-9A-Fa-f-]{36})\}?[''"]') { $ids.ActivityId = $Matches[1].ToLowerInvariant() }
+    if ($xml -match '<Execution\s[^>]*ProcessID=[''"](\d+)[''"]') { $ids.ProcessId = $Matches[1] }
+    return $ids
+}
+
+# A third-party antivirus product's own event log, which the collector puts
+# in AntiVirus\ (Symantec_SEP_EventLog.evtx, CrowdStrike_EventLog.evtx).
+# Every event in it is the product's, so all of them go through the filter
+# and wording of the antivirus events in the Application log
+# (Get-AntiVirusEventRow). SecurityAlert rows, Artifact AntiVirus.
+function Add-AntiVirusLogEntries {
+    param([object[]]$Records, [string]$FileName, [string]$FilePath)
+    $skipped = 0
+    foreach ($r in @($Records | Sort-Object TimeCreated, RecordId)) {
+        $avRow = Get-AntiVirusEventRow -Record $r
+        if ($null -eq $avRow) { $skipped++; continue }
+        $details = [ordered]@{ EventID = [int]$r.Id }
+        foreach ($key in $avRow.Details.Keys) { $details[$key] = $avRow.Details[$key] }
+        Add-TimelineEntry -Timestamp $r.TimeCreated -Source $FileName -EventType "SecurityAlert" `
+            -Description $avRow.Description -Details (Format-ArtifactDetails $details) `
+            -Artifact "AntiVirus" -RawPath $FilePath
+    }
+    if ($skipped -gt 0) { Log "    Skipped $skipped event(s): antivirus Information events that report no detection" }
+}
+
+# Fields of the context text of a classic Windows PowerShell event, as a
+# hashtable. Windows writes "<TAB>Name=value" lines in a fixed order: ...,
+# (800: UserId,) HostName, HostVersion, HostId, HostApplication,
+# EngineVersion, RunspaceId, PipelineId, then CommandName, CommandType,
+# ScriptName, CommandPath, CommandLine (400 / 403) or ScriptName,
+# CommandLine (800). HostApplication (the command line that started
+# PowerShell) and the CommandLine of an 800 are written as they are, line
+# breaks included, so they can hold lines that look like other fields
+# ("EngineVersion=2.0"). So the 800's CommandLine, which ends the text and
+# is the event's first value (-CommandLine), is taken off first, and
+# HostApplication runs up to the LAST EngineVersion line that is followed by
+# a RunspaceId line; the other fields are read before and after it.
+function Get-PowerShellContextFields {
+    param([string]$Text, [string]$CommandLine = "")
+    $fields = @{}
+    $rest = "$Text"
+    $tail = "`tCommandLine=" + $CommandLine
+    if ($CommandLine -and $rest.EndsWith($tail, [System.StringComparison]::Ordinal)) {
+        $fields["CommandLine"] = $CommandLine.Trim()
+        $rest = $rest.Substring(0, $rest.Length - $tail.Length)
+    }
+    $lines = $rest
+    $start = $rest.IndexOf("`tHostApplication=", [System.StringComparison]::Ordinal)
+    if ($start -ge 0) {
+        $value = $rest.Substring($start + "`tHostApplication=".Length)
+        # Greedy: the last EngineVersion / RunspaceId pair is the one Windows wrote
+        $m = [regex]::Match($value, '(?s)^(.*)\r?\n(\tEngineVersion=[^\r\n]*\r?\n\tRunspaceId=.*)$')
+        # Not the usual layout: HostApplication is its own line only
+        if (-not $m.Success) { $m = [regex]::Match($value, '(?s)^([^\r\n]*)(.*)$') }
+        $fields["HostApplication"] = $m.Groups[1].Value.Trim()
+        $lines = $rest.Substring(0, $start) + "`n" + $m.Groups[2].Value
+    }
+    foreach ($line in ($lines -split "`r?`n")) {
+        if ($line -match '^\s*([A-Za-z]+)=(.*)$' -and -not $fields.ContainsKey($Matches[1])) { $fields[$Matches[1]] = $Matches[2].Trim() }
+    }
+    return $fields
+}
+
+# Script text of the -EncodedCommand argument (base64 of UTF-16LE text) in a
+# PowerShell command line; "" if there is none or it does not decode to
+# text. powershell.exe takes -e, -ec and every abbreviation of
+# -EncodedCommand, after "-", "/" or a Unicode dash (en dash, em dash,
+# horizontal bar: U+2013-U+2015).
+function ConvertFrom-PowerShellEncodedCommand {
+    param([string]$CommandLine)
+    foreach ($m in [regex]::Matches("$CommandLine", '(?i)(?:^|\s)[-/\u2013\u2014\u2015](e[a-z]*)\s+[''"]?([A-Za-z0-9+/]{8,}={0,2})')) {
+        $name = $m.Groups[1].Value.ToLowerInvariant()
+        if ($name -ne "ec" -and -not "encodedcommand".StartsWith($name, [System.StringComparison]::Ordinal)) { continue }
+        try { $bytes = [Convert]::FromBase64String($m.Groups[2].Value) }
+        catch {
+            Write-Verbose "PowerShell -EncodedCommand argument is not base64: $($_.Exception.Message)"
+            continue
+        }
+        # UTF-16 text has an even byte count. A script is mostly printable
+        # ASCII (commands, operators, variable names), even with strings in
+        # another script; random bytes read as UTF-16 almost never are (95 in
+        # 65536 code units)
+        if ($bytes.Length -eq 0 -or $bytes.Length % 2 -ne 0) { continue }
+        $text = [System.Text.Encoding]::Unicode.GetString($bytes)
+        $printable = [regex]::Matches($text, '[\x09\x0A\x0D\x20-\x7E]').Count
+        if ($text.Trim() -and $printable -ge 0.5 * $text.Length) { return $text }
+    }
+    return ""
+}
+
+# Windows PowerShell.evtx, the classic log of Windows PowerShell 2.0-5.1
+# (provider "PowerShell", unnamed values; the last one holds "Name=value"
+# context lines, see Get-PowerShellContextFields; checked on real records):
+#   400  engine started: HostApplication is the command line that started
+#        PowerShell (the decoded -EncodedCommand script is added);
+#        EngineVersion 2.0 on a current Windows means a downgrade to the
+#        old engine, which has no script block or module logging   Execution
+#   403  engine stopped: folded into the row of its 400 (same HostId and
+#        RunspaceId) as Stopped; a row of its own only when that 400 is not
+#        in the log                                                Execution
+#   800  pipeline execution details (CommandLine, the commands run, UserId;
+#        a long one is split over several 800s with the same PipelineId).
+#        PowerShell 2.0 engines: one row per pipeline, as nothing else
+#        records what such a session ran. Later engines: one row per
+#        session (HostId and RunspaceId) at its first pipeline, with all its
+#        command lines and commands, Count and LastSeen. Without module
+#        logging Windows writes these only for Add-Type (compiled code); the
+#        PowerShell/Operational log, which also has them (4103), usually
+#        wraps much sooner, so these are often the only record left.
+#                                                                  Execution
+# Command lines are cut to 1000 characters in Details (all of a session's:
+# 2000), 200 in Description, with their whitespace collapsed there.
+function Add-WindowsPowerShellEntries {
+    param([object[]]$Records, [string]$FileName, [string]$FilePath)
+    $rows = New-Object System.Collections.Generic.List[object]
+    $openEngines = @{}
+    $groups = @{}
+    $folded403 = 0
+    $folded800 = 0
+    foreach ($r in @($Records | Sort-Object TimeCreated, RecordId)) {
+        $f = Get-EvtxEventFields $r
+        $id = [int]$r.Id
+        # 400 / 403: %1 new state, %2 old state, %3 context; 800: %1 command
+        # line, %2 context, %3 details ("CommandInvocation(...)" lines)
+        $commandLine = if ($id -eq 800) { "$($f['param1'])" } else { "" }
+        $context = Get-PowerShellContextFields -Text $(if ($id -eq 800) { $f["param2"] } else { $f["param3"] }) -CommandLine $commandLine
+        $isV2 = "$($context['EngineVersion'])" -match '^2\.'
+        $session = "$($context['HostId'])|$($context['RunspaceId'])"
+        $time = $r.TimeCreated.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture)
+        if ($id -eq 403 -and $context["HostId"] -and $openEngines.ContainsKey($session)) {
+            $openEngines[$session].Stopped = $time
+            $openEngines.Remove($session)
+            $folded403++
+            continue
+        }
+        $row = $null
+        if ($id -eq 800) {
+            $pipelineKey = if ($context["PipelineId"]) { "$session|$($context['PipelineId'])" } else { "$session|record $($r.RecordId)" }
+            $groupKey = if ($isV2) { "2.0|$pipelineKey" } elseif ($context["HostId"]) { $session } else { "record $($r.RecordId)" }
+            $row = $groups[$groupKey]
+            if ($row) { $folded800++ }
+        }
+        if (-not $row) {
+            $row = [PSCustomObject]@{ Record = $r; EventId = $id; Context = $context; IsV2 = $isV2; Stopped = ""; User = ""
+                CommandLines = New-Object System.Collections.Generic.List[string]; Commands = New-Object System.Collections.Generic.List[string]
+                Pipelines = 0; Pipeline = ""; LastSeen = "" }
+            $rows.Add($row)
+            if ($id -eq 400 -and $context["HostId"]) { $openEngines[$session] = $row }
+            if ($id -eq 800) {
+                $groups[$groupKey] = $row
+                $row.User = "$($context['UserId'])"
+            }
+        }
+        if ($id -eq 800) {
+            # A continuation part (DetailSequence 2 and up) adds commands only
+            if ("$($context['DetailSequence'])" -notmatch '^([2-9]|\d{2,})$' -or $row.Pipeline -ne $pipelineKey) {
+                $row.Pipelines++
+                if ($commandLine.Trim() -and -not $row.CommandLines.Contains($commandLine.Trim())) { $row.CommandLines.Add($commandLine.Trim()) }
+            }
+            $row.Pipeline = $pipelineKey
+            $row.LastSeen = $time
+            foreach ($m in [regex]::Matches("$($f['param3'])", 'CommandInvocation\(([^)]+)\)')) {
+                if (-not $row.Commands.Contains($m.Groups[1].Value)) { $row.Commands.Add($m.Groups[1].Value) }
+            }
+        }
+    }
+    foreach ($row in $rows) {
+        $context = $row.Context
+        $hostApp = "$($context['HostApplication'])"
+        $shown = if ($hostApp) { Get-EvtxShortText (($hostApp -replace '\s+', ' ').Trim()) 200 } else { "host $($context['HostName'])" }
+        $details = [ordered]@{ EventID = $row.EventId }
+        if ($row.EventId -eq 400) {
+            $desc = if ($row.IsV2) { "PowerShell 2.0 engine started (possible downgrade): $shown" } else { "PowerShell engine started: $shown" }
+        }
+        elseif ($row.EventId -eq 403) {
+            $desc = "PowerShell engine stopped: $shown"
+        }
+        else {
+            $first = if ($row.CommandLines.Count -gt 0) { $row.CommandLines[0] } else { "" }
+            $shownCommand = Get-EvtxShortText (($first -replace '\s+', ' ').Trim()) 200
+            $desc = if ($row.IsV2) { "PowerShell 2.0 pipeline executed: $shownCommand" } else { "PowerShell pipeline executed: $shownCommand" }
+            $details["CommandLine"] = Get-EvtxShortText $first 1000
+            $details["Commands"] = Get-EvtxShortText ($row.Commands -join ", ") 1000
+            if ($row.CommandLines.Count -gt 1) {
+                $details["CommandLines"] = Get-EvtxShortText ((@($row.CommandLines) | ForEach-Object { Get-EvtxShortText (($_ -replace '\s+', ' ').Trim()) 200 }) -join " || ") 2000
+            }
+            if ($row.Pipelines -gt 1) {
+                $details["Count"] = $row.Pipelines
+                $details["LastSeen"] = $row.LastSeen
+            }
+        }
+        $details["EngineVersion"] = $context["EngineVersion"]
+        $details["HostName"] = $context["HostName"]
+        $details["HostVersion"] = $context["HostVersion"]
+        $details["HostApplication"] = Get-EvtxShortText $hostApp 1000
+        if ($row.EventId -eq 400) { $details["EncodedCommand"] = Get-EvtxShortText (ConvertFrom-PowerShellEncodedCommand $hostApp) 1000 }
+        $details["ScriptName"] = $context["ScriptName"]
+        $details["HostId"] = $context["HostId"]
+        $details["RunspaceId"] = $context["RunspaceId"]
+        $details["Stopped"] = $row.Stopped
+        Add-TimelineEntry -Timestamp $row.Record.TimeCreated -Source $FileName -EventType "Execution" `
+            -Description $desc -User $row.User -Details (Format-ArtifactDetails $details) `
+            -Artifact "EventLogs" -RawPath $FilePath
+    }
+    if ($folded403 -gt 0) { Log "    Folded $folded403 engine stopped event(s) (403) into the row of their 400 (Stopped)" }
+    if ($folded800 -gt 0) {
+        Log "    Folded $folded800 pipeline event(s) (800) into the row of their session (PowerShell 3.0 and later) or pipeline (2.0)"
+    }
+}
+
+# Value of a property in the MOF text of a WMI instance (Name = "value";
+# with \" \\ \n escapes), or ""
+function Get-WmiMofProperty {
+    param([string]$Text, [string]$Name)
+    $m = [regex]::Match("$Text", '(?im)^\s*' + [regex]::Escape($Name) + '\s*=\s*"((?:[^"\\]|\\.)*)"\s*;')
+    if (-not $m.Success) { return "" }
+    return [regex]::Replace($m.Groups[1].Value, '\\(.)', {
+            param($escape)
+            switch -CaseSensitive ($escape.Groups[1].Value) {
+                "n" { "`n" }
+                "r" { "`r" }
+                "t" { "`t" }
+                default { $escape.Groups[1].Value }
+            }
+        })
+}
+
+# SID in the "CreatorSID = {1, 2, 0, ...};" line (the account that created
+# the instance, as the bytes of a binary SID) of the MOF text of a WMI
+# instance, or "" when there is none or it is not a valid SID
+function Get-WmiMofCreatorSid {
+    param([string]$Text)
+    $m = [regex]::Match("$Text", '(?im)^\s*CreatorSID\s*=\s*\{([\d,\s]+)\}\s*;')
+    if (-not $m.Success) { return "" }
+    try {
+        $bytes = [byte[]]@($m.Groups[1].Value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ } | ForEach-Object { [byte]$_ })
+        return (New-Object System.Security.Principal.SecurityIdentifier -ArgumentList $bytes, 0).Value
+    }
+    catch {
+        Write-Verbose "WMI CreatorSID is not a SID: $($_.Exception.Message)"
+        return ""
+    }
+}
+
+# Microsoft-Windows-WMI-Activity/Operational (fields from the UserData of real
+# records; the provider manifest has the same names):
+#   5861  permanent event subscription: an event filter bound to a consumer
+#         (Namespace; ESS = the filter name; CONSUMER = Class="name";
+#         PossibleCause = the filter and consumer instances as MOF text,
+#         with the query, what the consumer runs and the CreatorSID of
+#         each: User is the consumer's creator, else the filter's)
+#                                                          PersistenceChange
+#   5860  temporary event subscription: a running process waiting for WMI
+#         events (NamespaceName, Query, User, Processid, ClientMachine)
+#                                                          Execution
+# 5861 is written when a binding is created and again each time the WMI
+# service starts and activates the bindings that exist, so identical
+# bindings are folded into one row at the first event, with Count and
+# LastSeen; 5860 likewise per query, user, client machine and UTC day
+# (services register the same queries at every start). Windows' own "SCM
+# Event Log" binding (an NTEventLogEventConsumer) is labelled as the
+# Windows default. 5857 (provider started), 5858 (operation failed) and
+# 5859 (filter activated for a permanent consumer) are routine, hundreds a
+# day, and only counted.
+function Add-WmiActivityEntries {
+    param([object[]]$Records, [string]$FileName, [string]$FilePath)
+    $skipNames = @{ 5857 = "WMI provider started"; 5858 = "WMI operation failed"; 5859 = "event filter activated for a permanent consumer" }
+    $groups = [ordered]@{}
+    $skipped = [ordered]@{}
+    foreach ($r in @($Records | Sort-Object TimeCreated, RecordId)) {
+        $id = [int]$r.Id
+        if ($id -notin @(5860, 5861)) {
+            $label = "$id $($skipNames[$id])".Trim()
+            $skipped[$label] = 1 + [int]$skipped[$label]
+            continue
+        }
+        $f = Get-EvtxEventFields $r
+        if ($id -eq 5861) { $parts = @($f["Namespace"], $f["ESS"], $f["CONSUMER"], $f["PossibleCause"]) }
+        else { $parts = @($f["NamespaceName"], $f["Query"], $f["User"], $f["ClientMachine"], $r.TimeCreated.ToUniversalTime().ToString("yyyy-MM-dd", [System.Globalization.CultureInfo]::InvariantCulture)) }
+        $key = ("$id`t" + ((@($parts | ForEach-Object { ("$_" -replace '\s+', ' ').Trim() })) -join "`t")).ToLowerInvariant()
+        if (-not $groups.Contains($key)) { $groups[$key] = New-Object System.Collections.Generic.List[object] }
+        $groups[$key].Add([PSCustomObject]@{ Record = $r; Fields = $f })
+    }
+    $folded = 0
+    foreach ($key in $groups.Keys) {
+        $group = $groups[$key]
+        $r = $group[0].Record
+        $f = $group[0].Fields
+        $id = [int]$r.Id
+        $user = ""
+        $details = [ordered]@{ EventID = $id }
+        if ($id -eq 5861) {
+            $type = "PersistenceChange"
+            # "Binding EventFilter: instance of __EventFilter {...}; Perm. Consumer: instance of <class> {...};"
+            $cause = @("$($f['PossibleCause'])" -split 'Perm\. Consumer:', 2)
+            $filterText = $cause[0]
+            $consumerText = if ($cause.Count -gt 1) { $cause[1] } else { "" }
+            $filter = Get-EvtxFieldValue $f @("ESS")
+            $consumer = Get-EvtxFieldValue $f @("CONSUMER")
+            $consumerType = ""
+            $consumerName = $consumer
+            if ($consumer -match '^([^=]+)="?(.*?)"?$') {
+                $consumerType = $Matches[1].Trim()
+                $consumerName = $Matches[2]
+            }
+            elseif ($consumerText -match 'instance of (\w+)') { $consumerType = $Matches[1] }
+            $query = Get-WmiMofProperty $filterText "Query"
+            $desc = "WMI permanent event subscription: filter ""$filter"" -> $consumer"
+            if ($filter -eq "SCM Event Log Filter" -and $consumerType -eq "NTEventLogEventConsumer" -and $consumerName -eq "SCM Event Log Consumer") {
+                $desc += " (Windows default)"
+            }
+            $details["Namespace"] = $f["Namespace"]
+            $details["Filter"] = $filter
+            $details["Query"] = Get-EvtxShortText $query 1000
+            $details["EventNamespace"] = Get-WmiMofProperty $filterText "EventNamespace"
+            $details["ConsumerType"] = $consumerType
+            $details["Consumer"] = $consumerName
+            # What the consumer runs or writes
+            foreach ($name in @("CommandLineTemplate", "ExecutablePath", "WorkingDirectory", "ScriptingEngine", "ScriptFileName", "ScriptText", "Filename", "SourceName")) {
+                $details[$name] = Get-EvtxShortText (Get-WmiMofProperty $consumerText $name) 1000
+            }
+            # Who created the filter and the consumer (S-1-5-32-544: an
+            # elevated member of Administrators)
+            $filterCreator = Get-WmiMofCreatorSid $filterText
+            $consumerCreator = Get-WmiMofCreatorSid $consumerText
+            $details["FilterCreatorSID"] = $filterCreator
+            $details["ConsumerCreatorSID"] = $consumerCreator
+            $creator = if ($consumerCreator) { $consumerCreator } else { $filterCreator }
+            $user = if ($creator -eq "S-1-5-32-544") { "BUILTIN\Administrators" } elseif ($creator) { Resolve-BamUser -Sid $creator -SidNames @{} } else { "" }
+        }
+        else {
+            $type = "Execution"
+            $query = Get-EvtxFieldValue $f @("Query")
+            $user = Get-EvtxFieldValue $f @("User")
+            $desc = "WMI temporary event subscription: $(Get-EvtxShortText $query 200)"
+            $details["Namespace"] = $f["NamespaceName"]
+            $details["Query"] = Get-EvtxShortText $query 1000
+            $details["User"] = $user
+            $details["ClientProcessId"] = Get-EvtxFieldValue $f @("Processid")
+            $details["ClientMachine"] = $f["ClientMachine"]
+        }
+        if ($group.Count -gt 1) {
+            $details["Count"] = $group.Count
+            $details["LastSeen"] = $group[$group.Count - 1].Record.TimeCreated.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture)
+            $folded += $group.Count - 1
+        }
+        Add-TimelineEntry -Timestamp $r.TimeCreated -Source $FileName -EventType $type `
+            -Description $desc -User $user -Details (Format-ArtifactDetails $details) `
+            -Artifact "EventLogs" -RawPath $FilePath
+    }
+    if ($folded -gt 0) { Log "    Folded $folded repeated WMI subscription event(s) (5860 / 5861) into their first row (Count, LastSeen)" }
+    foreach ($label in $skipped.Keys) { Log "    Skipped $($skipped[$label]) event(s): $label (routine)" }
+}
+
+# Microsoft-Windows-TerminalServices-RDPClient/Operational: outbound RDP
+# connections made from this machine with the Remote Desktop client
+# (provider Microsoft-Windows-TerminalServices-ClientActiveXCore; field names
+# from its manifest and real records). The events of one connection share
+# an ActivityID, which names the server in the rows of the events that
+# do not carry it. All NetworkConnection; User is the account that ran the
+# client (the record's SID).
+#   1024  connecting to the server (Value = the server name as typed)
+#   1025  connected to the server (no data; the connection reached it)
+#   1102  multi-transport (UDP) connection initiated (Value = server address)
+#   1027  connected to the server's domain (DomainName, SessionId)
+#   1029  Base64(SHA-256(user name)) of the account used (TraceMessage)
+#   1009  the server did not accept the credentials
+#   1026  disconnected (Value = disconnect reason code)
+function Add-RdpClientEntries {
+    param([object[]]$Records, [string]$FileName, [string]$FilePath)
+    # Disconnect reasons (IMsTscAxEvents::OnDisconnected), the ones that show
+    # whether a connection or logon failed
+    $reasons = @{ "0" = "no information"; "1" = "local disconnection"; "2" = "remote disconnection by user"; "3" = "remote disconnection by server"
+        "260" = "DNS name lookup failure"; "264" = "connection timed out"; "516" = "socket connect failed"; "520" = "host not found"; "1288" = "DNS lookup failed"
+        "2055" = "login failed"; "2308" = "socket closed"; "2567" = "no such user"; "2823" = "account disabled"; "3335" = "account locked out"
+        "3591" = "account expired"; "3847" = "password expired" }
+    $items = @($Records | Sort-Object TimeCreated, RecordId | ForEach-Object {
+            [PSCustomObject]@{ Record = $_; Fields = Get-EvtxEventFields $_; ActivityId = (Get-EvtxSystemIds $_).ActivityId }
+        })
+    # Server of each connection: the name from its 1024, else the address
+    # from its 1102
+    $servers = @{}
+    foreach ($id in @(1024, 1102)) {
+        foreach ($item in $items) {
+            $name = Get-EvtxFieldValue $item.Fields @("Value")
+            if ([int]$item.Record.Id -eq $id -and $item.ActivityId -and $name -and -not $servers.ContainsKey($item.ActivityId)) { $servers[$item.ActivityId] = $name }
+        }
+    }
+    foreach ($item in $items) {
+        $r = $item.Record
+        $f = $item.Fields
+        $id = [int]$r.Id
+        $server = if ($item.ActivityId -and $servers.ContainsKey($item.ActivityId)) { $servers[$item.ActivityId] } else { "" }
+        $what = ""
+        $details = [ordered]@{ EventID = $id }
+        switch ($id) {
+            1024 { $server = Get-EvtxFieldValue $f @("Value") }
+            1102 {
+                $address = Get-EvtxFieldValue $f @("Value")
+                if (-not $server) { $server = $address }
+                $what = "multi-transport connection to $address"
+                $details["ServerAddress"] = $address
+            }
+            1027 {
+                $domain = Get-EvtxFieldValue $f @("DomainName")
+                $session = Get-EvtxFieldValue $f @("SessionId")
+                $what = "connected (domain $domain, session $session)"
+                $details["Domain"] = $domain
+                $details["SessionID"] = $session
+            }
+            1029 {
+                $hash = Get-EvtxFieldValue $f @("TraceMessage")
+                $what = "user name hash $hash"
+                $details["UserNameHash"] = $hash
+            }
+            1025 { $what = "connected to the server" }
+            1009 { $what = "credentials not accepted by the server" }
+            1026 {
+                $code = Get-EvtxFieldValue $f @("Value")
+                $what = "disconnected (reason $code"
+                if ($reasons.ContainsKey($code)) { $what += ", $($reasons[$code])" }
+                $what += ")"
+                $details["DisconnectReason"] = $code
+            }
+        }
+        $desc = if ($server) { "Outbound RDP connection to $server" } else { "Outbound RDP connection" }
+        if ($what) { $desc += ": $what" }
+        $details["Server"] = $server
+        $details["ActivityID"] = $item.ActivityId
+        $details["UserSID"] = "$($r.UserId)"
+        Add-TimelineEntry -Timestamp $r.TimeCreated -Source $FileName -EventType "NetworkConnection" `
+            -Description $desc -User (Resolve-BamUser -Sid "$($r.UserId)" -SidNames @{}) -Details (Format-ArtifactDetails $details) `
+            -Artifact "EventLogs" -RawPath $FilePath
+    }
+}
+
+# Microsoft-Windows-NTLM/Operational. Written only where NTLM auditing is on
+# (the "Network security: Restrict NTLM: Audit ..." policies; 4013, 4020-4024
+# and 4030-4033 come from the NTLM logging of Windows 11 24H2 and Windows
+# Server 2025). Field names from the manifests of the Microsoft-Windows-NTLM
+# and Microsoft-Windows-Security-Netlogon providers on Windows 11 26100:
+#   8001       outgoing NTLM authentication: TargetName, the supplied
+#              account, the client process                 NetworkConnection
+#   4013       outgoing NTLMv1 authentication that failed (this device does
+#              not support NTLMv1); same fields as 8001    NetworkConnection
+#   4024       outgoing authentication with NTLMv1-derived credentials
+#              (single sign-on); same fields as 8001       NetworkConnection
+#   8002       incoming NTLM authentication: the process and its caller
+#              identity                                    Logon
+#   8003       NTLM authentication in this domain (on a server): account,
+#              Workstation, LogonType                      Logon
+#   8004-8006  NTLM authentication passed to this domain controller:
+#              account, WorkstationName, secure channel (the three share
+#              one template and message)                   Logon
+#   4020/4021  outgoing NTLM authentication, with NtlmVersion
+#                                                          NetworkConnection
+#   4022/4023  incoming NTLM authentication from a remote client, with
+#              NtlmVersion                                 Logon
+#   4030/4031  NTLM authentication of an account of this domain processed by
+#              this domain controller: client, server, the server or trust
+#              it was forwarded from, NtlmVersion          Logon
+#   4032/4033  forwarded NTLM authentication from this domain processed by
+#              this domain controller: client, server, NtlmVersion   Logon
+# NTLMv1 is a finding: the rows of 4013, 4024 and of 4020-4033 with
+# NtlmVersion NTLMv1 say "(NTLMv1" in Description. Unset values are written
+# as "(NULL)" and read as empty.
+function Add-NtlmEventEntry {
+    param($Record, [string]$FileName, [string]$FilePath)
+    $f = Get-EvtxEventFields $Record
+    foreach ($key in @($f.Keys)) { if ("$($f[$key])".Trim() -eq "(NULL)") { $f[$key] = "" } }
+    $id = [int]$Record.Id
+    $type = "Logon"
+    $details = [ordered]@{ EventID = $id }
+    switch ($id) {
+        { $_ -in @(8001, 4013, 4024) } {
+            $type = "NetworkConnection"
+            $target = Get-EvtxFieldValue $f @("TargetName")
+            $account = Join-EvtxAccountName $f["DomainName"] $f["UserName"]
+            $caller = Join-EvtxAccountName $f["ClientDomainName"] $f["ClientUserName"]
+            $user = if ($account) { $account } else { $caller }
+            $desc = "Outgoing NTLM authentication to $target"
+            if ($id -eq 4013) { $desc += " (NTLMv1, failed: not supported on this device)" }
+            if ($id -eq 4024) { $desc += " (NTLMv1-derived credentials, single sign-on)" }
+            $details["Target"] = $target
+            if ($id -ne 8001) { $details["NtlmVersion"] = "NTLMv1" }
+            $details["Account"] = $account
+            $details["Process"] = $f["ProcessName"]
+            $details["PID"] = $f["CallerPID"]
+            $details["ProcessAccount"] = $caller
+            $details["MechanismOID"] = $f["MechanismOID"]
+        }
+        8002 {
+            $caller = Join-EvtxAccountName $f["ClientDomainName"] $f["ClientUserName"]
+            $process = Get-EvtxFieldValue $f @("ProcessName")
+            $user = $caller
+            $desc = "Incoming NTLM authentication (process $process, account $caller)"
+            $details["Process"] = $process
+            $details["PID"] = $f["CallerPID"]
+            $details["ProcessAccount"] = $caller
+            $details["MechanismOID"] = $f["MechanismOID"]
+        }
+        8003 {
+            $user = Join-EvtxAccountName $f["DomainName"] $f["UserName"]
+            $workstation = Get-EvtxFieldValue $f @("Workstation")
+            $desc = "NTLM authentication in this domain: $user from $workstation"
+            $details["Account"] = $user
+            $details["Workstation"] = $workstation
+            $details["LogonType"] = $f["LogonType"]
+            $details["Process"] = $f["ProcessName"]
+            $details["PID"] = $f["CallerPID"]
+            $details["MechanismOID"] = $f["MechanismOID"]
+        }
+        { $_ -in @(8004, 8005, 8006) } {
+            $user = Join-EvtxAccountName $f["DomainName"] $f["UserName"]
+            $workstation = Get-EvtxFieldValue $f @("WorkstationName")
+            $channel = Get-EvtxFieldValue $f @("SChannelName")
+            $desc = "NTLM authentication passed to this domain controller: $user from $workstation (secure channel $channel)"
+            $details["Account"] = $user
+            $details["Workstation"] = $workstation
+            $details["SecureChannel"] = $channel
+            $details["SecureChannelType"] = $f["SChannelType"]
+        }
+        { $_ -in @(4020, 4021) } {
+            $type = "NetworkConnection"
+            $user = Join-EvtxAccountName $f["DomainName"] $f["Username"]
+            $target = Get-EvtxFieldValue $f @("TargetMachine", "TargetIP", "TargetService")
+            $version = Get-EvtxFieldValue $f @("NtlmVersion")
+            $desc = "Outgoing NTLM authentication to $target"
+            if ($version) { $desc += " ($version)" }
+            $details["Target"] = $target
+            $details["TargetIP"] = $f["TargetIP"]
+            $details["TargetService"] = $f["TargetService"]
+            $details["NtlmVersion"] = $version
+            $details["Account"] = $user
+            $details["Process"] = $f["ProcessName"]
+            $details["PID"] = $f["ProcessPID"]
+            $details["Reason"] = $f["NtlmUsageReason"]
+            $details["ServiceBinding"] = $f["ServiceBinding"]
+            $details["MicStatus"] = $f["Mic Status"]
+        }
+        { $_ -in @(4022, 4023) } {
+            $user = Join-EvtxAccountName $f["DomainName"] $f["Username"]
+            $client = Get-EvtxFieldValue $f @("RemoteClientMachine", "ClientIP")
+            $version = Get-EvtxFieldValue $f @("NtlmVersion")
+            $desc = "Incoming NTLM authentication from $client"
+            if ($version) { $desc += " ($version)" }
+            $details["Account"] = $user
+            $details["ClientMachine"] = $f["RemoteClientMachine"]
+            $details["ClientIP"] = $f["ClientIP"]
+            $details["NtlmVersion"] = $version
+            $details["Process"] = $f["ProcessName"]
+            $details["PID"] = $f["ProcessPID"]
+            $details["Status"] = $f["Status"]
+            $details["ServiceBinding"] = $f["ServiceBinding"]
+            $details["MicStatus"] = $f["Mic Status"]
+        }
+        { $_ -in @(4030, 4031, 4032, 4033) } {
+            $user = Join-EvtxAccountName $f["AccountDomain"] $f["AccountName"]
+            $client = Get-EvtxFieldValue $f @("AccountMachine")
+            $server = Join-EvtxAccountName $f["ServerDomain"] $f["ServerName"]
+            $version = Get-EvtxFieldValue $f @("NtlmVersion")
+            $desc = if ($id -le 4031) { "NTLM authentication processed by this domain controller: $user" } else { "Forwarded NTLM authentication processed by this domain controller: $user" }
+            if ($client) { $desc += " from $client" }
+            if ($server) { $desc += " to $server" }
+            if ($version) { $desc += " ($version)" }
+            $details["Account"] = $user
+            $details["ClientMachine"] = $client
+            $details["Server"] = $server
+            $details["ServerIP"] = $f["ServerIP"]
+            $details["ServerOS"] = $f["ServerOS"]
+            $details["ForwardedFrom"] = Join-EvtxAccountName $f["ForwarderDomain"] $f["ForwarderName"]
+            $details["ForwarderIP"] = $f["ForwarderIP"]
+            $details["ForwarderType"] = $f["ForwarderType"]
+            $details["NtlmVersion"] = $version
+            $details["DomainController"] = $f["DCName"]
+            $details["TargetMachine"] = $f["TargetMachine"]
+            $details["Status"] = $f["Status"]
+            $details["ServiceBinding"] = $f["ServiceBinding"]
+            $details["MicStatus"] = $f["Mic Status"]
+        }
+        default { return }
+    }
+    Add-TimelineEntry -Timestamp $Record.TimeCreated -Source $FileName -EventType $type `
+        -Description $desc -User $user -Details (Format-ArtifactDetails $details) `
+        -Artifact "EventLogs" -RawPath $FilePath
+}
+
+# Firewall profile bit mask ([MS-FASP] FW_PROFILE_TYPE: 1 Domain, 2 Private,
+# 4 Public, 0x7FFFFFFF all) as names; other text as it is
+function ConvertFrom-FirewallProfileMask {
+    param([string]$Value)
+    $mask = 0L
+    if (-not [long]::TryParse($Value, [ref]$mask) -or $mask -le 0) { return $Value }
+    if ($mask -eq 0x7FFFFFFF) { return "All" }
+    return ((@(@(1, "Domain"), @(2, "Private"), @(4, "Public")) | Where-Object { $mask -band $_[0] } | ForEach-Object { $_[1] }) -join ", ")
+}
+
+# Microsoft-Windows-Windows Firewall With Advanced Security/Firewall. Earlier
+# Windows 10 builds write 2002-2006, 2032 and 2033; later builds and Windows 11
+# write the same changes under newer IDs that add an ErrorCode (all are in
+# the provider manifest; field names from it and from real records):
+#   rule added               2004 / 2071 / 2097   PersistenceChange
+#   rule modified            2005 / 2073 / 2099   PersistenceChange
+#   rule deleted             2006 / 2052          PersistenceChange
+#   all rules deleted        2033 / 2059          SecurityAlert
+#   reset to the defaults    2032 / 2060          SecurityAlert
+#   profile setting changed  2003 / 2082          SecurityAlert
+#   global setting changed   2002 / 2083          SecurityAlert
+# A firewall rule is a persistent configuration item, like a service or a Run
+# key (an inbound allow rule keeps a port open for remote access, an
+# outbound block rule can cut off a security product), so rule changes are
+# PersistenceChange. Changes to the firewall as a whole (rules wiped, reset,
+# the firewall or its logging turned off, default actions changed) are
+# tampering, SecurityAlert, like Defender's protection settings.
+# A non-zero ErrorCode means the change was attempted and failed: such rows
+# read "Firewall rule add failed (error N): ...", "Firewall reset failed
+# (error N)" and so on, and a modify or delete of a rule that does not exist
+# (ErrorCode 2: installers try a modify before they add the rule) is only
+# counted. Also only counted, as the routine churn of packaged apps at every
+# install, update and sign-in (hundreds a week): rule events whose
+# ModifyingUser is the firewall service itself (NT SERVICE\mpssvc, the rules
+# of Store apps), and the rules declared in app packages (MSIX), which
+# svchost.exe adds as SYSTEM with EmbeddedContext
+# {78E1CD88-49E3-476E-B926-580E596AD309} or a program under \WindowsApps\ or
+# \SystemApps\, and deletes again by the same RuleId or RuleName (or a name
+# that is an unresolved package resource, "ms-resource:..." or "@{...}").
+function Add-FirewallEntries {
+    param([object[]]$Records, [string]$FileName, [string]$FilePath)
+    $firewallServiceSid = "S-1-5-80-3088073201-1464728630-1879813800-1107566885-823218052"
+    $packageContext = "{78E1CD88-49E3-476E-B926-580E596AD309}"
+    $kinds = @{ 2004 = "added"; 2071 = "added"; 2097 = "added"; 2005 = "modified"; 2073 = "modified"; 2099 = "modified"; 2006 = "deleted"; 2052 = "deleted"
+        2033 = "all deleted"; 2059 = "all deleted"; 2032 = "reset"; 2060 = "reset"; 2003 = "profile setting"; 2082 = "profile setting"; 2002 = "global setting"; 2083 = "global setting" }
+    $verbs = @{ "added" = "add"; "modified" = "modify"; "deleted" = "delete" }
+    # [MS-FASP] FW_DIRECTION, FW_RULE_ACTION, IP protocol numbers, FW_PROFILE_CONFIG, FW_RULE_ORIGIN_TYPE
+    $directions = @{ "1" = "Inbound"; "2" = "Outbound" }
+    $actions = @{ "1" = "Allow bypass"; "2" = "Block"; "3" = "Allow" }
+    $protocols = @{ "1" = "ICMPv4"; "6" = "TCP"; "17" = "UDP"; "58" = "ICMPv6"; "256" = "Any" }
+    $settingNames = @{ "1" = "Enable firewall"; "2" = "Disable stealth mode"; "3" = "Shielded (block all inbound)"; "4" = "Disable unicast responses to multicast/broadcast"
+        "5" = "Log dropped packets"; "6" = "Log successful connections"; "7" = "Log ignored rules"; "8" = "Log max file size"; "9" = "Log file path"
+        "10" = "Disable inbound notifications"; "11" = "Authorized apps allow user preference merge"; "12" = "Global ports allow user preference merge"
+        "13" = "Allow local policy merge"; "14" = "Allow local IPsec policy merge"; "15" = "Disabled interfaces"; "16" = "Default outbound action"
+        "17" = "Default inbound action"; "18" = "Disable stealth mode IPsec secured packet exemption" }
+    $origins = @{ "1" = "Local"; "2" = "Group Policy"; "3" = "Dynamic"; "6" = "MDM"; "8" = "Local (Hyper-V host)"; "9" = "Group Policy (Hyper-V host)"
+        "10" = "Dynamic (Hyper-V host)"; "11" = "MDM (Hyper-V host)" }
+    $serviceRules = 0
+    $packageRules = 0
+    $missingRules = 0
+    $packageRuleIds = @{}
+    $packageRuleNames = @{}
+    foreach ($r in @($Records | Sort-Object TimeCreated, RecordId)) {
+        $f = Get-EvtxEventFields $r
+        $id = [int]$r.Id
+        $kind = $kinds[$id]
+        if (-not $kind) { continue }
+        $modifyingUser = Get-EvtxFieldValue $f @("ModifyingUser")
+        $modifyingApp = Get-EvtxFieldValue $f @("ModifyingApplication")
+        $ruleId = Get-EvtxFieldValue $f @("RuleId")
+        $ruleName = Get-EvtxFieldValue $f @("RuleName")
+        $errorCode = Get-EvtxFieldValue $f @("ErrorCode")
+        $failed = $errorCode -and $errorCode -ne "0"
+        $isRuleEvent = $kind -in @("added", "modified", "deleted", "all deleted")
+        if ($isRuleEvent -and $modifyingUser -eq $firewallServiceSid) { $serviceRules++; continue }
+        if ($kind -in @("modified", "deleted") -and $errorCode -eq "2") { $missingRules++; continue }
+        if ($modifyingUser -eq "S-1-5-18" -and $modifyingApp -match '\\svchost\.exe$') {
+            $appPath = Get-EvtxFieldValue $f @("ApplicationPath")
+            if ($kind -in @("added", "modified") -and ((Get-EvtxFieldValue $f @("EmbeddedContext")) -eq $packageContext -or $appPath -match '\\(WindowsApps|SystemApps)\\')) {
+                if ($ruleId) { $packageRuleIds[$ruleId] = $true }
+                if ($ruleName) { $packageRuleNames[$ruleName] = $true }
+                $packageRules++
+                continue
+            }
+            if ($kind -eq "deleted" -and (($ruleId -and $packageRuleIds.ContainsKey($ruleId)) -or ($ruleName -and $packageRuleNames.ContainsKey($ruleName)) -or $ruleName -match '^(ms-resource:|@\{)')) {
+                $packageRules++
+                continue
+            }
+        }
+        $type = "SecurityAlert"
+        $details = [ordered]@{ EventID = $id }
+        if ($kind -in @("added", "modified", "deleted")) {
+            $type = "PersistenceChange"
+            $direction = Get-EvtxFieldValue $f @("Direction")
+            if ($directions.ContainsKey($direction)) { $direction = $directions[$direction] }
+            $action = Get-EvtxFieldValue $f @("Action")
+            if ($actions.ContainsKey($action)) { $action = $actions[$action] }
+            $protocol = Get-EvtxFieldValue $f @("Protocol")
+            if ($protocols.ContainsKey($protocol)) { $protocol = $protocols[$protocol] }
+            $profiles = ConvertFrom-FirewallProfileMask (Get-EvtxFieldValue $f @("Profiles"))
+            $origin = Get-EvtxFieldValue $f @("Origin")
+            if ($origins.ContainsKey($origin)) { $origin = $origins[$origin] }
+            $desc = if ($failed) { "Firewall rule $($verbs[$kind]) failed (error $errorCode): $ruleName" } else { "Firewall rule ${kind}: $ruleName" }
+            # Deleted-rule events name the rule only
+            $shape = (@($direction, $action) | Where-Object { $_ }) -join ", "
+            if ($shape -and $kind -ne "deleted") { $desc += " ($shape)" }
+            $details["RuleName"] = $ruleName
+            $details["RuleId"] = $ruleId
+            $details["ApplicationPath"] = $f["ApplicationPath"]
+            $details["ServiceName"] = $f["ServiceName"]
+            $details["Direction"] = $direction
+            $details["Action"] = $action
+            $details["Protocol"] = $protocol
+            $details["LocalPorts"] = $f["LocalPorts"]
+            $details["RemotePorts"] = $f["RemotePorts"]
+            $details["RemoteAddresses"] = $f["RemoteAddresses"]
+            $details["Profiles"] = $profiles
+            $details["Active"] = $(switch ("$($f['Active'])".Trim()) { "1" { "Yes" } "0" { "No" } default { $_ } })
+            $details["Origin"] = $origin
+            $details["EmbeddedContext"] = $f["EmbeddedContext"]
+        }
+        elseif ($kind -eq "all deleted") {
+            $desc = if ($failed) { "Deleting all firewall rules failed (error $errorCode)" } else { "All firewall rules deleted" }
+            $details["StoreType"] = $f["Store Type"]
+        }
+        elseif ($kind -eq "reset") {
+            $desc = if ($failed) { "Firewall reset failed (error $errorCode)" } else { "Firewall reset to its default configuration" }
+        }
+        else {
+            $settingType = Get-EvtxFieldValue $f @("SettingType")
+            $value = Get-EvtxFieldValue $f @("SettingValueString", "SettingValueDisplay")
+            $change = if ($failed) { "change failed (error $errorCode)" } else { "changed" }
+            if ($kind -eq "profile setting") {
+                $setting = if ($settingNames.ContainsKey($settingType)) { $settingNames[$settingType] } else { "setting type $settingType" }
+                $profiles = ConvertFrom-FirewallProfileMask (Get-EvtxFieldValue $f @("Profiles"))
+                $desc = "Firewall setting $change ($profiles profile): $setting = $value"
+                $details["Profiles"] = $profiles
+            }
+            else {
+                $setting = "global setting type $settingType"
+                $desc = "Firewall global setting ${change}: $setting = $value"
+            }
+            $details["Setting"] = $setting
+            $details["SettingType"] = $settingType
+            $details["Value"] = $value
+        }
+        $details["ModifyingApplication"] = $modifyingApp
+        $details["ModifyingUser"] = $modifyingUser
+        if ($failed) { $details["ErrorCode"] = $errorCode }
+        $user = if ($modifyingUser) { Resolve-BamUser -Sid $modifyingUser -SidNames @{} } else { "" }
+        Add-TimelineEntry -Timestamp $r.TimeCreated -Source $FileName -EventType $type `
+            -Description $desc -User $user -Details (Format-ArtifactDetails $details) `
+            -Artifact "EventLogs" -RawPath $FilePath
+    }
+    if ($serviceRules -gt 0) {
+        Log "    Skipped $serviceRules event(s): rules the firewall service adds and removes for packaged (Store) apps (ModifyingUser NT SERVICE\mpssvc)"
+    }
+    if ($packageRules -gt 0) {
+        Log "    Skipped $packageRules event(s): rules declared in app packages (MSIX), added and removed by svchost.exe as SYSTEM"
+    }
+    if ($missingRules -gt 0) {
+        Log "    Skipped $missingRules event(s): attempts to modify or delete a rule that does not exist (ErrorCode 2)"
+    }
+}
+
+# Microsoft-Windows-Shell-Core/Operational: the commands Explorer starts at
+# logon from the Run and RunOnce keys and from Active Setup (fields from the
+# manifest and real records). 9705 / 9706 open and close the enumeration of
+# a Run or RunOnce key (KeyName, without the hive: HKLM and HKCU both log
+# "Software\Microsoft\Windows\CurrentVersion\Run"), 62170 / 62171 start and
+# finish a logon task (TaskName; "ActiveSetup" runs the StubPath commands of
+# HKLM\Software\Microsoft\Active Setup\Installed Components), 9707 says a
+# command was started (Command) and 9708 that Explorer finished with it
+# (PID, Command; up to about 30 s after the process started). Each 9707 and
+# its 9708, from the same Explorer process, make one row at the 9707 time
+# (Execution), named after the key being enumerated, else the Active Setup
+# task, else "key unknown". Windows logs only the part of the command line
+# after its last backslash (the program file name and its arguments, not
+# the folder).
+function Add-ShellCoreEntries {
+    param([object[]]$Records, [string]$FileName, [string]$FilePath)
+    $currentKey = @{}
+    $openTasks = @{}
+    $pending = @{}
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($r in @($Records | Sort-Object TimeCreated, RecordId)) {
+        $f = Get-EvtxEventFields $r
+        $explorer = (Get-EvtxSystemIds $r).ProcessId
+        $id = [int]$r.Id
+        if ($id -eq 9705) { $currentKey[$explorer] = Get-EvtxFieldValue $f @("KeyName"); continue }
+        if ($id -eq 9706) { $currentKey.Remove($explorer); continue }
+        if ($id -in @(62170, 62171)) {
+            $task = Get-EvtxFieldValue $f @("TaskName", "param2")
+            if (-not $openTasks.ContainsKey($explorer)) { $openTasks[$explorer] = @{} }
+            if ($id -eq 62170) { $openTasks[$explorer][$task] = $true } else { $openTasks[$explorer].Remove($task) }
+            continue
+        }
+        $command = Get-EvtxFieldValue $f @("Command")
+        $pendingKey = "$explorer`t$command"
+        if ($id -eq 9708 -and $pending.ContainsKey($pendingKey)) {
+            $row = $pending[$pendingKey]
+            $pending.Remove($pendingKey)
+        }
+        else {
+            $inActiveSetup = $openTasks.ContainsKey($explorer) -and $openTasks[$explorer].ContainsKey("ActiveSetup")
+            $row = [PSCustomObject]@{ Record = $r; Command = $command; Key = "$($currentKey[$explorer])"; ActiveSetup = $inActiveSetup; ProcessId = ""; Finished = $null }
+            $rows.Add($row)
+            if ($id -eq 9707) { $pending[$pendingKey] = $row }
+        }
+        if ($id -eq 9708) {
+            $row.ProcessId = Get-EvtxFieldValue $f @("PID")
+            $row.Finished = $r.TimeCreated
+        }
+    }
+    foreach ($row in $rows) {
+        $r = $row.Record
+        $registryKey = $row.Key
+        $hive = ""
+        $task = ""
+        if ($row.Key -match '\\RunOnce$') { $desc = "RunOnce key command started at logon"; $hive = "HKLM or HKCU" }
+        elseif ($row.Key -match '\\Run$') { $desc = "Run key command started at logon"; $hive = "HKLM or HKCU" }
+        elseif ($row.ActiveSetup) {
+            $desc = "Active Setup command started at logon"
+            $registryKey = "Software\Microsoft\Active Setup\Installed Components"
+            $hive = "HKLM"
+            $task = "ActiveSetup"
+        }
+        else { $desc = "Command started at logon (key unknown)" }
+        $details = [ordered]@{
+            EventID     = [int]$r.Id
+            Command     = $row.Command
+            ProcessId   = $row.ProcessId
+            RegistryKey = $registryKey
+            Hive        = $hive
+            LogonTask   = $task
+            Finished    = $(if ($null -ne $row.Finished -and [int]$r.Id -eq 9707) { ([datetime]$row.Finished).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture) } else { "" })
+            UserSID     = "$($r.UserId)"
+        }
+        Add-TimelineEntry -Timestamp $r.TimeCreated -Source $FileName -EventType "Execution" `
+            -Description "${desc}: $($row.Command)" -User (Resolve-BamUser -Sid "$($r.UserId)" -SidNames @{}) `
+            -Details (Format-ArtifactDetails $details) -Artifact "EventLogs" -RawPath $FilePath
+    }
+}
+
+# OAlerts.evtx: event 300 of "Microsoft Office <version> Alerts" (classic
+# log, unnamed values; message "%1 | %2 | P1: %3 | P2: %4 | P3: %5 | P4: %6").
+# Two kinds, told apart by their values (checked on real records):
+#   alerts (dialog boxes) shown by Office applications: %1 the application,
+#   %2 the alert text (for example a macro, Protected View or "save
+#   changes" prompt), P1 an alert ID, P2 the Office version, P3 an error
+#   code and P4 the document: "Office alert (<application>): <text>"
+#   events of Office add-ins ("Apps for Office" in P1, or %2 the add-in as
+#   "Id=..., DisplayName=..., ..."): %1 what happened ("Activated App",
+#   "Failed to parse element: ..."), P3 an error code, P4 the open document:
+#   "Office add-in event (<what>): <add-in name>"
+# Both Execution: the user had the application or document open. Events
+# with fewer than three values (Office diagnostics such as "Compositor Type:
+# 1") are neither and are only counted.
+function Add-OfficeAlertEntries {
+    param([object[]]$Records, [string]$FileName, [string]$FilePath)
+    $skipped = 0
+    foreach ($r in @($Records | Sort-Object TimeCreated, RecordId)) {
+        $f = Get-EvtxEventFields $r
+        $values = @(1..6 | ForEach-Object { Get-EvtxFieldValue $f @("param$_") })
+        $count = @($f.Keys | Where-Object { $_ -like "param*" }).Count
+        $message = ($values[1] -replace '\s+', ' ').Trim()
+        if ($count -lt 3 -or -not $message) { $skipped++; continue }
+        if ($values[2] -eq "Apps for Office" -or $message -match '^Id=[^,]*, DisplayName=') {
+            $addIn = if ($message -match 'DisplayName=([^,]*)') { $Matches[1].Trim() } else { "" }
+            if (-not $addIn) { $addIn = Get-EvtxShortText $message 200 }
+            $details = [ordered]@{
+                EventID   = [int]$r.Id
+                Event     = $values[0]
+                AddIn     = Get-EvtxShortText $message 1000
+                Component = $values[2]
+                Version   = $values[3]
+                ErrorCode = $values[4]
+                Document  = $values[5]
+            }
+            $desc = "Office add-in event ($($values[0])): $addIn"
+        }
+        else {
+            $details = [ordered]@{
+                EventID     = [int]$r.Id
+                Application = $values[0]
+                Message     = Get-EvtxShortText $message 1000
+                P1          = $values[2]
+                Version     = $values[3]
+                P3          = $values[4]
+                Document    = $values[5]
+            }
+            $desc = "Office alert ($($values[0])): $(Get-EvtxShortText $message 200)"
+        }
+        Add-TimelineEntry -Timestamp $r.TimeCreated -Source $FileName -EventType "Execution" `
+            -Description $desc -Details (Format-ArtifactDetails $details) -Artifact "EventLogs" -RawPath $FilePath
+    }
+    if ($skipped -gt 0) { Log "    Skipped $skipped event(s): Office diagnostics that are not alerts (fewer than three values)" }
 }
 
 function Parse-EventLogs {
@@ -1665,10 +2583,22 @@ function Parse-EventLogs {
                                 "11" { "CachedInteractive" }
                                 default { "Type $logonType" }
                             }
+                            # The authentication package fields: LmPackageName "NTLM V1" is
+                            # an NTLMv1 logon; KeyLength is the session key length
+                            $logonDetails = [ordered]@{
+                                LogonType                 = $logonType
+                                Source                    = "$($eventData['IpAddress']):$($eventData['IpPort'])"
+                                LogonID                   = $eventData['TargetLogonId']
+                                IpAddress                 = Get-EvtxFieldValue $eventData @("IpAddress")
+                                WorkstationName           = Get-EvtxFieldValue $eventData @("WorkstationName")
+                                AuthenticationPackageName = Get-EvtxFieldValue $eventData @("AuthenticationPackageName")
+                                LmPackageName             = Get-EvtxFieldValue $eventData @("LmPackageName")
+                                KeyLength                 = Get-EvtxFieldValue $eventData @("KeyLength")
+                            }
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "Logon" `
                                 -Description "Successful logon ($logonTypeDesc)" `
                                 -User "$($eventData['TargetDomainName'])\$($eventData['TargetUserName'])" `
-                                -Details "LogonType=$logonType Source=$($eventData['IpAddress']):$($eventData['IpPort']) LogonID=$($eventData['TargetLogonId'])" `
+                                -Details (Format-ArtifactDetails $logonDetails) `
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
                         4625 {
@@ -2114,6 +3044,72 @@ function Parse-EventLogs {
                 }
                 if ($events.Count -gt 0) { Log "    Events read: $(Format-EvtxEventCounts $events -ByProvider)" }
                 Add-ApplicationEventEntries -Records $events -FileName $fileName -FilePath $filePath
+            }
+
+            # Windows PowerShell (classic log): engine start and stop, and the
+            # pipeline details (see Add-WindowsPowerShellEntries)
+            if ($logName -eq "Windows PowerShell") {
+                $events = @(Get-EvtxEventsById -Path $filePath -Ids @(400, 403, 800) -Label "Windows PowerShell")
+                if ($events.Count -gt 0) { Log "    Events read: $(Format-EvtxEventCounts $events)" }
+                Add-WindowsPowerShellEntries -Records $events -FileName $fileName -FilePath $filePath
+            }
+
+            # WMI activity: permanent and temporary event subscriptions; the
+            # routine 5857-5859 are read only to be counted
+            if ($logName -eq "Microsoft-Windows-WMI-Activity/Operational") {
+                $events = @(Get-EvtxEventsById -Path $filePath -Ids @(5857, 5858, 5859, 5860, 5861) -Label "WMI-Activity")
+                if ($events.Count -gt 0) { Log "    Events read: $(Format-EvtxEventCounts $events)" }
+                Add-WmiActivityEntries -Records $events -FileName $fileName -FilePath $filePath
+            }
+
+            # Outbound RDP connections (Remote Desktop client)
+            if ($logName -eq "Microsoft-Windows-TerminalServices-RDPClient/Operational") {
+                $events = @(Get-EvtxEventsById -Path $filePath -Ids @(1024, 1025, 1102, 1027, 1029, 1009, 1026) -Label "RDPClient")
+                if ($events.Count -gt 0) { Log "    Events read: $(Format-EvtxEventCounts $events)" }
+                Add-RdpClientEntries -Records $events -FileName $fileName -FilePath $filePath
+            }
+
+            # NTLM authentication auditing
+            if ($logName -eq "Microsoft-Windows-NTLM/Operational") {
+                $events = @(Get-EvtxEventsById -Path $filePath -Ids @(8001, 8002, 8003, 8004, 8005, 8006, 4013, 4020, 4021, 4022, 4023, 4024, 4030, 4031, 4032, 4033) -Label "NTLM")
+                if ($events.Count -gt 0) { Log "    Events read: $(Format-EvtxEventCounts $events)" }
+                foreach ($evt in $events) { Add-NtlmEventEntry -Record $evt -FileName $fileName -FilePath $filePath }
+            }
+
+            # Windows Firewall rule and setting changes
+            if ($logName -eq "Microsoft-Windows-Windows Firewall With Advanced Security/Firewall") {
+                $events = @(Get-EvtxEventsById -Path $filePath -Ids @(2004, 2071, 2097, 2005, 2073, 2099, 2006, 2052, 2033, 2059, 2032, 2060, 2003, 2082, 2002, 2083) -Label "Firewall")
+                if ($events.Count -gt 0) { Log "    Events read: $(Format-EvtxEventCounts $events)" }
+                Add-FirewallEntries -Records $events -FileName $fileName -FilePath $filePath
+            }
+
+            # Run / RunOnce and Active Setup commands started by Explorer at logon
+            if ($logName -eq "Microsoft-Windows-Shell-Core/Operational") {
+                $events = @(Get-EvtxEventsById -Path $filePath -Ids @(9705, 9706, 9707, 9708, 62170, 62171) -Label "Shell-Core")
+                if ($events.Count -gt 0) { Log "    Events read: $(Format-EvtxEventCounts $events)" }
+                Add-ShellCoreEntries -Records $events -FileName $fileName -FilePath $filePath
+            }
+
+            # Office alerts (dialog boxes shown by Office applications) and add-in events
+            if ($logName -eq "OAlerts") {
+                $events = @(Get-EvtxEventsById -Path $filePath -Ids @(300) -Label "OAlerts")
+                if ($events.Count -gt 0) { Log "    Events read: $(Format-EvtxEventCounts $events)" }
+                Add-OfficeAlertEntries -Records $events -FileName $fileName -FilePath $filePath
+            }
+
+            # A third-party antivirus product's own event log, collected under
+            # AntiVirus\ (Symantec_SEP_EventLog.evtx, CrowdStrike_EventLog.evtx):
+            # every event, through the antivirus filter (Add-AntiVirusLogEntries)
+            if ($evtxFile.Directory -and $evtxFile.Directory.Name -eq "AntiVirus") {
+                $events = @()
+                try { $events = @(Get-WinEvent -Path $filePath -FilterXPath "*" -ErrorAction Stop) }
+                catch {
+                    if ($_.FullyQualifiedErrorId -notlike "NoMatchingEventsFound*" -and $_.Exception.Message -notmatch "No events were found") {
+                        Log-Warning "    Error reading antivirus events from $fileName : $($_.Exception.Message)"
+                    }
+                }
+                if ($events.Count -gt 0) { Log "    Events read: $(Format-EvtxEventCounts $events -ByProvider)" }
+                Add-AntiVirusLogEntries -Records $events -FileName $fileName -FilePath $filePath
             }
 
         }
