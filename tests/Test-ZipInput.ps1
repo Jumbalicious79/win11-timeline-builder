@@ -11,7 +11,8 @@
 #   lookup, a ".." entry not written outside the folder, nothing extracted
 #   when the zip does not fit), the manifest lookups from an outer folder,
 #   the input-file list of a collection folder and the list of missing
-#   files, the setupapi logs the manifest lists but that are gone, the
+#   files, the setupapi logs found (also under names shortened on
+#   extraction) and those the manifest lists but that are gone, the
 #   free-space verdict, the temp-folder check (8.3 short paths too), the
 #   end-of-run hive list, the clean-up of work folders left by
 #   earlier runs, the refusal of a network work folder and the end-of-run
@@ -270,23 +271,32 @@ try {
     Assert-Equal -Name "25 missing files: 20 names and a count on the console" -Expected "20 1" -Actual "$(@($console -match 'Browser\\file\d\d\.db$').Count) $(@($console -match '\.\.\. and 5 more \(all listed in the log file\)$').Count)"
 
     # --- SetupAPI logs the manifest lists (USB parser) --------------------
-    # Only a listed log that is gone is reported; one shortened on
-    # extraction is found under its shorter name
+    # Logs shortened on extraction, named the way Expand-CollectionZip does
+    # (the name's start, 8 characters or more, and a hash), are found and
+    # count by their full-length names; only a listed log that is gone is
+    # reported
     $usbColl = Join-Path $testRoot "usb\Coll"
-    $shortSetupApi = Join-Path $usbColl "USB\setupapi.dev.2024~0123ABCD.log"
+    $shortSetupApi = Join-Path $usbColl "USB\setupapi~0123ABCD.log"
+    $shortRotated = Join-Path $usbColl "USB\setupapi.dev.2023~4567CDEF.log"
     New-Item -ItemType Directory -Path (Join-Path $usbColl "USB") -Force | Out-Null
-    foreach ($file in @((Join-Path $usbColl "USB\setupapi.dev.log"), $shortSetupApi)) { [System.IO.File]::WriteAllText($file, "x") }
+    foreach ($file in @((Join-Path $usbColl "USB\setupapi.dev.log"), $shortSetupApi, $shortRotated)) { [System.IO.File]::WriteAllText($file, "x") }
     [System.IO.File]::WriteAllText((Join-Path $usbColl "collection_manifest.csv"),
-        (New-TestManifest -RelativePaths @("USB\setupapi.dev.log", "USB\setupapi.dev.20241201_000000.log", "USB\setupapi.dev.20240101_000000.log", "Registry\SYSTEM")))
+        (New-TestManifest -RelativePaths @("USB\setupapi.dev.log", "USB\setupapi.dev.20241201_000000.log", "USB\setupapi.dev.20230601_000000.log", "USB\setupapi.dev.20240101_000000.log", "Registry\SYSTEM")))
     Set-Variable -Name InputPath -Value (Split-Path $usbColl -Parent) -Scope Script
     $script:collectionManifest = $null
-    $script:shortenedNames = @{ $shortSetupApi = (Join-Path $usbColl "USB\setupapi.dev.20241201_000000.log") }
-    $foundLogs = @(Get-ChildItem -LiteralPath (Join-Path $usbColl "USB") -Filter "setupapi.dev*.log" -File)
+    $script:shortenedNames = @{
+        $shortSetupApi = (Join-Path $usbColl "USB\setupapi.dev.20241201_000000.log")
+        $shortRotated  = (Join-Path $usbColl "USB\setupapi.dev.20230601_000000.log")
+    }
+    $foundLogs = @(Find-SetupApiLogFiles)
+    $foundNames = [string[]]@($foundLogs | ForEach-Object { $_.Name })
+    [Array]::Sort($foundNames, [System.StringComparer]::Ordinal)
+    Assert-Equal -Name "SetupAPI logs: found, also under a shortened name, each once" -Expected "setupapi.dev.2023~4567CDEF.log, setupapi.dev.log, setupapi~0123ABCD.log" -Actual ($foundNames -join ", ")
     $setupApiCheck = Compare-ManifestSetupApiLogs -Found $foundLogs
-    Assert-Equal -Name "SetupAPI logs: listed in the manifest" -Expected "USB\setupapi.dev.20240101_000000.log, USB\setupapi.dev.20241201_000000.log, USB\setupapi.dev.log" -Actual ($setupApiCheck.Listed -join ", ")
-    Assert-Equal -Name "SetupAPI logs: only the one that is gone is missing (shortened one found)" -Expected "USB\setupapi.dev.20240101_000000.log" -Actual ($setupApiCheck.Missing -join ", ")
+    Assert-Equal -Name "SetupAPI logs: listed in the manifest" -Expected "USB\setupapi.dev.20230601_000000.log, USB\setupapi.dev.20240101_000000.log, USB\setupapi.dev.20241201_000000.log, USB\setupapi.dev.log" -Actual ($setupApiCheck.Listed -join ", ")
+    Assert-Equal -Name "SetupAPI logs: only the one that is gone is missing (shortened ones found)" -Expected "USB\setupapi.dev.20240101_000000.log" -Actual ($setupApiCheck.Missing -join ", ")
     $setupApiCheck = Compare-ManifestSetupApiLogs -Found @()
-    Assert-Equal -Name "SetupAPI logs: none found, all listed are missing" -Expected 3 -Actual $setupApiCheck.Missing.Count
+    Assert-Equal -Name "SetupAPI logs: none found, all listed are missing" -Expected 4 -Actual $setupApiCheck.Missing.Count
     $script:shortenedNames = @{}
 
     # --- Free space verdict ----------------------------------------------

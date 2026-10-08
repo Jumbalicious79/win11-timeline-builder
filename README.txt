@@ -719,12 +719,14 @@ Parses USB device history:
     setupapi.dev.<date>.log files): first-install times, converted from the
     examined system's local time to UTC. The logs record every device and
     driver install, so only USB devices -- instance IDs that start with
-    USB\ or contain USBSTOR or VID_xxxx -- are EventType USBDevice; all
-    others (graphics card, audio, Bluetooth, software devices, driver
-    packages, ...) are EventType Installation. Source is USB-SetupAPI for
-    both. Device deletions are reported for USB devices only. The log says
-    how many setupapi logs were found and warns when collection_manifest.csv
-    lists one that is missing (lost after collection)
+    USB\ or contain USBSTOR or VID_xxxx, and volumes on removable drives
+    (SWD\WPDBUSENUM\{volume GUID}#<partition offset>) -- are EventType
+    USBDevice; all others (graphics card, audio, Bluetooth, software
+    devices, driver packages, ...) are EventType Installation. Source is
+    USB-SetupAPI for both. Device deletions are reported for USB devices
+    only. The log says how many setupapi logs were found and warns when
+    collection_manifest.csv lists one that is missing (lost after
+    collection)
   - USB devices and storage devices (usb_devices.txt, usb_storage_devices.txt)
   - Mounted devices (mounted_devices.txt)
 
@@ -1019,11 +1021,16 @@ Timeline Explorer at the same time.
     told apart and may be off by one hour.
 
   - SetupAPI USB devices -- A setupapi install counts as a USB device
-    (USBDevice) only by its instance ID (USB\, USBSTOR, VID_xxxx). The disk
-    of a USB drive that uses UAS (USB Attached SCSI) is installed as
-    SCSI\Disk&Ven_...; that row is Installation, while the drive's own
-    USB\VID_... install just before it is USBDevice. Bluetooth devices are
-    Installation.
+    (USBDevice) only by its instance ID (USB\, USBSTOR, VID_xxxx, or
+    SWD\WPDBUSENUM\{volume GUID}#...). The disk of a USB drive that uses
+    UAS (USB Attached SCSI) is installed as SCSI\Disk&Ven_...; that row is
+    Installation, while the drive's own USB\VID_... install just before it
+    is USBDevice. Bluetooth devices are Installation. The portable device
+    Windows makes for a volume on a removable drive (the
+    SWD\WPDBUSENUM\{volume GUID}#<partition offset> rows) is USBDevice,
+    as it nearly always is a USB drive, but an SD card in a built-in card
+    reader gives one too. Such a row names only the volume GUID and the
+    partition offset, not the drive.
 
   - Excel row limit -- Timelines over 1,048,575 rows are written to CSV only.
 

@@ -24,20 +24,22 @@ WHAT THE LOGS CONTAIN
 ---------------------
 Both logs are synthetic: written for this test in the format of
 setupapi.dev.log. Vendor and product IDs (VEN_FFF0, VID_FFF1), serial
-numbers (FIXTURESERIAL000n) and the Bluetooth address (all zeros) are made
-up.
+numbers (FIXTURESERIAL000n), volume GUIDs (00000000-0000-11f0-...) and the
+Bluetooth address (all zeros) are made up.
 
   USB devices -> EventType USBDevice:
     USB\VID_...\<serial>, USBSTOR\Disk&Ven_...\<serial>&0, the same disk as
     a portable device (SWD\WPDBUSENUM\_??_USBSTOR#...) and as a volume
-    (STORAGE\VOLUME\_??_USBSTOR#...), HID\VID_...&MI_00\..., and a
-    lower-case software component swc\vid_...
+    (STORAGE\VOLUME\_??_USBSTOR#...), HID\VID_...&MI_00\..., a
+    lower-case software component swc\vid_..., and the portable device of
+    a removable-drive volume (SWD\WPDBUSENUM\{volume GUID}#<offset>)
   Other device and driver installs -> EventType Installation:
     PCI (also a Windows Update driver for it), HDAUDIO, ROOT, a driver
     package installed by path (DiInstallDriver), Bluetooth (BTHENUM\..._VID&...
     does not count as USB) and the SCSI\Disk of a UAS drive
-  Deletions: one USB\ and one USBSTOR\ device (rows), one PCI and one
-    SWD\MMDEVAPI device (no rows: only USB deletions are reported)
+  Deletions: one USB\, one USBSTOR\ and one removable-drive volume device
+    (rows), one PCI and one SWD\MMDEVAPI device (no rows: only USB
+    deletions are reported)
   Ignored: a Driver Install (DrvSetupInstallDriver) section, and the
     repeated Bluetooth section (counted as a duplicate)
 

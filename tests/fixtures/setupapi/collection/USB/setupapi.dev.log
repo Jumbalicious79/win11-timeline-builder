@@ -44,6 +44,13 @@
 <<<  Section end 2025/05/05 03:11:30.000
 <<<  [Exit status: SUCCESS]
 
+>>>  [Device Install (Hardware initiated) - SWD\WPDBUSENUM\{00000000-0000-11f0-8000-000000000001}#0000000000100000]
+>>>  Section start 2025/05/20 19:30:15.250
+     dvi: {Build Driver List} 19:30:15.250
+     dvi: {Build Driver List - exit(0x00000000)} 19:30:15.250
+<<<  Section end 2025/05/20 19:30:16.000
+<<<  [Exit status: SUCCESS]
+
 >>>  [Device Install (Hardware initiated) - USB\VID_FFF1&PID_0004\FIXTURESERIAL0002]
 >>>  Section start 2025/06/01 16:45:00.010
      dvi: {Build Driver List} 16:45:00.010
@@ -75,5 +82,11 @@
 >>>  Section start 2025/06/20 09:05:00.900
      dvi: Device removed
 <<<  Section end 2025/06/20 09:05:01.000
+<<<  [Exit status: SUCCESS]
+
+>>>  [Delete Device - SWD\WPDBUSENUM\{00000000-0000-11f0-8000-000000000002}#0000000000100000]
+>>>  Section start 2025/06/20 09:10:00.000
+     dvi: Device removed
+<<<  Section end 2025/06/20 09:10:00.500
 <<<  [Exit status: SUCCESS]
 

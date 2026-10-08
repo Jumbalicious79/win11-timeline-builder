@@ -8648,19 +8648,38 @@ function Get-DeviceInstanceLabel {
 
 # $true for the device instance path of a USB device: USB\VID_..., a USB
 # storage device (USBSTOR\..., also inside a portable-device or volume path
-# like SWD\WPDBUSENUM\_??_USBSTOR#...), or an ID with a USB vendor ID
-# (HID\VID_..., SWC\VID_...). Bluetooth IDs write "_VID&" and do not match.
+# like SWD\WPDBUSENUM\_??_USBSTOR#...), an ID with a USB vendor ID
+# (HID\VID_..., SWC\VID_...), or the portable device Windows makes for a
+# volume on a removable drive (SWD\WPDBUSENUM\{volume GUID}#<partition
+# offset>), nearly always a USB drive (an SD card in a built-in reader
+# gives one too). Bluetooth IDs write "_VID&" and do not match.
 function Test-UsbDeviceInstance {
     param([string]$InstancePath)
-    return ($InstancePath -match '(?i)USBSTOR|^USB\\|VID_[0-9A-F]{4}')
+    return ($InstancePath -match '(?i)USBSTOR|^USB\\|VID_[0-9A-F]{4}|^SWD\\WPDBUSENUM\\\{')
+}
+
+# The setupapi.dev*.log files under -InputPath. A log shortened on
+# extraction to fit the path limit (setupapi.dev.log becomes e.g.
+# setupapi~1A2B3C4D.log) is found by its full-length name.
+function Find-SetupApiLogFiles {
+    $files = @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("setupapi.dev*.log") |
+        Where-Object { $_.Name -like "setupapi.dev*.log" })
+    if ($script:shortenedNames) {
+        foreach ($shortPath in @($script:shortenedNames.Keys)) {
+            if ([System.IO.Path]::GetFileName($script:shortenedNames[$shortPath]) -like "setupapi.dev*.log" -and [System.IO.File]::Exists($shortPath)) {
+                $files += Get-Item -LiteralPath $shortPath
+            }
+        }
+    }
+    return @($files | Sort-Object FullName -Unique)
 }
 
 # The setupapi.dev*.log files collection_manifest.csv lists (relative
 # paths): Listed, and Missing = those not among $Found (the files the USB
 # parser found). A missing log was saved by the collector but lost
-# afterwards, and its device installs are not in the timeline. A log
-# shortened on extraction is found under its shorter name. Both are empty
-# without a manifest.
+# afterwards, and its device installs are not in the timeline. A found log
+# that was shortened on extraction counts by its full-length name. Both
+# are empty without a manifest.
 function Compare-ManifestSetupApiLogs {
     param([object[]]$Found)
     $result = [PSCustomObject]@{ Listed = @(); Missing = @() }
@@ -8834,8 +8853,7 @@ function Parse-USB {
     # Times are the examined system's local time. The logs record every device
     # and driver install (graphics card, audio, Bluetooth, software devices, ...):
     # USB devices are USBDevice rows, all others Installation rows.
-    $setupApiFiles = @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("setupapi.dev*.log") |
-        Where-Object { $_.Name -like "setupapi.dev*.log" } | Sort-Object FullName -Unique)
+    $setupApiFiles = @(Find-SetupApiLogFiles)
     Log "  Found $($setupApiFiles.Count) SetupAPI log(s)."
     # Logs the collector saved but that are not here were lost after collection
     $setupApiManifest = Compare-ManifestSetupApiLogs -Found $setupApiFiles
