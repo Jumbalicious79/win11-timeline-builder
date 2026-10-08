@@ -10,6 +10,7 @@
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSReviewUnusedParameter", "MftDays", Justification = "Read by Parse-FileSystem through script scope")]
 [CmdletBinding(DefaultParameterSetName = "Direct")]
 param(
+    # A collection folder, or a collection .zip (extracted into the work folder)
     [Parameter(ParameterSetName = "Direct", Mandatory = $true)]
     [string]$InputPath,
 
@@ -60,7 +61,13 @@ param(
 
     # CSV only: don't generate timeline.xlsx (ImportExcel isn't needed)
     [Parameter(Mandatory = $false)]
-    [switch]$NoExcel
+    [switch]$NoExcel,
+
+    # Folder in which this run's work folder (extracted zip, scratch copies)
+    # is created. Default: %LOCALAPPDATA%\TimelineBuilder. Not a temp folder:
+    # Windows cleans those up during the run.
+    [Parameter(Mandatory = $false)]
+    [string]$WorkDir
 )
 
 # --- Require Administrator ---
@@ -74,6 +81,458 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     Write-Host ""
     pause
     exit 1
+}
+
+$ErrorActionPreference = "Continue"
+
+# =============================================================
+# Logging
+# Set up before a collection is opened, so a zip extraction is logged
+# too. $logFile is set once a collection is picked and the report folder
+# exists; until then messages only go to the console.
+# =============================================================
+$logFile = $null
+
+function Log {
+    param([string]$Message)
+    $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message"
+    Write-Host $entry
+    if ($logFile) { Add-Content -Path $logFile -Value $entry }
+}
+
+function Log-Warning {
+    param([string]$Message)
+    $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] WARNING: $Message"
+    Write-Host $entry -ForegroundColor Yellow
+    if ($logFile) { Add-Content -Path $logFile -Value $entry }
+}
+
+function Log-Error {
+    param([string]$Message)
+    $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ERROR: $Message"
+    Write-Host $entry -ForegroundColor Red
+    if ($logFile) { Add-Content -Path $logFile -Value $entry }
+}
+
+function Log-Success {
+    param([string]$Message)
+    $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message"
+    Write-Host $entry -ForegroundColor Green
+    if ($logFile) { Add-Content -Path $logFile -Value $entry }
+}
+
+# =============================================================
+# Work folder and input files
+# A collection zip is extracted into a per-run work folder,
+# <base>\w<PID>_<HHmmss>, outside every temp folder: Windows Storage
+# Sense deletes files older than 7 days from %TEMP% when disk space is
+# low, and extracted files keep the date stored in the zip (often months
+# old), so it deleted collection files while a timeline was being built.
+# Scratch copies (hives for reg load, browser databases for sqlite3) go
+# to <work folder>\scratch. The main body runs in try/finally, so the
+# folder is removed on every exit (errors, exit, Ctrl+C). Every input
+# file is recorded; one that disappears before the end makes the run end
+# with exit code 2 ("timeline incomplete").
+# =============================================================
+$script:selectedZipPath = $null
+$script:runWorkDir = $null       # this run's work folder
+$script:runWorkLock = $null      # its .lock file, held open for the whole run
+$script:runScratchDir = $null    # <work folder>\scratch
+$script:runHives = New-Object System.Collections.Generic.List[string]    # HKLM hives loaded and not yet unloaded
+$script:inputFiles = New-Object System.Collections.Generic.List[string]  # input files that must exist until the end
+$script:shortenedNames = @{}     # extracted file shortened to fit -> its full-length path
+$script:collectionManifest = $null
+$script:missingInputCount = 0
+
+# Long form of a path: full, with 8.3 short names expanded (GitHub runners
+# have a %TEMP% like C:\Users\RUNNER~1\...) and no trailing backslash. A
+# path that does not exist is only made full.
+if (-not ([System.Management.Automation.PSTypeName]'TimelineNative.LongPath').Type) {
+    Add-Type -Namespace TimelineNative -Name LongPath -MemberDefinition @'
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern uint GetLongPathName(string lpszShortPath, System.Text.StringBuilder lpszLongPath, uint cchBuffer);
+'@
+}
+
+function Get-LongPath {
+    param([string]$Path)
+    if (-not $Path) { return "" }
+    $full = $Path
+    try { $full = [System.IO.Path]::GetFullPath($Path) }
+    catch { Write-Verbose "Could not make $Path a full path: $($_.Exception.Message)" }
+    $buffer = New-Object System.Text.StringBuilder 1024
+    $length = [TimelineNative.LongPath]::GetLongPathName($full, $buffer, [uint32]$buffer.Capacity)
+    if ($length -gt 0 -and $length -lt $buffer.Capacity) { $full = $buffer.ToString() }
+    if ($full.Length -gt 3) { $full = $full.TrimEnd('\') }
+    return $full
+}
+
+# The temp folder (long form) that contains $Path, or "". Windows cleans
+# these up on its own (Storage Sense, Disk Cleanup).
+function Get-ContainingTempFolder {
+    param([string]$Path)
+    $long = Get-LongPath $Path
+    if (-not $long) { return "" }
+    $candidates = @($env:TEMP, $env:TMP, [System.IO.Path]::GetTempPath())
+    $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
+    if ($localAppData) { $candidates += (Join-Path $localAppData "Temp") }
+    if ($env:SystemRoot) { $candidates += (Join-Path $env:SystemRoot "Temp") }
+    foreach ($candidate in $candidates) {
+        if (-not $candidate) { continue }
+        $temp = Get-LongPath $candidate
+        if ($long -eq $temp -or $long.StartsWith($temp.TrimEnd('\') + '\', [System.StringComparison]::OrdinalIgnoreCase)) { return $temp }
+    }
+    return ""
+}
+
+# Remove the work folders of earlier runs in $BaseFolder that ended
+# without cleaning up (crash, closed window): only w<PID>_<HHmmss> folders
+# whose .lock exists and is not held open by a running builder. Files in
+# use (e.g. a hive copy that is still loaded) are skipped; the .lock goes
+# last, so such a folder is tried again by the next run.
+function Remove-StaleWorkFolders {
+    param([string]$BaseFolder)
+    foreach ($dir in @(Get-ChildItem -LiteralPath $BaseFolder -Directory -ErrorAction SilentlyContinue)) {
+        if ($dir.Name -notmatch '^w\d+_\d{6}(_\d+)?$') { continue }
+        $lockPath = Join-Path $dir.FullName ".lock"
+        if (-not (Test-Path -LiteralPath $lockPath -PathType Leaf)) { continue }
+        try { [System.IO.File]::Open($lockPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None).Close() }
+        catch { continue }   # held open: that run is still going
+        Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne ".lock" } |
+            ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+        if (@(Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne ".lock" }).Count -gt 0) {
+            Log-Warning "Could not fully remove the work folder of an earlier run (files in use): $($dir.FullName)"
+            continue
+        }
+        Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        Log "Removed the work folder of an earlier run: $($dir.FullName)"
+    }
+}
+
+# Create this run's work folder, <base>\w<PID>_<HHmmss> (kept short: deep
+# collection paths come close to the 260-character limit), with a
+# <work folder>\scratch subfolder, and hold its .lock open until the end
+# of the run. Base: -WorkDir if given, else %LOCALAPPDATA%\TimelineBuilder
+# (no Windows cleanup covers it), else the script's work\ folder. Returns
+# the folder, or "" after logging why not.
+function New-RunWorkFolder {
+    param([string]$BaseFolder)
+    $bases = @()
+    if ($BaseFolder) { $bases += $BaseFolder }
+    else {
+        $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
+        if ($localAppData) { $bases += (Join-Path $localAppData "TimelineBuilder") }
+        $bases += (Join-Path $PSScriptRoot "work")
+    }
+    foreach ($base in $bases) {
+        $folder = ""
+        try {
+            [void][System.IO.Directory]::CreateDirectory($base)
+            Remove-StaleWorkFolders -BaseFolder $base
+            $name = "w$($PID)_$(Get-Date -Format 'HHmmss')"
+            $folder = Join-Path $base $name
+            for ($n = 2; Test-Path -LiteralPath $folder; $n++) { $folder = Join-Path $base "$($name)_$n" }
+            [void][System.IO.Directory]::CreateDirectory($folder)
+            $script:runWorkLock = [System.IO.File]::Open((Join-Path $folder ".lock"), [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            $note = [System.Text.Encoding]::ASCII.GetBytes("timeline-builder.ps1 work folder, PID $PID, started $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`r`n")
+            $script:runWorkLock.Write($note, 0, $note.Length)
+            $script:runWorkLock.Flush()
+            $script:runScratchDir = Join-Path $folder "scratch"
+            [void][System.IO.Directory]::CreateDirectory($script:runScratchDir)
+            return $folder
+        }
+        catch {
+            Log-Warning "Could not create a work folder in ${base}: $($_.Exception.Message)"
+            if ($script:runWorkLock) { $script:runWorkLock.Close(); $script:runWorkLock = $null }
+            $script:runScratchDir = $null
+            if ($folder -and (Test-Path -LiteralPath $folder)) { Remove-Item -LiteralPath $folder -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+    }
+    return ""
+}
+
+# Delete this run's work folder (extracted collection and scratch copies);
+# call Dismount-RunHives first. Hive copies stay locked briefly after reg
+# unload, so this retries. The .lock goes last: a folder that cannot be
+# emptied is removed by the next run.
+function Remove-RunWorkFolder {
+    if (-not $script:runWorkDir) { return }
+    Log "Removing the work folder: $($script:runWorkDir)"
+    [gc]::Collect()
+    [gc]::WaitForPendingFinalizers()
+    $left = @()
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        Get-ChildItem -LiteralPath $script:runWorkDir -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne ".lock" } |
+            ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+        $left = @(Get-ChildItem -LiteralPath $script:runWorkDir -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne ".lock" })
+        if ($left.Count -eq 0) { break }
+        if ($attempt -lt 3) { Start-Sleep -Seconds 2 }
+    }
+    if ($script:runWorkLock) { $script:runWorkLock.Close(); $script:runWorkLock = $null }
+    if ($left.Count -eq 0) { Remove-Item -LiteralPath $script:runWorkDir -Recurse -Force -ErrorAction SilentlyContinue }
+    if (Test-Path -LiteralPath $script:runWorkDir) {
+        Log-Warning "  Could not remove the work folder (file in use). The next run removes it, or delete it manually: $($script:runWorkDir)"
+    }
+    else { Log "  Work folder removed." }
+}
+
+# Folder for scratch copies (hives for reg load, browser databases for
+# sqlite3): <work folder>\scratch. Outside a builder run (functions loaded
+# by a test) the system temp folder.
+function Get-ScratchFolder {
+    if ($script:runScratchDir) { return $script:runScratchDir }
+    return [System.IO.Path]::GetTempPath()
+}
+
+# Hives this run loaded under HKLM (Mount-TimelineHive, Parse-Amcache) and
+# has not unloaded yet. Registered before reg load, so an interrupted load
+# is covered too.
+function Register-RunHive {
+    param([string]$Name)
+    if ($null -eq $script:runHives) { $script:runHives = New-Object System.Collections.Generic.List[string] }
+    if (-not $script:runHives.Contains($Name)) { $script:runHives.Add($Name) }
+}
+
+function Unregister-RunHive {
+    param([string]$Name)
+    if ($script:runHives) { [void]$script:runHives.Remove($Name) }
+}
+
+# Unload the hives this run left loaded (a parser stopped by an error or
+# Ctrl+C, or an unload that failed), so their copies in the work folder
+# can be deleted. Only this run's own TEMP_TL* / TEMP_AMCACHE_* hives.
+function Dismount-RunHives {
+    if (-not $script:runHives -or $script:runHives.Count -eq 0) { return }
+    $loadedNow = @()
+    try { $loadedNow = @([Microsoft.Win32.Registry]::LocalMachine.GetSubKeyNames()) }
+    catch { Write-Verbose "Could not list the loaded hives: $($_.Exception.Message)" }
+    foreach ($name in @($script:runHives)) {
+        # Not loaded (any more): nothing to unload
+        if ($loadedNow.Count -gt 0 -and $loadedNow -notcontains $name) { Unregister-RunHive $name; continue }
+        [gc]::Collect()
+        [gc]::WaitForPendingFinalizers()
+        $unloaded = $false
+        for ($attempt = 1; $attempt -le 3 -and -not $unloaded; $attempt++) {
+            $null = & reg unload "HKLM\$name" 2>&1
+            $unloaded = ($LASTEXITCODE -eq 0)
+            if (-not $unloaded) { Start-Sleep -Milliseconds 1000 }
+        }
+        if ($unloaded) {
+            Log "Unloaded hive HKLM\$name (left loaded by a parser)"
+            Unregister-RunHive $name
+        }
+        else { Log-Warning "Failed to unload hive HKLM\$name -- run: reg unload HKLM\$name" }
+    }
+}
+
+# Free space verdict for extracting $NeededBytes onto a volume: "Error"
+# below the size plus 256 MB, "Warning" below the size plus 1 GB or when
+# the system drive would be left with under 10% free, else "Ok"
+function Get-ExtractionSpaceVerdict {
+    param([long]$FreeBytes, [long]$TotalBytes, [long]$NeededBytes, [bool]$IsSystemDrive)
+    if ($FreeBytes -lt $NeededBytes + 256MB) { return "Error" }
+    if ($FreeBytes -lt $NeededBytes + 1GB) { return "Warning" }
+    if ($IsSystemDrive -and $TotalBytes -gt 0 -and ($FreeBytes - $NeededBytes) -lt ($TotalBytes / 10)) { return "Warning" }
+    return "Ok"
+}
+
+# Check the free space on the drive of $Folder before extracting
+# $NeededBytes into it. Logs the result; $false when the zip cannot fit.
+# Skipped (with a log line) for UNC paths and drives that report no size.
+function Test-ExtractionSpace {
+    param([string]$Folder, [long]$NeededBytes)
+    $root = ""
+    try { $root = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($Folder)) }
+    catch { Write-Verbose "Could not get the drive of ${Folder}: $($_.Exception.Message)" }
+    if (-not $root -or $root.StartsWith('\\')) {
+        Log "  Free space check skipped: $Folder is not on a drive letter."
+        return $true
+    }
+    try {
+        $drive = New-Object System.IO.DriveInfo($root)
+        $free = $drive.AvailableFreeSpace
+        $total = $drive.TotalSize
+    }
+    catch {
+        Log "  Free space check skipped for ${root}: $($_.Exception.Message)"
+        return $true
+    }
+    $isSystemDrive = $root.TrimEnd('\') -eq "$env:SystemDrive".TrimEnd('\')
+    $verdict = Get-ExtractionSpaceVerdict -FreeBytes $free -TotalBytes $total -NeededBytes $NeededBytes -IsSystemDrive $isSystemDrive
+    $numbers = "$([math]::Round($free / 1GB, 2)) GB free of $([math]::Round($total / 1GB, 1)) GB, $([math]::Round($NeededBytes / 1MB, 1)) MB to extract"
+    if ($verdict -eq "Error") {
+        Log-Error "Not enough free space on $root for the extraction ($numbers, plus 256 MB to spare). Free up space or pass -WorkDir with a folder on another drive."
+        return $false
+    }
+    if ($verdict -eq "Warning") {
+        Log-Warning "Low free space on $root ($numbers). Windows may start cleaning up when a drive runs low; consider -WorkDir with a folder on another drive."
+    }
+    else { Log "  Free space on ${root}: $numbers" }
+    return $true
+}
+
+# Extract a collection zip into $Destination entry by entry (not
+# Expand-Archive), so that:
+#  - entry names with "/" (the zip standard) and "\" (older collectors)
+#    both extract into folders;
+#  - a path over 240 characters is shortened (start of the name plus a
+#    hash) instead of failing the extraction; the full-length path is kept
+#    in $script:shortenedNames, so manifest lookups still find the file;
+#  - no entry is written outside $Destination ("..", rooted names);
+#  - files keep the date stored in the zip. Several parsers fall back to a
+#    file's date, so it is never changed to "now".
+# Every extracted file is recorded as an input file. Throws when the zip
+# cannot be read, does not fit on the drive, or an entry fails to extract.
+function Expand-CollectionZip {
+    param([string]$ZipPath, [string]$Destination)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $Destination = [System.IO.Path]::GetFullPath($Destination).TrimEnd('\')
+    [void][System.IO.Directory]::CreateDirectory($Destination)
+    $zipArchive = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+    $sha1 = $null
+    try {
+        # Folder entries end with a separator
+        $fileEntries = @($zipArchive.Entries | Where-Object { $_.FullName -and $_.FullName -notmatch '[/\\]$' })
+        $totalBytes = 0L
+        foreach ($entry in $fileEntries) { $totalBytes += $entry.Length }
+        Log "  Zip: $ZipPath -- $($zipArchive.Entries.Count) entries, $($fileEntries.Count) file(s), $([math]::Round($totalBytes / 1MB, 1)) MB uncompressed"
+        if (-not (Test-ExtractionSpace -Folder $Destination -NeededBytes $totalBytes)) {
+            throw "not enough free space to extract the zip"
+        }
+
+        $shortenedCount = 0
+        $skippedCount = 0
+        foreach ($entry in $fileEntries) {
+            $relName = $entry.FullName.Replace('/', '\')
+            $leaf = $relName.Substring($relName.LastIndexOf('\') + 1)
+            $entryDest = Join-Path $Destination $relName
+            $fullLengthDest = $entryDest
+            $shortened = $false
+            if ($entryDest.Length -gt 240) {
+                # Keep the name's start and add a hash so it stays unique
+                $entryDir = Split-Path $entryDest -Parent
+                $ext = [System.IO.Path]::GetExtension($leaf)
+                if (-not $sha1) { $sha1 = [System.Security.Cryptography.SHA1]::Create() }
+                $nameHash =[System.BitConverter]::ToString($sha1.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($leaf))).Replace("-", "").Substring(0, 8)
+                $keep = [Math]::Max(8, 240 - $entryDir.Length - 1 - $ext.Length - 9)
+                $baseName = [System.IO.Path]::GetFileNameWithoutExtension($leaf)
+                if ($baseName.Length -gt $keep) { $baseName = $baseName.Substring(0, $keep) }
+                $entryDest = Join-Path $entryDir "$baseName~$nameHash$ext"
+                $shortened = $true
+            }
+            # Never write outside the extraction folder (".." or rooted entry names)
+            $fullDest = ""
+            try { $fullDest = [System.IO.Path]::GetFullPath($entryDest) }
+            catch { Write-Verbose "Zip entry $($entry.FullName) has no valid path: $($_.Exception.Message)" }
+            if (-not $fullDest.StartsWith($Destination + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+                Log-Warning "  Zip entry skipped (it would be written outside the extraction folder): $($entry.FullName)"
+                $skippedCount++
+                continue
+            }
+            [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($fullDest))
+            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $fullDest, $true)
+            $script:inputFiles.Add($fullDest)
+            if ($shortened) {
+                $script:shortenedNames[$fullDest] = $fullLengthDest
+                Log "  Shortened to fit the 260-character path limit: $relName -> $(Split-Path $fullDest -Leaf)"
+                $shortenedCount++
+            }
+        }
+        $summary = "  Extracted $($fileEntries.Count - $skippedCount) file(s) to $Destination"
+        if ($shortenedCount -gt 0) { $summary += " ($shortenedCount over-long file name(s) shortened)" }
+        Log $summary
+    }
+    finally {
+        if ($sha1) { $sha1.Dispose() }
+        $zipArchive.Dispose()
+    }
+}
+
+# collection_manifest.csv of the collection (written by the triage
+# collector): the one nearest to -InputPath, so an outer folder (e.g. the
+# zip extracted with Windows "Extract All") works too. Its RelativePath
+# column is relative to the manifest's own folder. Read once. Path and
+# Folder are "" and Rows is empty when there is no manifest.
+function Get-CollectionManifest {
+    if ($script:collectionManifest) { return $script:collectionManifest }
+    $manifest = [PSCustomObject]@{
+        Path          = ""
+        Folder        = ""
+        Rows          = @()
+        RelativePaths = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    }
+    $mf = Get-ChildItem -Path $InputPath -Filter "collection_manifest.csv" -Recurse -File -ErrorAction SilentlyContinue |
+        Sort-Object { $_.FullName.Length } | Select-Object -First 1
+    if ($mf) {
+        $manifest.Path = $mf.FullName
+        $manifest.Folder = $mf.DirectoryName
+        try {
+            $manifest.Rows = @(Import-Csv -LiteralPath $mf.FullName -ErrorAction Stop)
+            foreach ($row in $manifest.Rows) {
+                if ($row.PSObject.Properties["RelativePath"] -and $row.RelativePath) { [void]$manifest.RelativePaths.Add($row.RelativePath) }
+            }
+        }
+        catch { Log-Warning "Could not read collection manifest: $($_.Exception.Message)" }
+    }
+    $script:collectionManifest = $manifest
+    return $manifest
+}
+
+# Folder the collection's relative paths start from: the folder of
+# collection_manifest.csv, else -InputPath
+function Get-CollectionRootFolder {
+    $folder = (Get-CollectionManifest).Folder
+    if (-not $folder) { $folder = $InputPath }
+    return [System.IO.Path]::GetFullPath($folder).TrimEnd('\')
+}
+
+# Input files of a collection folder: the files collection_manifest.csv
+# lists that exist now (files gone before the run are not tracked).
+# Memory dumps are left out: they are large and found separately. Without
+# a manifest nothing is tracked.
+function Add-ManifestInputFiles {
+    $manifest = Get-CollectionManifest
+    if (-not $manifest.Path) {
+        Log "No collection_manifest.csv found: input files are not checked for deletion during the run."
+        return
+    }
+    $root = [System.IO.Path]::GetFullPath($manifest.Folder).TrimEnd('\')
+    $listed = 0
+    foreach ($rel in $manifest.RelativePaths) {
+        if ($rel -match '^Memory\\.+\.dmp$') { continue }
+        $listed++
+        $full = Join-Path $root $rel
+        if ([System.IO.File]::Exists($full)) { $script:inputFiles.Add($full) }
+    }
+    Log "Input files: $($script:inputFiles.Count) of the $listed file(s) listed in $($manifest.Path) are present."
+}
+
+# Input files of this run that no longer exist
+function Get-MissingInputFiles {
+    return @($script:inputFiles | Where-Object { -not [System.IO.File]::Exists($_) })
+}
+
+# Log missing input files grouped by their top folder in the collection
+# (USB\, Browser\, Registry\, ...), which shows the parsers affected; at
+# most 20 names per folder
+function Write-MissingInputFiles {
+    param([string[]]$Files, [string]$BaseFolder)
+    $base = $BaseFolder.TrimEnd('\') + '\'
+    $groups = [ordered]@{}
+    foreach ($file in $Files) {
+        $name = $file
+        if ($file.StartsWith($base, [System.StringComparison]::OrdinalIgnoreCase)) { $name = $file.Substring($base.Length) }
+        $folder = "(collection folder)"
+        if ($name.Contains('\')) { $folder = $name.Substring(0, $name.IndexOf('\') + 1) }
+        if (-not $groups.Contains($folder)) { $groups[$folder] = New-Object System.Collections.Generic.List[string] }
+        $groups[$folder].Add($name)
+    }
+    foreach ($folder in $groups.Keys) {
+        $names = $groups[$folder]
+        Log-Warning "  Missing in ${folder}: $($names.Count) file(s)"
+        foreach ($name in ($names | Select-Object -First 20)) { Log "    $name" }
+        if ($names.Count -gt 20) { Log "    ... and $($names.Count - 20) more" }
+    }
 }
 
 # =============================================================
@@ -145,79 +604,17 @@ if ($Browse) {
     Write-Host ""
     Write-Host "Selected: $($selectedZip.Name)" -ForegroundColor Green
 
-    # Extract to a short temp path to avoid Windows 260-char path limit
-    # (the iCloud path is already very deep). A marker file next to the
-    # folder is written only when extraction finishes, so a half-extracted
-    # folder left by an earlier failed run is never reused.
-    $script:browseExtractDir = Join-Path $env:TEMP ("TriageExtract_" + $selectedZip.BaseName)
-    $extractDir = $script:browseExtractDir
-    $extractMarker = "$extractDir.complete"
-
-    if ((Test-Path -LiteralPath $extractMarker) -and (Test-Path -LiteralPath $extractDir)) {
-        Write-Host "Using existing extracted folder: $extractDir" -ForegroundColor Cyan
-    } else {
-        if (Test-Path -LiteralPath $extractDir) {
-            Write-Host "Removing incomplete extraction from an earlier run: $extractDir" -ForegroundColor Yellow
-            Remove-Item -LiteralPath $extractDir -Recurse -Force -ErrorAction SilentlyContinue
-        }
-        Write-Host "Extracting $($selectedZip.Name) to temp..." -ForegroundColor Cyan
-        try {
-            # Entry by entry (not Expand-Archive) so over-long paths can be
-            # shortened instead of failing the whole extraction
-            Add-Type -AssemblyName System.IO.Compression.FileSystem
-            $zipArchive = [System.IO.Compression.ZipFile]::OpenRead($selectedZip.FullName)
-            $renamedCount = 0
-            try {
-                foreach ($entry in $zipArchive.Entries) {
-                    if (-not $entry.Name) { continue }   # folder entry
-                    $entryDest = Join-Path $extractDir $entry.FullName.Replace('/', '\')
-                    if ($entryDest.Length -gt 240) {
-                        # Keep the name's start and add a hash so it stays unique
-                        $entryDir = Split-Path $entryDest -Parent
-                        $ext = [System.IO.Path]::GetExtension($entry.Name)
-                        $sha1 = New-Object System.Security.Cryptography.SHA1Managed
-                        $nameHash = [System.BitConverter]::ToString($sha1.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($entry.Name))).Replace("-", "").Substring(0, 8)
-                        $keep = [Math]::Max(8, 240 - $entryDir.Length - 1 - $ext.Length - 9)
-                        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($entry.Name)
-                        if ($baseName.Length -gt $keep) { $baseName = $baseName.Substring(0, $keep) }
-                        $entryDest = Join-Path $entryDir "$baseName~$nameHash$ext"
-                        $renamedCount++
-                    }
-                    # Never write outside the extraction folder (".." entries)
-                    if (-not [System.IO.Path]::GetFullPath($entryDest).StartsWith($extractDir + '\', [System.StringComparison]::OrdinalIgnoreCase)) { continue }
-                    New-Item -ItemType Directory -Path (Split-Path $entryDest -Parent) -Force | Out-Null
-                    [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $entryDest, $true)
-                }
-            }
-            finally {
-                $zipArchive.Dispose()
-            }
-            Set-Content -LiteralPath $extractMarker -Value $selectedZip.FullName
-            Write-Host "Extracted to: $extractDir" -ForegroundColor Green
-            if ($renamedCount -gt 0) {
-                Write-Host "  ($renamedCount over-long file name(s) shortened to fit the 260-character path limit)" -ForegroundColor DarkGray
-            }
-        } catch {
-            Write-Host "ERROR: Failed to extract zip: $($_.Exception.Message)" -ForegroundColor Red
-            Remove-Item -LiteralPath $extractDir -Recurse -Force -ErrorAction SilentlyContinue
-            pause
-            exit 1
-        }
-    }
-
-    # The extracted folder may contain a single subfolder -- find the actual collection root
-    $children = Get-ChildItem -Path $extractDir -Directory
-    if ($children.Count -eq 1 -and -not (Get-ChildItem -Path $extractDir -File)) {
-        $InputPath = $children[0].FullName
-    } else {
-        $InputPath = $extractDir
-    }
-
-    Write-Host "Input path: $InputPath" -ForegroundColor Cyan
+    # Extracted into this run's work folder once the log is set up (below)
+    $InputPath = $selectedZip.FullName
     Write-Host ""
+} elseif ((Test-Path -LiteralPath $InputPath -PathType Leaf) -and [System.IO.Path]::GetExtension($InputPath) -eq ".zip") {
+    # A collection zip passed as -InputPath is extracted like a browse-mode
+    # pick; Find-MemoryDump also looks for the memory dump next to it
+    $script:selectedZipPath = (Resolve-Path -LiteralPath $InputPath).ProviderPath
 }
 
-$ErrorActionPreference = "Continue"
+# Report folder: created only once a collection is picked, so "[0] Cancel"
+# leaves none behind
 $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
 $reportDir = Join-Path $PSScriptRoot "reports\timeline_$timestamp"
 New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
@@ -226,37 +623,6 @@ $logFile = Join-Path $reportDir "timeline_builder_log.txt"
 # Set default output file if not specified
 if (-not $OutputFile) {
     $OutputFile = Join-Path $reportDir "timeline.csv"
-}
-
-# =============================================================
-# Logging
-# =============================================================
-function Log {
-    param([string]$Message)
-    $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message"
-    Write-Host $entry
-    Add-Content -Path $logFile -Value $entry
-}
-
-function Log-Warning {
-    param([string]$Message)
-    $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] WARNING: $Message"
-    Write-Host $entry -ForegroundColor Yellow
-    Add-Content -Path $logFile -Value $entry
-}
-
-function Log-Error {
-    param([string]$Message)
-    $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ERROR: $Message"
-    Write-Host $entry -ForegroundColor Red
-    Add-Content -Path $logFile -Value $entry
-}
-
-function Log-Success {
-    param([string]$Message)
-    $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message"
-    Write-Host $entry -ForegroundColor Green
-    Add-Content -Path $logFile -Value $entry
 }
 
 # =============================================================
@@ -280,10 +646,95 @@ if ($EndDate)   { Log "End Date   : $EndDate" }
 if ($Keywords)  { Log "Keywords   : $($Keywords -join ', ')" }
 Log ""
 
-if (-not (Test-Path $InputPath)) {
+# =============================================================
+# Main body. Everything from here to the end of the script runs inside
+# this try block, which starts as soon as the work folder exists. Its
+# finally block (at the end) unloads any hive this run left loaded and
+# deletes the work folder on every exit path: normal end, exit, Ctrl+C
+# and terminating errors. The body is intentionally NOT re-indented so
+# the diff stays small. (Closing the console window kills the process
+# outright; that cannot be caught.)
+# =============================================================
+if ($WorkDir) { $WorkDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($WorkDir) }
+$script:runWorkDir = New-RunWorkFolder -BaseFolder $WorkDir
+try {
+
+# Inside a try block, a statement-terminating error (a .NET exception or a
+# method call on $null outside an inner try/catch) would skip the whole
+# rest of the run. Log it and go on with the next step instead. Ctrl+C
+# (PipelineStoppedException) is passed on, so the run stops and the
+# finally block cleans up.
+trap {
+    if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { break }
+    Log-Error "Unexpected error at line $($_.InvocationInfo.ScriptLineNumber) (rest of this step skipped): $($_.Exception.Message)"
+    continue
+}
+
+if (-not $script:runWorkDir) {
+    Log-Error "Could not create a work folder. Pass -WorkDir with a writable folder that is not a temp folder."
+    exit 1
+}
+Log "Work folder: $($script:runWorkDir)"
+$tempFolder = Get-ContainingTempFolder $script:runWorkDir
+if ($tempFolder) {
+    Log-Warning "The work folder is inside a temp folder ($tempFolder). Windows Storage Sense deletes files older than 7 days there when disk space is low, also during a run; pass -WorkDir with another folder."
+}
+
+if (-not (Test-Path -LiteralPath $InputPath)) {
     Log-Error "Input path does not exist: $InputPath"
     exit 1
 }
+
+if ($script:selectedZipPath) {
+    Log "Extracting the collection zip into the work folder..."
+    $extractDir = Join-Path $script:runWorkDir "in"
+    try { Expand-CollectionZip -ZipPath $script:selectedZipPath -Destination $extractDir }
+    catch {
+        Log-Error "Failed to extract the zip: $($_.Exception.Message)"
+        exit 1
+    }
+    # The zip normally holds one folder, the collection: use it as the input path
+    $children = @(Get-ChildItem -LiteralPath $extractDir -Directory)
+    if ($children.Count -eq 1 -and -not (Get-ChildItem -LiteralPath $extractDir -File)) {
+        $InputPath = $children[0].FullName
+    } else {
+        $InputPath = $extractDir
+    }
+    Log "Collection folder: $InputPath"
+
+    # Every extracted file must still be there (antivirus or a cleanup tool
+    # can remove files as soon as they are written)
+    $missingInputs = @(Get-MissingInputFiles)
+    if ($missingInputs.Count -gt 0) {
+        Log-Error "$($missingInputs.Count) extracted file(s) disappeared right after the extraction -- stopping:"
+        Write-MissingInputFiles -Files $missingInputs -BaseFolder $InputPath
+        exit 1
+    }
+
+    # Test hook for tests\Test-ZipInput.ps1: delete one extracted file now,
+    # as a cleanup tool would during the run. Only a file inside this run's
+    # work folder is ever deleted.
+    if ($env:TIMELINE_BUILDER_TEST_DELETE_INPUT) {
+        $hookFile = [System.IO.Path]::GetFullPath((Join-Path $InputPath $env:TIMELINE_BUILDER_TEST_DELETE_INPUT))
+        if ($hookFile.StartsWith($script:runWorkDir + '\', [System.StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $hookFile -PathType Leaf)) {
+            Remove-Item -LiteralPath $hookFile -Force
+            Log-Warning "Test hook: deleted $hookFile"
+        }
+        else { Log-Warning "Test hook ignored (not a file in the work folder): $hookFile" }
+    }
+}
+elseif (Test-Path -LiteralPath $InputPath -PathType Leaf) {
+    Log-Error "Input path is a file, not a collection folder or .zip: $InputPath"
+    exit 1
+}
+else {
+    $tempFolder = Get-ContainingTempFolder $InputPath
+    if ($tempFolder) {
+        Log-Warning "The input folder is inside a temp folder ($tempFolder). Windows Storage Sense deletes files older than 7 days there when disk space is low, also during a run. Copy the collection elsewhere, or pass the collection .zip as -InputPath."
+    }
+    Add-ManifestInputFiles
+}
+Log ""
 
 # =============================================================
 # Timeline Entry Collection
@@ -383,7 +834,9 @@ function Find-ArtifactFiles {
 # collector (see its README); older collections fall back to
 # collection_log.txt and file times.
 # =============================================================
-$script:collectionRoot = [System.IO.Path]::GetFullPath($InputPath).TrimEnd('\')
+# The folder of collection_manifest.csv (its paths are relative to it),
+# so an outer folder passed as -InputPath works too
+$script:collectionRoot = Get-CollectionRootFolder
 $script:collectionInfo = $null
 $script:manifestTimes = $null
 
@@ -569,33 +1022,38 @@ function Get-SnapshotTimeUtc {
 
 # Original filesystem times of a collected file (Created/Modified/Accessed,
 # Kind=Utc), from collection_manifest.csv. $null when the collector did not
-# record them (older collectors, command output, reg save exports).
+# record them (older collectors, command output, reg save exports). A file
+# whose name was shortened on extraction is looked up by its original name.
 function Get-SourceFileTimes {
     param([string]$FullPath)
     if ($null -eq $script:manifestTimes) {
         $script:manifestTimes = @{}
-        $mf = Get-ChildItem -Path $InputPath -Filter "collection_manifest.csv" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($mf) {
-            try {
-                foreach ($row in (Import-Csv -Path $mf.FullName -ErrorAction Stop)) {
-                    if ($row.PSObject.Properties["RelativePath"] -and $row.RelativePath -and $row.PSObject.Properties["SourceModifiedUtc"]) {
-                        $script:manifestTimes[$row.RelativePath] = [PSCustomObject]@{
-                            Created  = ConvertFrom-UtcText $row.SourceCreatedUtc
-                            Modified = ConvertFrom-UtcText $row.SourceModifiedUtc
-                            Accessed = ConvertFrom-UtcText $row.SourceAccessedUtc
-                        }
-                    }
+        foreach ($row in (Get-CollectionManifest).Rows) {
+            if ($row.PSObject.Properties["RelativePath"] -and $row.RelativePath -and $row.PSObject.Properties["SourceModifiedUtc"]) {
+                $script:manifestTimes[$row.RelativePath] = [PSCustomObject]@{
+                    Created  = ConvertFrom-UtcText $row.SourceCreatedUtc
+                    Modified = ConvertFrom-UtcText $row.SourceModifiedUtc
+                    Accessed = ConvertFrom-UtcText $row.SourceAccessedUtc
                 }
             }
-            catch { Log-Warning "Could not read collection manifest: $($_.Exception.Message)" }
         }
         if ($script:manifestTimes.Count -eq 0) {
             Log-Warning "Collection manifest has no original file times (older collector) -- file-time events will be limited."
         }
     }
+    if ($FullPath -and $script:shortenedNames -and $script:shortenedNames.ContainsKey($FullPath)) { $FullPath = $script:shortenedNames[$FullPath] }
     $rel = Get-RelativeCollectionPath $FullPath
     if (-not $rel) { return $null }
     return $script:manifestTimes[$rel]
+}
+
+# $true when collection_manifest.csv lists the file (the collector saved
+# it), so its absence means it was lost after collection
+function Test-ManifestListsFile {
+    param([string]$FullPath)
+    $rel = Get-RelativeCollectionPath $FullPath
+    if (-not $rel) { return $false }
+    return (Get-CollectionManifest).RelativePaths.Contains($rel)
 }
 
 # Last-write time (UTC) of an open registry key, or $null
@@ -3254,14 +3712,14 @@ function Find-OfflineHiveFile {
     return ($candidates | Select-Object -First 1)
 }
 
-# Load an offline hive under HKLM\<name> from a temp copy (plus any .LOG1/.LOG2
-# transaction logs, so reg load can replay a dirty hive). The collected file
-# is never modified. Returns Name/TempDir/Root (open .NET RegistryKey) or $null.
-# Always pair with Dismount-TimelineHive.
+# Load an offline hive under HKLM\<name> from a scratch copy in the work
+# folder (plus any .LOG1/.LOG2 transaction logs, so reg load can replay a
+# dirty hive). The collected file is never modified. Returns Name/TempDir/
+# Root (open .NET RegistryKey) or $null. Always pair with Dismount-TimelineHive.
 function Mount-TimelineHive {
     param([System.IO.FileInfo]$HiveFile, [string]$Prefix = "TEMP_TL")
     $hiveName = "$($Prefix)_$(Get-Random)"
-    $tempDir = Join-Path $env:TEMP "TimelineHive_$(Get-Random)"
+    $tempDir = Join-Path (Get-ScratchFolder) "TimelineHive_$(Get-Random)"
     $loaded = $false
     try {
         New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
@@ -3272,10 +3730,15 @@ function Mount-TimelineHive {
             if (Test-Path -LiteralPath $logSrc) {
                 Copy-Item -LiteralPath $logSrc -Destination ($tempHive + $logExt) -Force -ErrorAction SilentlyContinue
             }
+            elseif (Test-ManifestListsFile $logSrc) {
+                Log-Warning "  Transaction log missing: $logSrc is in the collection manifest but not here -- the hive is loaded without it (changes not yet written to the hive are lost)"
+            }
         }
         Log "  Loading hive: $($HiveFile.FullName)"
+        Register-RunHive $hiveName
         $regLoadResult = & reg load "HKLM\$hiveName" $tempHive 2>&1
         if ($LASTEXITCODE -ne 0) {
+            Unregister-RunHive $hiveName
             Log-Warning "  Could not load hive $($HiveFile.FullName) : $regLoadResult"
             Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
             return $null
@@ -3315,9 +3778,11 @@ function Dismount-TimelineHive {
     }
     if ($unloaded) {
         Log "  Unloaded hive: $($Mount.Name)"
+        Unregister-RunHive $Mount.Name
         Remove-Item -LiteralPath $Mount.TempDir -Recurse -Force -ErrorAction SilentlyContinue
     }
     else {
+        # Tried again at the end of the run, before the work folder is deleted
         Log-Warning "  Failed to unload hive $($Mount.Name) -- may need manual cleanup via: reg unload HKLM\$($Mount.Name) (temp copy: $($Mount.TempDir))"
     }
 }
@@ -5228,14 +5693,19 @@ function Find-Sqlite3Exe {
     return $null
 }
 
-# Run a query with sqlite3 against a temp copy of the database (plus its -wal
-# file, so recent history not yet checkpointed is included, and its rollback
-# -journal, so a copy taken mid-transaction is rolled back to its last
-# committed state instead of being read half-written). Returns the CSV output
-# lines, decoded as UTF-8.
+# Run a query with sqlite3 against a scratch copy of the database in the work
+# folder (plus its -wal file, so recent history not yet checkpointed is
+# included, and its rollback -journal, so a copy taken mid-transaction is
+# rolled back to its last committed state instead of being read
+# half-written). Returns the CSV output lines, decoded as UTF-8.
 function Invoke-Sqlite3Query {
     param([string]$Sqlite3Exe, [string]$DbPath, [string]$Query)
-    $tempDb = Join-Path $env:TEMP "timeline_browser_$(Get-Random).db"
+    # Found by the parser, so gone since then (not a sqlite3 problem)
+    if (-not (Test-Path -LiteralPath $DbPath -PathType Leaf)) {
+        Log-Warning "    sqlite3 query skipped, input file missing: $DbPath"
+        return @()
+    }
+    $tempDb = Join-Path (Get-ScratchFolder) "timeline_browser_$(Get-Random).db"
     $prevEncoding = $null
     try {
         Copy-Item -LiteralPath $DbPath -Destination $tempDb -Force -ErrorAction Stop
@@ -8657,9 +9127,10 @@ function Parse-Amcache {
         $tempHiveDir = $null
 
         try {
-            # Copy hive + transaction logs to a temp dir so reg load can replay
-            # dirty hive logs automatically (fixes "registry database is corrupt")
-            $tempHiveDir = Join-Path $env:TEMP "AmcacheRepair_$(Get-Random)"
+            # Copy hive + transaction logs to a scratch folder so reg load can
+            # replay dirty hive logs automatically (fixes "registry database is
+            # corrupt")
+            $tempHiveDir = Join-Path (Get-ScratchFolder) "AmcacheRepair_$(Get-Random)"
             New-Item -ItemType Directory -Path $tempHiveDir -Force | Out-Null
 
             $srcDir = Split-Path $amcache.FullName -Parent
@@ -8670,17 +9141,21 @@ function Parse-Amcache {
             $logsCopied = 0
             foreach ($logExt in @(".LOG1", ".LOG2")) {
                 $logSrc = Join-Path $srcDir "Amcache.hve${logExt}"
-                if (Test-Path $logSrc) {
+                if (Test-Path -LiteralPath $logSrc) {
                     Copy-Item -Path $logSrc -Destination (Join-Path $tempHiveDir "Amcache.hve${logExt}") -Force
                     $logsCopied++
+                }
+                elseif (Test-ManifestListsFile $logSrc) {
+                    Log-Warning "  Transaction log missing: $logSrc is in the collection manifest but not here -- the hive is loaded without it (changes not yet written to the hive are lost)"
                 }
             }
 
             if ($logsCopied -gt 0) {
-                Log "  Copied hive + $logsCopied transaction log(s) to temp for recovery"
+                Log "  Copied hive + $logsCopied transaction log(s) for recovery"
             }
 
             Log "  Loading Amcache hive: $tempHive"
+            Register-RunHive $hiveName
             $regLoadResult = & reg load "HKLM\$hiveName" $tempHive 2>&1
             if ($LASTEXITCODE -eq 0) {
                 $loaded = $true
@@ -8776,6 +9251,7 @@ function Parse-Amcache {
                 Log "  Parsed $count Amcache entries."
             }
             else {
+                Unregister-RunHive $hiveName
                 $regLoadText = (@($regLoadResult) | ForEach-Object { "$_".Trim() } | Where-Object { $_ }) -join " "
                 Log-Warning "  Could not load Amcache hive: $regLoadText -- No Amcache data available."
             }
@@ -8793,7 +9269,11 @@ function Parse-Amcache {
                     & reg unload "HKLM\$hiveName" 2>&1 | Out-Null
                     $unloaded = ($LASTEXITCODE -eq 0)
                 }
-                if ($unloaded) { Log "  Unloaded Amcache hive." }
+                if ($unloaded) {
+                    Log "  Unloaded Amcache hive."
+                    Unregister-RunHive $hiveName
+                }
+                # Tried again at the end of the run, before the work folder is deleted
                 else { Log-Warning "  Failed to unload Amcache hive -- run: reg unload HKLM\$hiveName" }
             }
             # The temp copy holds a copy of the hive; loading it also creates
@@ -10270,6 +10750,23 @@ if ($Sources -contains "AntiVirus")        { Parse-AntiVirus }
 if ($Sources -contains "Memory")           { Parse-Memory }
 
 # =============================================================
+# Input files: a file deleted while the timeline was built (by a cleanup
+# tool or antivirus) left no error, only rows missing from the timeline.
+# List them; the run then ends with exit code 2.
+# =============================================================
+$missingInputs = @(Get-MissingInputFiles)
+$script:missingInputCount = $missingInputs.Count
+if ($missingInputs.Count -gt 0) {
+    Log-Error "$($missingInputs.Count) of $($script:inputFiles.Count) input file(s) disappeared during the run -- their rows are missing from the timeline:"
+    Write-MissingInputFiles -Files $missingInputs -BaseFolder $script:collectionRoot
+    Log ""
+}
+elseif ($script:inputFiles.Count -gt 0) {
+    Log "All $($script:inputFiles.Count) input file(s) were still present at the end of parsing."
+    Log ""
+}
+
+# =============================================================
 # Post-Processing: Deduplicate, Sort, Keyword Flag
 # =============================================================
 Log "--- Post-Processing Timeline ---"
@@ -10279,6 +10776,10 @@ Log "  Raw entries collected: $entryCount"
 
 if ($entryCount -eq 0) {
     Log-Warning "No timeline entries were collected. Check input path and selected sources."
+    if ($script:missingInputCount -gt 0) {
+        Log-Error "=== Timeline Builder Finished WITH $($script:missingInputCount) MISSING INPUT FILE(S) (no output generated) ==="
+        exit 2
+    }
     Log "=== Timeline Builder Finished (no output generated) ==="
     exit 0
 }
@@ -10594,7 +11095,12 @@ if ($Keywords -and $Keywords.Count -gt 0) {
 
 Log ""
 Log "============================================================="
-Log "=== Timeline Builder Completed Successfully ==="
+if ($script:missingInputCount -gt 0) {
+    Log-Error "=== Timeline Builder Completed WITH $($script:missingInputCount) MISSING INPUT FILE(S) -- timeline incomplete ==="
+}
+else {
+    Log "=== Timeline Builder Completed Successfully ==="
+}
 Log ""
 Log "============================================================="
 
@@ -10762,29 +11268,15 @@ if ($selectedAction -eq "none") {
 
 Log "============================================================="
 
-# Cleanup: remove temp extraction directory from browse mode
-if ($script:browseExtractDir -and (Test-Path $script:browseExtractDir)) {
-    Log ""
-    Log "Cleaning up temp extraction: $($script:browseExtractDir)"
-    # Marker first: if the folder can't be fully removed, the next run re-extracts
-    Remove-Item -LiteralPath "$($script:browseExtractDir).complete" -Force -ErrorAction SilentlyContinue
-    # Give any lingering file handles time to release (e.g., reg unload)
-    [gc]::Collect()
-    [gc]::WaitForPendingFinalizers()
-    $cleaned = $false
-    for ($attempt = 1; $attempt -le 3; $attempt++) {
-        try {
-            Remove-Item -Path $script:browseExtractDir -Recurse -Force -ErrorAction Stop
-            Log "  Temp folder removed."
-            $cleaned = $true
-            break
-        }
-        catch {
-            if ($attempt -lt 3) { Start-Sleep -Seconds 2 }
-        }
-    }
-    if (-not $cleaned) {
-        Log-Warning "  Could not remove temp folder (file in use)."
-        Log-Warning "  You can manually delete: $($script:browseExtractDir)"
-    }
+# Exit code 2: the timeline was written, but input files went missing
+if ($script:missingInputCount -gt 0) { exit 2 }
+
+# End of the main try block that starts after the "Started" log lines (the
+# body in between is intentionally not re-indented). The finally block runs
+# on normal completion, on exit, on Ctrl+C and on terminating errors.
+}
+finally {
+    # Hives first: their scratch copies are in the work folder
+    Dismount-RunHives
+    Remove-RunWorkFolder
 }
