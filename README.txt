@@ -277,7 +277,8 @@ The script creates a timestamped report folder next to the script:
     %LOCALAPPDATA%\TimelineBuilder\w<PID>_<HHmmss>\
       .lock                          -- held open for the whole run
       in\                            -- the extracted collection zip
-      scratch\                       -- copies for reg load and sqlite3
+      scratch\                       -- copies for reg load and sqlite3,
+                                        Volatility 3 output
 
   It is deleted at the end of every run, also after an error or Ctrl+C. A
   folder left by a run that was killed (window closed, crash) is deleted by
@@ -369,6 +370,9 @@ Both timeline.csv and timeline.xlsx contain the same columns:
     the examined system's zone for setupapi). Collections from older
     collector versions have no collection_info.json; the time zone is then
     read from collection_log.txt.
+  - Memory dump (Volatility 3): process creation and connection times kept
+    in memory; rows without one get the capture time from the dump header
+    (see "Snapshot rows" and parser #15)
 
 ### Snapshot rows
 
@@ -377,12 +381,15 @@ Both timeline.csv and timeline.xlsx contain the same columns:
   connections, shares, Wi-Fi profiles, loaded DLLs, the drive letters and
   volumes in MountedDevices, and scheduled tasks, services or run keys that
   have no usable time of their own. These rows have EventType "Snapshot"
-  and the collection time as their Timestamp. A few context rows are
-  Snapshot rows at a time of their own: a security product reported ON to
-  Security Center (event time), the Outlook attachment folder and the
-  triage collector's own Defender exclusion (registry key last-write time).
-  Snapshot rows are colored light gray in Excel. Filter them out
-  (EventType <> Snapshot) to see only real events.
+  and the collection time as their Timestamp. The memory dump is read the
+  same way: services and process command lines found in memory, and
+  processes or connections without a valid time of their own, are Snapshot
+  rows at the time the memory was captured (parser #15). A few context
+  rows are Snapshot rows at a time of their own: a security product
+  reported ON to Security Center (event time), the Outlook attachment
+  folder and the triage collector's own Defender exclusion (registry key
+  last-write time). Snapshot rows are colored light gray in Excel. Filter
+  them out (EventType <> Snapshot) to see only real events.
 
 ### User column
 
@@ -821,13 +828,29 @@ in tools\.
 Requires vol.exe in tools\volatility3\ (see tools\volatility3\README.txt).
 Windows ARM64 dumps are detected from the dump header and skipped:
 Volatility 3 analyzes Intel x86/x64 Windows memory only (use WinDbg).
-  - windows.pslist: Running processes with creation timestamps, PIDs, parent PIDs
-  - windows.netscan: Network connections with protocol, addresses, ports, state
-  - windows.cmdline: Full command line arguments for each process
+  - windows.pslist: Running processes with creation timestamps, PIDs, parent
+    PIDs (ProcessCreation at the creation time)
+  - windows.netscan: Network connections with protocol, addresses, ports,
+    state (NetworkConnection at the time the connection was created)
+  - windows.cmdline: Full command line arguments for each process (Snapshot)
   - windows.svcscan: Windows services with binary paths, state, start type
-Memory artifacts use the same EventTypes as disk artifacts (ProcessCreation,
-NetworkConnection, Execution, ServiceChange) and are color-coded automatically.
-The Source column distinguishes them (Memory-Processes, Memory-Network, etc.).
+    (Snapshot)
+A memory row is an event only when its entry has a valid time of its own: a
+process creation time or a connection's created time from 1980 up to one
+day after the end of the acquisition. Every other row is a Snapshot row at
+the capture time: every command line (it is read from the process's own
+memory, which the process can change, so it shows the state at capture, not
+what was run), every service (its state, not when it changed), and
+processes and connections without a valid time. A time outside that range
+is kept in Details (CreateTime=... or Created=..., in UTC). The capture time
+is the SystemTime in the header of a 64-bit crash dump (DumpIt: when the
+acquisition started); raw images, 32-bit dumps and a header time that is
+not plausible fall back to the dump file's last-write time (when the
+acquisition ended). The log shows it as "Dump time: <UTC> (crash dump
+header)" or "(dump file last-write time)", and per plugin "windows.pslist:
+N entries (T timed, S snapshot)". The Source column distinguishes memory
+rows (Memory-Processes, Memory-Network, Memory-CommandLine,
+Memory-Services).
 
 ### 16. System Info
 Parses systeminfo.txt and the firewall rule list:
@@ -895,8 +918,9 @@ differences" above for details.
     SecurityAlert           Bright red  -- AV detections, security tampering
                                            (Defender disabled, exclusion added);
                                            text in bold
-    Snapshot                Light gray  -- state at collection time, not an
-                                           event (see "Snapshot rows")
+    Snapshot                Light gray  -- state when collected or captured
+                                           (memory dump), not an event (see
+                                           "Snapshot rows")
 
   The Excel file includes AutoFilter on all columns and a frozen header row.
   Use column filters to narrow by EventType, Source, User, or date range.
@@ -1069,8 +1093,16 @@ Timeline Explorer at the same time.
 
   - Snapshot rows -- Services, drivers, network state, DLLs and items with
     no recorded time are shown at the collection time with EventType
-    Snapshot. Their Timestamp is when the state was observed, not when it
-    was created.
+    Snapshot; memory rows without a time of their own (all command lines
+    and services) at the capture time of the memory dump. Their Timestamp
+    is when the state was observed, not when it was created.
+
+  - Memory capture time -- Only 64-bit crash dumps (DumpIt) store when the
+    memory was captured. For raw images (WinPmem, Magnet RAM Capture) and
+    32-bit dumps the dump file's last-write time is used: the end of the
+    acquisition, which for a large dump is minutes after its start. A copy
+    of the dump that does not keep the file's dates (most copies do) gives
+    the time of the copy instead.
 
   - Local-time sources -- USN and setupapi times are local-time text. Times
     inside the hour that repeats when daylight saving time ends cannot be
@@ -1235,7 +1267,11 @@ parsing is skipped, and the timeline CSV can be opened manually.
 
   Processing time: 5-30 minutes depending on dump size (16-64 GB typical).
   Memory artifacts are interleaved with disk artifacts in the timeline and
-  color-coded by EventType like all other entries.
+  color-coded by EventType like all other entries. Command lines and
+  services are Snapshot rows at the dump's capture time, and so are
+  processes and connections without a valid time of their own (see parser
+  #15). Volatility's JSON output goes to the work folder's scratch\ and is
+  deleted after each plugin.
 
 
 ## Tests
@@ -1341,8 +1377,17 @@ parsing is skipped, and the timeline CSV can be opened manually.
   collection folder's name (another collection's dump in the same folder
   is not used; also with collection_manifest.csv below -InputPath, an
   outer -InputPath of another name and after Windows "Extract All"). It
-  also checks the Memory parser's warning when there is no dump.
-  Volatility 3 is not run; no admin needed.
+  also checks the Memory parser's warning when there is no dump. Then it
+  reads synthetic dump headers: the architecture and the capture time
+  (64-bit SystemTime used; zero, before 1980, more than a day after the
+  last write, cut off, 32-bit and raw fall back to the last-write time;
+  also with [ ] in the path and while another program has the file open),
+  and the "Dump time" line of the Memory parser. It turns canned Volatility
+  JSON for pslist, netscan, cmdline and svcscan into rows and checks each
+  row's time, EventType and Details (rejected times kept), the counts, and
+  that the rows are the same under the de-DE culture. A stub stands in for
+  vol.exe to check that its output is read back from a scratch folder with
+  [ ] in its path and deleted. Volatility 3 is not run; no admin needed.
 
   Run them from an elevated PowerShell; -AllowSystemChanges lets the event
   log and registry tests change this machine:
@@ -1452,4 +1497,6 @@ Temporary actions (all cleaned up automatically, also after an error or Ctrl+C):
     after processing (a hive a parser left loaded is unloaded at the end)
   - Copies browser DBs into the work folder for sqlite3 -- deleted after
     processing
+  - Writes Volatility 3's JSON output (Memory parser) into the work folder
+    -- deleted after each plugin
   - Downloads zip files to %TEMP% (first run) -- deleted after extraction
