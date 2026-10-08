@@ -393,7 +393,9 @@ function Find-ArtifactFiles {
 # collector (see its README); older collections fall back to
 # collection_log.txt and file times.
 # =============================================================
-$script:collectionRoot = [System.IO.Path]::GetFullPath($InputPath).TrimEnd('\')
+# A relative -InputPath is resolved against the PowerShell location (as the
+# parsers' Get-ChildItem calls do), not the process working directory
+$script:collectionRoot = [System.IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($InputPath)).TrimEnd('\')
 $script:collectionInfo = $null
 $script:manifestTimes = $null
 
@@ -475,7 +477,8 @@ function ConvertFrom-LocalText {
 # Metadata about the collection: mode, when it was taken, and which time zones
 # apply. CollectorTimeZone = machine that ran the collector (text written by
 # tools such as fsutil is in this zone). TargetTimeZone = the examined Windows
-# install (its own logs, e.g. setupapi.dev.log, are in this zone).
+# install (its own logs, e.g. setupapi.dev.log, are in this zone). TargetRoot =
+# the examined install's root folder on the collector ("C:\"; "" if unknown).
 function Get-CollectionInfo {
     if ($script:collectionInfo) { return $script:collectionInfo }
 
@@ -486,6 +489,7 @@ function Get-CollectionInfo {
         CollectorTimeZone  = [System.TimeZoneInfo]::Local
         TargetTimeZone     = $null
         CollectorCulture   = $null
+        TargetRoot         = ""
     }
 
     $jsonFile = Get-ChildItem -Path $InputPath -Filter "collection_info.json" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -496,6 +500,7 @@ function Get-CollectionInfo {
             $j = Get-Content -Path $jsonFile.FullName -Raw -ErrorAction Stop | ConvertFrom-Json
             $info.Source = "collection_info.json"
             if ($j.Mode) { $info.Mode = [string]$j.Mode }
+            if ($j.TargetRoot) { $info.TargetRoot = [string]$j.TargetRoot }
             $info.CollectionStartUtc = ConvertFrom-UtcText $j.CollectionStartUtc
             $tz = Get-TimeZoneById ([string]$j.CollectorTimeZoneId)
             if ($tz) { $info.CollectorTimeZone = $tz }
@@ -7594,8 +7599,10 @@ function Parse-FileSystem {
     Log "--- Parsing File System Metadata ---"
 
     # Raw $MFT from newer collectors (FileSystem\$MFT). -Force: a copy may keep
-    # the Hidden/System attributes of the original.
-    $mftFiles = @(Get-ChildItem -Path $InputPath -Filter '$MFT' -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq '$MFT' })
+    # the Hidden/System attributes of the original. A mail attachment named
+    # $MFT (in the Email\ attachment copies) is not this system's MFT.
+    $mftFiles = @(Get-ChildItem -Path $InputPath -Filter '$MFT' -Recurse -File -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -eq '$MFT' -and -not (Test-EmailAttachmentCopy (Get-RelativeCollectionPath $_.FullName)) })
     if ($mftFiles.Count -gt 0) {
         foreach ($mftFile in $mftFiles) {
             Add-MftTimelineEntries -File $mftFile
@@ -7924,11 +7931,19 @@ function ConvertFrom-FormatTableText {
 $script:EmailListingFiles = @("outlook_temp_files.csv", "olk_files.csv", "outlook_data_files.csv", "thunderbird_mail_files.csv", "windows_mail_files.csv")
 # Newest messages added per Thunderbird search index
 $script:EmailMaxMessages = 20000
-# Description of an attachment row (and of its "modified" row) per program
+# Description of an attachment row (and of its "modified" row) per program,
+# and how the file got there (Details: Origin). Classic Outlook saves an
+# attachment to its temp folder to open it; the new Outlook's Attachments\
+# also keeps attachments that were sent or received, and is not cleaned up.
 $script:EmailAttachmentLabels = @{
     "Classic Outlook" = "Outlook attachment in temp folder"
-    "New Outlook"     = "New Outlook attachment in temp folder"
+    "New Outlook"     = "New Outlook attachment file"
     "Windows Mail"    = "Windows Mail attachment in mail store"
+}
+$script:EmailAttachmentOrigins = @{
+    "Classic Outlook" = "Opened from a message"
+    "New Outlook"     = "Opened, sent or received (not proof of opening)"
+    "Windows Mail"    = "Stored with a message (not proof of opening)"
 }
 # Thunderbird socketType and authMethod values (nsMsgSocketType, nsMsgAuthMethod)
 $script:ThunderbirdSocketTypes = @{ "0" = "None"; "1" = "STARTTLS if available"; "2" = "STARTTLS"; "3" = "SSL/TLS" }
@@ -7938,17 +7953,25 @@ $script:ThunderbirdAuthMethods = @{
 }
 
 # Email\ rows of collection_manifest.csv by RelativePath: SHA256, SourcePath,
-# Size and the original file's Created/Modified/Accessed times (UTC)
+# Size and the original file's Created/Modified/Accessed times (UTC). A copy
+# taken from the shadow copy is recorded as "(shadow)<path below the target
+# root>"; its SourcePath is given the target root again ("C:\Users\...")
 function Get-EmailManifestRows {
     $rows = @{}
     $mf = Get-ChildItem -Path $InputPath -Filter "collection_manifest.csv" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $mf) { return $rows }
+    $targetRoot = (Get-CollectionInfo).TargetRoot
     try {
         foreach ($row in (Import-Csv -Path $mf.FullName -ErrorAction Stop)) {
             if (-not $row.PSObject.Properties["RelativePath"] -or $row.RelativePath -notlike "Email\*") { continue }
+            $sourcePath = $row.SourcePath
+            if ($sourcePath -like "(shadow)*") {
+                $sourcePath = $sourcePath.Substring(8).TrimStart('\')
+                if ($targetRoot) { $sourcePath = $targetRoot.TrimEnd('\') + '\' + $sourcePath }
+            }
             $rows[$row.RelativePath] = [PSCustomObject]@{
                 SHA256     = $row.SHA256
-                SourcePath = $row.SourcePath
+                SourcePath = $sourcePath
                 Size       = $row.SizeBytes
                 Created    = ConvertFrom-UtcText (Get-ArtifactRowValue $row @("SourceCreatedUtc"))
                 Modified   = ConvertFrom-UtcText (Get-ArtifactRowValue $row @("SourceModifiedUtc"))
@@ -8025,9 +8048,10 @@ function Add-EmailAttachmentRows {
         $sha256 = $Copy.SHA256
     }
     $label = $script:EmailAttachmentLabels[$Program]
-    if (-not $label) { $label = "$Program attachment in temp folder" }
+    if (-not $label) { $label = "$Program attachment file" }
     $details = [ordered]@{
         Program     = $Program
+        Origin      = $script:EmailAttachmentOrigins[$Program]
         Folder      = [System.IO.Path]::GetDirectoryName($Path)
         Size        = $Size
         SHA256      = $sha256
@@ -8277,15 +8301,55 @@ function Add-ThunderbirdAccountRows {
     return $count
 }
 
+# $true if sqlite3.exe has the JSON functions (built in since 3.38)
+function Test-Sqlite3Json {
+    param([string]$Sqlite3Exe)
+    try {
+        $output = & $Sqlite3Exe ":memory:" "SELECT json_valid('[1]');" 2>&1
+        return ($LASTEXITCODE -eq 0 -and "$output".Trim() -eq "1")
+    }
+    catch {
+        Write-Verbose "sqlite3 JSON check failed: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# SQL for one message's addresses of a gloda attribute ("from", "to", "cc",
+# "bcc"), as "Name <address>; ..." text. Thunderbird keeps them in the
+# message's jsonAttributes ({"<attribute id>": identity id or [ids]}), with
+# the attribute ids in attributeDefinitions and the addresses in identities
+# (display name: the identity's contact).
+function Get-GlodaAddressSql {
+    param([string]$Attribute, [bool]$HasContacts)
+    $nameSql = "i.value"
+    $contactJoin = ""
+    if ($HasContacts) {
+        $nameSql = "CASE WHEN coalesce(c.name, '') IN ('', i.value) THEN i.value ELSE c.name || ' <' || i.value || '>' END"
+        $contactJoin = " LEFT JOIN contacts c ON c.id = i.contactID"
+    }
+    $json = "CASE WHEN json_valid(m.jsonAttributes) THEN m.jsonAttributes ELSE '{}' END"
+    $list = "(SELECT group_concat($nameSql, '; ') FROM json_each($json) j" +
+            " JOIN json_each(CASE WHEN j.type = 'array' THEN j.value ELSE json_array(j.value) END) v" +
+            " JOIN identities i ON i.id = v.value$contactJoin" +
+            " WHERE j.key IN (SELECT CAST(id AS TEXT) FROM attributeDefinitions WHERE name = '$Attribute' AND extensionName = 'built-in'))"
+    return "replace(replace(coalesce($list, ''), char(13), ' '), char(10), ' ')"
+}
+
 # Thunderbird global-messages-db.sqlite (the "gloda" search index): one row
-# per indexed message at its Date header (PRTime), newest
-# $script:EmailMaxMessages, with author, recipients (To), subject and
-# attachment names from the full-text table's content (messagesText_content)
-# and the folder. The message text (the body column) is never selected.
+# per indexed message at its Date header (PRTime, the sender's clock), newest
+# $script:EmailMaxMessages. From, To, Cc and Bcc are the message's addresses
+# as gloda stored them (jsonAttributes -> identities); subject and
+# attachment names come from the full-text table's content
+# (messagesText_content), with the folder. The message text (the body
+# column) is never selected. Only when a message has no stored addresses are
+# the full-text author and recipients columns used, as AuthorText and
+# RecipientsText: they are not the headers (recipients is the To header only,
+# and Thunderbird appends address book names, or "undefined", to both).
 # Returns the number of rows added.
 function Add-ThunderbirdMessageRows {
     param([string]$Sqlite3Exe, [System.IO.FileInfo]$File)
-    $schema = Get-Sqlite3TableColumns -Sqlite3Exe $Sqlite3Exe -DbPath $File.FullName -Tables @("messages", "messagesText_content", "folderLocations")
+    $schema = Get-Sqlite3TableColumns -Sqlite3Exe $Sqlite3Exe -DbPath $File.FullName `
+        -Tables @("messages", "messagesText_content", "folderLocations", "attributeDefinitions", "identities", "contacts")
     $m = $schema["messages"]
     if (-not $m -or $m -notcontains "date") { return 0 }
     $t = $schema["messagesText_content"]
@@ -8306,9 +8370,18 @@ function Add-ThunderbirdMessageRows {
         $joins += " LEFT JOIN folderLocations f ON f.id = m.folderID"
         $folderSql = @(Get-SqliteColumnSql -Columns $f -Alias "f" -Names @("name", "folderURI"))
     }
+    $addressSql = @("''", "''", "''", "''")
+    $attributeColumns = $schema["attributeDefinitions"]
+    $identityColumns = $schema["identities"]
+    if ($m -contains "jsonAttributes" -and $attributeColumns -contains "extensionName" -and $identityColumns -contains "contactID" -and
+        (Test-Sqlite3Json -Sqlite3Exe $Sqlite3Exe)) {
+        $hasContacts = [bool]($schema["contacts"] -and $schema["contacts"] -contains "name")
+        $addressSql = @(foreach ($attribute in @("from", "to", "cc", "bcc")) { Get-GlodaAddressSql -Attribute $attribute -HasContacts $hasContacts })
+    }
+    else { Log "    No stored addresses (older index, or sqlite3 without JSON functions): the full-text author and recipients are used." }
     $numbers = @(Get-SqliteColumnSql -Columns $m -Alias "m" -Number -Names @("date", "deleted"))
     $messageId = @(Get-SqliteColumnSql -Columns $m -Alias "m" -Names @("headerMessageID"))
-    $query = "SELECT (SELECT COUNT(*) FROM messages WHERE date > 0), " + (($numbers + $messageId + $folderSql + $textSql) -join ", ") +
+    $query = "SELECT (SELECT COUNT(*) FROM messages WHERE date > 0), " + (($numbers + $messageId + $folderSql + $textSql + $addressSql) -join ", ") +
              " FROM messages m$joins WHERE m.date > 0 ORDER BY m.date DESC LIMIT $($script:EmailMaxMessages);"
     $rows = @(Invoke-Sqlite3Query -Sqlite3Exe $Sqlite3Exe -DbPath $File.FullName -Query $query)
 
@@ -8316,24 +8389,34 @@ function Add-ThunderbirdMessageRows {
     $profileName = $File.Directory.Name
     $total = 0
     $count = 0
-    foreach ($r in ($rows | ConvertFrom-Csv -Header "Total", "Date", "Deleted", "MessageId", "Folder", "FolderUri", "Subject", "Author", "Recipients", "Attachments")) {
+    $header = @("Total", "Date", "Deleted", "MessageId", "Folder", "FolderUri", "Subject", "AuthorText", "RecipientsText", "Attachments", "From", "To", "Cc", "Bcc")
+    foreach ($r in ($rows | ConvertFrom-Csv -Header $header)) {
         if ($total -eq 0) { [void][int]::TryParse([string]$r.Total, [ref]$total) }
         $ts = ConvertFrom-UnixTime $r.Date -Unit Microseconds
         if ($null -eq $ts) { continue }
         $subject = if ($r.Subject) { $r.Subject } else { "(no subject)" }
+        # Full-text author / recipients only without stored addresses, with
+        # the "undefined" Thunderbird appends for names not in the address book removed
+        $authorText = if (-not $r.From) { $r.AuthorText -replace '(\s+undefined)+\s*$', '' } else { "" }
+        $recipientsText = if (-not ($r.To -or $r.Cc -or $r.Bcc)) { $r.RecipientsText -replace '(\s+undefined)+\s*$', '' } else { "" }
         Add-TimelineEntry -Timestamp $ts -Source "Email-Messages" -EventType "NetworkConnection" `
             -Description "Email (Thunderbird): $subject" `
             -User $user `
             -Details (Format-ArtifactDetails ([ordered]@{
-                Program     = "Thunderbird"
-                From        = $r.Author
-                To          = Limit-EmailText $r.Recipients
-                Attachments = Limit-EmailText $r.Attachments
-                Folder      = $r.Folder
-                FolderURI   = $r.FolderUri
-                MessageID   = $r.MessageId
-                Deleted     = $(if ($r.Deleted -ne "0") { "Yes" } else { "" })
-                Profile     = $profileName
+                Program        = "Thunderbird"
+                From           = $r.From
+                To             = Limit-EmailText $r.To
+                Cc             = Limit-EmailText $r.Cc
+                Bcc            = Limit-EmailText $r.Bcc
+                AuthorText     = $authorText
+                RecipientsText = Limit-EmailText $recipientsText
+                Attachments    = Limit-EmailText $r.Attachments
+                Folder         = $r.Folder
+                FolderURI      = $r.FolderUri
+                MessageID      = $r.MessageId
+                Deleted        = $(if ($r.Deleted -ne "0") { "Yes" } else { "" })
+                TimeSource     = "Date header (sender clock)"
+                Profile        = $profileName
             })) `
             -Artifact "Email" -RawPath $File.FullName
         $count++
@@ -8382,7 +8465,7 @@ function Parse-Email {
             $copy = $manifestRows[$relative]
             $program = if ($relative -match '\\NewOutlook\\') { "New Outlook" } else { "Classic Outlook" }
             $copyPath = Join-Path $script:collectionRoot $relative
-            $emailRows += Add-EmailAttachmentRows -Program $program -Path ($copy.SourcePath -replace '^\(shadow\)', '') -Size $copy.Size `
+            $emailRows += Add-EmailAttachmentRows -Program $program -Path $copy.SourcePath -Size $copy.Size `
                 -Created $null -Modified $null -Accessed $null -Status "Copied" -Copy $copy -User (Get-CollectionUser $copyPath) -RawPath $copyPath
         }
     }

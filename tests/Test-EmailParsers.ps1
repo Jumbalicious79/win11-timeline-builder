@@ -7,13 +7,16 @@
 # time, declared with Thunderbird's own full-text tokenizer as real ones
 # are), runs timeline-builder.ps1 -Sources Email,RecentFiles and checks
 # every email row, its time and its Details: attachments in the Outlook
-# temp folders (copied, skipped, and copied without a listing row), OST/PST
-# and Windows Mail store files, Thunderbird mail folders and filter rules,
-# accounts, and indexed messages. A message text, a saved password, an
-# OAuth token and a settings token hold a canary string that must appear
-# nowhere in the timeline, the builder log or its output. A shortcut (.lnk)
-# copied as an attachment must not be parsed as one of the system's recent
-# files (the same file under UserActivity\ is).
+# temp folders (copied, skipped, and copied from the shadow copy without a
+# listing row), OST/PST and Windows Mail store files, Thunderbird mail
+# folders and filter rules, accounts, and indexed messages (From, To, Cc and
+# Bcc from the addresses gloda stores, not its full-text columns). A
+# message text, a saved password, an OAuth token and a settings token hold
+# a canary string that must appear nowhere in the timeline, the builder log
+# or its output. A shortcut (.lnk) copied as an attachment must not be
+# parsed as one of the system's recent files (the same file under
+# UserActivity\ is), also when -InputPath is a relative path; nor an
+# attachment named $MFT as the system's MFT.
 #
 # Needs Administrator rights, like the builder itself (GitHub Actions
 # Windows runners are elevated). For a local run without them, pass
@@ -176,7 +179,7 @@ try {
 
     # --- Synthetic collection ---
     $collection = Join-Path $workDir "collection"
-    New-TestTextFile -Path (Join-Path $collection "collection_info.json") -Text '{"Mode":"Live","CollectionStartUtc":"2026-03-03T00:00:00Z","CollectorTimeZoneId":"UTC","TargetTimeZoneId":"UTC"}'
+    New-TestTextFile -Path (Join-Path $collection "collection_info.json") -Text '{"Mode":"Live","TargetRoot":"C:\\","CollectionStartUtc":"2026-03-03T00:00:00Z","CollectorTimeZoneId":"UTC","TargetTimeZoneId":"UTC"}'
     $alice = "Email\alice"
     $tempFolder = "C:\Users\alice\AppData\Local\Microsoft\Windows\INetCache\Content.Outlook\ABCD1234"
     $profileName = "abcd1234.default-release"
@@ -194,9 +197,10 @@ try {
                   '"IdentityMap":{"alice@example.com":"11111111-2222-3333-4444-555555555555","alice@contoso.com":"66666666-7777-8888-9999-000000000000"}},' +
                   '"Session":{"token":"' + $canary + '-settings-token"}}'
            Created = "2026-01-15 07:00:00"; Modified = "2026-03-01 07:00:00"; Accessed = "2026-03-02 07:00:00" }
-        # No listing CSV for bob: rows come from the manifest
+        # No listing CSV for bob: rows come from the manifest. Copied from the
+        # shadow copy: the manifest has the path below the target root
         @{ Relative = "Email\bob\Outlook\SecureTemp\INetCache\ZZZZ9999\payload.js"
-           Source = "C:\Users\bob\AppData\Local\Microsoft\Windows\INetCache\Content.Outlook\ZZZZ9999\payload.js"; Text = "WScript.Echo('x');"
+           Source = "(shadow)Users\bob\AppData\Local\Microsoft\Windows\INetCache\Content.Outlook\ZZZZ9999\payload.js"; Text = "WScript.Echo('x');"
            Created = "2026-02-27 13:00:00"; Modified = "2026-02-27 13:00:00"; Accessed = "2026-02-27 13:05:00" }
     )
     $hashes = @{}
@@ -229,6 +233,8 @@ try {
         }
     }
     finally { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($shell) }
+    # An attachment named $MFT (not listed, not in the manifest): not the system's MFT
+    New-TestTextFile -Path (Join-Path $collection "$alice\Outlook\SecureTemp\INetCache\ABCD1234\`$MFT") -Text ("FILE0" + ("x" * 1019))
 
     # Classic Outlook temp folder listing: the copied macro document (later
     # edited), the shortcut, and a file over the per-file cap
@@ -338,23 +344,54 @@ try {
         SizeBytes = (Get-Item -LiteralPath $prefsPath).Length; CollectedAt = "2026-03-03 00:01:00"; RelativePath = "$alice\Thunderbird\$profileName\prefs.js"
         SourceCreatedUtc = (ConvertTo-IsoTime "2026-01-05 10:00:00"); SourceModifiedUtc = (ConvertTo-IsoTime "2026-03-02 21:00:00"); SourceAccessedUtc = "" }
 
-    # global-messages-db.sqlite (gloda): two indexed messages (the second
-    # deleted, without subject or attachments) and a ghost message without a
-    # date. Thunderbird declares the full-text table with its own tokenizer
-    # (mozporter), which sqlite3.exe does not have: the schema is rewritten
-    # to that after the rows are added, as in a real database.
+    # global-messages-db.sqlite (gloda): indexed messages with their
+    # addresses in jsonAttributes ({"<attribute id>": identity id or [ids]},
+    # gloda's from/to/cc/bcc attributes in attributeDefinitions, addresses in
+    # identities, names in contacts): one with To and Cc, one deleted (no
+    # subject or attachments) with Bcc, one whose jsonAttributes is damaged
+    # (the full-text author and recipients are used instead), and a ghost
+    # message without a date. Attribute 20 is "to" of another extension and
+    # 14 ("involves") is not an address list; neither is read. The full-text
+    # author and recipients end with the " undefined" Thunderbird appends for
+    # names that are not in the address book. Thunderbird declares the
+    # full-text table with its own tokenizer (mozporter), which sqlite3.exe
+    # does not have: the schema is rewritten to that after the rows are
+    # added, as in a real database.
     $glodaPath = Join-Path $collection "$alice\Thunderbird\$profileName\global-messages-db.sqlite"
     New-TestDatabase -Path $glodaPath -Sql @"
 CREATE TABLE folderLocations (id INTEGER PRIMARY KEY, folderURI TEXT NOT NULL, dirtyStatus INTEGER NOT NULL, name TEXT NOT NULL, indexingPriority INTEGER NOT NULL);
 CREATE TABLE messages (id INTEGER PRIMARY KEY, folderID INTEGER, messageKey INTEGER, conversationID INTEGER NOT NULL, date INTEGER, headerMessageID TEXT, deleted INTEGER NOT NULL default 0, jsonAttributes TEXT, notability INTEGER NOT NULL default 255);
+CREATE TABLE attributeDefinitions (id INTEGER PRIMARY KEY, attributeType INTEGER NOT NULL, extensionName TEXT NOT NULL, name TEXT NOT NULL, parameter BLOB);
+CREATE TABLE contacts (id INTEGER PRIMARY KEY, directoryUUID TEXT, contactUUID TEXT, popularity INTEGER, frecency INTEGER, name TEXT, jsonAttributes TEXT);
+CREATE TABLE identities (id INTEGER PRIMARY KEY, contactID INTEGER NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL, description NOT NULL, relay INTEGER NOT NULL);
 CREATE VIRTUAL TABLE messagesText USING fts3(body, subject, attachmentNames, author, recipients);
+INSERT INTO attributeDefinitions VALUES (10, 0, 'built-in', 'from', NULL);
+INSERT INTO attributeDefinitions VALUES (11, 0, 'built-in', 'to', NULL);
+INSERT INTO attributeDefinitions VALUES (12, 0, 'built-in', 'cc', NULL);
+INSERT INTO attributeDefinitions VALUES (13, 0, 'built-in', 'bcc', NULL);
+INSERT INTO attributeDefinitions VALUES (14, 1, 'built-in', 'involves', NULL);
+INSERT INTO attributeDefinitions VALUES (20, 0, 'other-extension', 'to', NULL);
+INSERT INTO contacts VALUES (1, NULL, NULL, 10, 10, 'Mallory', '{}');
+INSERT INTO contacts VALUES (2, NULL, NULL, 10, 10, 'Alice', '{}');
+INSERT INTO contacts VALUES (3, NULL, NULL, 10, 10, 'carol@example.org', '{}');
+INSERT INTO contacts VALUES (4, NULL, NULL, 10, 10, 'Bob', '{}');
+INSERT INTO contacts VALUES (5, NULL, NULL, 10, 10, 'Dave', '{}');
+INSERT INTO contacts VALUES (6, NULL, NULL, 10, 10, 'Decoy', '{}');
+INSERT INTO identities VALUES (1, 1, 'email', 'billing@evil.example', '', 0);
+INSERT INTO identities VALUES (2, 2, 'email', 'alice@example.com', '', 0);
+INSERT INTO identities VALUES (3, 3, 'email', 'carol@example.org', '', 0);
+INSERT INTO identities VALUES (4, 4, 'email', 'bob@example.org', '', 0);
+INSERT INTO identities VALUES (5, 5, 'email', 'dave@example.net', '', 0);
+INSERT INTO identities VALUES (6, 6, 'email', 'decoy@example.com', '', 0);
 INSERT INTO folderLocations VALUES (1, 'imap://alice%40example.com@imap.example.com/INBOX', 0, 'Inbox', 0);
 INSERT INTO folderLocations VALUES (2, 'mailbox://nobody@Local%20Folders/Trash', 0, 'Trash', 0);
-INSERT INTO messages VALUES (1, 1, 101, 1, $(ConvertTo-PRTime "2026-03-02 09:15:00"), 'msg1@example.com', 0, '{}', 255);
-INSERT INTO messages VALUES (2, 2, 102, 2, $(ConvertTo-PRTime "2026-03-01 18:00:00"), 'msg2@example.org', 1, '{}', 255);
-INSERT INTO messages VALUES (3, NULL, NULL, 1, NULL, 'ghost@example.net', 0, NULL, 255);
-INSERT INTO messagesText (docid, body, subject, attachmentNames, author, recipients) VALUES (1, '$canary-body-1', 'Invoice 4471 overdue', 'invoice.docm' || char(10) || 'terms.pdf', 'Mallory <billing@evil.example>', 'Alice <alice@example.com>');
-INSERT INTO messagesText (docid, body, subject, attachmentNames, author, recipients) VALUES (2, '$canary-body-2', '', NULL, 'Bob <bob@example.org>', 'alice@example.com, carol@example.org');
+INSERT INTO messages VALUES (1, 1, 101, 1, $(ConvertTo-PRTime "2026-03-02 09:15:00"), 'msg1@example.com', 0, '{"10":1,"11":[2],"12":[3],"14":[1,2,3,6],"20":[6],"43":"x"}', 255);
+INSERT INTO messages VALUES (2, 2, 102, 2, $(ConvertTo-PRTime "2026-03-01 18:00:00"), 'msg2@example.org', 1, '{"10":4,"11":[2],"12":[],"13":[5]}', 255);
+INSERT INTO messages VALUES (3, 1, 103, 3, $(ConvertTo-PRTime "2026-02-28 07:00:00"), 'msg3@example.com', 0, '{"10":', 255);
+INSERT INTO messages VALUES (4, NULL, NULL, 1, NULL, 'ghost@example.net', 0, NULL, 255);
+INSERT INTO messagesText (docid, body, subject, attachmentNames, author, recipients) VALUES (1, '$canary-body-1', 'Invoice 4471 overdue', 'invoice.docm' || char(10) || 'terms.pdf', 'Mallory <billing@evil.example> undefined', 'Alice <alice@example.com> undefined undefined');
+INSERT INTO messagesText (docid, body, subject, attachmentNames, author, recipients) VALUES (2, '$canary-body-2', '', NULL, 'Bob <bob@example.org> undefined', 'alice@example.com undefined undefined');
+INSERT INTO messagesText (docid, body, subject, attachmentNames, author, recipients) VALUES (3, '$canary-body-3', 'Shipping notice', NULL, 'Eve <eve@example.com> undefined', 'alice@example.com undefined');
 .dbconfig defensive off
 PRAGMA writable_schema = ON;
 UPDATE sqlite_master SET sql = 'CREATE VIRTUAL TABLE messagesText USING fts3(tokenize mozporter, body, subject, attachmentNames, author, recipients)' WHERE name = 'messagesText';
@@ -378,7 +415,7 @@ PRAGMA writable_schema = OFF;
 
     # --- Expected email rows: time, source, event type, description, user,
     # and text the Details must (Has) or must not (Lacks) contain ---
-    $invoiceDetails = @("Program=Classic Outlook", "Folder=$tempFolder", "Size=14", "SHA256=$($hashes["$alice\Outlook\SecureTemp\INetCache\ABCD1234\invoice.docm"])",
+    $invoiceDetails = @("Program=Classic Outlook", "Origin=Opened from a message", "Folder=$tempFolder", "Size=14", "SHA256=$($hashes["$alice\Outlook\SecureTemp\INetCache\ABCD1234\invoice.docm"])",
         "Collected=Yes", "CreatedUtc=2026-03-01 10:00:00", "ModifiedUtc=2026-03-01 10:20:00", "AccessedUtc=2026-03-01 10:25:00")
     $ostDetails = @("Program=Classic Outlook", "Type=OST", "Path=C:\Users\alice\AppData\Local\Microsoft\Outlook\alice@example.com.ost", "Size=2147483648",
         "CreatedUtc=2025-11-01 08:00:00", "ModifiedUtc=2026-03-02 23:59:00")
@@ -401,10 +438,12 @@ PRAGMA writable_schema = OFF;
         # Copied, but no listing row (bob): from the manifest
         @{ Time = "2026-02-27 13:00:00.000"; Source = "Email-Attachments"; Type = "FileAccess"; Text = "Outlook attachment in temp folder: payload.js"; User = "bob"
             Has = @("Program=Classic Outlook", "Folder=C:\Users\bob\AppData\Local\Microsoft\Windows\INetCache\Content.Outlook\ZZZZ9999", "Size=18",
-                    "SHA256=$($hashes['Email\bob\Outlook\SecureTemp\INetCache\ZZZZ9999\payload.js'])", "Collected=Yes", "AccessedUtc=2026-02-27 13:05:00") }
-        # New Outlook
-        @{ Time = "2026-03-02 08:00:00.000"; Source = "Email-Attachments"; Type = "FileAccess"; Text = "New Outlook attachment in temp folder: report.pdf"
-            Has = @("Program=New Outlook", "Folder=$olk\Attachments\0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0", "Size=3", "Collected=Yes", "SHA256=") }
+                    "SHA256=$($hashes['Email\bob\Outlook\SecureTemp\INetCache\ZZZZ9999\payload.js'])", "Collected=Yes", "AccessedUtc=2026-02-27 13:05:00")
+            Lacks = @("(shadow)") }
+        # New Outlook: its Attachments\ also keeps sent and received attachments
+        @{ Time = "2026-03-02 08:00:00.000"; Source = "Email-Attachments"; Type = "FileAccess"; Text = "New Outlook attachment file: report.pdf"
+            Has = @("Program=New Outlook", "Origin=Opened, sent or received (not proof of opening)", "Folder=$olk\Attachments\0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+                    "Size=3", "Collected=Yes", "SHA256=") }
         @{ Time = $snapshot; Source = "Email-Accounts"; Type = "Snapshot"; Text = "New Outlook account: alice@example.com"
             Has = @("Program=New Outlook", "Account=alice@example.com", "IdentityId=11111111-2222-3333-4444-555555555555", "SettingsModifiedUtc=2026-03-01 07:00:00") }
         @{ Time = $snapshot; Source = "Email-Accounts"; Type = "Snapshot"; Text = "New Outlook account: alice@contoso.com"; Has = @("IdentityId=66666666-7777-8888-9999-000000000000") }
@@ -418,7 +457,8 @@ PRAGMA writable_schema = OFF;
         @{ Time = "2025-12-01 00:00:00.000"; Source = "Email-DataFiles"; Type = "FileAccess"; Text = "Windows Mail store file created: UnistoreDB\store.vol"; Has = @("Type=VOL") }
         @{ Time = "2026-03-02 20:05:00.000"; Source = "Email-DataFiles"; Type = "FileAccess"; Text = "Windows Mail store file last modified: UnistoreDB\store.vol"; Has = @("Type=VOL") }
         @{ Time = "2026-02-20 15:00:00.000"; Source = "Email-Attachments"; Type = "FileAccess"; Text = "Windows Mail attachment in mail store: quote[1].pdf"
-            Has = @("Program=Windows Mail", "Folder=$windowsMail\LocalState\Files\S0\3\Attachments", "Collected=No", "Status=Listed"); Lacks = @("SHA256=") }
+            Has = @("Program=Windows Mail", "Origin=Stored with a message (not proof of opening)", "Folder=$windowsMail\LocalState\Files\S0\3\Attachments", "Collected=No", "Status=Listed")
+            Lacks = @("SHA256=") }
         # Thunderbird mail folders and filter rules
         @{ Time = "2026-01-05 10:00:00.000"; Source = "Email-MailFolders"; Type = "FileAccess"; Text = "Thunderbird mail folder created: Local Folders/Inbox"
             Has = @("Account=Local Folders", "Storage=Mail", "Folder=Inbox") }
@@ -432,13 +472,20 @@ PRAGMA writable_schema = OFF;
         # Thunderbird accounts
         @{ Time = $snapshot; Source = "Email-Accounts"; Type = "Snapshot"; Text = "Thunderbird account: alice@example.com (IMAP imap.example.com)"; Has = $imapAccount }
         @{ Time = $snapshot; Source = "Email-Accounts"; Type = "Snapshot"; Text = "Thunderbird account: alice.smith@example.org (POP3 pop3.example.org)"; Has = $popAccount; Lacks = @("Port=") }
-        # Thunderbird search index
+        # Thunderbird search index: addresses from jsonAttributes, never the
+        # full-text "undefined" suffixes, another extension's "to" or "involves"
         @{ Time = "2026-03-02 09:15:00.000"; Source = "Email-Messages"; Type = "NetworkConnection"; Text = "Email (Thunderbird): Invoice 4471 overdue"
-            Has = @("Program=Thunderbird", "From=Mallory <billing@evil.example>", "To=Alice <alice@example.com>", "Attachments=invoice.docm; terms.pdf", "Folder=Inbox",
-                    "FolderURI=imap://alice%40example.com@imap.example.com/INBOX", "MessageID=msg1@example.com", "Profile=$profileName")
-            Lacks = @("Deleted=") }
+            Has = @("Program=Thunderbird", "From=Mallory <billing@evil.example> | To=Alice <alice@example.com> | Cc=carol@example.org | Attachments=invoice.docm; terms.pdf",
+                    "Folder=Inbox", "FolderURI=imap://alice%40example.com@imap.example.com/INBOX", "MessageID=msg1@example.com",
+                    "TimeSource=Date header (sender clock)", "Profile=$profileName")
+            Lacks = @("Deleted=", "Bcc=", "AuthorText=", "RecipientsText=", "undefined", "decoy@", "Decoy") }
         @{ Time = "2026-03-01 18:00:00.000"; Source = "Email-Messages"; Type = "NetworkConnection"; Text = "Email (Thunderbird): (no subject)"
-            Has = @("From=Bob <bob@example.org>", "To=alice@example.com, carol@example.org", "Folder=Trash", "Deleted=Yes", "MessageID=msg2@example.org"); Lacks = @("Attachments=") }
+            Has = @("From=Bob <bob@example.org> | To=Alice <alice@example.com> | Bcc=Dave <dave@example.net>", "Folder=Trash", "Deleted=Yes", "MessageID=msg2@example.org")
+            Lacks = @("Attachments=", "Cc=", "undefined", "RecipientsText=") }
+        # Damaged jsonAttributes: the full-text author and recipients, named as such
+        @{ Time = "2026-02-28 07:00:00.000"; Source = "Email-Messages"; Type = "NetworkConnection"; Text = "Email (Thunderbird): Shipping notice"
+            Has = @("AuthorText=Eve <eve@example.com> | RecipientsText=alice@example.com | Folder=Inbox", "MessageID=msg3@example.com")
+            Lacks = @("From=", "To=", "undefined") }
     )
 
     # --- Checks ---
@@ -473,6 +520,33 @@ PRAGMA writable_schema = OFF;
     $fromRecent = @($recentRows | Where-Object { $_.RawPath -like "*\UserActivity\alice\RecentFiles\shortcut.lnk" })
     Write-TestResult -Succeeded ($fromRecent.Count -gt 0) -Message "the shortcut under UserActivity\ is parsed as a recent file ($($fromRecent.Count) row(s))"
     Write-TestResult -Succeeded ($fromAttachment.Count -eq 0) -Message "the shortcut copied from the Outlook temp folder is not parsed as a recent file"
+
+    # Again with a relative -InputPath, resolved against the PowerShell
+    # location (not the process working directory), and with FileSystem: the
+    # attachment copies stay excluded, the user is still known, and the
+    # attachment named $MFT is not parsed as the system's MFT
+    $relativeCsv = Join-Path $workDir "timeline-relative.csv"
+    Write-Host "Running the builder again with a relative -InputPath ..."
+    $ErrorActionPreference = "Continue"
+    $relativeOutput = @(& $powershellExe -NoProfile -ExecutionPolicy Bypass -Command ("Set-Location -LiteralPath '$workDir'; & '$builder' -InputPath '.\collection' " +
+        "-Sources Email,RecentFiles,FileSystem -OutputFile '$relativeCsv' -NoExcel -Viewer None") 2>&1 | ForEach-Object { "$_" })
+    $ErrorActionPreference = "Stop"
+    if (Test-Path -LiteralPath $relativeCsv) {
+        $relativeRows = @(Import-Csv -LiteralPath $relativeCsv)
+        $relativeRecent = @($relativeRows | Where-Object { $_.Source -eq "RecentFiles" })
+        $relativeEmail = @($relativeRows | Where-Object { $_.Source -like "Email-*" })
+        Write-TestResult -Succeeded (@($relativeRecent | Where-Object { $_.RawPath -like "*\Email\*" }).Count -eq 0 -and @($relativeRecent | Where-Object { $_.User -eq "alice" }).Count -gt 0) `
+            -Message "relative -InputPath: the attached shortcut is not a recent file, the UserActivity one is (User=alice)"
+        Write-TestResult -Succeeded ($relativeEmail.Count -eq $expected.Count -and @($relativeEmail | Where-Object { -not $_.User }).Count -eq 0) `
+            -Message "relative -InputPath: $($relativeEmail.Count) email rows, all with a user ($($expected.Count) expected)"
+    }
+    else {
+        $relativeOutput | ForEach-Object { Write-Host "  | $_" }
+        Write-TestResult -Succeeded $false -Message "relative -InputPath: the builder wrote no timeline"
+    }
+    $relativeText = $relativeOutput -join "`n"
+    Write-TestResult -Succeeded ($relativeText.Contains("No `$MFT or file listing in this collection") -and -not $relativeText.Contains("not an `$MFT copy")) `
+        -Message "an attachment named `$MFT is not parsed as the system's MFT"
 
     # The canary is in every secret and message text: it must appear nowhere
     $csvText = [System.IO.File]::ReadAllText($timelineCsv)
