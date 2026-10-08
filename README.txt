@@ -197,8 +197,10 @@ themselves are never committed.
   -WorkDir        Folder in which this run's work folder is made (the
                   extracted zip and scratch copies; see "Work folder").
                   Default %LOCALAPPDATA%\TimelineBuilder. Use a folder on
-                  another drive when the system drive is low on space, and
-                  never a temp folder.
+                  another local drive when the system drive is low on
+                  space, and never a temp folder. A network share or mapped
+                  network drive is refused (reg load cannot load hives
+                  from there).
 
 
 ## Auto-Downloaded Dependencies
@@ -268,7 +270,10 @@ The script creates a timestamped report folder next to the script:
   folder left by a run that was killed (window closed, crash) is deleted by
   the next run, once no builder holds its .lock. -WorkDir makes the work
   folder in another folder; if %LOCALAPPDATA% cannot be written, work\ next
-  to the script is used. The log names the work folder.
+  to the script is used. The log names the work folder. It must be on a
+  local drive: reg load only loads a hive from a local file, so a network
+  share (\\server\share) or a mapped network drive is not used, and with
+  such a -WorkDir the run stops at the start.
 
   Why not %TEMP%: Windows Storage Sense deletes files older than 7 days from
   temp folders when disk space runs low, and extracted files keep the dates
@@ -280,22 +285,36 @@ The script creates a timestamped report folder next to the script:
   Before extracting, the free space on the work folder's drive is checked:
   the builder stops below the zip's uncompressed size plus 256 MB, and warns
   below the size plus 1 GB, or when the system drive would be left with
-  less than 10% free. A network (UNC) work folder is not checked.
+  less than 10% free.
 
-### Missing input files (exit code 2)
+### Incomplete timeline (exit code 2)
 
-  Every input file is recorded when the run starts: each file extracted
-  from the zip, or, for a collection folder, each file listed in
-  collection_manifest.csv that is present (memory dumps excepted). Files
-  that disappear right after the extraction (e.g. antivirus) stop the run.
-  After the parsers have run, all of them must still be there; files that
-  disappeared are listed in the log by collection folder (USB\, Browser\,
-  ...), the run ends with
+  Missing input files. Every input file is recorded when the run starts:
+  each file extracted from the zip, or, for a collection folder, each file
+  listed in collection_manifest.csv that is present (memory dumps
+  excepted). Files that disappear right after the extraction (e.g.
+  antivirus) stop the run. After the parsers have run, all of them must
+  still be there; files that disappeared are listed by collection folder
+  (USB\, Browser\, ...; the console shows 20 names per folder, the log file
+  all of them), and the run ends with
 
     === Timeline Builder Completed WITH N MISSING INPUT FILE(S) -- timeline incomplete ===
 
-  and the exit code is 2 instead of 0. The timeline is still written, but
-  rows from those files are missing.
+  The timeline is still written, but rows from those files may be missing.
+  The check runs once, after all parsers, so a file deleted after its
+  parser read it is listed too, although its rows are in the timeline.
+
+  Unexpected errors. An error the builder does not handle itself (a bug,
+  or input it does not expect) is logged as "Unexpected error at line N
+  (rest of this step skipped)", and the rest of that step -- usually the
+  rest of one parser -- is skipped. The run goes on with the next step and
+  ends with
+
+    === Timeline Builder Completed WITH N UNEXPECTED ERROR(S) -- timeline may be incomplete ===
+
+  In both cases the exit code is 2 instead of 0. Exit code 1 means the run
+  stopped early (input not found, a bad zip, no work folder, files gone
+  right after the extraction).
 
 
 ## Output Format (CSV and Excel)
@@ -923,9 +942,18 @@ Timeline Explorer at the same time.
   - "Completed WITH N MISSING INPUT FILE(S) -- timeline incomplete" (exit
     code 2) -- Input files were deleted while the timeline was being built,
     usually by a cleanup tool or antivirus; the log lists them. Rows from
-    them are missing (a browser store also logs "sqlite3 query skipped,
-    input file missing"). Build the timeline again from the zip, or from a
-    copy of the collection outside any temp folder.
+    them may be missing (a browser store also logs "sqlite3 query skipped,
+    input file missing"); a file deleted after its parser read it is listed
+    too, although its rows are there. Build the timeline again from the
+    zip, or from a copy of the collection outside any temp folder.
+
+  - "Completed WITH N UNEXPECTED ERROR(S) -- timeline may be incomplete"
+    (exit code 2) -- The log has an "Unexpected error at line N (rest of
+    this step skipped)" line for each. The rest of that step, often the
+    rest of one parser, produced no rows. Such an error used to skip only
+    its own statement; since the main body runs in try/finally (to clean up
+    the work folder on every exit), it skips the rest of the step, so the
+    run says so. Please report it with the log line.
 
   - "No service data found" -- Appears for mounted-image collections, which
     have no services.csv (it needs live queries). Scheduled tasks of mounted
@@ -1171,15 +1199,17 @@ parsing is skipped, and the timeline CSV can be opened manually.
 
   tests\Test-ZipInput.ps1 -- Part 1 loads the builder's functions and checks
   the zip extraction ("/" and "\" entry names, entry dates kept, over-long
-  names shortened, no ".." entry written outside the folder), the manifest
-  lookups, the list of input files, the free-space and temp-folder checks
-  and the clean-up of work folders left by killed runs; it needs no admin.
-  Part 2 runs the builder on a synthetic collection zip dated 2025 with two
-  setupapi logs: both must be parsed, the work folder must be outside
-  %TEMP% and removed afterwards, and an input file deleted during the run
-  (by a test hook) must give exit code 2 and the MISSING INPUT FILE(S)
-  banner. Part 2 needs admin like the builder (or -BuilderPath with a copy
-  without the admin check); it changes nothing on the system.
+  names shortened, no ".." entry written outside the folder, nothing
+  extracted when the zip does not fit), the manifest lookups, the list of
+  input files, the free-space and temp-folder checks, the refusal of a
+  network work folder, the clean-up of work folders left by killed runs
+  and the end-of-run banners; it needs no admin. Part 2 runs the builder
+  on a synthetic collection zip dated 2025 with two setupapi logs: both
+  must be parsed, the free space must be checked, the work folder must be
+  outside %TEMP% and removed afterwards, and an input file deleted during
+  the run (by a test hook) must give exit code 2 and the MISSING INPUT
+  FILE(S) banner. Part 2 needs admin like the builder (or -BuilderPath
+  with a copy without the admin check); it changes nothing on the system.
 
   Run them from an elevated PowerShell; -AllowSystemChanges lets the event
   log and registry tests change this machine:

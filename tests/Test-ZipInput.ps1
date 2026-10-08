@@ -8,15 +8,18 @@
 #   functions without running it and checks Expand-CollectionZip (entry
 #   names with "/" and "\", folder entries, original entry dates, an
 #   over-long name shortened with its original name kept for the manifest
-#   lookup, a ".." entry not written outside the folder), the manifest
-#   lookups from an outer folder, the input-file list of a collection
-#   folder, the free-space verdict, the temp-folder check (8.3 short paths
-#   too), the end-of-run hive list and the clean-up of work folders left
-#   by earlier runs.
+#   lookup, a ".." entry not written outside the folder, nothing extracted
+#   when the zip does not fit), the manifest lookups from an outer folder,
+#   the input-file list of a collection folder and the list of missing
+#   files, the free-space verdict, the temp-folder check (8.3 short paths
+#   too), the end-of-run hive list, the clean-up of work folders left by
+#   earlier runs, the refusal of a network work folder and the end-of-run
+#   banners (missing input files, unexpected errors).
 # Part 2 -- builder runs: a synthetic collection zip whose entries are dated
 #   2025, with two setupapi logs (USBSTOR devices) under "/" and "\" entry
 #   names and a manifest, passed as -InputPath (-Sources USB):
-#   - both logs are parsed, exit code 0, the extraction is in the log;
+#   - both logs are parsed, exit code 0, the extraction and the free-space
+#     check are in the log;
 #   - the work folder is in %LOCALAPPDATA%\TimelineBuilder, outside every
 #     temp folder, and removed at the end; no TriageExtract_* or
 #     TimelineHive_* is left in %TEMP%; the zip is not changed;
@@ -194,6 +197,18 @@ try {
     $wrongDates = @($extracted | Where-Object { $_.LastWriteTime -ne $entryDate } | ForEach-Object { "$($_.Name)=$($_.LastWriteTime.ToString('s'))" })
     Assert-Equal -Name "extracted files keep the zip entry date (2025-01-01)" -Expected "" -Actual ($wrongDates -join ", ")
 
+    # A zip that does not fit on the drive: nothing is extracted. The stub
+    # replaces the free-space check only inside this script block (functions
+    # are looked up through the caller's scopes).
+    $noSpaceDest = Join-Path $testRoot "nospace\in"
+    $noSpaceError = & {
+        function Test-ExtractionSpace { return $false }
+        try { Expand-CollectionZip -ZipPath $unitZip -Destination $noSpaceDest; "" }
+        catch { $_.Exception.Message }
+    }
+    Assert-Equal -Name "zip that does not fit: extraction stops" -Expected "not enough free space to extract the zip" -Actual $noSpaceError
+    Assert-Equal -Name "zip that does not fit: nothing extracted or recorded" -Expected "0 4" -Actual "$(@(Get-ChildItem -LiteralPath $noSpaceDest -Recurse -File -ErrorAction SilentlyContinue).Count) $($script:inputFiles.Count)"
+
     # --- Manifest lookups (shortened name, outer folder) -----------------
     # -InputPath as the builder's functions read it
     Set-Variable -Name InputPath -Value $coll -Scope Script
@@ -201,7 +216,7 @@ try {
     if ($shortFile.Count -eq 1) {
         $times = Get-SourceFileTimes $shortFile[0].FullName
         $modified = ""
-        if ($times -and $times.Modified) { $modified = $times.Modified.ToString("yyyy-MM-dd HH:mm:ss") }
+        if ($times -and $times.Modified) { $modified = $times.Modified.ToString("yyyy-MM-dd HH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture) }
         Assert-Equal -Name "original file times found for a shortened file" -Expected "2024-03-02 11:00:00" -Actual $modified
     }
     # The zip extracted with Windows "Extract All" gives an outer folder: the
@@ -214,7 +229,7 @@ try {
     Assert-Equal -Name "user from the collection layout below an outer folder" -Expected "alice" -Actual (Get-CollectionUser (Join-Path $coll "Registry\alice\NTUSER.DAT"))
     $times = Get-SourceFileTimes (Join-Path $coll "USB\setupapi.dev.log")
     $modified = ""
-    if ($times -and $times.Modified) { $modified = $times.Modified.ToString("yyyy-MM-dd HH:mm:ss") }
+    if ($times -and $times.Modified) { $modified = $times.Modified.ToString("yyyy-MM-dd HH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture) }
     Assert-Equal -Name "original file times found below an outer folder" -Expected "2024-03-02 11:00:00" -Actual $modified
     Assert-Equal -Name "manifest lists a collected file" -Expected $true -Actual (Test-ManifestListsFile (Join-Path $coll "Registry\alice\NTUSER.DAT"))
     Assert-Equal -Name "manifest does not list a file it lacks" -Expected $false -Actual (Test-ManifestListsFile (Join-Path $coll "Registry\alice\NTUSER.DAT.LOG1"))
@@ -241,6 +256,14 @@ try {
     Write-MissingInputFiles -Files $missing -BaseFolder $folderColl
     $groupLines = @(Get-Content -LiteralPath $logFile | Select-Object -Skip $logBefore)
     Assert-Equal -Name "missing files grouped by collection folder" -Expected "WARNING:   Missing in USB\: 1 file(s) |     USB\setupapi.dev.log" -Actual (($groupLines | ForEach-Object { $_ -replace '^\[[^\]]+\] ', '' }) -join " | ")
+    # Many missing files (a mass deletion): the console shows 20 names, the
+    # log file every one
+    $manyMissing = @(1..25 | ForEach-Object { Join-Path $folderColl ("Browser\file{0:D2}.db" -f $_) })
+    $logBefore = @(Get-Content -LiteralPath $logFile).Count
+    $console = @(Write-MissingInputFiles -Files $manyMissing -BaseFolder $folderColl 6>&1 | ForEach-Object { "$_" })
+    $logNames = @(Get-Content -LiteralPath $logFile | Select-Object -Skip $logBefore | Where-Object { $_ -match 'Browser\\file\d\d\.db$' })
+    Assert-Equal -Name "25 missing files: all 25 names in the log file" -Expected 25 -Actual $logNames.Count
+    Assert-Equal -Name "25 missing files: 20 names and a count on the console" -Expected "20 1" -Actual "$(@($console -match 'Browser\\file\d\d\.db$').Count) $(@($console -match '\.\.\. and 5 more \(all listed in the log file\)$').Count)"
 
     # --- Free space verdict ----------------------------------------------
     $need = 2GB
@@ -299,6 +322,36 @@ try {
         $held.Close()
         if ($script:runWorkLock) { $script:runWorkLock.Close() }
     }
+
+    # --- A network work folder is refused (reg load needs local hives) -----
+    # Only the path is looked at: no network access
+    $uncBase = "\\server.invalid\share\TimelineBuilder"
+    Assert-Equal -Name "a UNC path is a network path" -Expected $true -Actual (Test-NetworkPath $uncBase)
+    Assert-Equal -Name "a local folder is not a network path" -Expected $false -Actual (Test-NetworkPath $testRoot)
+    $logBefore = @(Get-Content -LiteralPath $logFile).Count
+    $uncWorkDir = New-RunWorkFolder -BaseFolder $uncBase 6>$null
+    $uncLog = @(Get-Content -LiteralPath $logFile | Select-Object -Skip $logBefore) -join "`n"
+    Assert-Equal -Name "no work folder made on a network share" -Expected "" -Actual $uncWorkDir
+    Assert-Equal -Name "network work folder refusal logged" -Expected $true -Actual ($uncLog -match [regex]::Escape("Not using $uncBase for the work folder: it is on a network drive or share"))
+
+    # --- End-of-run banner and exit code ----------------------------------
+    function Get-RunEndResult {
+        param([int]$Missing, [int]$Errors, [switch]$NoOutput)
+        $script:missingInputCount = $Missing
+        $script:unexpectedErrorCount = $Errors
+        $before = @(Get-Content -LiteralPath $logFile).Count
+        $incomplete = Write-RunEndBanner -NoOutput:$NoOutput 6>$null
+        $lines = @(Get-Content -LiteralPath $logFile | Select-Object -Skip $before | ForEach-Object { $_ -replace '^\[[^\]]+\] ', '' })
+        return "$incomplete | $($lines -join ' | ')"
+    }
+    Assert-Equal -Name "banner: complete run" -Expected "False | === Timeline Builder Completed Successfully ===" -Actual (Get-RunEndResult -Missing 0 -Errors 0)
+    Assert-Equal -Name "banner: missing input files (exit code 2)" -Expected "True | ERROR: === Timeline Builder Completed WITH 1 MISSING INPUT FILE(S) -- timeline incomplete ===" -Actual (Get-RunEndResult -Missing 1 -Errors 0)
+    Assert-Equal -Name "banner: unexpected errors (exit code 2)" -Expected "True | ERROR: === Timeline Builder Completed WITH 2 UNEXPECTED ERROR(S) -- timeline may be incomplete ===" -Actual (Get-RunEndResult -Missing 0 -Errors 2)
+    Assert-Equal -Name "banner: both" -Expected "True | ERROR: === Timeline Builder Completed WITH 3 MISSING INPUT FILE(S) -- timeline incomplete === | ERROR: === Timeline Builder Completed WITH 1 UNEXPECTED ERROR(S) -- timeline may be incomplete ===" -Actual (Get-RunEndResult -Missing 3 -Errors 1)
+    Assert-Equal -Name "banner: no entries" -Expected "False | === Timeline Builder Finished (no output generated) ===" -Actual (Get-RunEndResult -Missing 0 -Errors 0 -NoOutput)
+    Assert-Equal -Name "banner: no entries after an unexpected error (exit code 2)" -Expected "True | ERROR: === Timeline Builder Finished WITH 1 UNEXPECTED ERROR(S) (no output generated) ===" -Actual (Get-RunEndResult -Missing 0 -Errors 1 -NoOutput)
+    $script:missingInputCount = 0
+    $script:unexpectedErrorCount = 0
 
     # =============================================================
     # Part 2: builder runs on a collection zip
@@ -371,6 +424,7 @@ try {
     Assert-Equal -Name "run A: device from the rotated setupapi log (\ entry name)" -Expected "1 2024-11-30 09:00:00.000 Device install: TestVen DiskB (serial TESTSERIAL0002)" -Actual "$($rowB.Count) $($rowB[0].Timestamp) $($rowB[0].Description)"
     Assert-Equal -Name "run A: completed successfully" -Expected 1 -Actual @($runA.Lines -match "=== Timeline Builder Completed Successfully ===").Count
     Assert-Equal -Name "run A: extraction written to the log file" -Expected $true -Actual ($runA.Log -match "Extracting the collection zip" -and $runA.Log -match "Zip: .+ 4 file\(s\)" -and $runA.Log -match "Work folder: ")
+    Assert-Equal -Name "run A: free space checked before the extraction" -Expected $true -Actual ($runA.Log -match "Free space on |Low free space on |Free space check skipped")
     Assert-Equal -Name "run A: all input files still present" -Expected $true -Actual ($runA.Log -match "All 4 input file\(s\) were still present")
     $defaultBase = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) "TimelineBuilder"
     Write-TestResult -Name "run A: work folder in %LOCALAPPDATA%\TimelineBuilder" -Passed ($runA.WorkFolder -and $runA.WorkFolder.StartsWith($defaultBase + "\", [System.StringComparison]::OrdinalIgnoreCase)) -Message "work folder: $($runA.WorkFolder)"

@@ -143,6 +143,7 @@ $script:inputFiles = New-Object System.Collections.Generic.List[string]  # input
 $script:shortenedNames = @{}     # extracted file shortened to fit -> its full-length path
 $script:collectionManifest = $null
 $script:missingInputCount = 0
+$script:unexpectedErrorCount = 0  # errors caught by the main body's trap (rest of a step skipped)
 
 # Long form of a path: full, with 8.3 short names expanded (GitHub runners
 # have a %TEMP% like C:\Users\RUNNER~1\...) and no trailing backslash. A
@@ -209,12 +210,29 @@ function Remove-StaleWorkFolders {
     }
 }
 
+# $true when $Path is a network path: a UNC path (\\server\share\...) or a
+# folder on a mapped network drive. reg load (RegLoadKey) only loads a hive
+# from a local file, and the hive copies are made in the work folder, so
+# the work folder must be on a local drive. A path that is not valid is
+# not reported here; creating the folder reports it.
+function Test-NetworkPath {
+    param([string]$Path)
+    $root = ""
+    try { $root = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($Path)) }
+    catch { return $false }
+    if (-not $root) { return $false }
+    if ($root.StartsWith('\\')) { return $true }
+    try { return ((New-Object System.IO.DriveInfo($root)).DriveType -eq [System.IO.DriveType]::Network) }
+    catch { return $false }
+}
+
 # Create this run's work folder, <base>\w<PID>_<HHmmss> (kept short: deep
 # collection paths come close to the 260-character limit), with a
 # <work folder>\scratch subfolder, and hold its .lock open until the end
 # of the run. Base: -WorkDir if given, else %LOCALAPPDATA%\TimelineBuilder
-# (no Windows cleanup covers it), else the script's work\ folder. Returns
-# the folder, or "" after logging why not.
+# (no Windows cleanup covers it), else the script's work\ folder. A base
+# on a network drive is not used (see Test-NetworkPath). Returns the
+# folder, or "" after logging why not.
 function New-RunWorkFolder {
     param([string]$BaseFolder)
     $bases = @()
@@ -225,6 +243,10 @@ function New-RunWorkFolder {
         $bases += (Join-Path $PSScriptRoot "work")
     }
     foreach ($base in $bases) {
+        if (Test-NetworkPath $base) {
+            Log-Warning "Not using $base for the work folder: it is on a network drive or share, and reg load cannot load hives from there."
+            continue
+        }
         $folder = ""
         try {
             [void][System.IO.Directory]::CreateDirectory($base)
@@ -513,8 +535,8 @@ function Get-MissingInputFiles {
 }
 
 # Log missing input files grouped by their top folder in the collection
-# (USB\, Browser\, Registry\, ...), which shows the parsers affected; at
-# most 20 names per folder
+# (USB\, Browser\, Registry\, ...), which shows the parsers affected. The
+# log file gets every name; the console shows at most 20 per folder.
 function Write-MissingInputFiles {
     param([string[]]$Files, [string]$BaseFolder)
     $base = $BaseFolder.TrimEnd('\') + '\'
@@ -530,9 +552,43 @@ function Write-MissingInputFiles {
     foreach ($folder in $groups.Keys) {
         $names = $groups[$folder]
         Log-Warning "  Missing in ${folder}: $($names.Count) file(s)"
-        foreach ($name in ($names | Select-Object -First 20)) { Log "    $name" }
-        if ($names.Count -gt 20) { Log "    ... and $($names.Count - 20) more" }
+        $time = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        $lines = @($names | ForEach-Object { "[$time]     $_" })
+        $lines | Select-Object -First 20 | ForEach-Object { Write-Host $_ }
+        if ($names.Count -gt 20) { Write-Host "[$time]     ... and $($names.Count - 20) more (all listed in the log file)" }
+        if ($logFile) { Add-Content -Path $logFile -Value $lines }
     }
+}
+
+# The end-of-run banner. The timeline is incomplete when input files
+# disappeared during the run, and may be incomplete when the main body's
+# trap caught an unexpected error (the rest of that step, e.g. a whole
+# parser, was skipped). Returns $true in both cases; the run then ends
+# with exit code 2. -NoOutput: no timeline was written (no entries).
+function Write-RunEndBanner {
+    param([switch]$NoOutput)
+    $verb = "Completed"
+    $incompleteText = "-- timeline incomplete"
+    $maybeText = "-- timeline may be incomplete"
+    if ($NoOutput) {
+        $verb = "Finished"
+        $incompleteText = "(no output generated)"
+        $maybeText = "(no output generated)"
+    }
+    $incomplete = $false
+    if ($script:missingInputCount -gt 0) {
+        Log-Error "=== Timeline Builder $verb WITH $($script:missingInputCount) MISSING INPUT FILE(S) $incompleteText ==="
+        $incomplete = $true
+    }
+    if ($script:unexpectedErrorCount -gt 0) {
+        Log-Error "=== Timeline Builder $verb WITH $($script:unexpectedErrorCount) UNEXPECTED ERROR(S) $maybeText ==="
+        $incomplete = $true
+    }
+    if (-not $incomplete) {
+        if ($NoOutput) { Log "=== Timeline Builder Finished (no output generated) ===" }
+        else { Log "=== Timeline Builder Completed Successfully ===" }
+    }
+    return $incomplete
 }
 
 # =============================================================
@@ -661,17 +717,22 @@ try {
 
 # Inside a try block, a statement-terminating error (a .NET exception or a
 # method call on $null outside an inner try/catch) would skip the whole
-# rest of the run. Log it and go on with the next step instead. Ctrl+C
+# rest of the run. Log it and go on with the next step instead. Without
+# the try block such an error skipped only its own statement; here it
+# skips the rest of the step (e.g. the rest of a parser), so it is counted
+# and the run ends with "UNEXPECTED ERROR(S)" and exit code 2 instead of
+# "Completed Successfully" (Write-RunEndBanner). Ctrl+C
 # (PipelineStoppedException) is passed on, so the run stops and the
 # finally block cleans up.
 trap {
     if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { break }
+    $script:unexpectedErrorCount++
     Log-Error "Unexpected error at line $($_.InvocationInfo.ScriptLineNumber) (rest of this step skipped): $($_.Exception.Message)"
     continue
 }
 
 if (-not $script:runWorkDir) {
-    Log-Error "Could not create a work folder. Pass -WorkDir with a writable folder that is not a temp folder."
+    Log-Error "Could not create a work folder. Pass -WorkDir with a writable folder on a local drive that is not a temp folder."
     exit 1
 }
 Log "Work folder: $($script:runWorkDir)"
@@ -10752,12 +10813,13 @@ if ($Sources -contains "Memory")           { Parse-Memory }
 # =============================================================
 # Input files: a file deleted while the timeline was built (by a cleanup
 # tool or antivirus) left no error, only rows missing from the timeline.
-# List them; the run then ends with exit code 2.
+# List them; the run then ends with exit code 2. Checked once, after all
+# parsers: a file deleted after its parser read it has all its rows.
 # =============================================================
 $missingInputs = @(Get-MissingInputFiles)
 $script:missingInputCount = $missingInputs.Count
 if ($missingInputs.Count -gt 0) {
-    Log-Error "$($missingInputs.Count) of $($script:inputFiles.Count) input file(s) disappeared during the run -- their rows are missing from the timeline:"
+    Log-Error "$($missingInputs.Count) of $($script:inputFiles.Count) input file(s) disappeared during the run -- rows from them may be missing from the timeline (not if a file was deleted after its parser read it):"
     Write-MissingInputFiles -Files $missingInputs -BaseFolder $script:collectionRoot
     Log ""
 }
@@ -10776,11 +10838,7 @@ Log "  Raw entries collected: $entryCount"
 
 if ($entryCount -eq 0) {
     Log-Warning "No timeline entries were collected. Check input path and selected sources."
-    if ($script:missingInputCount -gt 0) {
-        Log-Error "=== Timeline Builder Finished WITH $($script:missingInputCount) MISSING INPUT FILE(S) (no output generated) ==="
-        exit 2
-    }
-    Log "=== Timeline Builder Finished (no output generated) ==="
+    if (Write-RunEndBanner -NoOutput) { exit 2 }
     exit 0
 }
 
@@ -11095,12 +11153,9 @@ if ($Keywords -and $Keywords.Count -gt 0) {
 
 Log ""
 Log "============================================================="
-if ($script:missingInputCount -gt 0) {
-    Log-Error "=== Timeline Builder Completed WITH $($script:missingInputCount) MISSING INPUT FILE(S) -- timeline incomplete ==="
-}
-else {
-    Log "=== Timeline Builder Completed Successfully ==="
-}
+# The exit code is decided here: an error while opening a viewer (below)
+# does not change it
+$timelineIncomplete = Write-RunEndBanner
 Log ""
 Log "============================================================="
 
@@ -11268,8 +11323,9 @@ if ($selectedAction -eq "none") {
 
 Log "============================================================="
 
-# Exit code 2: the timeline was written, but input files went missing
-if ($script:missingInputCount -gt 0) { exit 2 }
+# Exit code 2: the timeline was written, but input files went missing or
+# an unexpected error skipped part of a step
+if ($timelineIncomplete) { exit 2 }
 
 # End of the main try block that starts after the "Started" log lines (the
 # body in between is intentionally not re-indented). The finally block runs
