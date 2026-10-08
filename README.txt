@@ -120,15 +120,18 @@ themselves are never committed.
     1. Finds triage collection .zip files from sibling triage-collector\reports\
     2. Lists them with size and date, newest first
     3. You pick a number
-    4. Extracts to a temp folder (cleaned up after)
+    4. Extracts it into a work folder in %LOCALAPPDATA%\TimelineBuilder,
+       not %TEMP% (deleted after; see "Work folder" below)
     5. Builds the timeline (~2 minutes for ~36,000 events)
     6. Generates a color-coded Excel file (rows colored by EventType)
     7. Asks how you want to view: Excel (colored), Timeline Explorer, Both, None
 
-  You can also pass a path directly, optionally followed by a comma-separated
+  You can also pass a collection folder or a collection .zip directly (or
+  drop either on the .bat), optionally followed by a comma-separated
   keyword list (both in quotes):
 
   Run-TimelineBuilder.bat "path\to\triage\collection"
+  Run-TimelineBuilder.bat "path\to\TriageCollection_2026-04-08_09-30.zip"
   Run-TimelineBuilder.bat "path\to\collection" "mimikatz,psexec"
 
   The launcher asks for Administrator rights (UAC) and restarts itself
@@ -140,6 +143,7 @@ themselves are never committed.
 
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -Browse
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection"
+  powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\TriageCollection_2025-01-20_14-05.zip" -WorkDir "D:\Work"
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -StartDate "2025-01-15" -EndDate "2025-01-20"
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -Sources "EventLogs,Prefetch,Registry"
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -Keywords "mimikatz,psexec,powershell -enc"
@@ -155,7 +159,9 @@ themselves are never committed.
 
   -Browse         Auto-find triage zips in sibling triage-collector\reports\
                   and present a numbered menu to select one. No InputPath needed.
-  -InputPath      Path to a triage collection directory or any directory
+  -InputPath      Path to a triage collection directory, a collection .zip
+                  (extracted into the work folder, as in browse mode; a
+                  memory dump next to it is found too), or any directory
                   containing supported artifacts.
   -OutputFile     Output CSV path. Defaults to reports\timeline_<timestamp>\timeline.csv
   -StartDate      Only include events after this date (UTC).
@@ -188,6 +194,11 @@ themselves are never committed.
                   update alone can add hundreds of thousands. Possible
                   timestomping and Mark-of-the-Web (downloaded or
                   extracted file) rows are always reported (see parser #8).
+  -WorkDir        Folder in which this run's work folder is made (the
+                  extracted zip and scratch copies; see "Work folder").
+                  Default %LOCALAPPDATA%\TimelineBuilder. Use a folder on
+                  another drive when the system drive is low on space, and
+                  never a temp folder.
 
 
 ## Auto-Downloaded Dependencies
@@ -225,7 +236,8 @@ installed as PowerShell modules -- no manual installation needed.
   Eric Zimmerman's tools: https://ericzimmerman.github.io/
 
 All downloads happen once. On subsequent runs, cached copies are reused.
-All temp files (download zips, extraction dirs) are cleaned up automatically.
+Download zips are deleted from %TEMP% after extraction; the work folder
+(extracted collection, scratch copies) is deleted at the end of every run.
 
 
 ## Output
@@ -241,6 +253,49 @@ The script creates a timestamped report folder next to the script:
     tools\
       sqlite3\                       -- Auto-downloaded, cached
       TimelineExplorer\              -- Auto-downloaded on first use, cached
+
+### Work folder
+
+  A collection zip is extracted, and hives and browser databases are copied
+  for reading, into a work folder that exists only while the builder runs:
+
+    %LOCALAPPDATA%\TimelineBuilder\w<PID>_<HHmmss>\
+      .lock                          -- held open for the whole run
+      in\                            -- the extracted collection zip
+      scratch\                       -- copies for reg load and sqlite3
+
+  It is deleted at the end of every run, also after an error or Ctrl+C. A
+  folder left by a run that was killed (window closed, crash) is deleted by
+  the next run, once no builder holds its .lock. -WorkDir makes the work
+  folder in another folder; if %LOCALAPPDATA% cannot be written, work\ next
+  to the script is used. The log names the work folder.
+
+  Why not %TEMP%: Windows Storage Sense deletes files older than 7 days from
+  temp folders when disk space runs low, and extracted files keep the dates
+  stored in the zip, which are often months old. This once deleted setupapi
+  logs and browser databases while a timeline was being built. The builder
+  warns when the work folder, or a folder passed as -InputPath, is inside a
+  temp folder.
+
+  Before extracting, the free space on the work folder's drive is checked:
+  the builder stops below the zip's uncompressed size plus 256 MB, and warns
+  below the size plus 1 GB, or when the system drive would be left with
+  less than 10% free. A network (UNC) work folder is not checked.
+
+### Missing input files (exit code 2)
+
+  Every input file is recorded when the run starts: each file extracted
+  from the zip, or, for a collection folder, each file listed in
+  collection_manifest.csv that is present (memory dumps excepted). Files
+  that disappear right after the extraction (e.g. antivirus) stop the run.
+  After the parsers have run, all of them must still be there; files that
+  disappeared are listed in the log by collection folder (USB\, Browser\,
+  ...), the run ends with
+
+    === Timeline Builder Completed WITH N MISSING INPUT FILE(S) -- timeline incomplete ===
+
+  and the exit code is 2 instead of 0. The timeline is still written, but
+  rows from those files are missing.
 
 
 ## Output Format (CSV and Excel)
@@ -301,7 +356,7 @@ Both timeline.csv and timeline.xlsx contain the same columns:
   The user is taken from the collection's own folder layout: Registry\<user>\,
   UserActivity\<user>\, Browser\<user>\ or a Users\<user>\ folder inside the
   collection. It is never taken from the analysis machine's path (for
-  example the %TEMP% folder a browse-mode zip is extracted to). Rows that do
+  example the work folder a zip is extracted to). Rows that do
   not belong to a specific profile have an empty User.
 
 ### Duplicates
@@ -860,6 +915,18 @@ Timeline Explorer at the same time.
     with them often hit this warning and Amcache parsing is skipped.
     Re-collect with the current collector to get the logs.
 
+  - "Transaction log missing: ..." -- A hive's .LOG1/.LOG2 file is listed
+    in collection_manifest.csv but is not in the collection any more. The
+    hive is loaded without it, so changes Windows had not yet written into
+    the hive file are missing.
+
+  - "Completed WITH N MISSING INPUT FILE(S) -- timeline incomplete" (exit
+    code 2) -- Input files were deleted while the timeline was being built,
+    usually by a cleanup tool or antivirus; the log lists them. Rows from
+    them are missing (a browser store also logs "sqlite3 query skipped,
+    input file missing"). Build the timeline again from the zip, or from a
+    copy of the collection outside any temp folder.
+
   - "No service data found" -- Appears for mounted-image collections, which
     have no services.csv (it needs live queries). Scheduled tasks of mounted
     images are parsed from the collected task XML files instead.
@@ -1063,9 +1130,9 @@ parsing is skipped, and the timeline CSV can be opened manually.
   After an intended change to the parser output, regenerate the expected rows
   with -UpdateExpected and review the diff before committing.
 
-  Four more scripts test the event log, browser, registry and $MFT parsers.
-  CI runs them after Test-Parsers.ps1 in both PowerShell versions (GitHub
-  Actions runners are elevated):
+  The scripts below test more parsers and how the builder handles its
+  input. CI runs them after Test-Parsers.ps1 in both PowerShell versions
+  (GitHub Actions runners are elevated):
 
   tests\Test-EventLogParsers.ps1 -- Part 1 feeds the Security, System,
   Defender and Application handlers synthetic event records and checks
@@ -1102,11 +1169,24 @@ parsing is skipped, and the timeline CSV can be opened manually.
   No admin needed: it loads the builder's functions without running the
   script.
 
+  tests\Test-ZipInput.ps1 -- Part 1 loads the builder's functions and checks
+  the zip extraction ("/" and "\" entry names, entry dates kept, over-long
+  names shortened, no ".." entry written outside the folder), the manifest
+  lookups, the list of input files, the free-space and temp-folder checks
+  and the clean-up of work folders left by killed runs; it needs no admin.
+  Part 2 runs the builder on a synthetic collection zip dated 2025 with two
+  setupapi logs: both must be parsed, the work folder must be outside
+  %TEMP% and removed afterwards, and an input file deleted during the run
+  (by a test hook) must give exit code 2 and the MISSING INPUT FILE(S)
+  banner. Part 2 needs admin like the builder (or -BuilderPath with a copy
+  without the admin check); it changes nothing on the system.
+
   Run them from an elevated PowerShell; -AllowSystemChanges lets the event
   log and registry tests change this machine:
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-BrowserParsers.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-MftParser.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-ZipInput.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers.ps1 -AllowSystemChanges
     powershell -ExecutionPolicy Bypass -File tests\Test-RegistryParsers.ps1 -AllowSystemChanges
 
@@ -1190,16 +1270,20 @@ parsing is skipped, and the timeline CSV can be opened manually.
 ## What It Modifies
 
 This script is read-only with respect to the target system's artifacts. It only
-creates files in its own reports\ directory and temp folders (cleaned up after).
-No system files, registry keys, or artifacts are modified.
+creates files in its own reports\ directory, in its work folder
+(%LOCALAPPDATA%\TimelineBuilder\w<PID>_<HHmmss>, or inside -WorkDir; deleted
+at the end of the run) and in %TEMP% for downloads. No system files, registry
+keys, or artifacts are modified.
 
 One-time actions (first run only):
   - Installs ImportExcel PowerShell module (CurrentUser scope)
 
-Temporary actions (all cleaned up automatically):
-  - Extracts triage zip to %TEMP% (browse mode) -- deleted after processing
+Temporary actions (all cleaned up automatically, also after an error or Ctrl+C):
+  - Extracts a collection zip (browse mode, or a .zip as -InputPath) into the
+    work folder, with the dates stored in the zip -- deleted after processing
   - Copies registry hives (NTUSER.DAT, UsrClass.dat, SOFTWARE, SYSTEM,
-    Amcache.hve) to %TEMP% for reg load -- unloaded and deleted after
+    Amcache.hve) into the work folder for reg load -- unloaded and deleted
+    after processing (a hive a parser left loaded is unloaded at the end)
+  - Copies browser DBs into the work folder for sqlite3 -- deleted after
     processing
-  - Copies browser DBs to %TEMP% for sqlite3 -- deleted after processing
   - Downloads zip files to %TEMP% (first run) -- deleted after extraction
