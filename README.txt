@@ -365,6 +365,10 @@ Both timeline.csv and timeline.xlsx contain the same columns:
   - ShimCache (AppCompatCache): the file's last-modified time stored in
     each cache entry, not when the program ran (EventType
     FileLastModified)
+  - Scheduled tasks: the registered and last run times Windows records in
+    the TaskCache, and the last run times in scheduled_tasks.csv. The
+    registration date in the task XML is set by whoever wrote the task, so
+    its rows say "(author-supplied)" (parser #6)
   - Browser history, downloads, logins, cookies, form entries and
     permissions: times the browsers store in UTC
   - USN journal and setupapi logs: these are local-time text. They are
@@ -573,10 +577,12 @@ From the SOFTWARE hive (EventType PersistenceChange unless noted):
   - Scheduled tasks from the TaskCache (Registry-TaskCache): hidden tasks
     and task folders -- a Tree entry without an SD value, which schtasks
     and Task Scheduler do not list (ScheduledTaskChange); and, from
-    DynamicInfo, "Scheduled task registered" (ScheduledTaskChange) and
-    "Scheduled task last run" (Execution, with LastErrorCode) with the
-    task's Actions, for tasks that scheduled_tasks.csv or the task XML
-    files do not already put on the timeline
+    DynamicInfo, with the task's Actions: "Scheduled task registered"
+    (ScheduledTaskChange) for every task -- the time Windows recorded,
+    also for a task that scheduled_tasks.csv or the task XML files list
+    (Details: Listed=yes) -- and "Scheduled task last run" (Execution,
+    with LastErrorCode) unless scheduled_tasks.csv already gives the
+    task's last run time
   - Defender exclusions (Registry-DefenderExclusions; Paths, Extensions,
     Processes, IpAddresses; local and Group Policy): one SecurityAlert row
     each; local ones are "ignored by policy" when Group Policy sets
@@ -670,11 +676,19 @@ parsing). key4.db is never opened.
 Parses scheduled_tasks.csv from the triage collection (live collections):
   - Task name, path, state, author, run-as user, actions (the command) and
     triggers
-  - Registration and last run times; tasks with no usable time are
-    Snapshot rows
+  - The registration date of the task XML (RegistrationInfo/Date) as
+    "Scheduled task registration date (author-supplied)" (Details:
+    Time=task XML RegistrationInfo/Date ...). Whoever writes a task sets
+    this date, and Windows' own tasks carry dates years before the install
+    (2005, 2010, ...), so it does not show when the task appeared. The
+    time Windows recorded is the TaskCache "Scheduled task registered" row
+    (-Sources Registry); a date less than 2 seconds from it is not added
+    again (the log counts them)
+  - Last run times. A task with neither row (no usable time, or only a
+    date that is the TaskCache time) is a Snapshot row
 Mounted-image collections have no scheduled_tasks.csv; the task XML files
 the collector copies from Windows\System32\Tasks are parsed instead
-(registration date, author, command).
+(registration date, author, command), with the same rules.
 
 ### 7. Services
 Parses services.csv from triage collection:
@@ -1068,11 +1082,20 @@ Timeline Explorer at the same time.
     other folders in the same hive have an SD value; otherwise the log says
     "N TaskCache\Tree folder(s) without an SD value not reported".
 
-  - TaskCache times -- "Scheduled task registered" / "last run" rows from
-    Registry-TaskCache are only added for tasks that scheduled_tasks.csv or
-    the task XML files do not already cover. With -Sources Registry but not
-    ScheduledTasks they are added for every task (a few hundred Microsoft
-    tasks on a normal system).
+  - TaskCache times -- Every task in the TaskCache gets a "Scheduled task
+    registered" row from Registry-TaskCache (a few hundred Microsoft tasks
+    on a normal system). Its "last run" row is only added when
+    scheduled_tasks.csv has no last run time for the task; with -Sources
+    Registry but not ScheduledTasks it is added for every task.
+
+  - Scheduled task registration date (author-supplied) -- The date in the
+    task XML (RegistrationDateUtc in scheduled_tasks.csv, or the
+    ScheduledTasks_XML files) is whatever the task's author wrote, so a
+    task can be backdated. Compare it with the TaskCache "Scheduled task
+    registered" row of the same task. A date less than 2 seconds from that
+    time is left out as the same time; any other date is kept as its own
+    row. Without the Registry source or the SOFTWARE hive, every date is
+    kept.
 
   - Mark of the Web -- Only Zone.Identifier text stored inside the MFT
     record (resident, almost always the case) can be read. A non-resident
@@ -1347,7 +1370,9 @@ parsing is skipped, and the timeline CSV can be opened manually.
   with -Sources Registry,ScheduledTasks,USB and checks the rows and times
   (the MountedDevices rows must come from the SYSTEM hive, not from the
   empty mounted_devices.csv or the cut-off mounted_devices.txt of an older
-  collector next to it). Needs admin;
+  collector next to it; the tasks scheduled_tasks.csv lists keep their
+  TaskCache registered rows, and the list's own date is an author-supplied
+  row only where it is not the TaskCache time). Needs admin;
   because it writes to the registry it runs only in GitHub Actions or with
   -AllowSystemChanges (otherwise it prints SKIP).
 
@@ -1426,6 +1451,17 @@ parsing is skipped, and the timeline CSV can be opened manually.
   tree, that the summary counts the rows written to the CSV (after
   deduplication), so the counts add up to "Total events". No admin needed.
 
+  tests\Test-ScheduledTasks.ps1 -- loads the builder's functions and runs
+  the ScheduledTasks parser on synthetic collections: scheduled_tasks.csv
+  of the current and of older collectors, and the task XML files of a
+  mounted image, with and without the TaskCache times the Registry source
+  leaves for it. A registration date from the task XML must be a
+  "registration date (author-supplied)" row; one less than 2 seconds from
+  the task's TaskCache time is not added again (the task gets a Snapshot
+  row if it has no last run row); last run and Snapshot rows are
+  unchanged. It also checks that the Registry source runs first. No admin
+  needed; the TaskCache rows are checked by Test-RegistryParsers.ps1.
+
   Run them from an elevated PowerShell; -AllowSystemChanges lets the event
   log and registry tests change this machine:
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers.ps1
@@ -1436,6 +1472,7 @@ parsing is skipped, and the timeline CSV can be opened manually.
     powershell -ExecutionPolicy Bypass -File tests\Test-MemoryParser.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-ShimCacheParser.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-SummaryCounts.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-ScheduledTasks.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers.ps1 -AllowSystemChanges
     powershell -ExecutionPolicy Bypass -File tests\Test-RegistryParsers.ps1 -AllowSystemChanges
 
