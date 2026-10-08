@@ -1,0 +1,50 @@
+{
+  "SchemaVersion": 1,
+  "GeneratedUtc": "\/Date(1791472967000)\/",
+  "Collection": {
+    "ComputerName": "MINIMAL-PC",
+    "Users": [],
+    "Mode": "Offline",
+    "TargetTimeZoneId": "",
+    "CollectionStartUtc": "\/Date(1791469205000)\/",
+    "CollectorUser": "",
+    "SecretsIncluded": true,
+    "ThunderbirdIndexIncluded": false
+  },
+  "TimeSpan": { "FirstUtc": "2026-10-06 08:00:00.000", "LastUtc": "2026-10-08 14:20:00.000", "Rows": 1203 },
+  "Counts": { "High": 0, "Medium": 0, "Info": 0 },
+  "TopFindings": [],
+  "Findings": [],
+  "InfoFindings": [],
+  "Coverage": {
+    "Sources": [
+      { "Source": "Prefetch", "Rows": 903, "FirstUtc": "2026-10-06 08:00:00.000", "LastUtc": "2026-10-08 14:20:00.000" },
+      { "Source": "System.evtx", "Rows": 300, "FirstUtc": "2026-10-07 01:00:00.000", "LastUtc": "2026-10-08 13:00:00.000" }
+    ],
+    "LogClears": [],
+    "Boots": [],
+    "AuditNotes": [],
+    "CollectorErrors": { "Count": 0, "Lines": [] },
+    "Notes": []
+  },
+  "Activity": {
+    "PerDay": [
+      { "Day": "2026-10-06", "Rows": 410 },
+      { "Day": "2026-10-07", "Rows": 380 },
+      { "Day": "2026-10-08", "Rows": 413 }
+    ],
+    "PerHourUtc": [ 10, 12, 8, 5, 4, 3, 9, 30, 60, 80, 90, 95, 101, 99, 120, 110, 90, 70, 60, 50, 40, 30, 20, 6 ],
+    "TopSources": [ { "Source": "Prefetch", "Rows": 903 }, { "Source": "System.evtx", "Rows": 300 } ],
+    "PerUser": []
+  },
+  "Caveats": [
+    "A missing event proves nothing: much useful logging is off by default.",
+    "This collection includes credential material (made with -IncludeSecrets); store and share it as sensitive."
+  ],
+  "Rules": [
+    { "Id": "R1-AV-DETECTION", "Title": "Antivirus detection", "Severity": "High", "Category": "Antivirus" },
+    { "Id": "R14-TIMESTOMP", "Title": "File times altered on a program", "Severity": "Medium", "Category": "FileSystem" }
+  ],
+  "Workbook": { "FileName": "timeline.xlsx", "Available": false, "TimelineSheet": "Timeline", "FindingsSheet": "Findings" },
+  "Files": { "TimelineCsv": "timeline.csv" }
+}
