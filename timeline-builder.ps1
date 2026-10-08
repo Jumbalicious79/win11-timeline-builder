@@ -402,6 +402,7 @@ function Find-ArtifactFiles {
 $script:collectionRoot = [System.IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($InputPath)).TrimEnd('\')
 $script:collectionInfo = $null
 $script:manifestTimes = $null
+$script:secretsRoot = $null
 
 # Path of a file relative to the collection root, or $null if it is outside it
 function Get-RelativeCollectionPath {
@@ -414,16 +415,37 @@ function Get-RelativeCollectionPath {
     return $null
 }
 
+# Full path of the collection's top-level Secrets\ folder -- the one next to
+# collection_info.json (the sibling the collector's -IncludeSecrets writes),
+# computed once. Anchoring to it means a user profile folder that happens to be
+# named "Secrets" (Browser\Secrets\, UserActivity\secrets\, ...) is NOT treated
+# as the credential folder. Falls back to <collection root>\Secrets when there
+# is no collection_info.json (older collections, which have no Secrets folder).
+function Get-SecretsRoot {
+    if ($null -ne $script:secretsRoot) { return $script:secretsRoot }
+    $base = $script:collectionRoot
+    $jsonFile = Get-ChildItem -Path $InputPath -Filter "collection_info.json" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($jsonFile) {
+        try { $base = [System.IO.Path]::GetFullPath($jsonFile.DirectoryName).TrimEnd('\') } catch { Write-Verbose "Resolving the collection base: $($_.Exception.Message)" }
+    }
+    $script:secretsRoot = (Join-Path $base "Secrets")
+    return $script:secretsRoot
+}
+
 # $true when the path is inside the collection's top-level Secrets\ folder
 # (DPAPI credential material collected with the collector's -IncludeSecrets).
 # No parser reads anything there: it holds only secrets, nothing the timeline
-# needs. Used by Find-ArtifactFiles (so every caller skips it) and the raw
-# $MFT search.
+# needs. Used by Find-ArtifactFiles (so every caller skips it), the recursive
+# searches that bypass it (ScheduledTasks_XML, SRUDB.dat, AntiVirus vendors)
+# and the raw $MFT search.
 function Test-SecretsPath {
     param([string]$FullPath)
-    $rel = Get-RelativeCollectionPath $FullPath
-    if (-not $rel) { return $false }
-    return ($rel -match '(?:^|\\)Secrets(?:\\|$)')
+    if (-not $FullPath) { return $false }
+    try { $full = [System.IO.Path]::GetFullPath($FullPath) } catch { $full = $FullPath }
+    $secretsRoot = Get-SecretsRoot
+    if (-not $secretsRoot) { return $false }
+    return ($full.StartsWith($secretsRoot + '\', [System.StringComparison]::OrdinalIgnoreCase) -or
+        ($full.TrimEnd('\') -ieq $secretsRoot))
 }
 
 # Account an artifact belongs to, from the collection's own folder layout
@@ -5662,7 +5684,7 @@ function Get-CollectedTaskNames {
         }
         catch { Log-Warning "    Could not read $($csv.FullName) for the TaskCache comparison: $($_.Exception.Message)" }
     }
-    foreach ($dir in @(Get-ChildItem -Path $InputPath -Directory -Recurse -Filter "ScheduledTasks_XML" -ErrorAction SilentlyContinue)) {
+    foreach ($dir in @(Get-ChildItem -Path $InputPath -Directory -Recurse -Filter "ScheduledTasks_XML" -ErrorAction SilentlyContinue | Where-Object { -not (Test-SecretsPath $_.FullName) })) {
         foreach ($tf in @(Get-ChildItem -Path $dir.FullName -File -Recurse -ErrorAction SilentlyContinue)) {
             try {
                 $doc = New-Object System.Xml.XmlDocument
@@ -9188,7 +9210,7 @@ function Parse-ScheduledTasks {
     # Task XML definitions copied from a mounted image (Windows\System32\Tasks).
     # RegistrationInfo/Date gives the registration time; tasks without it
     # become Snapshot rows.
-    $xmlDirs = @(Get-ChildItem -Path $InputPath -Directory -Recurse -Filter "ScheduledTasks_XML" -ErrorAction SilentlyContinue)
+    $xmlDirs = @(Get-ChildItem -Path $InputPath -Directory -Recurse -Filter "ScheduledTasks_XML" -ErrorAction SilentlyContinue | Where-Object { -not (Test-SecretsPath $_.FullName) })
     foreach ($dir in $xmlDirs) {
         $taskFiles = @(Get-ChildItem -Path $dir.FullName -File -Recurse -ErrorAction SilentlyContinue)
         Log "  Parsing: $($dir.FullName) ($($taskFiles.Count) file(s))"
@@ -13318,7 +13340,7 @@ function Add-SrumTimelineEntries {
 function Parse-Srum {
     Log "--- Parsing SRUM ---"
     # -Force: a copy may keep the Hidden/System attributes of the original
-    $dbFiles = @(Get-ChildItem -Path $InputPath -Filter "SRUDB.dat" -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq "SRUDB.dat" })
+    $dbFiles = @(Get-ChildItem -Path $InputPath -Filter "SRUDB.dat" -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq "SRUDB.dat" -and -not (Test-SecretsPath $_.FullName) })
     if ($dbFiles.Count -eq 0) {
         Log "  No SRUM database (SRUDB.dat) in this collection (collected by newer collector versions, Execution\SRUM)."
         Log ""
@@ -15301,7 +15323,10 @@ function Parse-AntiVirus {
     $sophosPattern = '^\s*\d{8}\s\d{6}\s'
     $mcafeePattern = '^\s*\d{1,4}[./-]\d{1,2}[./-]\d{1,4}\t[^\t]*\t\s*(?:Would be blocked|Blocked) by (?:Access Protection|port blocking) rule'
 
-    $allDirs = @(Get-ChildItem -Path $InputPath -Directory -Recurse -ErrorAction SilentlyContinue)
+    # Secrets\ is never parsed: filtering $allDirs here covers the vendor
+    # folders, the Defender DetectionHistory folders and the Quarantine Entries
+    # folders, which are all derived from it below.
+    $allDirs = @(Get-ChildItem -Path $InputPath -Directory -Recurse -ErrorAction SilentlyContinue | Where-Object { -not (Test-SecretsPath $_.FullName) })
     $vendorDirs = @($allDirs | Where-Object { $_.Parent -and $_.Parent.Name -eq "AntiVirus" } | Sort-Object FullName)
     $parsedFiles = 0
     foreach ($dir in $vendorDirs) {

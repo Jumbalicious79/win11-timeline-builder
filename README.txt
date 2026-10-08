@@ -940,10 +940,15 @@ specially (collection_info.json records SecretsIncluded: true, and the builder
 logs one line about it at the start):
   - A top-level Secrets\ folder with DPAPI credential material (per-user and
     system master keys, Credentials, Vault). No parser ever reads anything
-    there: every recursive file search skips it, including the $MFT search and
-    all Find-ArtifactFiles callers (a $MFT or Preferences file left in Secrets\
-    is not parsed). Nothing from Secrets\ reaches the timeline, and no row has
-    a RawPath under it.
+    there: the Secrets\ exclusion is applied at the Find-ArtifactFiles choke
+    point (so all of its callers skip it) and on every other recursive search
+    that walks the whole collection -- the $MFT search, the ScheduledTasks_XML
+    folders, the SRUDB.dat search and the AntiVirus vendor / Defender folders.
+    A $MFT, Preferences, Task XML, SRUDB.dat or antivirus file left in Secrets\
+    is not parsed. Only the collection's own top-level Secrets\ folder (next to
+    collection_info.json) is excluded, so a user profile folder named "Secrets"
+    is unaffected. Nothing from Secrets\ reaches the timeline, and no row has a
+    RawPath under it.
   - UNREDACTED browser settings and session files (the collector did not blank
     them). The builder blanks the secret members itself, before the JSON is
     parsed (see "Browser" above), so no key, token, salt, password hash,
@@ -1441,14 +1446,18 @@ parsing is skipped, and the timeline CSV can be opened manually.
   Preferences and Secure Preferences, Firefox prefs.js and Chromium/Firefox
   session files that still hold canary secret values, collection_info.json
   with SecretsIncluded true, and a top-level Secrets\ folder with DPAPI
-  credential material (and a $MFT and a Preferences file there, to exercise
-  the exclusions). Runs the builder with -Sources Browser,FileSystem and
-  checks that the canary appears nowhere in the timeline, log or output (the
-  builder blanks the secret members before parsing), that no row has a
-  RawPath under Secrets\ (no parser reads it, including the $MFT search and
-  Find-ArtifactFiles callers), that the "made with -IncludeSecrets" log line
-  appears, and that non-secret settings and URLs still produced rows (so the
-  canary-free result is not vacuous).
+  credential material (plus a $MFT, a Preferences file, a ScheduledTasks_XML
+  task, a SRUDB.dat and an AntiVirus vendor folder planted there, to exercise
+  every exclusion). A control user profile named "Secrets" holds ordinary
+  artifacts that must still be parsed. Runs the builder with -Sources
+  Browser,FileSystem,ScheduledTasks,SRUM,AntiVirus and checks that the canary
+  appears nowhere in the timeline, log or output (the builder blanks the secret
+  members before parsing), that no row has a RawPath under the top-level
+  Secrets\ folder (no parser reads it: the $MFT search, ScheduledTasks_XML,
+  SRUDB.dat, AntiVirus and the Find-ArtifactFiles callers all skip it), that
+  the "Secrets" control user's artifacts still produced rows, that the "made
+  with -IncludeSecrets" log line appears, and that non-secret settings and URLs
+  still produced rows (so the canary-free result is not vacuous).
 
   tests\Test-EmailParsers.ps1 -- lays out a synthetic Email\<user>\
   collection (listing CSVs, copied attachments, manifest,

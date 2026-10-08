@@ -5,16 +5,21 @@
 # UNREDACTED (Chromium Local State / Preferences / Secure Preferences,
 # Firefox prefs.js, and Chromium / Firefox session files all still hold
 # canary secret values), collection_info.json has SecretsIncluded true, and
-# there is a top-level Secrets\ folder with DPAPI credential material (and,
-# to exercise the exclusions, a file named $MFT and a Preferences file there,
-# all holding the canary).
+# there is a top-level Secrets\ folder with DPAPI credential material (and, to
+# exercise every exclusion, files named $MFT, Preferences, a ScheduledTasks_XML
+# task, SRUDB.dat and an AntiVirus vendor folder there, all holding the
+# canary). A control user profile folder named "Secrets" (not the top-level
+# credential folder) holds an ordinary artifact that must still be parsed.
 #
-# Runs timeline-builder.ps1 -Sources Browser,FileSystem and checks:
+# Runs timeline-builder.ps1 -Sources Browser,FileSystem,ScheduledTasks,SRUM,
+# AntiVirus and checks:
 #   - the canary appears nowhere in the timeline CSV, the builder log or the
 #     builder output (the builder blanks the secret members before parsing
 #     the unredacted browser files);
-#   - no timeline row has a RawPath under Secrets\ (no parser reads it,
-#     including the $MFT search and every Find-ArtifactFiles caller);
+#   - no timeline row has a RawPath under the top-level Secrets\ folder (no
+#     parser reads it: the $MFT, ScheduledTasks_XML, SRUDB.dat and AntiVirus
+#     searches and every Find-ArtifactFiles caller all skip it);
+#   - the "Secrets" control user's ordinary artifacts still produced rows;
 #   - the "made with -IncludeSecrets" log line appears;
 #   - the browser files were actually parsed (non-secret settings and URLs
 #     produced rows), so the canary-free result is not vacuous.
@@ -66,14 +71,16 @@ if (-not $BuilderPath) {
 # Run the builder with the same PowerShell edition as this script
 $powershellExe = (Get-Process -Id $PID).Path
 
-# Runs the builder on a collection (Browser + FileSystem, CSV only)
+# Runs the builder on a collection (CSV only). Every source whose parser walks
+# the whole collection with its own recursive search is selected, so the
+# Secrets\ exclusions on all of them are exercised.
 function Invoke-TimelineBuilder {
     param([string]$CollectionPath, [string]$OutputFile)
     $ErrorActionPreference = "Continue"
     # One comma-joined string: powershell.exe -File would otherwise treat the
     # second source as a positional argument (the builder splits on commas)
     $output = & $powershellExe -NoProfile -ExecutionPolicy Bypass -File $builder `
-        -InputPath $CollectionPath -Sources "Browser,FileSystem" -OutputFile $OutputFile -NoExcel -Viewer None 2>&1
+        -InputPath $CollectionPath -Sources "Browser,FileSystem,ScheduledTasks,SRUM,AntiVirus" -OutputFile $OutputFile -NoExcel -Viewer None 2>&1
     return , @($output | ForEach-Object { "$_" })
 }
 
@@ -201,11 +208,34 @@ try {
             '"cookies":[{"host":".example.org","name":"sid","value":"' + $canary + '-21"}]}]}'))
 
     # --- Secrets\ folder: credential material the builder must never read,
-    # plus a $MFT and a Preferences file there to exercise the exclusions ---
+    # plus files with names several recursive searches look for (a $MFT, a
+    # Preferences file, a ScheduledTasks_XML task, a SRUDB.dat and an AntiVirus
+    # vendor folder), all under Secrets\, to prove every such search skips it ---
     New-TestTextFile -Path (Join-Path $collection "Secrets\alice\AppData\Roaming\Microsoft\Protect\S-1-5-21-1-2-3-1001\11111111-2222-3333-4444-555555555555") -Text "$canary-masterkey"
     New-TestTextFile -Path (Join-Path $collection "Secrets\alice\AppData\Local\Microsoft\Vault\GUID\Policy.vpol") -Text "$canary-vault"
     New-TestTextFile -Path (Join-Path $collection "Secrets\alice\Preferences") -Text ('{"homepage":"https://' + $canary + '.secret/"}')
     New-TestTextFile -Path (Join-Path $collection "Secrets\System\System32\Microsoft\Protect\S-1-5-18\`$MFT") -Text "$canary-notanmft"
+    # A valid scheduled-task XML planted in a ScheduledTasks_XML folder under
+    # Secrets\: if parsed it would add a row (RawPath under Secrets, canary in
+    # the action) -- it must not be.
+    New-TestTextFile -Path (Join-Path $collection "Secrets\alice\AppData\Local\Microsoft\Vault\ScheduledTasks_XML\PlantedUnderSecrets") -Text (@(
+        '<?xml version="1.0" encoding="utf-8"?>',
+        '<Task>',
+        '  <RegistrationInfo><Date>2026-03-01T12:00:00</Date><URI>\PlantedUnderSecrets</URI></RegistrationInfo>',
+        ('  <Actions><Exec><Command>' + $canary + '-task.exe</Command></Exec></Actions>'),
+        '</Task>'
+    ) -join "`r`n")
+    # A SRUDB.dat and an AntiVirus vendor folder under Secrets\: the SRUM and
+    # AntiVirus searches must skip them too.
+    New-TestTextFile -Path (Join-Path $collection "Secrets\alice\AppData\Local\Microsoft\Vault\SRUDB.dat") -Text "$canary-srudb"
+    New-TestTextFile -Path (Join-Path $collection "Secrets\alice\AppData\Local\Microsoft\Vault\AntiVirus\Symantec_SEP\probe.log") -Text ("0123456789AB,1,2,3," + $canary + "-av,infected")
+
+    # Control: a user profile folder that happens to be named "Secrets" (not
+    # the top-level credential folder). Its ordinary artifacts MUST still be
+    # parsed -- the exclusion is anchored to the collection's top-level
+    # Secrets\, so this user is unaffected.
+    $secretsUserFlag = "probe-flag-secretsuser@7"
+    New-TestTextFile -Path (Join-Path $collection "Browser\Secrets\Chrome\Local State") -Text ('{"browser":{"enabled_labs_experiments":["' + $secretsUserFlag + '"]}}')
 
     $timelineCsv = Join-Path $workDir "timeline.csv"
     Write-Host "Running the builder ($powershellExe) on $collection ..."
@@ -227,10 +257,20 @@ try {
     $logText = ($logFiles | ForEach-Object { [System.IO.File]::ReadAllText($_.FullName) }) -join "`n"
     Write-TestResult -Succeeded ($logFiles.Count -gt 0 -and $logText.IndexOf($canary, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) -Message "no secret or private value (canary) in the builder log"
 
-    # No row has a RawPath under Secrets\
+    # No row has a RawPath under the collection's top-level Secrets\ folder
+    # (anchored to that folder, so the "Secrets" control user is not caught)
+    $secretsRootPath = (Join-Path $collection "Secrets") + '\'
     $hasRawPath = $rows.Count -eq 0 -or ($null -ne $rows[0].PSObject.Properties["RawPath"])
-    $secretRows = @($rows | Where-Object { $_.PSObject.Properties["RawPath"] -and $_.RawPath -match '(?:^|\\)Secrets(?:\\|$)' })
-    Write-TestResult -Succeeded ($hasRawPath -and $secretRows.Count -eq 0) -Message "no timeline row has a RawPath under Secrets\$(if ($secretRows.Count) { ' (' + $secretRows.Count + ' found)' })"
+    $secretRows = @($rows | Where-Object { $_.PSObject.Properties["RawPath"] -and $_.RawPath -and $_.RawPath.StartsWith($secretsRootPath, [System.StringComparison]::OrdinalIgnoreCase) })
+    Write-TestResult -Succeeded ($hasRawPath -and $secretRows.Count -eq 0) -Message "no timeline row has a RawPath under the top-level Secrets\ folder$(if ($secretRows.Count) { ' (' + $secretRows.Count + ' found: ' + (($secretRows | ForEach-Object { $_.RawPath }) -join '; ') + ')' })"
+
+    # No parser even walked into the top-level Secrets\ folder: its path never
+    # appears in the builder log or output (a recursive search that reached in
+    # would log "Parsing: ...\Secrets\..."). This catches the SRUDB.dat and
+    # AntiVirus searches, whose planted files do not themselves produce rows.
+    $secretsPathSeen = ($logText.IndexOf($secretsRootPath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or
+        ($outputText.IndexOf($secretsRootPath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+    Write-TestResult -Succeeded (-not $secretsPathSeen) -Message "no parser logged walking into the top-level Secrets\ folder"
 
     # The SecretsIncluded log line appears (log or console)
     $secretsLine = ($logText -match 'made with -IncludeSecrets') -or ($outputText -match 'made with -IncludeSecrets')
@@ -243,6 +283,11 @@ try {
     Write-TestResult -Succeeded ($csvText.Contains("https://home.example.com/")) -Message "a non-secret Chromium setting (homepage) reached the timeline"
     Write-TestResult -Succeeded ($csvText.Contains("https://session.example.com/")) -Message "a non-secret Chromium session URL reached the timeline"
     Write-TestResult -Succeeded ($csvText.Contains("https://ff-open.example.org/")) -Message "a non-secret Firefox session URL reached the timeline"
+
+    # Control: the user profile named "Secrets" is NOT the credential folder;
+    # its ordinary artifacts must still be parsed (the exclusion is anchored to
+    # the top-level Secrets\ folder, not any folder segment named Secrets)
+    Write-TestResult -Succeeded ($csvText.Contains($secretsUserFlag)) -Message "the 'Secrets' control user's artifacts still reached the timeline"
 
     if ($script:failures -gt 0) {
         Write-Host "FAIL: $($script:failures) check(s) failed" -ForegroundColor Red
