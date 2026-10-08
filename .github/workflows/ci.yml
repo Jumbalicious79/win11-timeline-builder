@@ -74,6 +74,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: ./tests/Test-BrowserExtrasParsers.ps1
 
+      - name: Run secrets handling parser test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-SecretsHandling.ps1
+
       - name: Run email parser tests
         if: ${{ !cancelled() }}
         run: ./tests/Test-EmailParsers.ps1
