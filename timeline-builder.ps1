@@ -738,6 +738,10 @@ function ConvertFrom-CollectorTimeText {
 
 # Get-MpThreat SeverityID values
 $script:DefenderSeverityNames = @{ "0" = "Unknown"; "1" = "Low"; "2" = "Moderate"; "4" = "High"; "5" = "Severe" }
+# Get-MpThreatDetection ThreatStatusID values (also in DetectionHistory files)
+$script:DefenderThreatStatusNames = @{ "0" = "Unknown"; "1" = "Detected"; "2" = "Cleaned"; "3" = "Quarantined"; "4" = "Removed";
+    "5" = "Allowed"; "6" = "Blocked"; "102" = "QuarantineFailed"; "103" = "RemoveFailed"; "104" = "AllowFailed";
+    "105" = "Abandoned"; "107" = "BlockedFailed" }
 
 # Defender threat catalog written by the collector (Get-MpThreat: ThreatID,
 # ThreatName, SeverityID, CategoryID). Get-MpThreatDetection has no threat
@@ -2128,9 +2132,7 @@ function Parse-EventLogs {
     # Defender detection history written by the collector (Get-MpThreatDetection).
     # Its times are local [datetime] values that Export-Csv wrote as text on
     # the collector host.
-    $threatStatusNames = @{ "0" = "Unknown"; "1" = "Detected"; "2" = "Cleaned"; "3" = "Quarantined"; "4" = "Removed";
-        "5" = "Allowed"; "6" = "Blocked"; "102" = "QuarantineFailed"; "103" = "RemoveFailed"; "104" = "AllowFailed";
-        "105" = "Abandoned"; "107" = "BlockedFailed" }
+    $threatStatusNames = $script:DefenderThreatStatusNames
     # Get-MpThreatDetection has no threat name: it comes from the Get-MpThreat catalog
     $threatCatalog = Get-DefenderThreatCatalog
     $detectionCsvs = Find-ArtifactFiles -BasePath $InputPath -FileNames @("defender_detections.csv")
@@ -9660,7 +9662,10 @@ function Parse-SystemInfo {
 # loaded, engine version) are counted and skipped: they are frequent, have no
 # EventType of their own and add little to an investigation -- the log is
 # still named in RawPath. Other files and vendor folders are skipped
-# (Write-Verbose). Defender is covered by Parse-EventLogs.
+# (Write-Verbose). Microsoft Defender's event log, Get-MpThreatDetection
+# output and support logs are covered by Parse-EventLogs; its
+# DetectionHistory files and quarantine entries are read here (see
+# Read-DefenderDetectionHistory and Read-DefenderQuarantineEntry).
 
 # Lines of a text log. A byte order mark decides the encoding; without one,
 # UTF-16LE is recognized by its zero high bytes, then strict UTF-8 is tried,
@@ -10127,6 +10132,398 @@ function Read-EsetVirlog {
     }
 }
 
+# --- Microsoft Defender DetectionHistory and quarantine entries ---
+# The collector copies them to AntiVirus\Defender\DetectionHistory\ and
+# AntiVirus\Defender\Quarantine\Entries\; any folder of these names is read
+# (e.g. a copied ProgramData tree). Defender's event log, Get-MpThreatDetection
+# and support log rows (Parse-EventLogs) can describe the same detection:
+# these rows have their own Source (Defender-DetectionHistory,
+# Defender-Quarantine), and their DetectionID / threat name match those rows.
+
+# Values of a DetectionHistory file (format: see Read-DefenderDetectionHistory)
+# as objects with Type, Offset and Size of the data, and the decoded Value:
+# a number (types 0x00, 0x05, 0x06: uint32; 0x08: uint64), a FILETIME as
+# Int64 (0x0A), text (0x15), "{GUID}" text (0x1E), or $null for other types
+# (binary data is read through Offset and Size). Every value states its
+# size, so values of unknown types are skipped; reading stops at the first
+# value that runs past the end of the file.
+function Get-DefenderHistoryValues {
+    param([byte[]]$Bytes)
+    $values = New-Object System.Collections.Generic.List[object]
+    $p = 0
+    while ($p + 8 -le $Bytes.Length) {
+        $size = [long][BitConverter]::ToUInt32($Bytes, $p)
+        $type = [long][BitConverter]::ToUInt32($Bytes, $p + 4)
+        $data = $p + 8
+        if ($size -gt $Bytes.Length - $data) { break }
+        $value = $null
+        if (($type -eq 0x00 -or $type -eq 0x05 -or $type -eq 0x06) -and $size -eq 4) { $value = [long][BitConverter]::ToUInt32($Bytes, $data) }
+        elseif ($type -eq 0x08 -and $size -eq 8) { $value = [BitConverter]::ToUInt64($Bytes, $data) }
+        elseif ($type -eq 0x0A -and $size -eq 8) { $value = [BitConverter]::ToInt64($Bytes, $data) }
+        elseif ($type -eq 0x15) { $value = [System.Text.Encoding]::Unicode.GetString($Bytes, $data, [int]($size - ($size % 2))).Split([char]0)[0] }
+        elseif ($type -eq 0x1E -and $size -eq 16) {
+            $guidBytes = New-Object byte[] 16
+            [Array]::Copy($Bytes, $data, $guidBytes, 0, 16)
+            $value = "{" + (New-Object System.Guid (, $guidBytes)).ToString().ToUpperInvariant() + "}"
+        }
+        $values.Add([PSCustomObject]@{ Type = $type; Offset = $data; Size = [int]$size; Value = $value })
+        $p = $data + [int]$size
+        if ($p % 8 -ne 0) { $p += 8 - ($p % 8) }
+    }
+    return , $values.ToArray()
+}
+
+# Value of a DetectionHistory value set at an index if it has one of the
+# given types, else $null
+function Get-DefenderHistorySetValue {
+    param([object[]]$Set, [int]$Index, [int[]]$Types)
+    if ($Index -lt $Set.Count -and $Types -contains $Set[$Index].Type) { return $Set[$Index].Value }
+    return $null
+}
+
+# Threat tracking data of a DetectionHistory resource (bytes Start to
+# Start + Size) as a hashtable of key -> number or text. Layout: either a
+# header (uint32 1, uint32 header size, uint32 values size, uint32 total
+# size, uint32 ?) and a uint32 values size, or only a uint32 values size;
+# then the values: uint32 key size, UTF-16LE key, uint32 type, and by type
+# 3 uint32, 4 uint64, 5 uint8, 6 uint32 size + UTF-16LE text, 7 five bytes.
+# An unknown type ends the list (the size of its data is unknown).
+function Read-DefenderThreatTracking {
+    param([byte[]]$Bytes, [int]$Start, [int]$Size)
+    $result = @{}
+    if ($Size -lt 4 -or $Start + $Size -gt $Bytes.Length) { return $result }
+    $end = $Start + $Size
+    $first = [long][BitConverter]::ToUInt32($Bytes, $Start)
+    if ($first -eq 1) {
+        if ($Size -lt 20) { return $result }
+        $headerSize = [long][BitConverter]::ToUInt32($Bytes, $Start + 4)
+        $totalSize = [long][BitConverter]::ToUInt32($Bytes, $Start + 12)
+        if ($headerSize -lt 20 -or $headerSize -ge $Size) { return $result }
+        $p = $Start + [int]$headerSize + 4
+        if ($totalSize -lt $Size) { $end = $Start + [int]$totalSize }
+    }
+    else {
+        $p = $Start + 4
+        if ($first -lt $Size) { $end = $Start + [int]$first }
+    }
+    while ($p + 4 -le $end) {
+        $keySize = [long][BitConverter]::ToUInt32($Bytes, $p)
+        if ($keySize -lt 2 -or $keySize -gt 1024 -or $p + 8 + $keySize -gt $end) { break }
+        $key = [System.Text.Encoding]::Unicode.GetString($Bytes, $p + 4, [int]($keySize - ($keySize % 2))).Split([char]0)[0]
+        $p += 4 + [int]$keySize
+        $valueType = [BitConverter]::ToUInt32($Bytes, $p)
+        $p += 4
+        $value = $null
+        if ($valueType -eq 3 -and $p + 4 -le $end) { $value = [long][BitConverter]::ToUInt32($Bytes, $p); $p += 4 }
+        elseif ($valueType -eq 4 -and $p + 8 -le $end) { $value = [BitConverter]::ToInt64($Bytes, $p); $p += 8 }
+        elseif ($valueType -eq 5 -and $p + 1 -le $end) { $value = [long]$Bytes[$p]; $p += 1 }
+        elseif ($valueType -eq 6 -and $p + 4 -le $end) {
+            $textSize = [long][BitConverter]::ToUInt32($Bytes, $p)
+            if ($p + 4 + $textSize -gt $end) { break }
+            $value = [System.Text.Encoding]::Unicode.GetString($Bytes, $p + 4, [int]($textSize - ($textSize % 2))).Split([char]0)[0]
+            $p += 4 + [int]$textSize
+        }
+        elseif ($valueType -eq 7 -and $p + 5 -le $end) { $value = [BitConverter]::ToString($Bytes, $p, 5).Replace("-", ""); $p += 5 }
+        else { break }
+        if ($key) { $result[$key] = $value }
+    }
+    return $result
+}
+
+# Defender DetectionHistory file (Scans\History\Service\DetectionHistory\
+# <nn>\<DetectionID>), one per detection (Windows 10 and later). Format from
+# the public write-ups (libyal dtformats "Windows Defender scan
+# DetectionHistory file format", plaso's windefender_history parser, ERNW
+# quarantine-formats) and checked on plaso's sample files: a list of values,
+# each uint32 data size, uint32 data type, the data, then padding to an
+# 8-byte boundary (see Get-DefenderHistoryValues). A text value
+# "Magic.Version:1.2" (index 0 of its set) starts each value set after the
+# first. Indexes used:
+#   set 1      0 threat ID, 1 detection ID (a GUID, also the file name)
+#   set 2      1 threat name, 3 severity ID, 4 category ID, 7 threat status
+#              ID (3 and 7 are only guessed at in the write-ups; in the
+#              samples their values match Get-MpThreat SeverityID and
+#              Get-MpThreatDetection ThreatStatusID)
+#   set 3...   one set per resource: 1 type ("file", "webfile",
+#              "containerfile", "regkey", "process", ...), 2 location,
+#              5 threat tracking data (see Read-DefenderThreatTracking)
+#   last set   the detection's own values follow its resource: 6 last threat
+#              status change time, 12 domain\user, 14 process, 18 initial
+#              detection time, 20 remediation time (FILETIMEs, UTC; 0 =
+#              not set; the time names are the write-ups' guesses, which
+#              the samples bear out)
+# Values are only used when they have the expected type. One row per file,
+# at the initial detection time, else ThreatTrackingStartTime, else the
+# status change time, else the file's original creation time (manifest).
+# Returns the number of rows added (0: no time found), or -1 if the file is
+# not a DetectionHistory file.
+function Read-DefenderDetectionHistory {
+    param([System.IO.FileInfo]$File)
+    $numberTypes = @(0x00, 0x05, 0x06, 0x08)
+    $bytes = [System.IO.File]::ReadAllBytes($File.FullName)
+    $values = Get-DefenderHistoryValues -Bytes $bytes
+
+    # Value sets, split at the "Magic.Version:" values
+    $sets = New-Object System.Collections.Generic.List[object]
+    $current = New-Object System.Collections.Generic.List[object]
+    foreach ($v in $values) {
+        if ($v.Type -eq 0x15 -and "$($v.Value)".StartsWith("Magic.Version:", [System.StringComparison]::Ordinal)) {
+            $sets.Add($current.ToArray())
+            $current = New-Object System.Collections.Generic.List[object]
+        }
+        $current.Add($v)
+    }
+    $sets.Add($current.ToArray())
+    if ($sets.Count -lt 2) { return -1 }
+    $detectionId = Get-DefenderHistorySetValue -Set $sets[0] -Index 1 -Types 0x1E
+    $threat = Get-DefenderHistorySetValue -Set $sets[1] -Index 1 -Types 0x15
+    if (-not $detectionId -or -not $threat) { return -1 }
+    $threatId = Get-DefenderHistorySetValue -Set $sets[0] -Index 0 -Types $numberTypes
+    $severityId = Get-DefenderHistorySetValue -Set $sets[1] -Index 3 -Types $numberTypes
+    $categoryId = Get-DefenderHistorySetValue -Set $sets[1] -Index 4 -Types $numberTypes
+    $statusId = Get-DefenderHistorySetValue -Set $sets[1] -Index 7 -Types $numberTypes
+
+    # Resources; the main one is the first "file" resource, else the first
+    $resources = @()
+    for ($i = 2; $i -lt $sets.Count; $i++) {
+        $resourceType = Get-DefenderHistorySetValue -Set $sets[$i] -Index 1 -Types 0x15
+        $location = Get-DefenderHistorySetValue -Set $sets[$i] -Index 2 -Types 0x15
+        if (-not $resourceType -and -not $location) { continue }
+        $tracking = @{}
+        if ($sets[$i].Count -gt 5 -and $sets[$i][5].Type -eq 0x28) {
+            $tracking = Read-DefenderThreatTracking -Bytes $bytes -Start $sets[$i][5].Offset -Size $sets[$i][5].Size
+        }
+        $resources += [PSCustomObject]@{ Type = "$resourceType"; Location = "$location"; Tracking = $tracking }
+    }
+    $ordered = @(@($resources | Where-Object { $_.Type -eq "file" }) + @($resources))
+    $path = ""
+    if ($ordered.Count -gt 0) { $path = ($ordered[0].Location -split '\|')[0] }
+    # SHA-256 and tracking start time: from the main resource, else the first that has them
+    $sha256 = ""
+    $trackingStart = $null
+    foreach ($resource in $ordered) {
+        if (-not $sha256 -and $resource.Tracking["ThreatTrackingSha256"]) { $sha256 = "$($resource.Tracking['ThreatTrackingSha256'])" }
+        if ($null -eq $trackingStart -and $resource.Tracking["ThreatTrackingStartTime"] -is [long]) {
+            $trackingStart = ConvertFrom-JumpListFileTime $resource.Tracking["ThreatTrackingStartTime"]
+        }
+    }
+
+    # The detection's own values, after the last resource
+    $user = ""; $process = ""; $initial = $null; $statusChange = $null; $remediation = $null
+    if ($sets.Count -gt 2) {
+        $last = $sets[$sets.Count - 1]
+        $user = "$(Get-DefenderHistorySetValue -Set $last -Index 12 -Types 0x15)"
+        $process = "$(Get-DefenderHistorySetValue -Set $last -Index 14 -Types 0x15)"
+        $initial = ConvertFrom-JumpListFileTime ([long](Get-DefenderHistorySetValue -Set $last -Index 18 -Types 0x0A))
+        $statusChange = ConvertFrom-JumpListFileTime ([long](Get-DefenderHistorySetValue -Set $last -Index 6 -Types 0x0A))
+        $remediation = ConvertFrom-JumpListFileTime ([long](Get-DefenderHistorySetValue -Set $last -Index 20 -Types 0x0A))
+    }
+
+    $timeNote = ""
+    $time = $initial
+    if ($null -eq $time -and $null -ne $trackingStart) { $time = $trackingStart; $timeNote = "ThreatTrackingStartTime (no initial detection time in the file)" }
+    if ($null -eq $time -and $null -ne $statusChange) { $time = $statusChange; $timeNote = "last threat status change (no detection time in the file)" }
+    if ($null -eq $time) {
+        $fileTimes = Get-SourceFileTimes $File.FullName
+        if ($fileTimes -and $fileTimes.Created) { $time = $fileTimes.Created; $timeNote = "DetectionHistory file created (no time in the file)" }
+    }
+    if ($null -eq $time) { return 0 }
+
+    $resourceTexts = @($resources | ForEach-Object { "$($_.Type):_$($_.Location)" })
+    if ($resourceTexts.Count -gt 10) { $resourceTexts = @($resourceTexts[0..9]) + "(+$($resourceTexts.Count - 10) more)" }
+    $severity = "$severityId"
+    if ($null -ne $severityId -and $script:DefenderSeverityNames.ContainsKey("$severityId")) { $severity = "$($script:DefenderSeverityNames["$severityId"]) ($severityId)" }
+    $status = "$statusId"
+    if ($null -ne $statusId -and $script:DefenderThreatStatusNames.ContainsKey("$statusId")) { $status = $script:DefenderThreatStatusNames["$statusId"] }
+    $desc = "Defender detection (DetectionHistory): $threat"
+    if ($path) { $desc += " on $path" }
+    Add-TimelineEntry -Timestamp $time -Source "Defender-DetectionHistory" -EventType "SecurityAlert" `
+        -Description $desc `
+        -User $user `
+        -Details (Format-ArtifactDetails ([ordered]@{
+            ThreatName      = $threat
+            ThreatID        = $threatId
+            Severity        = $severity
+            CategoryID      = $categoryId
+            Status          = $status
+            Resources       = ($resourceTexts -join "; ")
+            User            = $user
+            Process         = $process
+            SHA256          = $sha256
+            StatusChangeUtc = Format-UtcDetailTime $statusChange
+            RemediationUtc  = Format-UtcDetailTime $remediation
+            TimeNote        = $timeNote
+            DetectionID     = $detectionId
+        })) `
+        -Artifact "AntiVirus" -RawPath $File.FullName
+    return 1
+}
+
+# RC4 of Count bytes of Data from Offset with Defender's static quarantine
+# key (state after the key schedule cached in $script:DefenderRc4State).
+# The key is the 256 bytes from mpengine.dll first published by the Cuckoo
+# Sandbox project; ERNW's quarantine-formats and N. Knezevic's defender-dump
+# give the same bytes.
+function ConvertFrom-DefenderRc4 {
+    param([byte[]]$Data, [int]$Offset, [int]$Count)
+    if ($null -eq $script:DefenderRc4State) {
+        $keyHex = "1E87781B8DBAA844CE69702C0C78B786A3F623B738F5EDF9AF83530FB3FC54FAA21EB9CF1331FD0F0DA954F687CB9E18279697900E53FB317C9CBCE48E23D053" +
+            "71ECC15951B8F3649D7CA33ED68DC9047E82C9BAAD9799D0D458CB847CA9FFBE3C8A775233557DDE13A8B14087CC1BC8F10F6ECDD083A959CFF84A9D1D50755E" +
+            "3E191818AF23E2293558766D2C07E25712B2CA0B535ED8F6C56CE73D24BDD0291771861A54B4C285A9A3DB7ACA6D224AEACD621DB9F2A22ED1E9E11D75BED7DC" +
+            "0ECB0A8E68A2FF1263408DC808DFFD164B116774CD0B9B8D05411ED6262E429BA495676B8398DB2F35D3C1B9CED52636F2765E1A95CB7CA4C3DDABDDBFF38253"
+        $state = New-Object int[] 256
+        for ($n = 0; $n -lt 256; $n++) { $state[$n] = $n }
+        $j = 0
+        for ($n = 0; $n -lt 256; $n++) {
+            $j = ($j + $state[$n] + [Convert]::ToInt32($keyHex.Substring($n * 2, 2), 16)) -band 0xFF
+            $swap = $state[$n]; $state[$n] = $state[$j]; $state[$j] = $swap
+        }
+        $script:DefenderRc4State = $state
+    }
+    $s = [int[]]$script:DefenderRc4State.Clone()
+    $out = New-Object byte[] $Count
+    $i = 0
+    $j = 0
+    for ($n = 0; $n -lt $Count; $n++) {
+        $i = ($i + 1) -band 0xFF
+        $j = ($j + $s[$i]) -band 0xFF
+        $swap = $s[$i]; $s[$i] = $s[$j]; $s[$j] = $swap
+        $out[$n] = $Data[$Offset + $n] -bxor $s[($s[$i] + $s[$j]) -band 0xFF]
+    }
+    return , $out
+}
+
+# Defender quarantine entry (Quarantine\Entries\{GUID}): the metadata of one
+# quarantined threat. Format from the public write-ups (Fox-IT / NCC Group
+# "Reverse, Reveal, Recover: Windows Defender Quarantine Forensics", ERNW
+# quarantine-formats, defender-dump), which agree on it: three parts, each
+# RC4-encrypted on its own with the static key (see ConvertFrom-DefenderRc4):
+#   header  0x3C bytes: magic DB E8 C5 01, ..., uint32 size of part 1 at
+#           0x28, uint32 size of part 2 at 0x2C
+#   part 1  entry GUID, scan GUID, FILETIME (UTC) of the quarantine at 0x20,
+#           ..., threat name at 0x34 (NUL-terminated UTF-8)
+#   part 2  uint32 resource count, then a uint32 offset (from the start of
+#           part 2) per resource. A resource: original path (NUL-terminated
+#           UTF-16LE, may start with \\?\), uint16 field count, type
+#           (NUL-terminated ASCII: "file", "regkey", ...), then fields that
+#           are not read here
+# One row per resource. Only these metadata files are read: the quarantined
+# files themselves (Quarantine\ResourceData) are never read or decrypted.
+# Returns the number of rows added (0: no time found), or -1 if the file is
+# not a quarantine entry.
+function Read-DefenderQuarantineEntry {
+    param([System.IO.FileInfo]$File)
+    $bytes = [System.IO.File]::ReadAllBytes($File.FullName)
+    if ($bytes.Length -lt 0x3C) { return -1 }
+    $header = ConvertFrom-DefenderRc4 -Data $bytes -Offset 0 -Count 0x3C
+    if ($header[0] -ne 0xDB -or $header[1] -ne 0xE8 -or $header[2] -ne 0xC5 -or $header[3] -ne 0x01) { return -1 }
+    $size1 = [long][BitConverter]::ToUInt32($header, 0x28)
+    $size2 = [long][BitConverter]::ToUInt32($header, 0x2C)
+    if ($size1 -lt 0x35 -or 0x3C + $size1 + $size2 -gt $bytes.Length) { return -1 }
+    $part1 = ConvertFrom-DefenderRc4 -Data $bytes -Offset 0x3C -Count ([int]$size1)
+    $part2 = ConvertFrom-DefenderRc4 -Data $bytes -Offset (0x3C + [int]$size1) -Count ([int]$size2)
+
+    $nameEnd = [Array]::IndexOf($part1, [byte]0, 0x34)
+    if ($nameEnd -lt 0) { $nameEnd = $part1.Length }
+    $threat = [System.Text.Encoding]::UTF8.GetString($part1, 0x34, $nameEnd - 0x34)
+    if (-not $threat) { $threat = "unknown threat" }
+    $time = ConvertFrom-JumpListFileTime ([BitConverter]::ToInt64($part1, 0x20))
+    $timeNote = ""
+    if ($null -eq $time) {
+        $fileTimes = Get-SourceFileTimes $File.FullName
+        if ($fileTimes -and $fileTimes.Created) { $time = $fileTimes.Created; $timeNote = "quarantine entry file created (no time in the entry)" }
+    }
+    if ($null -eq $time) { return 0 }
+
+    # Resources (at most 100 per entry)
+    $resources = @()
+    if ($size2 -ge 4) {
+        $count = [long][BitConverter]::ToUInt32($part2, 0)
+        $maxCount = [long](($size2 - 4 - (($size2 - 4) % 4)) / 4)
+        if ($count -gt $maxCount) { $count = $maxCount }
+        if ($count -gt 100) { $count = 100 }
+        for ($r = 0; $r -lt $count; $r++) {
+            $start = [long][BitConverter]::ToUInt32($part2, 4 + 4 * $r)
+            if ($start -lt 4 + 4 * $count -or $start -ge $size2) { continue }
+            # Path: UTF-16LE up to its NUL character
+            $q = [int]$start
+            while ($q + 1 -lt $size2 -and ($part2[$q] -ne 0 -or $part2[$q + 1] -ne 0)) { $q += 2 }
+            if ($q + 1 -ge $size2) { continue }
+            $path = [System.Text.Encoding]::Unicode.GetString($part2, [int]$start, $q - [int]$start)
+            if ($path.StartsWith("\\?\UNC\", [System.StringComparison]::OrdinalIgnoreCase)) { $path = "\\" + $path.Substring(8) }
+            elseif ($path.StartsWith("\\?\", [System.StringComparison]::Ordinal)) { $path = $path.Substring(4) }
+            # Type: after the NUL and the uint16 field count
+            $typeStart = $q + 4
+            $resourceType = ""
+            if ($typeStart -lt $size2) {
+                $typeEnd = [Array]::IndexOf($part2, [byte]0, $typeStart)
+                if ($typeEnd -lt 0) { $typeEnd = [int]$size2 }
+                $resourceType = [System.Text.Encoding]::ASCII.GetString($part2, $typeStart, $typeEnd - $typeStart)
+            }
+            if ($path) { $resources += [PSCustomObject]@{ Path = $path; Type = $resourceType } }
+        }
+    }
+    if ($resources.Count -eq 0) { $resources = @([PSCustomObject]@{ Path = ""; Type = "" }) }
+
+    foreach ($resource in $resources) {
+        $shown = $resource.Path
+        if (-not $shown) { $shown = "(no path recorded)" }
+        Add-TimelineEntry -Timestamp $time -Source "Defender-Quarantine" -EventType "SecurityAlert" `
+            -Description "Defender quarantined: $shown ($threat)" `
+            -Details (Format-ArtifactDetails ([ordered]@{
+                ThreatName    = $threat
+                Path          = $resource.Path
+                ResourceType  = $resource.Type
+                ResourceCount = $(if ($resources.Count -gt 1) { $resources.Count } else { "" })
+                TimeNote      = $timeNote
+            })) `
+            -Artifact "AntiVirus" -RawPath $File.FullName
+    }
+    return $resources.Count
+}
+
+# Defender DetectionHistory files and quarantine entries in the collection
+# (folders found by Parse-AntiVirus). Files over 1 MB are not read (real ones
+# are a few KB).
+function Read-DefenderDetectionFiles {
+    param([System.IO.DirectoryInfo[]]$HistoryDirs, [System.IO.DirectoryInfo[]]$EntriesDirs)
+    $kinds = @(
+        @{ Quarantine = $false; Label = "Defender DetectionHistory file(s)"
+           Files = @($HistoryDirs | ForEach-Object { Get-ChildItem -LiteralPath $_.FullName -File -Recurse -ErrorAction SilentlyContinue } | Sort-Object FullName) },
+        @{ Quarantine = $true; Label = "Defender quarantine entry file(s)"
+           Files = @($EntriesDirs | ForEach-Object { Get-ChildItem -LiteralPath $_.FullName -File -ErrorAction SilentlyContinue } | Sort-Object FullName) }
+    )
+    $parsed = 0
+    foreach ($kind in $kinds) {
+        if ($kind.Files.Count -eq 0) { continue }
+        Log "  Parsing: $($kind.Files.Count) $($kind.Label)"
+        $added = 0; $unreadable = 0; $noTime = 0; $tooLarge = 0
+        foreach ($file in $kind.Files) {
+            if ($file.Length -gt 1MB) { $tooLarge++; continue }
+            try {
+                if ($kind.Quarantine) { $result = Read-DefenderQuarantineEntry -File $file }
+                else { $result = Read-DefenderDetectionHistory -File $file }
+                if ($result -lt 0) { $unreadable++ }
+                elseif ($result -eq 0) { $noTime++ }
+                else { $added += $result }
+            }
+            catch {
+                $unreadable++
+                Log-Warning "    Failed to parse $($file.FullName): $($_.Exception.Message)"
+            }
+        }
+        $notes = @()
+        if ($unreadable -gt 0) { $notes += "$unreadable not in the expected format" }
+        if ($noTime -gt 0) { $notes += "$noTime without a time" }
+        if ($tooLarge -gt 0) { $notes += "$tooLarge over 1 MB not read" }
+        $note = ""
+        if ($notes.Count -gt 0) { $note = " (skipped: $($notes -join ', '))" }
+        Log "    Added $added timeline entries$note"
+        $parsed += $kind.Files.Count
+    }
+    return $parsed
+}
+
 function Parse-AntiVirus {
     Log "--- Parsing Antivirus Logs ---"
 
@@ -10135,11 +10532,13 @@ function Parse-AntiVirus {
     $sophosPattern = '^\s*\d{8}\s\d{6}\s'
     $mcafeePattern = '^\s*\d{1,4}[./-]\d{1,2}[./-]\d{1,4}\t[^\t]*\t\s*(?:Would be blocked|Blocked) by (?:Access Protection|port blocking) rule'
 
-    $vendorDirs = @(Get-ChildItem -Path $InputPath -Directory -Recurse -ErrorAction SilentlyContinue |
-        Where-Object { $_.Parent -and $_.Parent.Name -eq "AntiVirus" } | Sort-Object FullName)
+    $allDirs = @(Get-ChildItem -Path $InputPath -Directory -Recurse -ErrorAction SilentlyContinue)
+    $vendorDirs = @($allDirs | Where-Object { $_.Parent -and $_.Parent.Name -eq "AntiVirus" } | Sort-Object FullName)
     $parsedFiles = 0
     foreach ($dir in $vendorDirs) {
         $vendor = $dir.Name
+        # Defender: read below (DetectionHistory, quarantine entries) and by Parse-EventLogs
+        if ($vendor -eq "Defender") { continue }
         if (@("Symantec_SEP", "Sophos", "McAfee_Trellix", "ESET") -notcontains $vendor) {
             Write-Verbose "No antivirus log parser for $($dir.FullName)"
             continue
@@ -10182,6 +10581,14 @@ function Parse-AntiVirus {
     }
 
     if ($parsedFiles -eq 0) { Log "  No supported third-party antivirus logs (Symantec, Sophos, McAfee, ESET) in the collection." }
+
+    # Microsoft Defender DetectionHistory files and quarantine entries. Only
+    # Quarantine\Entries is read, never Quarantine\ResourceData.
+    $historyDirs = @($allDirs | Where-Object { $_.Name -eq "DetectionHistory" })
+    $entriesDirs = @($allDirs | Where-Object { $_.Name -eq "Entries" -and $_.Parent -and $_.Parent.Name -eq "Quarantine" })
+    if ((Read-DefenderDetectionFiles -HistoryDirs $historyDirs -EntriesDirs $entriesDirs) -eq 0) {
+        Log "  No Defender DetectionHistory files or quarantine entries in the collection."
+    }
     Log "  Antivirus log parsing complete."
     Log ""
 }
