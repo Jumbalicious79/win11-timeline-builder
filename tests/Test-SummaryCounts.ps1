@@ -75,7 +75,9 @@ function Format-ArtifactRowCounts {
 # script's main flow)
 function Find-MainFlowCommand {
     param([string]$Name)
-    return @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq $Name }, $true) | Where-Object {
+    # Read here: PSReviewUnusedParameter does not see uses inside the predicate
+    $commandName = $Name
+    return @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq $commandName }, $true) | Where-Object {
             $parent = $_.Parent
             while ($parent -and -not ($parent -is [System.Management.Automation.Language.FunctionDefinitionAst])) { $parent = $parent.Parent }
             $null -eq $parent
