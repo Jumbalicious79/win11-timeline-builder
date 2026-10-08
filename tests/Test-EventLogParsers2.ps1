@@ -8,15 +8,17 @@
 #   records (our own XML, laid out like the real records), checking every
 #   row they add; then runs Parse-EventLogs itself on synthetic records, with
 #   Get-WinEvent replaced, to check which IDs each channel reads.
-# Part 2 -- real records (no admin, always run): starts Windows PowerShell
-#   with an encoded command (events 400 / 403), exports the last 30 days of
-#   the Phase 2 channels that exist on this machine with wevtutil, runs the
-#   builder (-Sources EventLogs) and checks the PowerShell rows and that no
-#   log fails to parse. Needs a builder that runs here: the repository's
-#   needs Administrator, -BuilderPath can name a copy without that check.
+# Part 2 -- real records (no admin; reads this machine's logs, changes
+#   nothing): exports the last 30 days of the Phase 2 channels that exist on
+#   this machine with wevtutil, runs the builder (-Sources EventLogs) and
+#   checks that every Windows PowerShell 400 has its row and that no log
+#   fails to parse. Needs a builder that runs here: the repository's needs
+#   Administrator (without it Part 2 is SKIPPED), -BuilderPath can name a
+#   copy without that check.
 # Part 3 -- system test (needs Administrator; runs only in GitHub Actions or
-#   with -AllowSystemChanges): adds, changes and deletes a disabled firewall
-#   rule and changes and restores the Public profile's log size (firewall
+#   with -AllowSystemChanges): starts Windows PowerShell with an encoded
+#   command (400 / 403), adds, changes and deletes a disabled firewall rule
+#   and changes and restores the Public profile's log size (firewall
 #   events). In GitHub Actions only, also: a temporary WMI permanent event
 #   subscription (5861), NTLM auditing with a loopback SMB connection
 #   (8001 / 8002, Security 4624) and an RDP client connection attempt to an
@@ -178,61 +180,127 @@ function Get-LogLineCount {
 $alice = "S-1-5-21-1111-2222-3333-1001"
 
 # --- Windows PowerShell.evtx ---
-# Context text of a classic PowerShell event, as Windows writes it
+# Context text of a classic PowerShell event, as Windows writes it (checked
+# on real records): 400 / 403
 function New-PowerShellContext {
-    param([string]$HostApplication, [string]$Engine = "5.1.26100.1", [string]$HostId = "11111111-0000-0000-0000-000000000001", [string]$Extra = "")
-    return "`tNewEngineState=Available`n`tPreviousEngineState=None`n`n`tSequenceNumber=13`n`n`tHostName=ConsoleHost`n`tHostVersion=$Engine`n" +
-        "`tHostId=$HostId`n`tHostApplication=$HostApplication`n`tEngineVersion=$Engine`n`tRunspaceId=22222222-0000-0000-0000-000000000002`n" +
-        "`tPipelineId=$Extra`n`tCommandName=`n`tCommandType=`n`tScriptName=`n`tCommandPath=`n`tCommandLine="
+    param([string]$HostApplication, [string]$Engine = "5.1.26100.1", [string]$HostId = "11111111-0000-0000-0000-000000000001", [string]$RunspaceId = "22222222-0000-0000-0000-000000000002")
+    return "`tNewEngineState=Available`r`n`tPreviousEngineState=None`r`n`r`n`tSequenceNumber=13`r`n`r`n`tHostName=ConsoleHost`r`n`tHostVersion=$Engine`r`n" +
+        "`tHostId=$HostId`r`n`tHostApplication=$HostApplication`r`n`tEngineVersion=$Engine`r`n`tRunspaceId=$RunspaceId`r`n" +
+        "`tPipelineId=`r`n`tCommandName=`r`n`tCommandType=`r`n`tScriptName=`r`n`tCommandPath=`r`n`tCommandLine="
+}
+# 800: ends with the pipeline's command line, which is also the event's first value
+function New-PipelineContext {
+    param([string]$HostApplication, [string]$CommandLine, [string]$HostId, [string]$Engine = "5.1.26100.1", [string]$PipelineId = "1", [int]$Sequence = 1, [int]$Total = 1)
+    return "`tDetailSequence=$Sequence`r`n`tDetailTotal=$Total`r`n`r`n`tSequenceNumber=21`r`n`r`n`tUserId=TESTHOST\alice`r`n`tHostName=ConsoleHost`r`n`tHostVersion=$Engine`r`n" +
+        "`tHostId=$HostId`r`n`tHostApplication=$HostApplication`r`n`tEngineVersion=$Engine`r`n`tRunspaceId=22222222-0000-0000-0000-000000000002`r`n" +
+        "`tPipelineId=$PipelineId`r`n`tScriptName=`r`n`tCommandLine=$CommandLine"
+}
+function New-PipelineRecord {
+    param([string]$Time, [string]$HostApplication, [string]$CommandLine, [string]$HostId, [string]$Engine = "5.1.26100.1", [string]$PipelineId = "1", [int]$Sequence = 1, [int]$Total = 1, [string[]]$Commands)
+    $context = New-PipelineContext -HostApplication $HostApplication -CommandLine $CommandLine -HostId $HostId -Engine $Engine -PipelineId $PipelineId -Sequence $Sequence -Total $Total
+    $invocations = ($Commands | ForEach-Object { "CommandInvocation($_): `"$_`"" }) -join "`r`n"
+    return New-TestRecord -Provider "PowerShell" -Id 800 -Time $Time -Body (New-EventDataXml -Data @($CommandLine, $context, $invocations))
 }
 $psFile = "Windows PowerShell.evtx"
 $psPath = "X:\EventLogs\Windows PowerShell.evtx"
 $encodedScript = "Write-Output 'tlt-encoded'"
 $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($encodedScript))
 $longApp = "powershell.exe -NoProfile -Command " + ("x" * 1100)
-Test-Case -Name "Windows PowerShell 400 / 403 / 800 (encoded command decoded, 2.0 downgrade, 800 only for 2.0)" -Action {
+$runspace = "RunspaceId=22222222-0000-0000-0000-000000000002"
+# Command lines with line breaks, as a real record holds them, with lines
+# that look like the fields Windows writes after HostApplication
+$injectedApp = "powershell.exe -NoProfile -Command `"Write-Output a`r`n`tEngineVersion=2.0`r`n`tRunspaceId=x`r`nWrite-Output b`""
+$injectedV2App = "powershell.exe -Version 2 -Command `"Get-Date`r`n`tEngineVersion=9.9`r`n`tRunspaceId=z`r`nEngineVersion=9.8`""
+$addTypeCode = "Add-Type -TypeDefinition @'`r`npublic class T { }`r`n'@"
+Test-Case -Name "Windows PowerShell 400 / 403 / 800 (403 folded, 2.0 downgrade, 800 per 2.0 pipeline or per later session, multi-line command lines)" -Action {
     $plain = "C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -File C:\Scripts\a.ps1"
     $records = @(
         (New-TestRecord -Provider "PowerShell" -Id 400 -Time "2026-02-01 10:00:00" -Body (New-EventDataXml -Data @("Available", "None", (New-PowerShellContext -HostApplication $plain)))),
         (New-TestRecord -Provider "PowerShell" -Id 403 -Time "2026-02-01 10:00:05" -Body (New-EventDataXml -Data @("Stopped", "Available", (New-PowerShellContext -HostApplication $plain)))),
         (New-TestRecord -Provider "PowerShell" -Id 400 -Time "2026-02-01 10:01:00" -Body (New-EventDataXml -Data @("Available", "None", (New-PowerShellContext -HostApplication "powershell.exe -NoP -W Hidden -enc $encoded" -HostId "33333333-0000-0000-0000-000000000003")))),
-        (New-TestRecord -Provider "PowerShell" -Id 400 -Time "2026-02-01 10:02:00" -Body (New-EventDataXml -Data @("Available", "None", (New-PowerShellContext -HostApplication "powershell.exe -Version 2 -Command Get-Date" -Engine "2.0")))),
-        (New-TestRecord -Provider "PowerShell" -Id 800 -Time "2026-02-01 10:02:01" -Body (New-EventDataXml -Data @("Get-Date", "`tDetailSequence=1`n`tUserId=TESTHOST\alice`n`tHostName=ConsoleHost`n`tHostApplication=powershell.exe -Version 2 -Command Get-Date`n`tEngineVersion=2.0`n`tScriptName=`n`tCommandLine=Get-Date", "CommandInvocation(Get-Date): `"Get-Date`"`nCommandInvocation(Out-Default): `"Out-Default`"`nCommandInvocation(Get-Date): `"Get-Date`""))),
-        (New-TestRecord -Provider "PowerShell" -Id 800 -Time "2026-02-01 10:03:00" -Body (New-EventDataXml -Data @("Add-Type -TypeDefinition `$code", "`tUserId=TESTHOST\alice`n`tHostApplication=powershell.exe`n`tEngineVersion=5.1.26100.1", "CommandInvocation(Add-Type): `"Add-Type`""))),
-        (New-TestRecord -Provider "PowerShell" -Id 400 -Time "2026-02-01 10:04:00" -Body (New-EventDataXml -Data @("Available", "None", (New-PowerShellContext -HostApplication $longApp))))
+        (New-TestRecord -Provider "PowerShell" -Id 400 -Time "2026-02-01 10:02:00" -Body (New-EventDataXml -Data @("Available", "None", (New-PowerShellContext -HostApplication "powershell.exe -Version 2 -Command Get-Date" -Engine "2.0" -HostId "44444444-0000-0000-0000-000000000004")))),
+        # A 2.0 pipeline split over two 800s, then a second pipeline
+        (New-PipelineRecord -Time "2026-02-01 10:02:01" -HostApplication "powershell.exe -Version 2 -Command Get-Date" -CommandLine "Get-Date | Format-List" -HostId "44444444-0000-0000-0000-000000000004" -Engine "2.0" -Total 2 -Commands @("Get-Date", "Get-Date")),
+        (New-PipelineRecord -Time "2026-02-01 10:02:01" -HostApplication "powershell.exe -Version 2 -Command Get-Date" -CommandLine "Get-Date | Format-List" -HostId "44444444-0000-0000-0000-000000000004" -Engine "2.0" -Sequence 2 -Total 2 -Commands @("Format-List", "Out-Default")),
+        (New-PipelineRecord -Time "2026-02-01 10:02:02" -HostApplication "powershell.exe -Version 2 -Command Get-Date" -CommandLine "Get-Process" -HostId "44444444-0000-0000-0000-000000000004" -Engine "2.0" -PipelineId "2" -Commands @("Get-Process")),
+        # Three pipelines of one 5.1 session (two the same): one row
+        (New-PipelineRecord -Time "2026-02-01 10:03:00" -HostApplication "powershell.exe" -CommandLine $addTypeCode -HostId "55555555-0000-0000-0000-000000000005" -Commands @("Add-Type")),
+        (New-PipelineRecord -Time "2026-02-01 10:03:30" -HostApplication "powershell.exe" -CommandLine "Add-Type -AssemblyName System.Drawing" -HostId "55555555-0000-0000-0000-000000000005" -PipelineId "2" -Commands @("Add-Type")),
+        (New-PipelineRecord -Time "2026-02-01 10:04:30" -HostApplication "powershell.exe" -CommandLine $addTypeCode -HostId "55555555-0000-0000-0000-000000000005" -PipelineId "3" -Commands @("Add-Type", "Out-Null")),
+        (New-TestRecord -Provider "PowerShell" -Id 400 -Time "2026-02-01 10:04:00" -Body (New-EventDataXml -Data @("Available", "None", (New-PowerShellContext -HostApplication $longApp -HostId "66666666-0000-0000-0000-000000000006")))),
+        (New-TestRecord -Provider "PowerShell" -Id 400 -Time "2026-02-01 10:05:00" -Body (New-EventDataXml -Data @("Available", "None", (New-PowerShellContext -HostApplication $injectedApp -HostId "77777777-0000-0000-0000-000000000007")))),
+        (New-TestRecord -Provider "PowerShell" -Id 400 -Time "2026-02-01 10:05:30" -Body (New-EventDataXml -Data @("Available", "None", (New-PowerShellContext -HostApplication $injectedV2App -Engine "2.0" -HostId "88888888-0000-0000-0000-000000000008")))),
+        # A 403 whose 400 is not in the log
+        (New-TestRecord -Provider "PowerShell" -Id 403 -Time "2026-02-01 10:06:00" -Body (New-EventDataXml -Data @("Stopped", "Available", (New-PowerShellContext -HostApplication "powershell.exe -File old.ps1" -HostId "99999999-0000-0000-0000-000000000009"))))
     )
     $logBefore = Get-LogLineCount
     Add-WindowsPowerShellEntries -Records $records -FileName $psFile -FilePath $psPath
-    $skipLine = @(Get-NewLogLines $logBefore | Where-Object { $_ -match 'Skipped 1 event\(s\): 800 pipeline details of PowerShell 3\.0 and later' })
-    if ($skipLine.Count -ne 1) { throw "no log line counting the skipped 800 event" }
+    $lines = Get-NewLogLines $logBefore
+    foreach ($expected in @("Folded 1 engine stopped event(s) (403) into the row of their 400 (Stopped)", "Folded 3 pipeline event(s) (800) into the row of their session (PowerShell 3.0 and later) or pipeline (2.0)")) {
+        if (@($lines | Where-Object { $_.Trim() -ceq $expected }).Count -ne 1) { throw "log line missing: $expected (log: $($lines -join ' || '))" }
+    }
 } -Expected @(
     @{ Timestamp = "2026-02-01 10:00:00.000"; Source = $psFile; EventType = "Execution"; Description = "PowerShell engine started: C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -File C:\Scripts\a.ps1"; User = ""
-        Details = "EventID=400 | EngineVersion=5.1.26100.1 | HostName=ConsoleHost | HostVersion=5.1.26100.1 | HostApplication=C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -File C:\Scripts\a.ps1 | HostId=11111111-0000-0000-0000-000000000001 | RunspaceId=22222222-0000-0000-0000-000000000002"
+        Details = "EventID=400 | EngineVersion=5.1.26100.1 | HostName=ConsoleHost | HostVersion=5.1.26100.1 | HostApplication=C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -File C:\Scripts\a.ps1 | HostId=11111111-0000-0000-0000-000000000001 | $runspace | Stopped=2026-02-01 10:00:05"
         Artifact = "EventLogs"; RawPath = $psPath },
-    @{ EventType = "Execution"; Description = "PowerShell engine stopped: C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -File C:\Scripts\a.ps1"
-        Details = "EventID=403 | EngineVersion=5.1.26100.1 | HostName=ConsoleHost | HostVersion=5.1.26100.1 | HostApplication=C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -File C:\Scripts\a.ps1 | HostId=11111111-0000-0000-0000-000000000001 | RunspaceId=22222222-0000-0000-0000-000000000002" },
     @{ Description = "PowerShell engine started: powershell.exe -NoP -W Hidden -enc $encoded"
-        Details = "EventID=400 | EngineVersion=5.1.26100.1 | HostName=ConsoleHost | HostVersion=5.1.26100.1 | HostApplication=powershell.exe -NoP -W Hidden -enc $encoded | EncodedCommand=$encodedScript | HostId=33333333-0000-0000-0000-000000000003 | RunspaceId=22222222-0000-0000-0000-000000000002" },
+        Details = "EventID=400 | EngineVersion=5.1.26100.1 | HostName=ConsoleHost | HostVersion=5.1.26100.1 | HostApplication=powershell.exe -NoP -W Hidden -enc $encoded | EncodedCommand=$encodedScript | HostId=33333333-0000-0000-0000-000000000003 | $runspace" },
     @{ EventType = "Execution"; Description = "PowerShell 2.0 engine started (possible downgrade): powershell.exe -Version 2 -Command Get-Date"
-        Details = "EventID=400 | EngineVersion=2.0 | HostName=ConsoleHost | HostVersion=2.0 | HostApplication=powershell.exe -Version 2 -Command Get-Date | HostId=11111111-0000-0000-0000-000000000001 | RunspaceId=22222222-0000-0000-0000-000000000002" },
-    @{ EventType = "Execution"; Description = "PowerShell 2.0 pipeline executed: Get-Date"; User = "TESTHOST\alice"
-        Details = "EventID=800 | CommandLine=Get-Date | Commands=Get-Date, Out-Default | EngineVersion=2.0 | HostName=ConsoleHost | HostApplication=powershell.exe -Version 2 -Command Get-Date" },
+        Details = "EventID=400 | EngineVersion=2.0 | HostName=ConsoleHost | HostVersion=2.0 | HostApplication=powershell.exe -Version 2 -Command Get-Date | HostId=44444444-0000-0000-0000-000000000004 | $runspace" },
+    @{ Timestamp = "2026-02-01 10:02:01.000"; EventType = "Execution"; Description = "PowerShell 2.0 pipeline executed: Get-Date | Format-List"; User = "TESTHOST\alice"
+        Details = "EventID=800 | CommandLine=Get-Date | Format-List | Commands=Get-Date, Format-List, Out-Default | EngineVersion=2.0 | HostName=ConsoleHost | HostVersion=2.0 | HostApplication=powershell.exe -Version 2 -Command Get-Date | HostId=44444444-0000-0000-0000-000000000004 | $runspace" },
+    @{ Timestamp = "2026-02-01 10:02:02.000"; Description = "PowerShell 2.0 pipeline executed: Get-Process"; User = "TESTHOST\alice"
+        Details = "EventID=800 | CommandLine=Get-Process | Commands=Get-Process | EngineVersion=2.0 | HostName=ConsoleHost | HostVersion=2.0 | HostApplication=powershell.exe -Version 2 -Command Get-Date | HostId=44444444-0000-0000-0000-000000000004 | $runspace" },
+    @{ Timestamp = "2026-02-01 10:03:00.000"; EventType = "Execution"; Description = "PowerShell pipeline executed: Add-Type -TypeDefinition @' public class T { } '@"; User = "TESTHOST\alice"
+        Details = "EventID=800 | CommandLine=$addTypeCode | Commands=Add-Type, Out-Null | CommandLines=Add-Type -TypeDefinition @' public class T { } '@ || Add-Type -AssemblyName System.Drawing | Count=3 | LastSeen=2026-02-01 10:04:30 | EngineVersion=5.1.26100.1 | HostName=ConsoleHost | HostVersion=5.1.26100.1 | HostApplication=powershell.exe | HostId=55555555-0000-0000-0000-000000000005 | $runspace" },
     @{ Description = "PowerShell engine started: " + $longApp.Substring(0, 200) + "..."
-        Details = "EventID=400 | EngineVersion=5.1.26100.1 | HostName=ConsoleHost | HostVersion=5.1.26100.1 | HostApplication=" + $longApp.Substring(0, 1000) + "... | HostId=11111111-0000-0000-0000-000000000001 | RunspaceId=22222222-0000-0000-0000-000000000002" }
+        Details = "EventID=400 | EngineVersion=5.1.26100.1 | HostName=ConsoleHost | HostVersion=5.1.26100.1 | HostApplication=" + $longApp.Substring(0, 1000) + "... | HostId=66666666-0000-0000-0000-000000000006 | $runspace" },
+    @{ Description = "PowerShell engine started: powershell.exe -NoProfile -Command `"Write-Output a EngineVersion=2.0 RunspaceId=x Write-Output b`""
+        Details = "EventID=400 | EngineVersion=5.1.26100.1 | HostName=ConsoleHost | HostVersion=5.1.26100.1 | HostApplication=$injectedApp | HostId=77777777-0000-0000-0000-000000000007 | $runspace" },
+    @{ Description = "PowerShell 2.0 engine started (possible downgrade): powershell.exe -Version 2 -Command `"Get-Date EngineVersion=9.9 RunspaceId=z EngineVersion=9.8`""
+        Details = "EventID=400 | EngineVersion=2.0 | HostName=ConsoleHost | HostVersion=2.0 | HostApplication=$injectedV2App | HostId=88888888-0000-0000-0000-000000000008 | $runspace" },
+    @{ Timestamp = "2026-02-01 10:06:00.000"; Description = "PowerShell engine stopped: powershell.exe -File old.ps1"
+        Details = "EventID=403 | EngineVersion=5.1.26100.1 | HostName=ConsoleHost | HostVersion=5.1.26100.1 | HostApplication=powershell.exe -File old.ps1 | HostId=99999999-0000-0000-0000-000000000009 | $runspace" }
 )
 
-Test-Case -Name "Helpers: -EncodedCommand decoding, MOF properties, firewall profiles" -Action {
+Test-Case -Name "Helpers: -EncodedCommand decoding, PowerShell context, MOF properties and creator SID, firewall profiles" -Action {
     $abc = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes("abc def"))
     $binary = [Convert]::ToBase64String([byte[]](0, 1, 2, 3, 4, 5, 6, 7, 8, 9))
+    $odd = [Convert]::ToBase64String([byte[]](97, 0, 98, 0, 99, 0, 100, 0, 101))
+    # A script with a word in another script (Cyrillic): 79 of 89 characters ASCII
+    $localized = "Write-Output '" + (-join [char[]](0x041F, 0x0440, 0x0438, 0x0432, 0x0435, 0x0442, 0x043C, 0x0438, 0x0440, 0x0021)) + "'; Get-ChildItem -Path C:\Temp -Recurse | Out-Null # 89 chars"
+    $localizedB64 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($localized))
+    $sid = New-Object System.Security.Principal.SecurityIdentifier -ArgumentList $alice
+    $sidBytes = New-Object byte[] $sid.BinaryLength
+    $sid.GetBinaryForm($sidBytes, 0)
+    $injected800 = New-PipelineContext -HostApplication "powershell.exe -Version 2" -CommandLine "Get-Date`r`n`tEngineVersion=5.1`r`n`tRunspaceId=y" -HostId "h" -Engine "2.0"
+    $context800 = Get-PowerShellContextFields -Text $injected800 -CommandLine "Get-Date`r`n`tEngineVersion=5.1`r`n`tRunspaceId=y"
+    $context400 = Get-PowerShellContextFields -Text (New-PowerShellContext -HostApplication $injectedApp -HostId "h4")
     $checks = @(
         @((ConvertFrom-PowerShellEncodedCommand "powershell.exe -e $abc"), "abc def"),
         @((ConvertFrom-PowerShellEncodedCommand "powershell.exe /EncodedCommand $abc"), "abc def"),
         @((ConvertFrom-PowerShellEncodedCommand "powershell.exe -ec '$abc'"), "abc def"),
         @((ConvertFrom-PowerShellEncodedCommand "powershell.exe -EncodedC $abc -NoExit"), "abc def"),
+        @((ConvertFrom-PowerShellEncodedCommand ("powershell.exe " + [char]0x2013 + "NoProfile " + [char]0x2013 + "enc $abc")), "abc def"),
+        @((ConvertFrom-PowerShellEncodedCommand ("powershell.exe " + [char]0x2014 + "e $abc")), "abc def"),
+        @((ConvertFrom-PowerShellEncodedCommand ("powershell.exe " + [char]0x2015 + "EncodedCommand $abc")), "abc def"),
+        @((ConvertFrom-PowerShellEncodedCommand "powershell.exe -enc $localizedB64"), $localized),
         @((ConvertFrom-PowerShellEncodedCommand "powershell.exe -ExecutionPolicy Unrestricted -File x.ps1"), ""),
         @((ConvertFrom-PowerShellEncodedCommand "powershell.exe -enc NotBase64Text!"), ""),
         @((ConvertFrom-PowerShellEncodedCommand "powershell.exe -enc $binary"), ""),
+        @((ConvertFrom-PowerShellEncodedCommand "powershell.exe -enc $odd"), ""),
         @((ConvertFrom-PowerShellEncodedCommand "C:\Tools\enc.exe -encrypt $abc"), ""),
+        @($context800["EngineVersion"], "2.0"),
+        @($context800["CommandLine"], "Get-Date`r`n`tEngineVersion=5.1`r`n`tRunspaceId=y"),
+        @($context800["UserId"], "TESTHOST\alice"),
+        @($context800["HostApplication"], "powershell.exe -Version 2"),
+        @($context400["HostApplication"], $injectedApp),
+        @($context400["EngineVersion"], "5.1.26100.1"),
+        @($context400["RunspaceId"], "22222222-0000-0000-0000-000000000002"),
+        @((Get-WmiMofCreatorSid "instance of __EventFilter`n{`n`tCreatorSID = {1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0};`n};"), "S-1-5-32-544"),
+        @((Get-WmiMofCreatorSid "`tCreatorSID = {$($sidBytes -join ', ')};"), $alice),
+        @((Get-WmiMofCreatorSid "`tCreatorSID = {1, 2};"), ""),
+        @((Get-WmiMofCreatorSid "`tName = `"n`";"), ""),
         @((Get-WmiMofProperty "instance of X`n{`n`tCommandLineTemplate = `"cmd /c \`"a\\b\`"`";`n`tName = `"n`";`n};" "CommandLineTemplate"), "cmd /c `"a\b`""),
         @((Get-WmiMofProperty "`tScriptText = `"line1\nline2\tx\\n`";" "scripttext"), "line1`nline2`tx\n"),
         @((Get-WmiMofProperty "`tName = `"n`";" "Query"), ""),
@@ -257,12 +325,17 @@ function New-WmiBindingCause {
         (($ConsumerLines | ForEach-Object { "`t$_`n" }) -join "") + "};`n"
 }
 $wmiQuery = "SELECT * FROM __InstanceModificationEvent WITHIN 60 WHERE TargetInstance ISA 'Win32_PerfFormattedData_PerfOS_System'"
+# CreatorSID line (a binary SID as bytes) of an instance created by $alice
+$aliceSid = New-Object System.Security.Principal.SecurityIdentifier -ArgumentList $alice
+$aliceSidBytes = New-Object byte[] $aliceSid.BinaryLength
+$aliceSid.GetBinaryForm($aliceSidBytes, 0)
+$aliceCreator = "CreatorSID = {" + ($aliceSidBytes -join ", ") + "};"
 Test-Case -Name "WMI-Activity 5861 permanent / 5860 temporary subscriptions (folded), 5857-5859 counted" -Action {
     $cmdCause = New-WmiBindingCause -FilterName "UpdFilter" -Query $wmiQuery -ConsumerClass "CommandLineEventConsumer" -ConsumerLines @(
         "CommandLineTemplate = `"cmd.exe /c \`"C:\\Users\\Public\\run.bat\`"`";", "CreatorSID = {1, 2};", "Name = `"UpdConsumer`";")
     $cmd = [ordered]@{ Namespace = "//./root/subscription"; ESS = "UpdFilter"; CONSUMER = "CommandLineEventConsumer=`"UpdConsumer`""; PossibleCause = $cmdCause }
     $scriptCause = New-WmiBindingCause -FilterName "ScriptFilter" -Query "SELECT * FROM __InstanceCreationEvent WITHIN 5 WHERE TargetInstance ISA 'Win32_Process'" -ConsumerClass "ActiveScriptEventConsumer" -ConsumerLines @(
-        "Name = `"ScriptConsumer`";", "ScriptingEngine = `"VBScript`";", "ScriptText = `"Set o = CreateObject(\`"WScript.Shell\`")\no.Run \`"calc.exe\`"`";")
+        $aliceCreator, "Name = `"ScriptConsumer`";", "ScriptingEngine = `"VBScript`";", "ScriptText = `"Set o = CreateObject(\`"WScript.Shell\`")\no.Run \`"calc.exe\`"`";")
     $script = [ordered]@{ Namespace = "//./root/subscription"; ESS = "ScriptFilter"; CONSUMER = "ActiveScriptEventConsumer=`"ScriptConsumer`""; PossibleCause = $scriptCause }
     $scmCause = New-WmiBindingCause -FilterName "SCM Event Log Filter" -Query "select * from MSFT_SCMEventLogEvent" -ConsumerClass "NTEventLogEventConsumer" -ConsumerLines @(
         "Category = 0;", "EventType = 1;", "Name = `"SCM Event Log Consumer`";", "NameOfUserSIDProperty = `"sid`";", "SourceName = `"Service Control Manager`";")
@@ -291,17 +364,17 @@ Test-Case -Name "WMI-Activity 5861 permanent / 5860 temporary subscriptions (fol
         if (@($lines | Where-Object { $_.Trim() -ceq $expected }).Count -ne 1) { throw "log line missing: $expected (log: $($lines -join ' || '))" }
     }
 } -Expected @(
-    @{ Timestamp = "2026-02-02 08:00:00.000"; Source = $wmiFile; EventType = "PersistenceChange"; Description = "WMI permanent event subscription: filter `"UpdFilter`" -> CommandLineEventConsumer=`"UpdConsumer`""; User = ""
-        Details = "EventID=5861 | Namespace=//./root/subscription | Filter=UpdFilter | Query=$wmiQuery | EventNamespace=root\cimv2 | ConsumerType=CommandLineEventConsumer | Consumer=UpdConsumer | CommandLineTemplate=cmd.exe /c `"C:\Users\Public\run.bat`" | Count=2 | LastSeen=2026-02-03 09:00:00"
+    @{ Timestamp = "2026-02-02 08:00:00.000"; Source = $wmiFile; EventType = "PersistenceChange"; Description = "WMI permanent event subscription: filter `"UpdFilter`" -> CommandLineEventConsumer=`"UpdConsumer`""; User = "BUILTIN\Administrators"
+        Details = "EventID=5861 | Namespace=//./root/subscription | Filter=UpdFilter | Query=$wmiQuery | EventNamespace=root\cimv2 | ConsumerType=CommandLineEventConsumer | Consumer=UpdConsumer | CommandLineTemplate=cmd.exe /c `"C:\Users\Public\run.bat`" | FilterCreatorSID=S-1-5-32-544 | Count=2 | LastSeen=2026-02-03 09:00:00"
         Artifact = "EventLogs" },
-    @{ EventType = "PersistenceChange"; Description = "WMI permanent event subscription: filter `"SCM Event Log Filter`" -> NTEventLogEventConsumer=`"SCM Event Log Consumer`" (Windows default)"
-        Details = "EventID=5861 | Namespace=//./root/subscription | Filter=SCM Event Log Filter | Query=select * from MSFT_SCMEventLogEvent | EventNamespace=root\cimv2 | ConsumerType=NTEventLogEventConsumer | Consumer=SCM Event Log Consumer | SourceName=Service Control Manager" },
+    @{ EventType = "PersistenceChange"; Description = "WMI permanent event subscription: filter `"SCM Event Log Filter`" -> NTEventLogEventConsumer=`"SCM Event Log Consumer`" (Windows default)"; User = "BUILTIN\Administrators"
+        Details = "EventID=5861 | Namespace=//./root/subscription | Filter=SCM Event Log Filter | Query=select * from MSFT_SCMEventLogEvent | EventNamespace=root\cimv2 | ConsumerType=NTEventLogEventConsumer | Consumer=SCM Event Log Consumer | SourceName=Service Control Manager | FilterCreatorSID=S-1-5-32-544" },
     @{ Timestamp = "2026-02-02 08:00:30.000"; EventType = "Execution"; Description = "WMI temporary event subscription: SELECT * FROM __InstanceOperationEvent WHERE TargetInstance ISA 'AntiVirusProduct'"; User = "NT AUTHORITY\LOCAL SERVICE"
         Details = "EventID=5860 | Namespace=ROOT\SecurityCenter | Query=SELECT * FROM __InstanceOperationEvent WHERE TargetInstance ISA 'AntiVirusProduct' | User=NT AUTHORITY\LOCAL SERVICE | ClientProcessId=4321 | ClientMachine=TESTHOST | Count=2 | LastSeen=2026-02-02 20:00:00" },
     @{ Timestamp = "2026-02-03 08:00:30.000"; EventType = "Execution"
         Details = "EventID=5860 | Namespace=ROOT\SecurityCenter | Query=SELECT * FROM __InstanceOperationEvent WHERE TargetInstance ISA 'AntiVirusProduct' | User=NT AUTHORITY\LOCAL SERVICE | ClientProcessId=4321 | ClientMachine=TESTHOST" },
-    @{ Timestamp = "2026-02-03 10:00:00.000"; EventType = "PersistenceChange"; Description = "WMI permanent event subscription: filter `"ScriptFilter`" -> ActiveScriptEventConsumer=`"ScriptConsumer`""
-        Details = "EventID=5861 | Namespace=//./root/subscription | Filter=ScriptFilter | Query=SELECT * FROM __InstanceCreationEvent WITHIN 5 WHERE TargetInstance ISA 'Win32_Process' | EventNamespace=root\cimv2 | ConsumerType=ActiveScriptEventConsumer | Consumer=ScriptConsumer | ScriptingEngine=VBScript | ScriptText=Set o = CreateObject(`"WScript.Shell`")`no.Run `"calc.exe`"" }
+    @{ Timestamp = "2026-02-03 10:00:00.000"; EventType = "PersistenceChange"; Description = "WMI permanent event subscription: filter `"ScriptFilter`" -> ActiveScriptEventConsumer=`"ScriptConsumer`""; User = $alice
+        Details = "EventID=5861 | Namespace=//./root/subscription | Filter=ScriptFilter | Query=SELECT * FROM __InstanceCreationEvent WITHIN 5 WHERE TargetInstance ISA 'Win32_Process' | EventNamespace=root\cimv2 | ConsumerType=ActiveScriptEventConsumer | Consumer=ScriptConsumer | ScriptingEngine=VBScript | ScriptText=Set o = CreateObject(`"WScript.Shell`")`no.Run `"calc.exe`" | FilterCreatorSID=S-1-5-32-544 | ConsumerCreatorSID=$alice" }
 )
 
 # --- TerminalServices-RDPClient ---
@@ -309,9 +382,10 @@ $rdpFile = "Microsoft-Windows-TerminalServices-RDPClient%4Operational.evtx"
 $rdpProvider = "Microsoft-Windows-TerminalServices-ClientActiveXCore"
 $activityA = "f6818d5d-ae3d-444f-bf3f-61ea8fbb0000"
 $activityB = "0a0a0a0a-1111-2222-3333-444444444444"
-Test-Case -Name "RDPClient 1024 / 1102 / 1027 / 1029 / 1026 / 1009 (server named by ActivityID)" -Action {
+Test-Case -Name "RDPClient 1024 / 1025 / 1102 / 1027 / 1029 / 1026 / 1009 (server named by ActivityID)" -Action {
     $records = @(
         (New-TestRecord -Provider $rdpProvider -Id 1024 -Time "2026-02-04 10:00:00" -UserSid $alice -ActivityId $activityA -Body (New-EventDataXml -Data ([ordered]@{ Name = "Server Name"; Value = "srv01.contoso.test"; CustomLevel = "Info" }))),
+        (New-TestRecord -Provider $rdpProvider -Id 1025 -Time "2026-02-04 10:00:01" -UserSid $alice -ActivityId $activityA),
         (New-TestRecord -Provider $rdpProvider -Id 1102 -Time "2026-02-04 10:00:01" -UserSid $alice -ActivityId $activityA -Body (New-EventDataXml -Data ([ordered]@{ Name = "Server Address"; Value = "10.1.2.3"; CustomLevel = "Info" }))),
         (New-TestRecord -Provider $rdpProvider -Id 1029 -Time "2026-02-04 10:00:02" -UserSid $alice -ActivityId $activityA -Body (New-EventDataXml -Data ([ordered]@{ TraceMessage = "rpMTvXv3Qz1W9VsU1g7o5Q5V6w0Tq2bhkuN3aW1J9cE=-" }))),
         (New-TestRecord -Provider $rdpProvider -Id 1027 -Time "2026-02-04 10:00:03" -UserSid $alice -ActivityId $activityA -Body (New-EventDataXml -Data ([ordered]@{ DomainName = "CONTOSO"; SessionId = "2" }))),
@@ -324,6 +398,8 @@ Test-Case -Name "RDPClient 1024 / 1102 / 1027 / 1029 / 1026 / 1009 (server named
 } -Expected @(
     @{ Timestamp = "2026-02-04 10:00:00.000"; Source = $rdpFile; EventType = "NetworkConnection"; Description = "Outbound RDP connection to srv01.contoso.test"; User = $alice
         Details = "EventID=1024 | Server=srv01.contoso.test | ActivityID=$activityA | UserSID=$alice"; Artifact = "EventLogs" },
+    @{ EventType = "NetworkConnection"; Description = "Outbound RDP connection to srv01.contoso.test: connected to the server"
+        Details = "EventID=1025 | Server=srv01.contoso.test | ActivityID=$activityA | UserSID=$alice" },
     @{ EventType = "NetworkConnection"; Description = "Outbound RDP connection to srv01.contoso.test: multi-transport connection to 10.1.2.3"
         Details = "EventID=1102 | ServerAddress=10.1.2.3 | Server=srv01.contoso.test | ActivityID=$activityA | UserSID=$alice" },
     @{ Description = "Outbound RDP connection to srv01.contoso.test: user name hash rpMTvXv3Qz1W9VsU1g7o5Q5V6w0Tq2bhkuN3aW1J9cE=-"
@@ -339,14 +415,21 @@ Test-Case -Name "RDPClient 1024 / 1102 / 1027 / 1029 / 1026 / 1009 (server named
 
 # --- NTLM/Operational ---
 $ntlmFile = "Microsoft-Windows-NTLM%4Operational.evtx"
-Test-Case -Name "NTLM 8001-8004 and 4020 / 4022 (NTLM version)" -Action {
+Test-Case -Name "NTLM 8001-8005, 4013, 4020, 4022, 4024, 4030, 4032 (NTLM version, (NULL) values)" -Action {
     $events = @(
         @("Microsoft-Windows-NTLM", 8001, [ordered]@{ TargetName = "cifs/fs01"; UserName = "bob"; DomainName = "CONTOSO"; CallerPID = "4"; ProcessName = ""; ClientLUID = "0x3e7"; ClientUserName = "TESTHOST$"; ClientDomainName = "WORKGROUP"; MechanismOID = "(NULL)" }),
         @("Microsoft-Windows-NTLM", 8002, [ordered]@{ CallerPID = "4"; ProcessName = "System"; ClientLUID = "0x3e7"; ClientUserName = "alice"; ClientDomainName = "TESTHOST"; MechanismOID = "1.3.6.1.4.1.311.2.2.10" }),
         @("Microsoft-Windows-NTLM", 8003, [ordered]@{ UserName = "bob"; DomainName = "CONTOSO"; Workstation = "WKS-9"; CallerPID = "700"; ProcessName = "C:\Windows\System32\lsass.exe"; LogonType = "3"; InProc = "true"; MechanismOID = "(NULL)" }),
         @("Microsoft-Windows-Security-Netlogon", 8004, [ordered]@{ SChannelName = "FS01"; UserName = "bob"; DomainName = "CONTOSO"; WorkstationName = "WKS-9"; SChannelType = "2" }),
         @("Microsoft-Windows-NTLM", 4020, [ordered]@{ ProcessName = "C:\Windows\explorer.exe"; ProcessPID = "0x1234"; Username = "alice"; DomainName = "TESTHOST"; Hostname = "TESTHOST"; SingleSignOn = "Yes"; TargetMachine = "fs01"; TargetDomain = ""; TargetService = "cifs/fs01"; TargetIP = "10.0.0.5"; TargetNetworkName = ""; NtlmUsageId = "1"; NtlmUsageReason = "No Kerberos"; NegotiatedFlags = "0xe2888215"; NtlmVersion = "NTLMv2"; SessionKeyStatus = "OK"; ChannelBindingStatus = "None"; ServiceBinding = "cifs/fs01"; "Mic Status" = "Present"; AvlFlags = "0x2"; AvlFlagsStr = "MIC" }),
-        @("Microsoft-Windows-NTLM", 4022, [ordered]@{ ProcessName = "System"; ProcessPID = "0x4"; Username = "bob"; DomainName = "CONTOSO"; RemoteClientMachine = "WKS-9"; ClientIP = "10.0.0.9"; ClientNetworkName = ""; NegotiatedFlags = "0x1"; NtlmVersion = "NTLMv1"; SessionKeyStatus = ""; ChannelBindingStatus = ""; ServiceBinding = ""; TargetMachine = "TESTHOST"; TargetDomain = ""; "Mic Status" = "Absent"; AvFlags = "0x0"; AvFlagsStr = ""; Status = "0x0"; StatusMsg = "0" })
+        @("Microsoft-Windows-NTLM", 4022, [ordered]@{ ProcessName = "System"; ProcessPID = "0x4"; Username = "bob"; DomainName = "CONTOSO"; RemoteClientMachine = "WKS-9"; ClientIP = "10.0.0.9"; ClientNetworkName = ""; NegotiatedFlags = "0x1"; NtlmVersion = "NTLMv1"; SessionKeyStatus = ""; ChannelBindingStatus = ""; ServiceBinding = ""; TargetMachine = "TESTHOST"; TargetDomain = ""; "Mic Status" = "Absent"; AvFlags = "0x0"; AvFlagsStr = ""; Status = "0x0"; StatusMsg = "0" }),
+        # Default credentials: the supplied account is "(NULL)", the process account is used
+        @("Microsoft-Windows-NTLM", 8001, [ordered]@{ TargetName = "http/web01"; UserName = "(NULL)"; DomainName = "(NULL)"; CallerPID = "1234"; ProcessName = "C:\Program Files\App\app.exe"; ClientLUID = "0x1"; ClientUserName = "alice"; ClientDomainName = "TESTHOST"; MechanismOID = "(NULL)" }),
+        @("Microsoft-Windows-Security-Netlogon", 8005, [ordered]@{ SChannelName = "FS02"; UserName = "carol"; DomainName = "CONTOSO"; WorkstationName = "WKS-7"; SChannelType = "2" }),
+        @("Microsoft-Windows-NTLM", 4013, [ordered]@{ TargetName = "cifs/old01"; UserName = "bob"; DomainName = "CONTOSO"; CallerPID = "4"; ProcessName = ""; ClientLUID = "0x3e7"; ClientUserName = "TESTHOST$"; ClientDomainName = "WORKGROUP"; MechanismOID = "(NULL)" }),
+        @("Microsoft-Windows-NTLM", 4024, [ordered]@{ TargetName = "cifs/fs01"; UserName = "alice"; DomainName = "TESTHOST"; CallerPID = "900"; ProcessName = "C:\Windows\explorer.exe"; ClientLUID = "0x1"; ClientUserName = "alice"; ClientDomainName = "TESTHOST"; MechanismOID = "(NULL)" }),
+        @("Microsoft-Windows-Security-Netlogon", 4030, [ordered]@{ DCName = "DC01"; AccountName = "bob"; AccountDomain = "CONTOSO"; AccountMachine = "WKS-9"; ServerName = "FS01"; ServerDomain = "CONTOSO"; ForwarderType = "1"; ForwarderName = "FS01"; ForwarderDomain = "CONTOSO"; ForwarderIP = "10.0.0.5"; NtlmVersion = "NTLMv1"; ServiceBinding = ""; TargetMachine = ""; TargetDomain = ""; "Mic Status" = "Absent"; AvFlags = "0x0"; AvFlagsStr = ""; Status = "0x0"; StatusMsg = "" }),
+        @("Microsoft-Windows-Security-Netlogon", 4032, [ordered]@{ DCName = "DC01"; AccountName = "dave"; AccountDomain = "CONTOSO"; AccountMachine = "WKS-3"; ServerName = "APP01"; ServerDomain = "FABRIKAM"; ServerIP = "10.9.0.4"; ServerOS = ""; NtlmVersion = "NTLMv2"; ServiceBinding = "HTTP/app01"; TargetMachine = "APP01"; TargetDomain = ""; "Mic Status" = "Present"; AvFlags = "0x2"; AvFlagsStr = "MIC"; Status = "0x0"; StatusMsg = "" })
     )
     $minute = 0
     foreach ($e in $events) {
@@ -365,26 +448,41 @@ Test-Case -Name "NTLM 8001-8004 and 4020 / 4022 (NTLM version)" -Action {
     @{ EventType = "NetworkConnection"; Description = "Outgoing NTLM authentication to fs01 (NTLMv2)"; User = "TESTHOST\alice"
         Details = "EventID=4020 | Target=fs01 | TargetIP=10.0.0.5 | TargetService=cifs/fs01 | NtlmVersion=NTLMv2 | Account=TESTHOST\alice | Process=C:\Windows\explorer.exe | PID=0x1234 | Reason=No Kerberos | ServiceBinding=cifs/fs01 | MicStatus=Present" },
     @{ EventType = "Logon"; Description = "Incoming NTLM authentication from WKS-9 (NTLMv1)"; User = "CONTOSO\bob"
-        Details = "EventID=4022 | Account=CONTOSO\bob | ClientMachine=WKS-9 | ClientIP=10.0.0.9 | NtlmVersion=NTLMv1 | Process=System | PID=0x4 | Status=0x0 | MicStatus=Absent" }
+        Details = "EventID=4022 | Account=CONTOSO\bob | ClientMachine=WKS-9 | ClientIP=10.0.0.9 | NtlmVersion=NTLMv1 | Process=System | PID=0x4 | Status=0x0 | MicStatus=Absent" },
+    @{ EventType = "NetworkConnection"; Description = "Outgoing NTLM authentication to http/web01"; User = "TESTHOST\alice"
+        Details = "EventID=8001 | Target=http/web01 | Process=C:\Program Files\App\app.exe | PID=1234 | ProcessAccount=TESTHOST\alice" },
+    @{ EventType = "Logon"; Description = "NTLM authentication passed to this domain controller: CONTOSO\carol from WKS-7 (secure channel FS02)"; User = "CONTOSO\carol"
+        Details = "EventID=8005 | Account=CONTOSO\carol | Workstation=WKS-7 | SecureChannel=FS02 | SecureChannelType=2" },
+    @{ EventType = "NetworkConnection"; Description = "Outgoing NTLM authentication to cifs/old01 (NTLMv1, failed: not supported on this device)"; User = "CONTOSO\bob"
+        Details = "EventID=4013 | Target=cifs/old01 | NtlmVersion=NTLMv1 | Account=CONTOSO\bob | PID=4 | ProcessAccount=WORKGROUP\TESTHOST$" },
+    @{ EventType = "NetworkConnection"; Description = "Outgoing NTLM authentication to cifs/fs01 (NTLMv1-derived credentials, single sign-on)"; User = "TESTHOST\alice"
+        Details = "EventID=4024 | Target=cifs/fs01 | NtlmVersion=NTLMv1 | Account=TESTHOST\alice | Process=C:\Windows\explorer.exe | PID=900 | ProcessAccount=TESTHOST\alice" },
+    @{ EventType = "Logon"; Description = "NTLM authentication processed by this domain controller: CONTOSO\bob from WKS-9 to CONTOSO\FS01 (NTLMv1)"; User = "CONTOSO\bob"
+        Details = "EventID=4030 | Account=CONTOSO\bob | ClientMachine=WKS-9 | Server=CONTOSO\FS01 | ForwardedFrom=CONTOSO\FS01 | ForwarderIP=10.0.0.5 | ForwarderType=1 | NtlmVersion=NTLMv1 | DomainController=DC01 | Status=0x0 | MicStatus=Absent" },
+    @{ EventType = "Logon"; Description = "Forwarded NTLM authentication processed by this domain controller: CONTOSO\dave from WKS-3 to FABRIKAM\APP01 (NTLMv2)"; User = "CONTOSO\dave"
+        Details = "EventID=4032 | Account=CONTOSO\dave | ClientMachine=WKS-3 | Server=FABRIKAM\APP01 | ServerIP=10.9.0.4 | NtlmVersion=NTLMv2 | DomainController=DC01 | TargetMachine=APP01 | Status=0x0 | ServiceBinding=HTTP/app01 | MicStatus=Present" }
 )
 
 # --- Windows Firewall ---
 $fwFile = "Microsoft-Windows-Windows Firewall With Advanced Security%4Firewall.evtx"
 $fwProvider = "Microsoft-Windows-Windows Firewall With Advanced Security"
 $mpssvc = "S-1-5-80-3088073201-1464728630-1879813800-1107566885-823218052"
+$svchost = "C:\WINDOWS\System32\svchost.exe"
 # Rule fields of 2004 / 2005 (2071 / 2073 / 2097 / 2099 add ErrorCode, 2097 / 2099 also PolicyAppId)
 function New-FirewallRuleData {
-    param([string]$RuleId, [string]$Name, [string]$App, [string]$Direction, [string]$Protocol, [string]$LocalPorts, [string]$Action, [string]$Profiles, [string]$User, [string]$ErrorCode = $null)
+    param([string]$RuleId, [string]$Name, [string]$App, [string]$Direction, [string]$Protocol, [string]$LocalPorts, [string]$Action, [string]$Profiles, [string]$User, [string]$ErrorCode = $null,
+        [string]$ModifyingApp = "C:\Windows\System32\netsh.exe", [string]$Context = "")
     $data = [ordered]@{ RuleId = $RuleId; RuleName = $Name; Origin = "1"; ApplicationPath = $App; ServiceName = ""; Direction = $Direction; Protocol = $Protocol; LocalPorts = $LocalPorts; RemotePorts = "*"
-        Action = $Action; Profiles = $Profiles; LocalAddresses = "*"; RemoteAddresses = "*"; RemoteMachineAuthorizationList = ""; RemoteUserAuthorizationList = ""; EmbeddedContext = ""; Flags = "1"; Active = "1"
-        EdgeTraversal = "0"; LooseSourceMapped = "0"; SecurityOptions = "0"; ModifyingUser = $User; ModifyingApplication = "C:\Windows\System32\netsh.exe"; SchemaVersion = "545"; RuleStatus = "65536"; LocalOnlyMapped = "0" }
+        Action = $Action; Profiles = $Profiles; LocalAddresses = "*"; RemoteAddresses = "*"; RemoteMachineAuthorizationList = ""; RemoteUserAuthorizationList = ""; EmbeddedContext = $Context; Flags = "1"; Active = "1"
+        EdgeTraversal = "0"; LooseSourceMapped = "0"; SecurityOptions = "0"; ModifyingUser = $User; ModifyingApplication = $ModifyingApp; SchemaVersion = "545"; RuleStatus = "65536"; LocalOnlyMapped = "0" }
     if ($null -ne $ErrorCode) { $data["PolicyAppId"] = ""; $data["ErrorCode"] = $ErrorCode }
     return $data
 }
-Test-Case -Name "Firewall rule added / modified / deleted, all deleted, reset, settings (old and new IDs; firewall service rules counted)" -Action {
+Test-Case -Name "Firewall rule added / modified / deleted, all deleted, reset, settings (old and new IDs; failed changes; packaged-app and firewall service rules counted)" -Action {
+    $packageContext = "{78E1CD88-49E3-476E-B926-580E596AD309}"
     $records = @(
         (New-TestRecord -Provider $fwProvider -Id 2097 -Time "2026-02-06 10:00:00" -UserSid "S-1-5-19" -Body (New-EventDataXml -Data (New-FirewallRuleData -RuleId "{AAAA}" -Name "Open RDP" -App "" -Direction "1" -Protocol "6" -LocalPorts "3389" -Action "3" -Profiles "7" -User $alice -ErrorCode "0"))),
-        (New-TestRecord -Provider $fwProvider -Id 2099 -Time "2026-02-06 10:01:00" -UserSid "S-1-5-19" -Body (New-EventDataXml -Data (New-FirewallRuleData -RuleId "{BBBB}" -Name "Block EDR" -App "C:\Program Files\EDR\agent.exe" -Direction "2" -Protocol "256" -LocalPorts "" -Action "2" -Profiles "2147483647" -User "S-1-5-18" -ErrorCode "2"))),
+        (New-TestRecord -Provider $fwProvider -Id 2099 -Time "2026-02-06 10:01:00" -UserSid "S-1-5-19" -Body (New-EventDataXml -Data (New-FirewallRuleData -RuleId "{BBBB}" -Name "Block EDR" -App "C:\Program Files\EDR\agent.exe" -Direction "2" -Protocol "256" -LocalPorts "" -Action "2" -Profiles "2147483647" -User "S-1-5-18" -ErrorCode "0"))),
         (New-TestRecord -Provider $fwProvider -Id 2052 -Time "2026-02-06 10:02:00" -UserSid "S-1-5-19" -Body (New-EventDataXml -Data ([ordered]@{ RuleId = "{AAAA}"; RuleName = "Open RDP"; ModifyingUser = $alice; ModifyingApplication = "C:\Windows\System32\wbem\WmiPrvSE.exe"; ErrorCode = "0" }))),
         (New-TestRecord -Provider $fwProvider -Id 2004 -Time "2026-02-06 10:03:00" -UserSid "S-1-5-19" -Body (New-EventDataXml -Data (New-FirewallRuleData -RuleId "{CCCC}" -Name "Old add" -App "C:\Temp\x.exe" -Direction "1" -Protocol "17" -LocalPorts "53" -Action "1" -Profiles "4" -User $alice))),
         (New-TestRecord -Provider $fwProvider -Id 2006 -Time "2026-02-06 10:04:00" -UserSid "S-1-5-19" -Body (New-EventDataXml -Data ([ordered]@{ RuleId = "{CCCC}"; RuleName = "Old add"; ModifyingUser = $alice; ModifyingApplication = "C:\Windows\System32\netsh.exe" }))),
@@ -392,28 +490,43 @@ Test-Case -Name "Firewall rule added / modified / deleted, all deleted, reset, s
         (New-TestRecord -Provider $fwProvider -Id 2060 -Time "2026-02-06 10:06:00" -UserSid "S-1-5-19" -Body (New-EventDataXml -Data ([ordered]@{ ModifyingUser = $alice; ModifyingApplication = "C:\Windows\System32\netsh.exe"; ErrorCode = "0" }))),
         (New-TestRecord -Provider $fwProvider -Id 2082 -Time "2026-02-06 10:07:00" -UserSid "S-1-5-19" -Body (New-EventDataXml -Data ([ordered]@{ Profiles = "4"; SettingType = "1"; SettingValueSize = "4"; SettingValue = "00000000"; SettingValueString = "No"; Origin = "1"; ModifyingUser = $alice; ModifyingApplication = "C:\Windows\System32\netsh.exe"; ErrorCode = "0" }))),
         (New-TestRecord -Provider $fwProvider -Id 2003 -Time "2026-02-06 10:08:00" -UserSid "S-1-5-19" -Body (New-EventDataXml -Data ([ordered]@{ Profiles = "1"; SettingType = "17"; SettingValueSize = "4"; SettingValue = "00000000"; SettingValueString = "Allow"; Origin = "1"; ModifyingUser = $alice; ModifyingApplication = "C:\Windows\System32\netsh.exe" }))),
-        (New-TestRecord -Provider $fwProvider -Id 2082 -Time "2026-02-06 10:09:00" -UserSid "S-1-5-19" -Body (New-EventDataXml -Data ([ordered]@{ Profiles = "2"; SettingType = "99"; SettingValueString = "1"; ModifyingUser = "S-1-5-18"; ModifyingApplication = "C:\Windows\System32\svchost.exe"; ErrorCode = "0" }))),
+        (New-TestRecord -Provider $fwProvider -Id 2082 -Time "2026-02-06 10:09:00" -UserSid "S-1-5-19" -Body (New-EventDataXml -Data ([ordered]@{ Profiles = "2"; SettingType = "99"; SettingValueString = "1"; ModifyingUser = "S-1-5-18"; ModifyingApplication = $svchost; ErrorCode = "0" }))),
         (New-TestRecord -Provider $fwProvider -Id 2083 -Time "2026-02-06 10:10:00" -UserSid "S-1-5-19" -Body (New-EventDataXml -Data ([ordered]@{ SettingType = "4"; SettingValueSize = "4"; SettingValue = "01000000"; SettingValueDisplay = "Yes"; Origin = "1"; ModifyingUser = $alice; ModifyingApplication = "C:\Windows\System32\netsh.exe"; ErrorCode = "0" }))),
         # The firewall service's own packaged-app rules: counted only
-        (New-TestRecord -Provider $fwProvider -Id 2097 -Time "2026-02-06 10:11:00" -UserSid "S-1-5-19" -Body (New-EventDataXml -Data (New-FirewallRuleData -RuleId "App_8wekyb3d8bbweS-1-5-21-1-In-Allow" -Name "Store App" -App "" -Direction "1" -Protocol "256" -LocalPorts "" -Action "3" -Profiles "7" -User $mpssvc -ErrorCode "0"))),
-        (New-TestRecord -Provider $fwProvider -Id 2052 -Time "2026-02-06 10:12:00" -UserSid "S-1-5-19" -Body (New-EventDataXml -Data ([ordered]@{ RuleId = "App"; RuleName = "Store App"; ModifyingUser = $mpssvc; ModifyingApplication = "C:\WINDOWS\System32\svchost.exe"; ErrorCode = "0" }))),
-        (New-TestRecord -Provider $fwProvider -Id 2059 -Time "2026-02-06 10:13:00" -UserSid "S-1-5-19" -Body (New-EventDataXml -Data ([ordered]@{ "Store Type" = "12"; ModifyingUser = $mpssvc; ModifyingApplication = "C:\WINDOWS\System32\svchost.exe"; ErrorCode = "0" })))
+        (New-TestRecord -Provider $fwProvider -Id 2097 -Time "2026-02-06 10:11:00" -UserSid "S-1-5-19" -Body (New-EventDataXml -Data (New-FirewallRuleData -RuleId "App_8wekyb3d8bbweS-1-5-21-1-In-Allow" -Name "Store App" -App "" -Direction "1" -Protocol "256" -LocalPorts "" -Action "3" -Profiles "7" -User $mpssvc -ErrorCode "0" -ModifyingApp $svchost))),
+        (New-TestRecord -Provider $fwProvider -Id 2052 -Time "2026-02-06 10:12:00" -UserSid "S-1-5-19" -Body (New-EventDataXml -Data ([ordered]@{ RuleId = "App"; RuleName = "Store App"; ModifyingUser = $mpssvc; ModifyingApplication = $svchost; ErrorCode = "0" }))),
+        (New-TestRecord -Provider $fwProvider -Id 2059 -Time "2026-02-06 10:13:00" -UserSid "S-1-5-19" -Body (New-EventDataXml -Data ([ordered]@{ "Store Type" = "12"; ModifyingUser = $mpssvc; ModifyingApplication = $svchost; ErrorCode = "0" }))),
+        # Rules declared in an app package (svchost.exe as SYSTEM): counted
+        # only, and so are their deletes (by RuleName, or a package resource
+        # name); another rule svchost.exe deletes is a row
+        (New-TestRecord -Provider $fwProvider -Id 2097 -Time "2026-02-06 10:14:00" -UserSid "S-1-5-19" -Body (New-EventDataXml -Data (New-FirewallRuleData -RuleId "{PKG1}" -Name "Claude" -App "C:\Program Files\WindowsApps\Example.App_1.0.0.0_x64__abcdefghjkmnp\app\app.exe" -Direction "1" -Protocol "17" -LocalPorts "" -Action "3" -Profiles "4" -User "S-1-5-18" -ErrorCode "0" -ModifyingApp $svchost -Context $packageContext))),
+        (New-TestRecord -Provider $fwProvider -Id 2052 -Time "2026-02-06 10:15:00" -UserSid "S-1-5-19" -Body (New-EventDataXml -Data ([ordered]@{ RuleId = "{PKG2}"; RuleName = "Claude"; ModifyingUser = "S-1-5-18"; ModifyingApplication = $svchost; ErrorCode = "0" }))),
+        (New-TestRecord -Provider $fwProvider -Id 2052 -Time "2026-02-06 10:16:00" -UserSid "S-1-5-19" -Body (New-EventDataXml -Data ([ordered]@{ RuleId = "{PKG3}"; RuleName = "ms-resource:ProductPkgDisplayName"; ModifyingUser = "S-1-5-18"; ModifyingApplication = $svchost; ErrorCode = "0" }))),
+        (New-TestRecord -Provider $fwProvider -Id 2052 -Time "2026-02-06 10:17:00" -UserSid "S-1-5-19" -Body (New-EventDataXml -Data ([ordered]@{ RuleId = "{GPO1}"; RuleName = "Corp rule"; ModifyingUser = "S-1-5-18"; ModifyingApplication = $svchost; ErrorCode = "0" }))),
+        # Failed changes: a modify of a rule that does not exist (ErrorCode
+        # 2, an installer's first try) is counted; other failures are rows
+        (New-TestRecord -Provider $fwProvider -Id 2099 -Time "2026-02-06 10:18:00" -UserSid "S-1-5-19" -Body (New-EventDataXml -Data (New-FirewallRuleData -RuleId "{DDDD}" -Name "Browser (mDNS-In)" -App "C:\Program Files\Browser\browser.exe" -Direction "1" -Protocol "17" -LocalPorts "5353" -Action "3" -Profiles "7" -User "S-1-5-18" -ErrorCode "2" -ModifyingApp "C:\Program Files\Browser\Installer\setup.exe"))),
+        (New-TestRecord -Provider $fwProvider -Id 2097 -Time "2026-02-06 10:19:00" -UserSid "S-1-5-19" -Body (New-EventDataXml -Data (New-FirewallRuleData -RuleId "{EEEE}" -Name "Bad add" -App "C:\Temp\y.exe" -Direction "1" -Protocol "6" -LocalPorts "4444" -Action "3" -Profiles "7" -User $alice -ErrorCode "5"))),
+        (New-TestRecord -Provider $fwProvider -Id 2060 -Time "2026-02-06 10:20:00" -UserSid "S-1-5-19" -Body (New-EventDataXml -Data ([ordered]@{ ModifyingUser = $alice; ModifyingApplication = "C:\Windows\System32\netsh.exe"; ErrorCode = "5" })))
     )
     $logBefore = Get-LogLineCount
     Add-FirewallEntries -Records $records -FileName $fwFile -FilePath "X:\fw.evtx"
-    if (@(Get-NewLogLines $logBefore | Where-Object { $_ -match 'Skipped 3 event\(s\): rules the firewall service adds and removes for packaged \(Store\) apps' }).Count -ne 1) {
-        throw "no log line counting the firewall service's rule events"
+    $lines = Get-NewLogLines $logBefore
+    foreach ($expected in @("Skipped 3 event(s): rules the firewall service adds and removes for packaged (Store) apps (ModifyingUser NT SERVICE\mpssvc)",
+            "Skipped 3 event(s): rules declared in app packages (MSIX), added and removed by svchost.exe as SYSTEM",
+            "Skipped 1 event(s): attempts to modify or delete a rule that does not exist (ErrorCode 2)")) {
+        if (@($lines | Where-Object { $_.Trim() -ceq $expected }).Count -ne 1) { throw "log line missing: $expected (log: $($lines -join ' || '))" }
     }
 } -Expected @(
     @{ Timestamp = "2026-02-06 10:00:00.000"; Source = $fwFile; EventType = "PersistenceChange"; Description = "Firewall rule added: Open RDP (Inbound, Allow)"; User = $alice
-        Details = "EventID=2097 | RuleName=Open RDP | RuleId={AAAA} | Direction=Inbound | Action=Allow | Protocol=TCP | LocalPorts=3389 | RemotePorts=* | RemoteAddresses=* | Profiles=Domain, Private, Public | Active=Yes | ModifyingApplication=C:\Windows\System32\netsh.exe | ModifyingUser=$alice"
+        Details = "EventID=2097 | RuleName=Open RDP | RuleId={AAAA} | Direction=Inbound | Action=Allow | Protocol=TCP | LocalPorts=3389 | RemotePorts=* | RemoteAddresses=* | Profiles=Domain, Private, Public | Active=Yes | Origin=Local | ModifyingApplication=C:\Windows\System32\netsh.exe | ModifyingUser=$alice"
         Artifact = "EventLogs" },
     @{ EventType = "PersistenceChange"; Description = "Firewall rule modified: Block EDR (Outbound, Block)"; User = "SYSTEM"
-        Details = "EventID=2099 | RuleName=Block EDR | RuleId={BBBB} | ApplicationPath=C:\Program Files\EDR\agent.exe | Direction=Outbound | Action=Block | Protocol=Any | RemotePorts=* | RemoteAddresses=* | Profiles=All | Active=Yes | ModifyingApplication=C:\Windows\System32\netsh.exe | ModifyingUser=S-1-5-18 | ErrorCode=2" },
+        Details = "EventID=2099 | RuleName=Block EDR | RuleId={BBBB} | ApplicationPath=C:\Program Files\EDR\agent.exe | Direction=Outbound | Action=Block | Protocol=Any | RemotePorts=* | RemoteAddresses=* | Profiles=All | Active=Yes | Origin=Local | ModifyingApplication=C:\Windows\System32\netsh.exe | ModifyingUser=S-1-5-18" },
     @{ EventType = "PersistenceChange"; Description = "Firewall rule deleted: Open RDP"
         Details = "EventID=2052 | RuleName=Open RDP | RuleId={AAAA} | ModifyingApplication=C:\Windows\System32\wbem\WmiPrvSE.exe | ModifyingUser=$alice" },
     @{ EventType = "PersistenceChange"; Description = "Firewall rule added: Old add (Inbound, Allow bypass)"
-        Details = "EventID=2004 | RuleName=Old add | RuleId={CCCC} | ApplicationPath=C:\Temp\x.exe | Direction=Inbound | Action=Allow bypass | Protocol=UDP | LocalPorts=53 | RemotePorts=* | RemoteAddresses=* | Profiles=Public | Active=Yes | ModifyingApplication=C:\Windows\System32\netsh.exe | ModifyingUser=$alice" },
+        Details = "EventID=2004 | RuleName=Old add | RuleId={CCCC} | ApplicationPath=C:\Temp\x.exe | Direction=Inbound | Action=Allow bypass | Protocol=UDP | LocalPorts=53 | RemotePorts=* | RemoteAddresses=* | Profiles=Public | Active=Yes | Origin=Local | ModifyingApplication=C:\Windows\System32\netsh.exe | ModifyingUser=$alice" },
     @{ EventType = "PersistenceChange"; Description = "Firewall rule deleted: Old add" },
     @{ EventType = "SecurityAlert"; Description = "All firewall rules deleted"; Details = "EventID=2033 | StoreType=2 | ModifyingApplication=C:\Windows\System32\netsh.exe | ModifyingUser=$alice" },
     @{ EventType = "SecurityAlert"; Description = "Firewall reset to its default configuration"; Details = "EventID=2060 | ModifyingApplication=C:\Windows\System32\netsh.exe | ModifyingUser=$alice" },
@@ -422,40 +535,58 @@ Test-Case -Name "Firewall rule added / modified / deleted, all deleted, reset, s
     @{ EventType = "SecurityAlert"; Description = "Firewall setting changed (Domain profile): Default inbound action = Allow" },
     @{ EventType = "SecurityAlert"; Description = "Firewall setting changed (Private profile): setting type 99 = 1"; User = "SYSTEM" },
     @{ EventType = "SecurityAlert"; Description = "Firewall global setting changed: global setting type 4 = Yes"
-        Details = "EventID=2083 | Setting=global setting type 4 | SettingType=4 | Value=Yes | ModifyingApplication=C:\Windows\System32\netsh.exe | ModifyingUser=$alice" }
+        Details = "EventID=2083 | Setting=global setting type 4 | SettingType=4 | Value=Yes | ModifyingApplication=C:\Windows\System32\netsh.exe | ModifyingUser=$alice" },
+    @{ Timestamp = "2026-02-06 10:17:00.000"; EventType = "PersistenceChange"; Description = "Firewall rule deleted: Corp rule"; User = "SYSTEM"
+        Details = "EventID=2052 | RuleName=Corp rule | RuleId={GPO1} | ModifyingApplication=$svchost | ModifyingUser=S-1-5-18" },
+    @{ Timestamp = "2026-02-06 10:19:00.000"; EventType = "PersistenceChange"; Description = "Firewall rule add failed (error 5): Bad add (Inbound, Allow)"
+        Details = "EventID=2097 | RuleName=Bad add | RuleId={EEEE} | ApplicationPath=C:\Temp\y.exe | Direction=Inbound | Action=Allow | Protocol=TCP | LocalPorts=4444 | RemotePorts=* | RemoteAddresses=* | Profiles=Domain, Private, Public | Active=Yes | Origin=Local | ModifyingApplication=C:\Windows\System32\netsh.exe | ModifyingUser=$alice | ErrorCode=5" },
+    @{ EventType = "SecurityAlert"; Description = "Firewall reset failed (error 5)"; Details = "EventID=2060 | ModifyingApplication=C:\Windows\System32\netsh.exe | ModifyingUser=$alice | ErrorCode=5" }
 )
 
 # --- Shell-Core ---
 $shellFile = "Microsoft-Windows-Shell-Core%4Operational.evtx"
 $shellProvider = "Microsoft-Windows-Shell-Core"
-Test-Case -Name "Shell-Core 9705-9708: Run / RunOnce commands at logon (start and launch paired per Explorer process)" -Action {
+Test-Case -Name "Shell-Core 9705-9708, 62170 / 62171: Run / RunOnce and Active Setup commands at logon (start and finish paired per Explorer process)" -Action {
     $records = @(
         (New-TestRecord -Provider $shellProvider -Id 9705 -Time "2026-02-07 08:00:00" -UserSid $alice -ProcessId "9688" -Body (New-EventDataXml -Data ([ordered]@{ KeyName = "Software\Microsoft\Windows\CurrentVersion\Run" }))),
         (New-TestRecord -Provider $shellProvider -Id 9707 -Time "2026-02-07 08:00:01" -UserSid $alice -ProcessId "9688" -Body (New-EventDataXml -Data ([ordered]@{ Command = "updater.exe`" /silent" }))),
         # Another Explorer process, at the same time
         (New-TestRecord -Provider $shellProvider -Id 9708 -Time "2026-02-07 08:00:01" -UserSid $alice -ProcessId "5555" -Body (New-EventDataXml -Data ([ordered]@{ PID = "777"; Command = "orphan.exe" }))),
-        (New-TestRecord -Provider $shellProvider -Id 9708 -Time "2026-02-07 08:00:03" -UserSid $alice -ProcessId "9688" -Body (New-EventDataXml -Data ([ordered]@{ PID = "4242"; Command = "updater.exe`" /silent" }))),
-        (New-TestRecord -Provider $shellProvider -Id 9706 -Time "2026-02-07 08:00:03" -UserSid $alice -ProcessId "9688" -Body (New-EventDataXml -Data ([ordered]@{ KeyName = "Software\Microsoft\Windows\CurrentVersion\Run" }))),
-        (New-TestRecord -Provider $shellProvider -Id 9705 -Time "2026-02-07 08:00:04" -UserSid $alice -ProcessId "9688" -Body (New-EventDataXml -Data ([ordered]@{ KeyName = "Software\Microsoft\Windows\CurrentVersion\RunOnce" }))),
-        (New-TestRecord -Provider $shellProvider -Id 9707 -Time "2026-02-07 08:00:05" -UserSid $alice -ProcessId "9688" -Body (New-EventDataXml -Data ([ordered]@{ Command = "stage2.cmd" }))),
-        (New-TestRecord -Provider $shellProvider -Id 9706 -Time "2026-02-07 08:00:06" -UserSid $alice -ProcessId "9688" -Body (New-EventDataXml -Data ([ordered]@{ KeyName = "Software\Microsoft\Windows\CurrentVersion\RunOnce" })))
+        (New-TestRecord -Provider $shellProvider -Id 9708 -Time "2026-02-07 08:00:31" -UserSid $alice -ProcessId "9688" -Body (New-EventDataXml -Data ([ordered]@{ PID = "4242"; Command = "updater.exe`" /silent" }))),
+        (New-TestRecord -Provider $shellProvider -Id 9706 -Time "2026-02-07 08:00:31" -UserSid $alice -ProcessId "9688" -Body (New-EventDataXml -Data ([ordered]@{ KeyName = "Software\Microsoft\Windows\CurrentVersion\Run" }))),
+        (New-TestRecord -Provider $shellProvider -Id 9705 -Time "2026-02-07 08:00:34" -UserSid $alice -ProcessId "9688" -Body (New-EventDataXml -Data ([ordered]@{ KeyName = "Software\Microsoft\Windows\CurrentVersion\RunOnce" }))),
+        (New-TestRecord -Provider $shellProvider -Id 9707 -Time "2026-02-07 08:00:35" -UserSid $alice -ProcessId "9688" -Body (New-EventDataXml -Data ([ordered]@{ Command = "stage2.cmd" }))),
+        (New-TestRecord -Provider $shellProvider -Id 9706 -Time "2026-02-07 08:00:36" -UserSid $alice -ProcessId "9688" -Body (New-EventDataXml -Data ([ordered]@{ KeyName = "Software\Microsoft\Windows\CurrentVersion\RunOnce" }))),
+        # The Active Setup logon task: StubPath commands, no 9705
+        (New-TestRecord -Provider $shellProvider -Id 62170 -Time "2026-02-07 08:01:00" -UserSid $alice -ProcessId "9688" -Body (New-EventDataXml -Data ([ordered]@{ LogonType = "0"; TaskName = "ActiveSetup" }))),
+        (New-TestRecord -Provider $shellProvider -Id 9707 -Time "2026-02-07 08:01:01" -UserSid $alice -ProcessId "9688" -Body (New-EventDataXml -Data ([ordered]@{ Command = "ie4uinit.exe -UserConfig" }))),
+        (New-TestRecord -Provider $shellProvider -Id 9708 -Time "2026-02-07 08:01:02" -UserSid $alice -ProcessId "9688" -Body (New-EventDataXml -Data ([ordered]@{ PID = "5150"; Command = "ie4uinit.exe -UserConfig" }))),
+        (New-TestRecord -Provider $shellProvider -Id 62171 -Time "2026-02-07 08:01:03" -UserSid $alice -ProcessId "9688" -Body (New-EventDataXml -Data ([ordered]@{ LogonType = "0"; TaskName = "ActiveSetup" }))),
+        # After the task: neither a key nor Active Setup
+        (New-TestRecord -Provider $shellProvider -Id 9707 -Time "2026-02-07 08:02:00" -UserSid $alice -ProcessId "9688" -Body (New-EventDataXml -Data ([ordered]@{ Command = "late.exe" })))
     )
     Add-ShellCoreEntries -Records $records -FileName $shellFile -FilePath "X:\shell.evtx"
 } -Expected @(
     @{ Timestamp = "2026-02-07 08:00:01.000"; Source = $shellFile; EventType = "Execution"; Description = "Run key command started at logon: updater.exe`" /silent"; User = $alice
-        Details = "EventID=9707 | Command=updater.exe`" /silent | ProcessId=4242 | RegistryKey=Software\Microsoft\Windows\CurrentVersion\Run | Launched=2026-02-07 08:00:03 | UserSID=$alice"; Artifact = "EventLogs" },
-    @{ Timestamp = "2026-02-07 08:00:01.000"; Description = "Run or RunOnce key command started at logon: orphan.exe"; Details = "EventID=9708 | Command=orphan.exe | ProcessId=777 | UserSID=$alice" },
-    @{ Timestamp = "2026-02-07 08:00:05.000"; Description = "RunOnce key command started at logon: stage2.cmd"
-        Details = "EventID=9707 | Command=stage2.cmd | RegistryKey=Software\Microsoft\Windows\CurrentVersion\RunOnce | UserSID=$alice" }
+        Details = "EventID=9707 | Command=updater.exe`" /silent | ProcessId=4242 | RegistryKey=Software\Microsoft\Windows\CurrentVersion\Run | Hive=HKLM or HKCU | Finished=2026-02-07 08:00:31 | UserSID=$alice"; Artifact = "EventLogs" },
+    @{ Timestamp = "2026-02-07 08:00:01.000"; Description = "Command started at logon (key unknown): orphan.exe"; Details = "EventID=9708 | Command=orphan.exe | ProcessId=777 | UserSID=$alice" },
+    @{ Timestamp = "2026-02-07 08:00:35.000"; Description = "RunOnce key command started at logon: stage2.cmd"
+        Details = "EventID=9707 | Command=stage2.cmd | RegistryKey=Software\Microsoft\Windows\CurrentVersion\RunOnce | Hive=HKLM or HKCU | UserSID=$alice" },
+    @{ Timestamp = "2026-02-07 08:01:01.000"; Description = "Active Setup command started at logon: ie4uinit.exe -UserConfig"
+        Details = "EventID=9707 | Command=ie4uinit.exe -UserConfig | ProcessId=5150 | RegistryKey=Software\Microsoft\Active Setup\Installed Components | Hive=HKLM | LogonTask=ActiveSetup | Finished=2026-02-07 08:01:02 | UserSID=$alice" },
+    @{ Timestamp = "2026-02-07 08:02:00.000"; Description = "Command started at logon (key unknown): late.exe"; Details = "EventID=9707 | Command=late.exe | UserSID=$alice" }
 )
 
 # --- OAlerts ---
 $longAlert = "Microsoft Word has blocked macros. " + ("y" * 1100)
-Test-Case -Name "OAlerts 300: Office alerts (diagnostic events counted)" -Action {
+Test-Case -Name "OAlerts 300: Office alerts and add-in events (diagnostic events counted)" -Action {
     $records = @(
         (New-TestRecord -Provider "Microsoft Office 16 Alerts" -Id 300 -Time "2026-02-08 09:00:00" -Body (New-EventDataXml -Data @("Microsoft Word`n", "SECURITY WARNING  Macros have been disabled.`n", "200054`n", "16.0.19231.20156`n", "0x0`n", "invoice.docm`n"))),
         (New-TestRecord -Provider "Microsoft Office 16 Alerts" -Id 300 -Time "2026-02-08 09:01:00" -Body (New-EventDataXml -Data @("Compositor Type: 1", "EXCEL"))),
-        (New-TestRecord -Provider "Microsoft Office 16 Alerts" -Id 300 -Time "2026-02-08 09:02:00" -Level 2 -Body (New-EventDataXml -Data @("Microsoft Word", $longAlert, "100", "16.0.1", "", "")))
+        (New-TestRecord -Provider "Microsoft Office 16 Alerts" -Id 300 -Time "2026-02-08 09:02:00" -Level 2 -Body (New-EventDataXml -Data @("Microsoft Word", $longAlert, "100", "16.0.1", "", ""))),
+        # Office add-in events, laid out like real ones
+        (New-TestRecord -Provider "Microsoft Office 16 Alerts" -Id 300 -Time "2026-02-08 09:03:00" -Body (New-EventDataXml -Data @("Activated App`n", "Id=fa000000124, DisplayName=Copilot (Preview), Provider=Microsoft Corporation, Version=1.0.0.0, StoreType=Exchange`n", "Apps for Office`n", "16.0.19231.20156`n", "`n", "C:\Users\bob\Documents\report.docx`n"))),
+        (New-TestRecord -Provider "Microsoft Office 16 Alerts" -Id 300 -Time "2026-02-08 09:04:00" -Body (New-EventDataXml -Data @("Failed to parse element: VersionOverrides", "Id=65ff8bd9-e8d3-4581-a27a-75840c41de94, DisplayName=Forms, Provider=Contoso", "Apps for Office", "16.0.19231.20156", "0x8004323E", "")))
     )
     $logBefore = Get-LogLineCount
     Add-OfficeAlertEntries -Records $records -FileName "OAlerts.evtx" -FilePath "X:\OAlerts.evtx"
@@ -464,7 +595,11 @@ Test-Case -Name "OAlerts 300: Office alerts (diagnostic events counted)" -Action
     @{ Timestamp = "2026-02-08 09:00:00.000"; Source = "OAlerts.evtx"; EventType = "Execution"; Description = "Office alert (Microsoft Word): SECURITY WARNING Macros have been disabled."; User = ""
         Details = "EventID=300 | Application=Microsoft Word | Message=SECURITY WARNING Macros have been disabled. | P1=200054 | Version=16.0.19231.20156 | P3=0x0 | Document=invoice.docm"; Artifact = "EventLogs" },
     @{ Description = "Office alert (Microsoft Word): " + $longAlert.Substring(0, 200) + "..."
-        Details = "EventID=300 | Application=Microsoft Word | Message=" + $longAlert.Substring(0, 1000) + "... | P1=100 | Version=16.0.1" }
+        Details = "EventID=300 | Application=Microsoft Word | Message=" + $longAlert.Substring(0, 1000) + "... | P1=100 | Version=16.0.1" },
+    @{ Timestamp = "2026-02-08 09:03:00.000"; EventType = "Execution"; Description = "Office add-in event (Activated App): Copilot (Preview)"
+        Details = "EventID=300 | Event=Activated App | AddIn=Id=fa000000124, DisplayName=Copilot (Preview), Provider=Microsoft Corporation, Version=1.0.0.0, StoreType=Exchange | Component=Apps for Office | Version=16.0.19231.20156 | Document=C:\Users\bob\Documents\report.docx" },
+    @{ Description = "Office add-in event (Failed to parse element: VersionOverrides): Forms"
+        Details = "EventID=300 | Event=Failed to parse element: VersionOverrides | AddIn=Id=65ff8bd9-e8d3-4581-a27a-75840c41de94, DisplayName=Forms, Provider=Contoso | Component=Apps for Office | Version=16.0.19231.20156 | ErrorCode=0x8004323E" }
 )
 
 # --- Antivirus products' own logs (AntiVirus\*.evtx) ---
@@ -529,6 +664,7 @@ try {
     $script:mockEvtx.Records[$psFile] = @(
         (New-TestRecord -Provider "PowerShell" -Id 400 -Time "2026-02-10 09:00:00" -Body (New-EventDataXml -Data @("Available", "None", (New-PowerShellContext -HostApplication "powershell.exe -c 1")))),
         (New-TestRecord -Provider "PowerShell" -Id 403 -Time "2026-02-10 09:00:01" -Body (New-EventDataXml -Data @("Stopped", "Available", (New-PowerShellContext -HostApplication "powershell.exe -c 1")))),
+        (New-PipelineRecord -Time "2026-02-10 09:00:01" -HostApplication "powershell.exe -c 1" -CommandLine "Add-Type -AssemblyName System.Drawing" -HostId "11111111-0000-0000-0000-000000000001" -Commands @("Add-Type")),
         (New-TestRecord -Provider "PowerShell" -Id 600 -Time "2026-02-10 09:00:02" -Body (New-EventDataXml -Data @("Variable", "Started", "x"))),
         (New-TestRecord -Provider "PowerShell" -Id 300 -Time "2026-02-10 09:00:03" -Level 3 -Body (New-EventDataXml -Data @("x", "y")))
     )
@@ -541,6 +677,7 @@ try {
     )
     $script:mockEvtx.Records[$rdpFile] = @(
         (New-TestRecord -Provider $rdpProvider -Id 1024 -Time "2026-02-10 11:00:00" -UserSid $alice -ActivityId $activityA -Body (New-EventDataXml -Data ([ordered]@{ Name = "Server Name"; Value = "srv01"; CustomLevel = "Info" }))),
+        (New-TestRecord -Provider $rdpProvider -Id 1025 -Time "2026-02-10 11:00:00" -UserSid $alice -ActivityId $activityA),
         (New-TestRecord -Provider $rdpProvider -Id 1102 -Time "2026-02-10 11:00:01" -UserSid $alice -ActivityId $activityA -Body (New-EventDataXml -Data ([ordered]@{ Name = "Server Address"; Value = "10.1.2.3"; CustomLevel = "Info" }))),
         (New-TestRecord -Provider $rdpProvider -Id 1027 -Time "2026-02-10 11:00:02" -UserSid $alice -ActivityId $activityA -Body (New-EventDataXml -Data ([ordered]@{ DomainName = "CONTOSO"; SessionId = "2" }))),
         (New-TestRecord -Provider $rdpProvider -Id 1029 -Time "2026-02-10 11:00:03" -UserSid $alice -ActivityId $activityA -Body (New-EventDataXml -Data ([ordered]@{ TraceMessage = "hash=" }))),
@@ -558,6 +695,14 @@ try {
         (New-TestRecord -Provider "Microsoft-Windows-NTLM" -Id 4021 -Time "2026-02-10 12:00:05" -Level 3 -Body (New-EventDataXml -Data ([ordered]@{ TargetMachine = "fs02"; NtlmVersion = "NTLMv1" }))),
         (New-TestRecord -Provider "Microsoft-Windows-NTLM" -Id 4022 -Time "2026-02-10 12:00:06" -Body (New-EventDataXml -Data ([ordered]@{ RemoteClientMachine = "WKS-9"; NtlmVersion = "NTLMv2" }))),
         (New-TestRecord -Provider "Microsoft-Windows-NTLM" -Id 4023 -Time "2026-02-10 12:00:07" -Level 3 -Body (New-EventDataXml -Data ([ordered]@{ ClientIP = "10.0.0.8"; NtlmVersion = "NTLMv1" }))),
+        (New-TestRecord -Provider "Microsoft-Windows-Security-Netlogon" -Id 8005 -Time "2026-02-10 12:00:09" -Body (New-EventDataXml -Data ([ordered]@{ SChannelName = "FS01"; UserName = "bob"; DomainName = "CONTOSO"; WorkstationName = "WKS-9" }))),
+        (New-TestRecord -Provider "Microsoft-Windows-Security-Netlogon" -Id 8006 -Time "2026-02-10 12:00:10" -Body (New-EventDataXml -Data ([ordered]@{ SChannelName = "FS02"; UserName = "bob"; DomainName = "CONTOSO"; WorkstationName = "WKS-9" }))),
+        (New-TestRecord -Provider "Microsoft-Windows-NTLM" -Id 4013 -Time "2026-02-10 12:00:11" -Level 3 -Body (New-EventDataXml -Data ([ordered]@{ TargetName = "old01"; UserName = "bob"; DomainName = "CONTOSO" }))),
+        (New-TestRecord -Provider "Microsoft-Windows-NTLM" -Id 4024 -Time "2026-02-10 12:00:12" -Level 3 -Body (New-EventDataXml -Data ([ordered]@{ TargetName = "fs03"; UserName = "bob"; DomainName = "CONTOSO" }))),
+        (New-TestRecord -Provider "Microsoft-Windows-Security-Netlogon" -Id 4030 -Time "2026-02-10 12:00:13" -Body (New-EventDataXml -Data ([ordered]@{ AccountName = "bob"; AccountDomain = "CONTOSO"; AccountMachine = "WKS-9"; ServerName = "FS01"; NtlmVersion = "NTLMv1" }))),
+        (New-TestRecord -Provider "Microsoft-Windows-Security-Netlogon" -Id 4031 -Time "2026-02-10 12:00:14" -Level 3 -Body (New-EventDataXml -Data ([ordered]@{ AccountName = "bob"; AccountDomain = "CONTOSO"; AccountMachine = "WKS-8"; ServerName = "FS01"; NtlmVersion = "NTLMv1" }))),
+        (New-TestRecord -Provider "Microsoft-Windows-Security-Netlogon" -Id 4032 -Time "2026-02-10 12:00:15" -Body (New-EventDataXml -Data ([ordered]@{ AccountName = "dave"; AccountDomain = "CONTOSO"; AccountMachine = "WKS-3"; ServerName = "APP01"; NtlmVersion = "NTLMv2" }))),
+        (New-TestRecord -Provider "Microsoft-Windows-Security-Netlogon" -Id 4033 -Time "2026-02-10 12:00:16" -Level 3 -Body (New-EventDataXml -Data ([ordered]@{ AccountName = "dave"; AccountDomain = "CONTOSO"; AccountMachine = "WKS-4"; ServerName = "APP01"; NtlmVersion = "NTLMv1" }))),
         (New-TestRecord -Provider "Microsoft-Windows-NTLM" -Id 4001 -Time "2026-02-10 12:00:08" -Level 3 -Body (New-EventDataXml -Data ([ordered]@{ TargetName = "x" })))
     )
     $fwIds = @(2004, 2071, 2097, 2005, 2073, 2099, 2006, 2052, 2033, 2059, 2032, 2060, 2003, 2082, 2002, 2083, 2010, 2084)
@@ -571,10 +716,14 @@ try {
         (New-TestRecord -Provider $shellProvider -Id 9707 -Time "2026-02-10 14:00:01" -ProcessId "1" -Body (New-EventDataXml -Data ([ordered]@{ Command = "a.exe" }))),
         (New-TestRecord -Provider $shellProvider -Id 9708 -Time "2026-02-10 14:00:02" -ProcessId "1" -Body (New-EventDataXml -Data ([ordered]@{ PID = "5"; Command = "a.exe" }))),
         (New-TestRecord -Provider $shellProvider -Id 9706 -Time "2026-02-10 14:00:03" -ProcessId "1" -Body (New-EventDataXml -Data ([ordered]@{ KeyName = "Software\Microsoft\Windows\CurrentVersion\Run" }))),
-        (New-TestRecord -Provider $shellProvider -Id 62170 -Time "2026-02-10 14:00:04" -ProcessId "1")
+        (New-TestRecord -Provider $shellProvider -Id 62170 -Time "2026-02-10 14:00:04" -ProcessId "1"),
+        (New-TestRecord -Provider $shellProvider -Id 62170 -Time "2026-02-10 14:00:05" -ProcessId "1" -Body (New-EventDataXml -Data ([ordered]@{ LogonType = "0"; TaskName = "ActiveSetup" }))),
+        (New-TestRecord -Provider $shellProvider -Id 9707 -Time "2026-02-10 14:00:06" -ProcessId "1" -Body (New-EventDataXml -Data ([ordered]@{ Command = "stub.exe" }))),
+        (New-TestRecord -Provider $shellProvider -Id 62171 -Time "2026-02-10 14:00:07" -ProcessId "1" -Body (New-EventDataXml -Data ([ordered]@{ LogonType = "0"; TaskName = "ActiveSetup" })))
     )
     $script:mockEvtx.Records["OAlerts.evtx"] = @(
         (New-TestRecord -Provider "Microsoft Office 16 Alerts" -Id 300 -Time "2026-02-10 15:00:00" -Body (New-EventDataXml -Data @("Microsoft Excel", "Protected View", "1", "16.0", "", "a.xlsx"))),
+        (New-TestRecord -Provider "Microsoft Office 16 Alerts" -Id 300 -Time "2026-02-10 15:00:02" -Body (New-EventDataXml -Data @("Activated App", "Id=fa000000005, DisplayName=Ideas, Provider=Microsoft Office", "Apps for Office", "16.0", "", ""))),
         (New-TestRecord -Provider "Microsoft Office 16 Alerts" -Id 301 -Time "2026-02-10 15:00:01" -Body (New-EventDataXml -Data @("x", "y", "z")))
     )
     $script:mockEvtx.Records["Symantec_SEP_EventLog.evtx"] = @(
@@ -588,11 +737,12 @@ try {
     $expectedRows = @(
         @("Security.evtx", "Logon", "Successful logon (Network)", "LogonType=3 | Source=10.0.0.9:51515 | LogonID=0x99 | IpAddress=10.0.0.9 | WorkstationName=WKS-9 | AuthenticationPackageName=NTLM | LmPackageName=NTLM V1 | KeyLength=0"),
         @("Security.evtx", "Logon", "Successful logon (Interactive)", "LogonType=2 | Source=-:- | LogonID=0x77 | AuthenticationPackageName=Negotiate | KeyLength=0"),
-        @($psFile, "Execution", "PowerShell engine started: powershell.exe -c 1", "EventID=400 | *"),
-        @($psFile, "Execution", "PowerShell engine stopped: powershell.exe -c 1", "EventID=403 | *"),
-        @($wmiFile, "PersistenceChange", "WMI permanent event subscription: filter `"F`" -> CommandLineEventConsumer=`"C`"", "*CommandLineTemplate=cmd"),
+        @($psFile, "Execution", "PowerShell engine started: powershell.exe -c 1", "EventID=400 | *Stopped=2026-02-10 09:00:01"),
+        @($psFile, "Execution", "PowerShell pipeline executed: Add-Type -AssemblyName System.Drawing", "EventID=800 | CommandLine=Add-Type -AssemblyName System.Drawing | Commands=Add-Type | *"),
+        @($wmiFile, "PersistenceChange", "WMI permanent event subscription: filter `"F`" -> CommandLineEventConsumer=`"C`"", "*CommandLineTemplate=cmd | FilterCreatorSID=S-1-5-32-544"),
         @($wmiFile, "Execution", "WMI temporary event subscription: SELECT * FROM Win32_ProcessStartTrace", "EventID=5860 | *"),
         @($rdpFile, "NetworkConnection", "Outbound RDP connection to srv01", "EventID=1024 | *"),
+        @($rdpFile, "NetworkConnection", "Outbound RDP connection to srv01: connected to the server", "EventID=1025 | *"),
         @($rdpFile, "NetworkConnection", "Outbound RDP connection to srv01: multi-transport connection to 10.1.2.3", "EventID=1102 | *"),
         @($rdpFile, "NetworkConnection", "Outbound RDP connection to srv01: connected (domain CONTOSO, session 2)", "EventID=1027 | *"),
         @($rdpFile, "NetworkConnection", "Outbound RDP connection to srv01: user name hash hash=", "EventID=1029 | *"),
@@ -606,8 +756,18 @@ try {
         @($ntlmFile, "NetworkConnection", "Outgoing NTLM authentication to fs02 (NTLMv1)", "EventID=4021 | *"),
         @($ntlmFile, "Logon", "Incoming NTLM authentication from WKS-9 (NTLMv2)", "EventID=4022 | *"),
         @($ntlmFile, "Logon", "Incoming NTLM authentication from 10.0.0.8 (NTLMv1)", "EventID=4023 | *"),
+        @($ntlmFile, "Logon", "NTLM authentication passed to this domain controller: CONTOSO\bob from WKS-9 (secure channel FS01)", "EventID=8005 | *"),
+        @($ntlmFile, "Logon", "NTLM authentication passed to this domain controller: CONTOSO\bob from WKS-9 (secure channel FS02)", "EventID=8006 | *"),
+        @($ntlmFile, "NetworkConnection", "Outgoing NTLM authentication to old01 (NTLMv1, failed: not supported on this device)", "EventID=4013 | *"),
+        @($ntlmFile, "NetworkConnection", "Outgoing NTLM authentication to fs03 (NTLMv1-derived credentials, single sign-on)", "EventID=4024 | *"),
+        @($ntlmFile, "Logon", "NTLM authentication processed by this domain controller: CONTOSO\bob from WKS-9 to FS01 (NTLMv1)", "EventID=4030 | *"),
+        @($ntlmFile, "Logon", "NTLM authentication processed by this domain controller: CONTOSO\bob from WKS-8 to FS01 (NTLMv1)", "EventID=4031 | *"),
+        @($ntlmFile, "Logon", "Forwarded NTLM authentication processed by this domain controller: CONTOSO\dave from WKS-3 to APP01 (NTLMv2)", "EventID=4032 | *"),
+        @($ntlmFile, "Logon", "Forwarded NTLM authentication processed by this domain controller: CONTOSO\dave from WKS-4 to APP01 (NTLMv1)", "EventID=4033 | *"),
         @($shellFile, "Execution", "Run key command started at logon: a.exe", "EventID=9707 | Command=a.exe | ProcessId=5 | *"),
+        @($shellFile, "Execution", "Active Setup command started at logon: stub.exe", "EventID=9707 | Command=stub.exe | *LogonTask=ActiveSetup*"),
         @("OAlerts.evtx", "Execution", "Office alert (Microsoft Excel): Protected View", "EventID=300 | *"),
+        @("OAlerts.evtx", "Execution", "Office add-in event (Activated App): Ideas", "EventID=300 | Event=Activated App | *"),
         @("Symantec_SEP_EventLog.evtx", "SecurityAlert", "Antivirus event (Symantec Endpoint Protection Client 45): Tamper protection blocked a change", "EventID=45 | *Level=Error*"),
         @("CrowdStrike_EventLog.evtx", "SecurityAlert", "Antivirus event (CSFalconService 2): Malware detected and quarantined: C:\x.exe", "EventID=2 | *")
     )
@@ -714,62 +874,59 @@ $phase2Channels = @("Windows PowerShell", "Microsoft-Windows-WMI-Activity/Operat
     "Microsoft-Windows-NTLM/Operational", "Microsoft-Windows-Windows Firewall With Advanced Security/Firewall", "Microsoft-Windows-Shell-Core/Operational", "OAlerts")
 
 # =============================================================
-# Part 2: real records (no admin)
+# Part 2: real records (no admin; reads this machine's logs only)
 # =============================================================
 Write-Host ""
-Write-Host "Part 2: real records of this machine"
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $tag = "TLT" + (Get-Random -Minimum 100000 -Maximum 999999)
-$workDir = Join-Path ([System.IO.Path]::GetTempPath()) ("timeline-evtx2-test-" + [guid]::NewGuid().ToString("N"))
-$collection = Join-Path $workDir "collection"
-try {
-    # Windows PowerShell 5.1 started with an encoded command: events 400 / 403
-    $windowsPowerShell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-    $script = "Write-Output '$tag'"
-    $encodedTag = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($script))
-    $null = & $windowsPowerShell -NoProfile -NonInteractive -EncodedCommand $encodedTag 2>&1
-    Start-Sleep -Seconds 2
-    $exported = @(Export-TestChannels -Collection $collection -Channels $phase2Channels -Minutes 43200)
-    if ($exported -notcontains "Windows PowerShell") {
-        Write-Host "SKIPPED: Part 2 (the Windows PowerShell log could not be exported)" -ForegroundColor Yellow
-    }
-    else {
-        $result = Invoke-TestBuilder -Collection $collection -WorkDir $workDir -Label "Part 2"
-        if ($result) {
-            $hostId = ""
-            $started = @($result.Rows | Where-Object { $_.Source -eq "Windows PowerShell.evtx" -and $_.Details -like "*EncodedCommand=$script*" })
-            if ($started.Count -gt 0 -and $started[0].Details -match 'HostId=([0-9a-f-]+)') { $hostId = $Matches[1] }
-            Test-ExpectedRows -Rows $result.Rows -Label "Part 2" -Checks @(
-                , @("Windows PowerShell 400 with the decoded -EncodedCommand", "Windows PowerShell.evtx", "Execution", "PowerShell engine started: *powershell.exe*-EncodedCommand $encodedTag*",
-                    "EventID=400 | EngineVersion=5.1.* | HostName=ConsoleHost | *HostApplication=*-EncodedCommand $encodedTag | EncodedCommand=$script | HostId=*")
-            )
-            if ($hostId) {
-                Test-ExpectedRows -Rows $result.Rows -Label "Part 2" -Checks @(
-                    , @("Windows PowerShell 403 of the same session", "Windows PowerShell.evtx", "Execution", "PowerShell engine stopped: *-EncodedCommand $encodedTag*", "EventID=403 | *HostId=$hostId*")
-                )
+if (-not $isAdmin -and -not $BuilderPath) {
+    Write-Host "SKIPPED: Part 2 (real records): the repository's timeline-builder.ps1 needs Administrator. Run elevated, or pass" -ForegroundColor Yellow
+    Write-Host "         -BuilderPath with a copy of the builder without its administrator check." -ForegroundColor Yellow
+}
+else {
+    Write-Host "Part 2: real records of this machine"
+    $workDir = Join-Path ([System.IO.Path]::GetTempPath()) ("timeline-evtx2-test-" + [guid]::NewGuid().ToString("N"))
+    $collection = Join-Path $workDir "collection"
+    try {
+        $exported = @(Export-TestChannels -Collection $collection -Channels $phase2Channels -Minutes 43200)
+        if ($exported.Count -eq 0) {
+            Write-Host "SKIPPED: Part 2 (none of the logs could be exported)" -ForegroundColor Yellow
+        }
+        else {
+            $result = Invoke-TestBuilder -Collection $collection -WorkDir $workDir -Label "Part 2"
+            if ($result) {
+                # Engine starts in the export have rows
+                $psExport = Join-Path $collection "EventLogs\Windows PowerShell.evtx"
+                $starts = @()
+                if (Test-Path -LiteralPath $psExport) { $starts = @(Get-WinEvent -Path $psExport -FilterXPath "*[System[EventID=400]]" -ErrorAction SilentlyContinue) }
+                if ($starts.Count -gt 0) {
+                    $rows = @($result.Rows | Where-Object { $_.Source -eq "Windows PowerShell.evtx" -and $_.Details -like "EventID=400 | *" -and $_.Description -like "PowerShell*engine started*" })
+                    Write-TestResult -Name "Part 2: every Windows PowerShell 400 has its row" -Passed ($rows.Count -eq $starts.Count) -Message "$($starts.Count) event(s) 400 in the export, $($rows.Count) row(s)"
+                }
+                # Every exported log parses without warnings
+                $problems = @($result.Output | Where-Object { $_ -match "WARNING: .*(Error reading|Failed to parse)" })
+                Write-TestResult -Name "Part 2: the exported logs ($($exported -join ', ')) parse without errors" -Passed ($problems.Count -eq 0) -Message ($problems -join " || ")
+                $counts = @($result.Rows | Group-Object Source | Sort-Object Name | ForEach-Object { "$($_.Name) $($_.Count)" })
+                Write-Host "  Rows per log: $($counts -join ', ')"
             }
-            # Every exported log parses without warnings
-            $problems = @($result.Output | Where-Object { $_ -match "WARNING: .*(Error reading|Failed to parse)" })
-            Write-TestResult -Name "Part 2: the exported logs ($($exported -join ', ')) parse without errors" -Passed ($problems.Count -eq 0) -Message ($problems -join " || ")
-            $counts = @($result.Rows | Group-Object Source | Sort-Object Name | ForEach-Object { "$($_.Name) $($_.Count)" })
-            Write-Host "  Rows per log: $($counts -join ', ')"
         }
     }
-}
-catch {
-    Write-TestResult -Name "Part 2" -Passed $false -Message $_.Exception.Message
-}
-finally {
-    Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
+    catch {
+        Write-TestResult -Name "Part 2" -Passed $false -Message $_.Exception.Message
+    }
+    finally {
+        Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # =============================================================
 # Part 3: system test (changes this machine)
 # =============================================================
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $env:GITHUB_ACTIONS -and -not $AllowSystemChanges) {
     Write-Host ""
-    Write-Host "SKIPPED: Part 3 (system test). It changes this machine (a disabled firewall rule and the Public profile's log size,"
-    Write-Host "         undone afterwards; in GitHub Actions also a WMI subscription, NTLM auditing and an RDP client attempt)"
+    Write-Host "SKIPPED: Part 3 (system test). It changes this machine (Windows PowerShell started with an encoded command, which adds"
+    Write-Host "         events to its log; a disabled firewall rule and the Public profile's log size, undone afterwards; in GitHub Actions"
+    Write-Host "         also a WMI subscription, NTLM auditing and an RDP client attempt)"
     Write-Host "         and runs only in GitHub Actions or with -AllowSystemChanges (as Administrator)."
 }
 elseif (-not $isAdmin) {
@@ -791,7 +948,13 @@ else {
     $generated = $false
     $workDir = Join-Path ([System.IO.Path]::GetTempPath()) ("timeline-evtx2-system-" + [guid]::NewGuid().ToString("N"))
     $collection = Join-Path $workDir "collection"
+    $tagScript = "Write-Output '$tag'"
+    $encodedTag = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($tagScript))
     try {
+        # Windows PowerShell 5.1 started with an encoded command: 400 / 403
+        $windowsPowerShell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+        $null = & $windowsPowerShell -NoProfile -NonInteractive -EncodedCommand $encodedTag 2>&1
+
         # Firewall: a disabled rule added (2097 / 2004), changed (2099 / 2005),
         # deleted (2052 / 2006); the Public profile's log size changed and back
         $null = New-NetFirewallRule -Name $ruleName -DisplayName $ruleName -Direction Inbound -Action Allow -Protocol TCP -LocalPort 49123 `
@@ -865,6 +1028,8 @@ else {
                 $rows = $result.Rows
                 $fw = "Microsoft-Windows-Windows Firewall With Advanced Security%4Firewall.evtx"
                 $checks = @(
+                    @("Windows PowerShell 400 with the decoded -EncodedCommand and its 403 (Stopped)", "Windows PowerShell.evtx", "Execution", "PowerShell engine started: *powershell.exe*-EncodedCommand $encodedTag*",
+                        "EventID=400 | EngineVersion=5.1.* | HostName=ConsoleHost | *HostApplication=*-EncodedCommand $encodedTag | EncodedCommand=$tagScript | HostId=* | Stopped=*"),
                     @("firewall rule added", $fw, "PersistenceChange", "Firewall rule added: $ruleName (Inbound, Allow)", "EventID=* | RuleName=$ruleName | *Direction=Inbound | Action=Allow | Protocol=TCP | LocalPorts=49123 | *ModifyingUser=S-1-5-*"),
                     @("firewall rule modified", $fw, "PersistenceChange", "Firewall rule modified: $ruleName (Inbound, Allow)", "*LocalPorts=49124*"),
                     @("firewall rule deleted", $fw, "PersistenceChange", "Firewall rule deleted: $ruleName", "EventID=* | RuleName=$ruleName | *"),
