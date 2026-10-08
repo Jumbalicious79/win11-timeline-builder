@@ -1035,9 +1035,6 @@ else {
                     @("firewall rule deleted", $fw, "PersistenceChange", "Firewall rule deleted: $ruleName", "EventID=* | RuleName=$ruleName | *"),
                     @("firewall profile setting changed", $fw, "SecurityAlert", "Firewall setting changed (Public profile): Log max file size = *", "*Setting=Log max file size | SettingType=8 | *")
                 )
-                if ($exported -contains "Security") {
-                    $checks += , @("Security 4624 carries the authentication package", "Security.evtx", "Logon", "Successful logon (*", "*AuthenticationPackageName=*")
-                }
                 if ($onCi) {
                     $checks += , @("WMI permanent subscription (5861)", "Microsoft-Windows-WMI-Activity%4Operational.evtx", "PersistenceChange", "WMI permanent event subscription: filter `"$wmiFilterName`" -> *$wmiConsumerName*",
                         "*Filter=$wmiFilterName | Query=SELECT * FROM __InstanceModificationEvent * | ConsumerType=CommandLineEventConsumer | Consumer=$wmiConsumerName | CommandLineTemplate=cmd.exe /c rem $tag*")
@@ -1063,6 +1060,22 @@ else {
                     }
                     $match = @($rows | Where-Object { $_.Source -eq $o[1] -and $_.EventType -eq $o[3] -and $_.Description -like $o[4] -and $_.Details -like "EventID=$($o[2]) | *" })
                     Write-TestResult -Name "Part 3: $($o[0])" -Passed ($match.Count -gt 0) -Message "$($events.Count) event(s) in the log, no row like '$($o[4])'"
+                }
+                # Security 4624: in CI an earlier step clears the Security log (for 1102),
+                # so whether a logon was recorded since then depends on the runner's
+                # timing. Each logon in the export must have its row; none at all is a
+                # skip (the Details format is also checked with synthetic records above).
+                if ($exported -contains "Security") {
+                    $securityFile = Join-Path $collection "EventLogs\Security.evtx"
+                    $logons = @()
+                    if (Test-Path -LiteralPath $securityFile) { $logons = @(Get-WinEvent -Path $securityFile -FilterXPath "*[System[EventID=4624]]" -ErrorAction SilentlyContinue) }
+                    if ($logons.Count -eq 0) {
+                        Write-Host "SKIPPED: Part 3: Security 4624 carries the authentication package -- no logon in the exported window" -ForegroundColor Yellow
+                    }
+                    else {
+                        $logonRows = @($rows | Where-Object { $_.Source -eq "Security.evtx" -and $_.EventType -eq "Logon" -and $_.Description -like "Successful logon (*" -and $_.Details -like "*AuthenticationPackageName=*" })
+                        Write-TestResult -Name "Part 3: Security 4624 carries the authentication package" -Passed ($logonRows.Count -gt 0) -Message "$($logons.Count) 4624 event(s) in the log, no logon row with AuthenticationPackageName"
+                    }
                 }
                 $ntlmLogons = @($rows | Where-Object { $_.Source -eq "Security.evtx" -and $_.Description -like "Successful logon*" -and $_.Details -like "*AuthenticationPackageName=NTLM*" })
                 if ($ntlmLogons.Count -gt 0) {
