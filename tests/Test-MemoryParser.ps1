@@ -2,15 +2,17 @@
 # Memory parser test
 # Checks where the Memory parser finds a collection's memory dump
 # (Find-MemoryDump) on synthetic folders: -MemoryDumpPath first (also a
-# relative path; a path that is not a file is reported once, then the
-# other places are tried), the dump next to the collection zip (.dmp or
-# .raw), Memory\ inside the collection, and the dump next to the
-# collection folder, which must be named after that folder: another
-# collection's dump in the same folder (e.g. the collector's reports\) is
-# never used. The collection folder is the folder of collection_manifest.csv
-# (also below -InputPath and in the <name>\<name>\ layout of Windows
-# "Extract All"), else -InputPath. Parse-Memory without a dump must point
-# to -MemoryDumpPath. Volatility 3 is not run.
+# relative path and one with [ ] in it; a path that is not a file is
+# reported once, then the other places are tried), the dump next to the
+# collection zip (.dmp or .raw), Memory\ inside the collection, and the
+# dump next to the collection folder or next to -InputPath (an outer
+# folder of another name, also given as a relative path), which must be
+# named after the collection folder: another collection's dump in the same
+# folder (e.g. the collector's reports\) is never used. The collection
+# folder is the folder of collection_manifest.csv (also below -InputPath
+# and in the <name>\<name>\ layout of Windows "Extract All"), else
+# -InputPath. Parse-Memory without a dump must point to -MemoryDumpPath.
+# Volatility 3 is not run.
 # The builder's functions are loaded from its AST, so the script itself (and
 # its Administrator check) does not run: no admin rights needed.
 # Exit code 0 = pass, 1 = fail.
@@ -114,6 +116,7 @@ $nameF = "TriageCollection_2025-06-25_10-10"   # manifest below -InputPath
 $nameG = "TriageCollection_2025-06-24_16-45"   # a folder named like its dump
 $nameH = "TriageCollection_2025-06-23_11-20"   # no collection_manifest.csv
 $nameR = "TriageCollection_2025-06-22_13-55"   # a raw image next to the zip
+$nameI = "TriageCollection_2025-06-21_15-35"   # extracted into a folder of another name
 $missingWarning = "-MemoryDumpPath is not an existing file:"
 
 $workDir = Join-Path ([System.IO.Path]::GetTempPath()) ("memory-parser-test-" + [guid]::NewGuid().ToString("N"))
@@ -124,6 +127,7 @@ try {
     $extracted = Join-Path $workDir "work\in"
     $dumps = Join-Path $workDir "dumps"
     $cases = Join-Path $workDir "cases"
+    $caseDir = Join-Path $workDir "Case001"   # <zip>, its dump, Extracted\<collection>\
 
     foreach ($name in @($nameA, $nameC, $nameR)) {
         New-TestFile (Join-Path $reports "$name.zip")
@@ -138,10 +142,15 @@ try {
     $dumpD = Join-Path $reports "$nameD\Memory\memory_dump.raw"
     $elsewhereA = Join-Path $dumps "${nameA}_memory_dump.dmp"
     $elsewhereC = Join-Path $dumps "${nameC}_memory_dump.dmp"
-    foreach ($file in @($dumpA, $dumpB, $dumpR, $dumpE, $dumpF, $dumpH, $dumpD, $elsewhereA, $elsewhereC)) { New-TestFile $file }
+    $bracketedC = Join-Path $workDir "dumps [7]\${nameC}_memory_dump.dmp"
+    $dumpI = Join-Path $caseDir "${nameI}_memory_dump.dmp"
+    $otherI = Join-Path $caseDir "${nameB}_memory_dump.dmp"
+    foreach ($file in @($dumpA, $dumpB, $dumpR, $dumpE, $dumpF, $dumpH, $dumpD, $elsewhereA, $elsewhereC, $bracketedC, $dumpI, $otherI)) { New-TestFile $file }
     foreach ($name in @($nameA, $nameC, $nameD, $nameG)) { New-TestCollection (Join-Path $reports $name) }
     New-TestCollection (Join-Path $reports "$nameE\$nameE")
+    New-TestCollection (Join-Path $reports "Extracted\$nameC")
     New-TestCollection (Join-Path $cases $nameF)
+    New-TestCollection (Join-Path $caseDir "Extracted\$nameI")
     New-TestFile (Join-Path $reports "$nameH\USB\setupapi.dev.log")
     [void][System.IO.Directory]::CreateDirectory((Join-Path $reports "${nameG}_memory_dump.dmp"))
 
@@ -165,6 +174,8 @@ try {
     Pop-Location
     $pushed = $false
     Assert-Equal -Name "-MemoryDumpPath: a relative path becomes a full path" -Expected $elsewhereC -Actual $run.Path
+    $run = Invoke-FindMemoryDump -Collection (Join-Path $reports $nameC) -DumpPath $bracketedC
+    Assert-Equal -Name "-MemoryDumpPath: [ ] in the path are not wildcards" -Expected "$bracketedC|" -Actual "$($run.Path)|$($run.Log)"
 
     $missing = Join-Path $dumps "missing_memory_dump.dmp"
     $run = Invoke-FindMemoryDump -Collection (Join-Path $extracted $nameA) -Zip $zipA -DumpPath $missing
@@ -203,6 +214,20 @@ try {
     Assert-Equal -Name "Extract All: the inner folder as -InputPath, the dump next to the outer one" -Expected $dumpE -Actual $run.Path
     $run = Invoke-FindMemoryDump -Collection $cases
     Assert-Equal -Name "manifest below -InputPath: the dump named after the manifest's folder" -Expected $dumpF -Actual $run.Path
+
+    # An outer folder of another name as -InputPath (e.g. 7-Zip "Extract
+    # files..." into Case001\Extracted\): the dump next to the zip is next to
+    # -InputPath, not next to the collection folder
+    $run = Invoke-FindMemoryDump -Collection (Join-Path $caseDir "Extracted")
+    Assert-Equal -Name "outer folder of another name as -InputPath: the dump named after the collection, next to -InputPath" -Expected $dumpI -Actual $run.Path
+    Push-Location -LiteralPath $caseDir
+    $pushed = $true
+    $run = Invoke-FindMemoryDump -Collection ".\Extracted"
+    Pop-Location
+    $pushed = $false
+    Assert-Equal -Name "outer folder as a relative -InputPath: the dump next to it" -Expected $dumpI -Actual $run.Path
+    $run = Invoke-FindMemoryDump -Collection (Join-Path $reports "Extracted")
+    Assert-Equal -Name "outer folder as -InputPath: other collections' dumps next to it are not used" -Expected "" -Actual $run.Path
 
     # --- Parse-Memory without a dump ------------------------------------------
     $noDumpWarning = "WARNING: No memory dump found in the collection or next to it (pass -MemoryDumpPath with the dump file if it was saved elsewhere)."

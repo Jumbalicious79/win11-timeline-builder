@@ -809,7 +809,8 @@ it is too large to zip. The dump is looked for in this order:
   2. next to the collection zip: <zip name>_memory_dump.dmp or .raw
   3. inside the collection folder (Memory\memory_dump.dmp or .raw, where
      the collector leaves it with -NoCompress)
-  4. next to the collection folder (the folder of collection_manifest.csv):
+  4. next to the collection folder (the folder of collection_manifest.csv)
+     or next to -InputPath (an outer folder that holds the collection):
      only <folder name>_memory_dump.dmp or .raw, so the dump of another
      collection in the same folder (e.g. the collector's reports\) is
      never used. After Windows "Extract All" (<name>\<name>\), a dump next
@@ -1333,14 +1334,15 @@ parsing is skipped, and the timeline CSV can be opened manually.
 
   tests\Test-MemoryParser.ps1 -- loads the builder's functions and checks
   where the memory dump is found, on synthetic folders: -MemoryDumpPath
-  first (also a relative path; a missing file or a folder gives one
-  warning, then the other places are searched), next to the collection
-  zip (.dmp or .raw), Memory\ inside the collection, and next to the
-  collection folder only under that folder's name (another collection's
-  dump in the same folder is not used; also with collection_manifest.csv
-  below -InputPath and after Windows "Extract All"). It also checks the
-  Memory parser's warning when there is no dump. Volatility 3 is not run;
-  no admin needed.
+  first (also a relative path and one with [ ] in it; a missing file or
+  a folder gives one warning, then the other places are searched), next
+  to the collection zip (.dmp or .raw), Memory\ inside the collection,
+  and next to the collection folder or -InputPath only under the
+  collection folder's name (another collection's dump in the same folder
+  is not used; also with collection_manifest.csv below -InputPath, an
+  outer -InputPath of another name and after Windows "Extract All"). It
+  also checks the Memory parser's warning when there is no dump.
+  Volatility 3 is not run; no admin needed.
 
   Run them from an elevated PowerShell; -AllowSystemChanges lets the event
   log and registry tests change this machine:

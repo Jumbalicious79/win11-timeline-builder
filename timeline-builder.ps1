@@ -10271,10 +10271,12 @@ function Find-MemoryDump {
     if ($memFiles.Count -gt 0) { return $memFiles[0].FullName }
 
     # Check 4: Next to the collection folder (the folder of
-    # collection_manifest.csv, else -InputPath), by its name only: a folder
-    # such as the collector's reports\ holds the dumps of other collections
-    # too. Windows "Extract All" of <name>.zip makes <name>\<name>\, so the
-    # dump next to the zip is then next to the outer folder.
+    # collection_manifest.csv, else -InputPath) and next to -InputPath (an
+    # outer folder that holds the collection), by the collection folder's
+    # name only: a folder such as the collector's reports\ holds the dumps
+    # of other collections too. Windows "Extract All" of <name>.zip makes
+    # <name>\<name>\, so the dump next to the zip is then next to the outer
+    # folder.
     $root = Get-CollectionRootFolder
     $collectionName = [System.IO.Path]::GetFileName($root)
     $parentDir = [System.IO.Path]::GetDirectoryName($root)
@@ -10282,6 +10284,9 @@ function Find-MemoryDump {
     $dumpDirs = @($parentDir)
     $outerParentDir = [System.IO.Path]::GetDirectoryName($parentDir)
     if ($outerParentDir -and [System.IO.Path]::GetFileName($parentDir) -eq $collectionName) { $dumpDirs += $outerParentDir }
+    $inputDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($InputPath).TrimEnd('\')
+    $inputParentDir = [System.IO.Path]::GetDirectoryName($inputDir)
+    if ($inputParentDir -and $dumpDirs -notcontains $inputParentDir) { $dumpDirs += $inputParentDir }
     foreach ($dumpDir in $dumpDirs) {
         foreach ($ext in $extensions) {
             $namedDump = Join-Path $dumpDir "${collectionName}_memory_dump.$ext"
@@ -10381,7 +10386,7 @@ function Parse-Memory {
         @{ Name = "windows.svcscan"; EventType = "ServiceChange";     Source = "Memory-Services";    Desc = "Windows services" }
     )
 
-    $dumpTimestamp = (Get-Item $dumpPath).LastWriteTimeUtc
+    $dumpTimestamp = (Get-Item -LiteralPath $dumpPath).LastWriteTimeUtc
     $totalMemEntries = 0
 
     foreach ($plugin in $plugins) {
@@ -11211,7 +11216,7 @@ if ($Sources -notcontains "Memory") {
         }
 
         if ($volAvailable) {
-            $dumpSizeGB = [math]::Round((Get-Item $detectedDump).Length / 1GB, 2)
+            $dumpSizeGB = [math]::Round((Get-Item -LiteralPath $detectedDump).Length / 1GB, 2)
             Write-Host ""
             Write-Host "========================================" -ForegroundColor Cyan
             Write-Host "  Memory Dump Detected" -ForegroundColor Cyan
