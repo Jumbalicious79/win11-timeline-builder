@@ -10198,9 +10198,11 @@ function Parse-PowerShellHistory {
                     else { $entryName = $e.Path -replace "`t", " " }
                 }
                 if ($e.LastModifiedUtc) {
-                    # The time is the file's last-modified time, not when it ran
-                    Add-TimelineEntry -Timestamp $e.LastModifiedUtc -Source "AppCompatCache" -EventType "Execution" `
-                        -Description "ShimCache entry: $entryName" `
+                    # The time is the file's last-modified time, not when it
+                    # ran (on Windows 10/11 an entry alone does not prove
+                    # that it ran): FileLastModified, not Execution
+                    Add-TimelineEntry -Timestamp $e.LastModifiedUtc -Source "AppCompatCache" -EventType "FileLastModified" `
+                        -Description "ShimCache entry (file last modified): $entryName" `
                         -Details "$($entryNote)Time=file last-modified time (NOT an execution time); CachePosition=$($e.Position) of $total (1 = most recent)" `
                         -Artifact "Registry" -RawPath $shimSource
                     $timed++
@@ -11590,6 +11592,7 @@ if (-not $skipExcel -and (Get-Module -ListAvailable -Name ImportExcel)) {
             "SecurityAlert"       = "FF4D4D"   # Bright red (bold text)
             "NetworkConnection"   = "6BB5FF"   # Blue
             "FileAccess"          = "D9D9D9"   # Light gray
+            "FileLastModified"    = "E2C9A0"   # Tan (ShimCache file time, not an execution)
             "Snapshot"            = "F2F2F2"   # Very light gray (state, not an event)
             "ServiceChange"       = "FFFF00"   # Yellow
             "ScheduledTaskChange" = "FFFF00"   # Yellow
@@ -11704,6 +11707,7 @@ if (-not $skipExcel -and (Get-Module -ListAvailable -Name ImportExcel)) {
         Log "    Bright red   SecurityAlert        -- AV detections, security tampering (bold)"
         Log "    Blue         NetworkConnection    -- network activity, browser, DNS"
         Log "    Gray         FileAccess           -- file system activity"
+        Log "    Tan          FileLastModified     -- file last-modified time (ShimCache), not execution"
         Log "    Yellow       ServiceChange        -- service state changes"
         Log "    Yellow       ScheduledTaskChange  -- task scheduler changes"
         Log "    Purple       USBDevice            -- USB device connections"
