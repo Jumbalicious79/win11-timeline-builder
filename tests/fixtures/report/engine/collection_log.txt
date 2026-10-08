@@ -1,0 +1,18 @@
+[2026-03-10 04:00:00] === Windows Forensic Triage Collection Started ===
+[2026-03-10 04:00:00] Output directory: C:\Collection
+[2026-03-10 04:00:00] Target drive: C:
+[2026-03-10 04:00:00] Mode: LIVE SYSTEM (full collection with live commands)
+[2026-03-10 04:00:00] OK: Temporary Defender exclusion added for output path (will be removed at end).
+[2026-03-10 04:00:00] Computer: WS01 (collector host)
+[2026-03-10 04:00:00] User: examiner
+[2026-03-10 04:00:01] OS: Microsoft Windows 11 Pro Build 26100
+[2026-03-10 04:00:01] Time zone: (UTC-08:00) Pacific Time (US & Canada)
+[2026-03-10 04:00:02] WARNING: Could not copy: C:\Windows\System32\config\BBI -- The process cannot access the file because it is being used by another process.
+[2026-03-10 04:00:03] ERROR: Unexpected error at line 1234 (rest of this step skipped): Access is denied.
+[2026-03-10 04:00:04] ERROR: Failed to export Microsoft-Windows-Sysmon/Operational: The specified channel could not be found.
+[2026-03-10 04:05:00] =============================================================
+[2026-03-10 04:05:00]   COLLECTION SUMMARY
+[2026-03-10 04:05:00] =============================================================
+[2026-03-10 04:05:00]   Files collected: 512
+[2026-03-10 04:05:00]   Errors:         2
+[2026-03-10 04:05:00] =============================================================

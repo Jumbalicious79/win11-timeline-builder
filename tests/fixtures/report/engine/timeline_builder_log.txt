@@ -1,0 +1,8 @@
+[2026-03-10 05:00:00] === Windows 11 Forensic Timeline Builder Started ===
+[2026-03-10 05:00:00] Input Path : C:\Collection
+[2026-03-10 05:00:00] Sources    : EventLogs, Prefetch, FileSystem, UsnJournal, SystemInfo
+[2026-03-10 05:00:00]
+[2026-03-10 05:00:01] Collection metadata from collection_info.json: Mode=Live Start=2026-03-10 12:00:00 UTC CollectorTZ=Pacific Standard Time TargetTZ=Pacific Standard Time
+[2026-03-10 05:00:02]   Window: times from 2026-03-03 12:00:00 UTC, 7 day(s) before the collection start (2026-03-10 12:00:00 UTC) (-MftDays 0 = all).
+[2026-03-10 05:00:03] WARNING: No systeminfo.txt found in the collection.
+[2026-03-10 05:00:04] === Timeline Builder Completed Successfully ===
