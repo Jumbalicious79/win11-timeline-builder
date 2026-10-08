@@ -55,18 +55,33 @@ param(
 
     # Viewer to open at the end without asking (for scripts and automation)
     [Parameter(Mandatory = $false)]
-    [ValidateSet("Excel", "TimelineExplorer", "Both", "None")]
+    [ValidateSet("Excel", "TimelineExplorer", "Both", "Report", "None")]
     [string]$Viewer,
 
     # CSV only: don't generate timeline.xlsx (ImportExcel isn't needed)
     [Parameter(Mandatory = $false)]
-    [switch]$NoExcel
+    [switch]$NoExcel,
+
+    # Don't write the findings report (report.html, report.pdf, findings.csv)
+    [Parameter(Mandatory = $false, ParameterSetName = "Direct")]
+    [Parameter(Mandatory = $false, ParameterSetName = "Browse")]
+    [switch]$NoReport,
+
+    # Rebuild only the findings report from an existing timeline: a
+    # timeline.csv, or a reports\timeline_* folder that holds one. Nothing is
+    # parsed, and no administrator rights are needed.
+    [Parameter(ParameterSetName = "ReportOnly", Mandatory = $true)]
+    [string]$ReportOnly,
+
+    # Rules file for the findings report (default: report\report-rules.json)
+    [Parameter(Mandatory = $false)]
+    [string]$ReportRules
 )
 
-# --- Require Administrator ---
+# --- Require Administrator (not for -ReportOnly: it only reads a timeline) ---
 $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
-if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+if (-not $ReportOnly -and -not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host ""
     Write-Host "ERROR: This script must be run as Administrator." -ForegroundColor Red
     Write-Host "  Option 1: Double-click Run-TimelineBuilder.bat (recommended)" -ForegroundColor Yellow
@@ -219,13 +234,30 @@ if ($Browse) {
 
 $ErrorActionPreference = "Continue"
 $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
-$reportDir = Join-Path $PSScriptRoot "reports\timeline_$timestamp"
-New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
-$logFile = Join-Path $reportDir "timeline_builder_log.txt"
+if ($ReportOnly) {
+    # -ReportOnly works in the existing timeline folder and logs to its
+    # report_log.txt (the builder log of the original run stays as it was)
+    $OutputFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ReportOnly)
+    if (Test-Path -LiteralPath $OutputFile -PathType Container) { $OutputFile = Join-Path $OutputFile "timeline.csv" }
+    if (-not (Test-Path -LiteralPath $OutputFile -PathType Leaf)) {
+        Write-Host ""
+        Write-Host "ERROR: -ReportOnly needs a timeline.csv, or a reports\timeline_* folder that holds one:" -ForegroundColor Red
+        Write-Host "  $OutputFile" -ForegroundColor Yellow
+        Write-Host ""
+        exit 1
+    }
+    $reportDir = Split-Path $OutputFile -Parent
+    $logFile = Join-Path $reportDir "report_log.txt"
+}
+else {
+    $reportDir = Join-Path $PSScriptRoot "reports\timeline_$timestamp"
+    New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
+    $logFile = Join-Path $reportDir "timeline_builder_log.txt"
 
-# Set default output file if not specified
-if (-not $OutputFile) {
-    $OutputFile = Join-Path $reportDir "timeline.csv"
+    # Set default output file if not specified
+    if (-not $OutputFile) {
+        $OutputFile = Join-Path $reportDir "timeline.csv"
+    }
 }
 
 # =============================================================
@@ -259,6 +291,661 @@ function Log-Success {
     Add-Content -Path $logFile -Value $entry
 }
 
+# Characters that are not allowed in XML 1.0 (and so break the .xlsx):
+# control characters other than tab/LF/CR, U+FFFE/U+FFFF, and unpaired
+# surrogate halves. Everything else is kept, including non-Latin text and
+# emoji (properly paired surrogates). Used by Add-TimelineEntry, the Excel
+# export and the workbook's Findings sheet.
+$script:xmlInvalidPattern = '[\x00-\x08\x0B\x0C\x0E-\x1F\uFFFE\uFFFF]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]'
+$script:xmlInvalidRegex = New-Object System.Text.RegularExpressions.Regex($script:xmlInvalidPattern, [System.Text.RegularExpressions.RegexOptions]::Compiled)
+
+# =============================================================
+# Findings report (report.html, report.pdf, findings.csv)
+# =============================================================
+# The rules engine and report model (report\TimelineReport.Engine.ps1) and the
+# renderer (report\TimelineReport.Render.ps1) are dot-sourced here, at script
+# level, so their functions and compiled helper stay available. The rules
+# are data (report\report-rules.json, or -ReportRules): keyword lists such as
+# attacker-tool names live only there, never in a .ps1 file (Defender's AMSI
+# blocks PowerShell code that holds such names). A report problem never fails
+# the timeline: it is logged as a warning and the run goes on.
+$script:reportRulesFile = Join-Path $PSScriptRoot "report\report-rules.json"
+if ($ReportRules) { $script:reportRulesFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ReportRules) }
+$script:reportScriptsLoaded = $false
+$script:reportLoadError = ""
+if (-not $NoReport) {
+    try {
+        . (Join-Path $PSScriptRoot "report\TimelineReport.Engine.ps1")
+        . (Join-Path $PSScriptRoot "report\TimelineReport.Render.ps1")
+        $script:reportScriptsLoaded = $true
+    }
+    catch { $script:reportLoadError = $_.Exception.Message }
+}
+
+# Severity colors of the report, reused in the workbook: fill, then text
+$script:reportSeverityColors = @{
+    High   = @("FFC7CE", "9C0006")
+    Medium = @("FFEB9C", "7A4500")
+    Info   = @("DDEBF7", "1F4E79")
+}
+
+# What the report says about the collection. collection_info.json gives the
+# computer name and the collector's user (Get-CollectionInfo does not keep
+# them); the builder's own view of the collection (-BuilderInfo, the
+# Get-CollectionInfo object) wins over it. -ReportOnly has no builder view, so
+# the "Collection metadata" line of the original run's log stands in for it.
+function Get-TimelineReportCollectionInfo {
+    param([string]$InfoJsonPath, $BuilderInfo, [string]$BuilderLogPath)
+    $info = [ordered]@{
+        ComputerName             = ""
+        CollectorUser            = ""
+        Mode                     = ""
+        TargetTimeZoneId         = ""
+        CollectionStartUtc       = $null
+        SecretsIncluded          = $false
+        ThunderbirdIndexIncluded = $false
+    }
+    if ($InfoJsonPath -and (Test-Path -LiteralPath $InfoJsonPath -PathType Leaf)) {
+        try {
+            $json = Get-Content -LiteralPath $InfoJsonPath -Raw -ErrorAction Stop | ConvertFrom-Json
+            foreach ($name in @("ComputerName", "CollectorUser", "Mode", "TargetTimeZoneId")) {
+                if ($json.PSObject.Properties[$name] -and $json.$name) { $info[$name] = [string]$json.$name }
+            }
+            # Text, or a [datetime] in PowerShell 7: the engine reads both
+            if ($json.PSObject.Properties["CollectionStartUtc"] -and $json.CollectionStartUtc) { $info.CollectionStartUtc = $json.CollectionStartUtc }
+            foreach ($name in @("SecretsIncluded", "ThunderbirdIndexIncluded")) {
+                if ($json.PSObject.Properties[$name]) { $info[$name] = [bool]$json.$name }
+            }
+        }
+        catch { Log-Warning "  Could not read $InfoJsonPath for the report: $($_.Exception.Message)" }
+    }
+    if ($BuilderInfo) {
+        if ($BuilderInfo.Mode) { $info.Mode = [string]$BuilderInfo.Mode }
+        if ($BuilderInfo.CollectionStartUtc) { $info.CollectionStartUtc = $BuilderInfo.CollectionStartUtc }
+        if ($BuilderInfo.TargetTimeZone) { $info.TargetTimeZoneId = $BuilderInfo.TargetTimeZone.Id }
+        $info.SecretsIncluded = [bool]$BuilderInfo.SecretsIncluded
+        $info.ThunderbirdIndexIncluded = [bool]$BuilderInfo.ThunderbirdIndexIncluded
+    }
+    elseif ($BuilderLogPath -and (Test-Path -LiteralPath $BuilderLogPath -PathType Leaf)) {
+        foreach ($line in @(Get-Content -LiteralPath $BuilderLogPath -TotalCount 300 -ErrorAction SilentlyContinue)) {
+            if ($line -match 'Collection metadata from .+?: Mode=(\S*) Start=(.+?) CollectorTZ=.* TargetTZ=(.+?)\s*$') {
+                $loggedMode = $Matches[1]
+                $loggedStart = $Matches[2]
+                $loggedZone = $Matches[3]
+                if ($loggedMode) { $info.Mode = $loggedMode }
+                if ($loggedZone) { $info.TargetTimeZoneId = $loggedZone }
+                $start = [datetime]::MinValue
+                $styles = [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal
+                if ([datetime]::TryParseExact($loggedStart, "yyyy-MM-dd HH:mm:ss 'UTC'", [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$start)) {
+                    $info.CollectionStartUtc = $start
+                }
+            }
+            elseif ($line -match '\] Collection made with -IncludeSecrets') { $info.SecretsIncluded = $true }
+        }
+    }
+    return [PSCustomObject]$info
+}
+
+# Copies collection_info.json and collection_log.txt next to the timeline, so
+# -ReportOnly can rebuild the report later without the collection
+function Copy-TimelineReportInputs {
+    param([string]$Folder, [string[]]$Paths)
+    foreach ($path in $Paths) {
+        if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+        $destination = Join-Path $Folder (Split-Path $path -Leaf)
+        if ([System.IO.Path]::GetFullPath($path) -ieq [System.IO.Path]::GetFullPath($destination)) { continue }
+        try { Copy-Item -LiteralPath $path -Destination $destination -Force -ErrorAction Stop }
+        catch { Log-Warning "  Could not copy $(Split-Path $path -Leaf) next to the timeline: $($_.Exception.Message)" }
+    }
+}
+
+# Loads the rules and runs them on the final timeline rows (row i is Excel
+# row i + 2). Returns what the later report steps need, or $null (after a
+# warning) when no report can be made.
+function Invoke-TimelineReportRules {
+    param([System.Collections.IList]$Rows, [string]$RulesPath, $CollectionInfo)
+    Log ""
+    Log "--- Running Report Rules ---"
+    if (-not $script:reportScriptsLoaded) {
+        Log-Warning "  The report scripts in report\ could not be loaded ($($script:reportLoadError)) -- no findings report."
+        return $null
+    }
+    if (-not (Test-Path -LiteralPath $RulesPath -PathType Leaf)) {
+        Log-Warning "  Rules file not found: $RulesPath -- no findings report."
+        return $null
+    }
+    try {
+        $timer = [System.Diagnostics.Stopwatch]::StartNew()
+        $rules = Import-ReportRules -Path $RulesPath
+        $statistics = @{}
+        $ruleWarnings = $null
+        $findings = @(Invoke-ReportRules -Rows $Rows -Rules $rules -CollectionInfo $CollectionInfo -Statistics $statistics -WarningVariable ruleWarnings -WarningAction SilentlyContinue)
+        $timer.Stop()
+        foreach ($warning in @($ruleWarnings)) { Log-Warning "  $warning" }
+        $high = @($findings | Where-Object { $_.Severity -eq "High" }).Count
+        $medium = @($findings | Where-Object { $_.Severity -eq "Medium" }).Count
+        $info = $findings.Count - $high - $medium
+        Log "  Rules file: $RulesPath ($(@($rules.Rules | Where-Object { $_.Enabled }).Count) of $(@($rules.Rules).Count) rules enabled)"
+        Log-Success "  $($findings.Count) finding(s) in $([math]::Round($timer.Elapsed.TotalSeconds, 1)) s: High $high, Medium $medium, Info $info"
+        foreach ($group in @($findings | Group-Object RuleId | Sort-Object Name)) {
+            $bySeverity = @($group.Group | Group-Object Severity | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ", "
+            Log "    $($group.Name.PadRight(28)) $bySeverity"
+        }
+        $allowlistedRows = 0
+        foreach ($ruleStatistics in $statistics.Values) { $allowlistedRows += $ruleStatistics.AllowlistedRows }
+        if ($allowlistedRows -gt 0) { Log "  $allowlistedRows matching row(s) set aside by the rules' allowlist (known benign activity)." }
+        return [PSCustomObject]@{
+            Rules           = $rules
+            Findings        = [object[]]$findings
+            Statistics      = $statistics
+            High            = $high
+            Medium          = $medium
+            Info            = $info
+            WorkbookUpdated = $false
+        }
+    }
+    catch {
+        Log-Warning "  The report rules failed: $($_.Exception.Message) -- no findings report (the timeline is not affected)."
+        return $null
+    }
+}
+
+# Cell text for the workbook: no XML-invalid characters, at most 32,767
+# characters (Excel's cell limit)
+function ConvertTo-TimelineReportCellText {
+    param([string]$Text)
+    if (-not $Text) { return "" }
+    $clean = $script:xmlInvalidRegex.Replace($Text, '')
+    if ($clean.Length -gt 32767) { $clean = $clean.Substring(0, 32755) + " [TRUNCATED]" }
+    return $clean
+}
+
+function ConvertTo-TimelineReportColor {
+    param([string]$Hex)
+    return [System.Drawing.Color]::FromArgb([Convert]::ToInt32($Hex.Substring(0, 2), 16), [Convert]::ToInt32($Hex.Substring(2, 2), 16), [Convert]::ToInt32($Hex.Substring(4, 2), 16))
+}
+
+# A cell that shows a Timeline row number and links to that row (A<row> on the
+# Timeline sheet), so a click jumps from the Findings sheet to the evidence
+function Set-TimelineReportRowLink {
+    param($Cell, [int]$RowNumber)
+    $Cell.Value = $RowNumber
+    $Cell.Hyperlink = New-Object OfficeOpenXml.ExcelHyperLink("'Timeline'!A$RowNumber", "$RowNumber")
+    $Cell.Style.Font.UnderLine = $true
+    $Cell.Style.Font.Color.SetColor((ConvertTo-TimelineReportColor "0563C1"))
+}
+
+# Adds the report's findings to an open workbook (EPPlus package from
+# ImportExcel): a FIRST sheet "Findings" -- per finding a summary row, then
+# one row per evidence row, each linked to its row on the Timeline sheet --
+# and a "Finding" column on the Timeline sheet with the finding ids of every
+# matching row, to filter on. A Findings sheet and Finding column from an
+# earlier run (-ReportOnly) are replaced. Throws on failure.
+function Add-TimelineReportWorkbookSheets {
+    param($Package, [object[]]$Findings)
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    $workbook = $Package.Workbook
+    $timeline = $workbook.Worksheets["Timeline"]
+    if (-not $timeline -or -not $timeline.Dimension) { throw "the workbook has no Timeline sheet" }
+    $lastRow = $timeline.Dimension.End.Row
+    $severityOf = @{}
+    foreach ($finding in $Findings) { $severityOf[[string]$finding.Id] = [string]$finding.Severity }
+    $severityRank = @{ High = 3; Medium = 2; Info = 1 }
+
+    # --- The Finding column of the Timeline sheet ---
+    $findingColumn = 0
+    $dataColumns = 0
+    for ($c = 1; $c -le $timeline.Dimension.End.Column; $c++) {
+        $header = [string]$timeline.Cells[1, $c].Value
+        if (-not $header) { break }
+        if ($header -eq "Finding") { $findingColumn = $c; break }
+        $dataColumns = $c
+    }
+    if ($findingColumn -eq 0) { $findingColumn = $dataColumns + 1 }
+    elseif ($lastRow -ge 2) { $timeline.Cells[2, $findingColumn, $lastRow, $findingColumn].Clear() }
+    $timeline.Cells[1, $findingColumn].Value = "Finding"
+    $timeline.Cells[1, $findingColumn].Style.Font.Bold = $true
+    $timeline.Column($findingColumn).Width = 16
+    $rowMap = Get-ReportFindingRowMap -Findings $Findings
+    foreach ($entry in $rowMap.GetEnumerator()) {
+        if ($entry.Key -lt 2 -or $entry.Key -gt $lastRow) { continue }
+        $cell = $timeline.Cells[$entry.Key, $findingColumn]
+        $cell.Value = $entry.Value
+        # Colored by the row's most severe finding
+        $top = ""
+        foreach ($id in ($entry.Value -split ', ')) {
+            $severity = [string]$severityOf[$id]
+            if ($severityRank.ContainsKey($severity) -and (-not $top -or $severityRank[$severity] -gt $severityRank[$top])) { $top = $severity }
+        }
+        if ($top) {
+            $cell.Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+            $cell.Style.Fill.BackgroundColor.SetColor((ConvertTo-TimelineReportColor $script:reportSeverityColors[$top][0]))
+            $cell.Style.Font.Color.SetColor((ConvertTo-TimelineReportColor $script:reportSeverityColors[$top][1]))
+        }
+    }
+    # Widen the AutoFilter to the new column
+    $timeline.Cells[1, 1, [Math]::Max(2, $lastRow), $findingColumn].AutoFilter = $true
+
+    # --- The Findings sheet ---
+    if ($workbook.Worksheets["Findings"]) { $workbook.Worksheets.Delete("Findings") }
+    $sheet = $workbook.Worksheets.Add("Findings")
+    $workbook.Worksheets.MoveToStart("Findings")
+    $headers = @("Finding", "Severity", "Row type", "Timeline row", "Time (UTC)", "Title", "Description", "Source", "Event type", "User", "Category", "Rule")
+    $widths = @(9, 9, 11, 12, 23, 45, 90, 28, 16, 20, 13, 28)
+    for ($c = 0; $c -lt $headers.Count; $c++) {
+        $sheet.Cells[1, ($c + 1)].Value = $headers[$c]
+        $sheet.Column($c + 1).Width = $widths[$c]
+    }
+    $headerRange = $sheet.Cells[1, 1, 1, $headers.Count]
+    $headerRange.Style.Font.Bold = $true
+    $headerRange.Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+    $headerRange.Style.Fill.BackgroundColor.SetColor((ConvertTo-TimelineReportColor "D9D9D9"))
+
+    $row = 2
+    foreach ($finding in $Findings) {
+        $severity = [string]$finding.Severity
+        $colors = $script:reportSeverityColors[$severity]
+        $first = if ($finding.FirstSeenUtc) { $finding.FirstSeenUtc.ToString("yyyy-MM-dd HH:mm:ss.fff", $invariant) } else { "" }
+        $last = if ($finding.LastSeenUtc) { $finding.LastSeenUtc.ToString("yyyy-MM-dd HH:mm:ss.fff", $invariant) } else { "" }
+        $rowNumbers = @($finding.RowNumbers)
+        $evidence = @($finding.Evidence)
+        $summary = "$($finding.Count) matching row(s), $first to $last UTC"
+        if ($finding.GroupKey) { $summary += "; group: $($finding.GroupKey)" }
+        if ($finding.Escalated) { $summary += "; severity raised by $($finding.EscalationCount) related row(s)" }
+        if ($rowNumbers.Count -gt $evidence.Count) { $summary += "; the first $($evidence.Count) of $($rowNumbers.Count) rows are listed (filter the Finding column of the Timeline sheet for all)" }
+        if ($finding.AllowlistedCount) { $summary += "; $($finding.AllowlistedCount) allowlisted row(s) not counted" }
+        if ($finding.DuringCollection) { $summary += "; all rows are from during the collection (possibly the collector itself)" }
+
+        # Summary row: the whole row in the severity color, linked to the first row
+        $values = @($finding.Id, $severity, "Summary", $null, $first, $finding.Title, $summary, "", "", "", $finding.Category, $finding.RuleId)
+        for ($c = 0; $c -lt $values.Count; $c++) {
+            if ($c -ne 3) { $sheet.Cells[$row, ($c + 1)].Value = ConvertTo-TimelineReportCellText ([string]$values[$c]) }
+        }
+        if ($rowNumbers.Count -gt 0) { Set-TimelineReportRowLink -Cell $sheet.Cells[$row, 4] -RowNumber $rowNumbers[0] }
+        $summaryRange = $sheet.Cells[$row, 1, $row, $headers.Count]
+        $summaryRange.Style.Font.Bold = $true
+        if ($colors) {
+            $summaryRange.Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+            $summaryRange.Style.Fill.BackgroundColor.SetColor((ConvertTo-TimelineReportColor $colors[0]))
+        }
+        $row++
+
+        # One row per evidence row
+        foreach ($item in $evidence) {
+            $rowType = if ($item.Escalation) { "Escalation" } else { "Evidence" }
+            $values = @($finding.Id, $severity, $rowType, $null, $item.Timestamp, $finding.Title, $item.Description, $item.Source, $item.EventType, $item.User, $finding.Category, $finding.RuleId)
+            for ($c = 0; $c -lt $values.Count; $c++) {
+                if ($c -ne 3) { $sheet.Cells[$row, ($c + 1)].Value = ConvertTo-TimelineReportCellText ([string]$values[$c]) }
+            }
+            Set-TimelineReportRowLink -Cell $sheet.Cells[$row, 4] -RowNumber ([int]$item.RowNumber)
+            if ($colors) {
+                $severityCell = $sheet.Cells[$row, 2]
+                $severityCell.Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+                $severityCell.Style.Fill.BackgroundColor.SetColor((ConvertTo-TimelineReportColor $colors[0]))
+                $severityCell.Style.Font.Color.SetColor((ConvertTo-TimelineReportColor $colors[1]))
+            }
+            $row++
+        }
+    }
+    if ($row -eq 2) {
+        $sheet.Cells[2, 1].Value = "(none)"
+        $sheet.Cells[2, 6].Value = "The report rules found nothing in this timeline."
+        $row++
+    }
+    $sheet.Cells[1, 1, ($row - 1), $headers.Count].AutoFilter = $true
+    $sheet.View.FreezePanes(2, 1)
+
+    # Open the workbook on the Findings sheet, the only selected tab. The
+    # attribute is set in the sheet XML: EPPlus 4.5's View.TabSelected setter
+    # does not select a sheet.
+    foreach ($worksheet in $workbook.Worksheets) {
+        $namespaces = New-Object System.Xml.XmlNamespaceManager($worksheet.WorksheetXml.NameTable)
+        $namespaces.AddNamespace("d", "http://schemas.openxmlformats.org/spreadsheetml/2006/main")
+        $sheetView = $worksheet.WorksheetXml.SelectSingleNode("//d:sheetViews/d:sheetView", $namespaces)
+        if ($sheetView) { $sheetView.SetAttribute("tabSelected", $(if ($worksheet.Name -eq "Findings") { "1" } else { "0" })) }
+    }
+    $workbook.View.ActiveTab = 0
+}
+
+# -ReportOnly: adds the findings to an existing workbook (it must hold the
+# same rows as timeline.csv). $true when the workbook was updated.
+function Update-TimelineReportWorkbook {
+    param([string]$Path, [object[]]$Findings, [int]$RowCount)
+    if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
+        Log-Warning "  ImportExcel is not installed, so the workbook's findings are not updated (Install-Module -Name ImportExcel -Scope CurrentUser)."
+        return $false
+    }
+    $package = $null
+    try {
+        Import-Module ImportExcel -ErrorAction Stop
+        Log "  Updating the workbook: $Path"
+        $package = Open-ExcelPackage -Path $Path
+        $timeline = $package.Workbook.Worksheets["Timeline"]
+        if (-not $timeline -or -not $timeline.Dimension) { throw "it has no Timeline sheet" }
+        $sheetRows = $timeline.Dimension.End.Row - 1
+        if ($sheetRows -ne $RowCount) { throw "its Timeline sheet has $sheetRows rows but the timeline CSV has $RowCount" }
+        Add-TimelineReportWorkbookSheets -Package $package -Findings $Findings
+        Close-ExcelPackage $package
+        $package = $null
+        Log-Success "  Workbook updated: Findings sheet and Finding column."
+        return $true
+    }
+    catch {
+        Log-Warning "  Could not update the workbook: $($_.Exception.Message). The report gives timeline.csv row numbers instead of Excel links."
+        if ($package) { Close-ExcelPackage $package -NoSave }
+        return $false
+    }
+}
+
+# Writes findings.csv, report-model.json, report.html and report.pdf next to
+# the timeline. Call it after the workbook is final (the model records its
+# hash). Returns the files and counts, or $null (after a warning).
+function Complete-TimelineReport {
+    param(
+        $State,
+        [System.Collections.IList]$Rows,
+        [string]$TimelinePath,
+        [string]$WorkbookPath,
+        [bool]$WorkbookAvailable,
+        $CollectionInfo,
+        [string]$CollectorLogPath,
+        [string]$BuilderLogPath,
+        [int]$MftDays = -1,
+        [string]$CollectionPath
+    )
+    Log ""
+    Log "--- Writing Findings Report ---"
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $timelineFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($TimelinePath)
+    $workbookFull = ""
+    if ($WorkbookPath) { $workbookFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($WorkbookPath) }
+    $folder = Split-Path $timelineFull -Parent
+    $findingsCsv = Join-Path $folder "findings.csv"
+    $htmlPath = Join-Path $folder "report.html"
+    $pdfPath = Join-Path $folder "report.pdf"
+    try {
+        Export-ReportFindingsCsv -Findings $State.Findings -Path $findingsCsv
+        $modelWarnings = $null
+        $model = New-ReportModel -Rows $Rows -Findings $State.Findings -CollectionInfo $CollectionInfo -CollectorLogPath $CollectorLogPath `
+            -BuilderLogPath $BuilderLogPath -TimelinePath $timelineFull -WorkbookPath $workbookFull -WorkbookAvailable:$WorkbookAvailable `
+            -Rules $State.Rules -RuleStatistics $State.Statistics -FindingsCsvPath $findingsCsv -MftDays $MftDays -CollectionPath $CollectionPath `
+            -WarningVariable modelWarnings -WarningAction SilentlyContinue
+        foreach ($warning in @($modelWarnings)) { Log-Warning "  $warning" }
+        Export-ReportModelJson -Model $model -Path (Join-Path $folder "report-model.json")
+        Export-ReportHtml -Model $model -Path $htmlPath
+    }
+    catch {
+        Log-Warning "  The findings report could not be written: $($_.Exception.Message) (the timeline is not affected)."
+        return $null
+    }
+    Log-Success "  Findings (CSV): $findingsCsv"
+    Log-Success "  Report (HTML) : $htmlPath"
+    # A PDF from an earlier run must not sit next to a newer report.html
+    if (Test-Path -LiteralPath $pdfPath) { Remove-Item -LiteralPath $pdfPath -Force -ErrorAction SilentlyContinue }
+    $pdfWritten = ConvertTo-ReportPdf -HtmlPath $htmlPath -PdfPath $pdfPath
+    if ($pdfWritten) { Log-Success "  Report (PDF)  : $pdfPath" }
+    else {
+        Log-Warning "  PDF not created: $($script:ReportPdfLastError)"
+        Log "  report.html is complete: open it in a browser (and print it to PDF there if needed)."
+    }
+    Log "  Report written in $([math]::Round($timer.Elapsed.TotalSeconds, 1)) s."
+    return [PSCustomObject]@{
+        FindingsCsv = $findingsCsv
+        Html        = $htmlPath
+        Pdf         = $(if ($pdfWritten) { $pdfPath } else { "" })
+        OpenPath    = $(if ($pdfWritten) { $pdfPath } else { $htmlPath })
+        High        = $State.High
+        Medium      = $State.Medium
+        Info        = $State.Info
+    }
+}
+
+# --- Helper: ensure Timeline Explorer is available ---
+function Get-TimelineExplorer {
+    $teLocations = @(
+        (Join-Path $PSScriptRoot "tools\TimelineExplorer\TimelineExplorer\TimelineExplorer.exe"),
+        (Join-Path $PSScriptRoot "tools\TimelineExplorer\TimelineExplorer.exe"),
+        (Join-Path $PSScriptRoot "reports\TimelineExplorer\TimelineExplorer\TimelineExplorer.exe"),
+        (Join-Path $PSScriptRoot "reports\TimelineExplorer\TimelineExplorer.exe"),
+        (Join-Path $PSScriptRoot "TimelineExplorer\TimelineExplorer.exe"),
+        (Join-Path $PSScriptRoot "TimelineExplorer.exe")
+    )
+    foreach ($loc in $teLocations) {
+        if (Test-Path $loc) { return $loc }
+    }
+
+    # Not found -- download it
+    Log ""
+    Log "Timeline Explorer not found. Downloading latest from Eric Zimmerman's tools..."
+    Log "  Credit: Timeline Explorer by Eric Zimmerman (https://ericzimmerman.github.io/)"
+    $teDir = Join-Path $PSScriptRoot "tools\TimelineExplorer"
+    $teZip = Join-Path $env:TEMP "TimelineExplorer_download.zip"
+    try {
+        $teUrl = "https://download.ericzimmermanstools.com/net9/TimelineExplorer.zip"
+        try {
+            $page = Invoke-WebRequest -Uri "https://ericzimmerman.github.io/#!index.md" -UseBasicParsing -ErrorAction Stop -TimeoutSec 10
+            $match = [regex]::Match($page.Content, 'https://download\.ericzimmermanstools\.com/[^"'']+TimelineExplorer\.zip')
+            if ($match.Success) {
+                $teUrl = $match.Value
+                Log "  Found latest URL: $teUrl"
+            }
+        }
+        catch {
+            Log "  Could not check for latest version, using known URL."
+        }
+
+        Invoke-WebRequest -Uri $teUrl -OutFile $teZip -UseBasicParsing -ErrorAction Stop
+        New-Item -ItemType Directory -Path $teDir -Force | Out-Null
+        Expand-Archive -Path $teZip -DestinationPath $teDir -Force -ErrorAction Stop
+
+        $found = Get-ChildItem -Path $teDir -Filter "TimelineExplorer.exe" -Recurse | Select-Object -First 1
+        if ($found) {
+            Log-Success "  Downloaded Timeline Explorer to: $($found.FullName)"
+            return $found.FullName
+        }
+    }
+    catch {
+        Log-Warning "  Failed to download Timeline Explorer: $($_.Exception.Message)"
+        Log "  You can manually download from: https://ericzimmerman.github.io/#!index.md"
+    }
+    finally {
+        Remove-Item $teZip -Force -ErrorAction SilentlyContinue
+    }
+    return $null
+}
+
+# --- Let the user choose how to view the results ---
+# -Choice is -Viewer (empty: ask with a menu). -ReportPath is report.pdf, or
+# report.html when no PDF was made (empty: no report).
+function Invoke-TimelineViewer {
+    param([string]$Choice, [string]$CsvPath, [string]$XlsxPath, [bool]$XlsxAvailable, [string]$ReportPath)
+    if ($Choice) {
+        # -Viewer given: no menu (scripts, automation, tests)
+        $selectedAction = switch ($Choice) {
+            "Excel"            { "excel" }
+            "TimelineExplorer" { "te" }
+            "Both"             { "both" }
+            "Report"           { "report" }
+            default            { "none" }
+        }
+        if (($selectedAction -eq "excel" -or $selectedAction -eq "both") -and -not $XlsxAvailable) {
+            Log-Warning "  -Viewer ${Choice}: no Excel file was generated, so Excel is not opened."
+            if ($selectedAction -eq "both") { $selectedAction = "te" } else { $selectedAction = "none" }
+        }
+        if ($selectedAction -eq "report" -and -not $ReportPath) {
+            Log-Warning "  -Viewer ${Choice}: no findings report was written, so nothing is opened."
+            $selectedAction = "none"
+        }
+        Log "  Viewer selection: $Choice (-Viewer)"
+    }
+    else {
+        # Build viewer menu dynamically based on what's available
+        Write-Host ""
+        Write-Host "========================================" -ForegroundColor Cyan
+        Write-Host "  How would you like to view the timeline?" -ForegroundColor Cyan
+        Write-Host "========================================" -ForegroundColor Cyan
+        Write-Host ""
+
+        $menuOptions = @()
+
+        if ($XlsxAvailable) {
+            $menuOptions += @{ Key = "1"; Label = "Excel (color-coded .xlsx)"; Action = "excel" }
+            Write-Host "  [1] Excel -- rows pre-colored by EventType, ready to analyze" -ForegroundColor Green
+            Write-Host "       (Logon=Green, Execution=Orange, Persistence=Red, Network=Blue, etc.)" -ForegroundColor DarkGray
+        }
+
+        $teOptionNum = $menuOptions.Count + 1
+        $menuOptions += @{ Key = "$teOptionNum"; Label = "Timeline Explorer (Eric Zimmerman)"; Action = "te" }
+        Write-Host "  [$teOptionNum] Timeline Explorer -- powerful forensic CSV viewer (no colors," -ForegroundColor White
+        Write-Host "       requires manual conditional formatting setup per session)" -ForegroundColor DarkGray
+
+        if ($XlsxAvailable) {
+            $bothOptionNum = $menuOptions.Count + 1
+            $menuOptions += @{ Key = "$bothOptionNum"; Label = "Both"; Action = "both" }
+            Write-Host "  [$bothOptionNum] Both -- open Excel (colored) and Timeline Explorer side by side" -ForegroundColor White
+        }
+
+        if ($ReportPath) {
+            $reportOptionNum = $menuOptions.Count + 1
+            $reportKind = if ($ReportPath -match '\.pdf$') { "PDF" } else { "HTML" }
+            $menuOptions += @{ Key = "$reportOptionNum"; Label = "Open report"; Action = "report" }
+            Write-Host "  [$reportOptionNum] Open report -- the findings report ($reportKind): leads to review," -ForegroundColor White
+            Write-Host "       each with its timeline rows (plain-English summary first)" -ForegroundColor DarkGray
+        }
+
+        $noneOptionNum = $menuOptions.Count + 1
+        $menuOptions += @{ Key = "$noneOptionNum"; Label = "None"; Action = "none" }
+        Write-Host "  [$noneOptionNum] None -- just save the files, don't open anything" -ForegroundColor DarkGray
+        Write-Host ""
+
+        $maxOption = $menuOptions.Count
+        do {
+            $viewerChoice = Read-Host "Select a viewer (1-$maxOption)"
+        } while (-not ($menuOptions.Key -contains $viewerChoice))
+
+        $selectedAction = ($menuOptions | Where-Object { $_.Key -eq $viewerChoice }).Action
+        Log "  Viewer selection: $($($menuOptions | Where-Object { $_.Key -eq $viewerChoice }).Label)"
+    }
+
+    # --- Launch selected viewer(s) ---
+    if ($selectedAction -eq "excel" -or $selectedAction -eq "both") {
+        Log ""
+        Log "--- Opening Color-Coded Timeline in Excel ---"
+        try {
+            Start-Process -FilePath $XlsxPath
+            Log-Success "  Excel launched with color-coded timeline."
+            Log "  NOTE: Excel may prompt to repair the file -- click Yes. This is a known"
+            Log "  ImportExcel library issue. The data and formatting are intact."
+        }
+        catch {
+            Log-Warning "  Could not open Excel: $($_.Exception.Message)"
+        }
+    }
+
+    if ($selectedAction -eq "te" -or $selectedAction -eq "both") {
+        $teExe = Get-TimelineExplorer
+        if ($teExe) {
+            Log ""
+            Log "Opening timeline in Timeline Explorer (Eric Zimmerman)..."
+            Log "  https://ericzimmerman.github.io/"
+            try {
+                Start-Process -FilePath $teExe -ArgumentList "`"$CsvPath`""
+                Log-Success "  Timeline Explorer launched."
+                Log ""
+                Log "  TIP: Color-code your timeline by EventType for easier analysis:"
+                Log "    1. Right-click any cell in the EventType column"
+                Log "    2. Conditional Formatting -> Highlight Cell Rules -> Text That Contains"
+                Log "    3. Enter an event type (e.g. Logon, Execution, PersistenceChange)"
+                Log "    4. Pick a color and CHECK 'Apply formatting to an entire row'"
+                Log "    5. Repeat for each EventType. File -> Save Session to keep your setup."
+            }
+            catch {
+                Log-Warning "  Could not launch Timeline Explorer: $($_.Exception.Message)"
+                Log "  Open manually: $teExe"
+            }
+        }
+    }
+
+    if ($selectedAction -eq "report") {
+        Log ""
+        Log "--- Opening the Findings Report ---"
+        try {
+            Start-Process -FilePath $ReportPath
+            Log-Success "  Report opened: $ReportPath"
+        }
+        catch {
+            Log-Warning "  Could not open the report: $($_.Exception.Message)"
+        }
+    }
+
+    if ($selectedAction -eq "none") {
+        Log ""
+        Log "  No viewer launched. Files saved to:"
+        Log "    CSV: $CsvPath"
+        if ($XlsxAvailable) { Log "    Excel: $XlsxPath" }
+        if ($ReportPath) { Log "    Report: $ReportPath" }
+    }
+}
+
+# =============================================================
+# -ReportOnly: rebuild the findings report from an existing timeline
+# (nothing is parsed; the collection is not needed)
+# =============================================================
+if ($ReportOnly) {
+    Log "=== Timeline Report Rebuild (-ReportOnly) Started ==="
+    Log "Timeline   : $OutputFile"
+    Log "Rules      : $($script:reportRulesFile)"
+    $boundNames = @($PSBoundParameters.Keys)
+    $ignoredParameters = @(foreach ($name in @("OutputFile", "StartDate", "EndDate", "Sources", "Keywords", "MaxUsnEntries", "MftDays")) { if ($boundNames -contains $name) { "-$name" } })
+    if ($ignoredParameters.Count -gt 0) { Log-Warning "-ReportOnly parses nothing, so these are ignored: $($ignoredParameters -join ', ')" }
+    Log ""
+    if (-not $script:reportScriptsLoaded) {
+        Log-Error "The report scripts in report\ could not be loaded: $($script:reportLoadError)"
+        exit 1
+    }
+    $reportOnlyTimer = [System.Diagnostics.Stopwatch]::StartNew()
+    Log "--- Reading the Timeline ---"
+    try { $reportRows = @(Import-TimelineCsvForReport -Path $OutputFile) }
+    catch {
+        Log-Error "Could not read the timeline: $($_.Exception.Message)"
+        exit 1
+    }
+    Log "  $($reportRows.Count) row(s) read in $([math]::Round($reportOnlyTimer.Elapsed.TotalSeconds, 1)) s."
+    if ($reportRows.Count -eq 0) {
+        Log-Error "The timeline has no rows, so there is nothing to report."
+        exit 1
+    }
+    $reportInfo = Get-TimelineReportCollectionInfo -InfoJsonPath (Join-Path $reportDir "collection_info.json") -BuilderLogPath (Join-Path $reportDir "timeline_builder_log.txt")
+    $reportState = Invoke-TimelineReportRules -Rows $reportRows -RulesPath $script:reportRulesFile -CollectionInfo $reportInfo
+    if (-not $reportState) {
+        Log-Error "No report was made."
+        exit 1
+    }
+
+    $xlsxFile = $OutputFile -replace '\.csv$', '.xlsx'
+    $workbookReady = $false
+    if ($xlsxFile -ne $OutputFile -and (Test-Path -LiteralPath $xlsxFile -PathType Leaf)) {
+        Log ""
+        Log "--- Adding the Findings to the Excel Workbook ---"
+        if ($NoExcel) { Log "  -NoExcel: the workbook is left as it is, so the report does not link to it." }
+        else { $workbookReady = Update-TimelineReportWorkbook -Path $xlsxFile -Findings $reportState.Findings -RowCount $reportRows.Count }
+    }
+    else {
+        Log "  No workbook next to the timeline: the report gives timeline.csv row numbers."
+    }
+
+    $reportResult = Complete-TimelineReport -State $reportState -Rows $reportRows -TimelinePath $OutputFile -WorkbookPath $xlsxFile `
+        -WorkbookAvailable $workbookReady -CollectionInfo $reportInfo -CollectorLogPath (Join-Path $reportDir "collection_log.txt") `
+        -BuilderLogPath (Join-Path $reportDir "timeline_builder_log.txt")
+    Log ""
+    Log "=== Report rebuild finished in $([math]::Round($reportOnlyTimer.Elapsed.TotalSeconds, 1)) s ==="
+    $reportOpenPath = ""
+    if ($reportResult) { $reportOpenPath = $reportResult.OpenPath }
+    Invoke-TimelineViewer -Choice $Viewer -CsvPath $OutputFile -XlsxPath $xlsxFile -XlsxAvailable (Test-Path -LiteralPath $xlsxFile -PathType Leaf) -ReportPath $reportOpenPath
+    if ($reportResult) { exit 0 }
+    exit 1
+}
+
 # =============================================================
 # Validation
 # =============================================================
@@ -290,13 +977,6 @@ if (-not (Test-Path $InputPath)) {
 # =============================================================
 $script:timelineEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
 $script:artifactStats = @{}
-
-# Characters that are not allowed in XML 1.0 (and so break the .xlsx):
-# control characters other than tab/LF/CR, U+FFFE/U+FFFF, and unpaired
-# surrogate halves. Everything else is kept, including non-Latin text and
-# emoji (properly paired surrogates). Used here and by the Excel export.
-$script:xmlInvalidPattern = '[\x00-\x08\x0B\x0C\x0E-\x1F\uFFFE\uFFFF]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]'
-$script:xmlInvalidRegex = New-Object System.Text.RegularExpressions.Regex($script:xmlInvalidPattern, [System.Text.RegularExpressions.RegexOptions]::Compiled)
 
 function Add-TimelineEntry {
     param(
@@ -533,10 +1213,15 @@ function Get-CollectionInfo {
         # credential material (the Secrets\ folder) and Thunderbird's index
         SecretsIncluded          = $false
         ThunderbirdIndexIncluded = $false
+        # The files found (copied next to the timeline for the findings report)
+        InfoJsonPath             = ""
+        CollectorLogPath         = ""
     }
 
     $jsonFile = Get-ChildItem -Path $InputPath -Filter "collection_info.json" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
     $collLog = Get-ChildItem -Path $InputPath -Filter "collection_log.txt" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($jsonFile) { $info.InfoJsonPath = $jsonFile.FullName }
+    if ($collLog) { $info.CollectorLogPath = $collLog.FullName }
 
     if ($jsonFile) {
         try {
@@ -15583,6 +16268,23 @@ $fileSizeMB = [math]::Round((Get-Item $OutputFile).Length / 1MB, 2)
 Log-Success "  Timeline exported: $OutputFile ($fileSizeMB MB)"
 
 # =============================================================
+# Findings report, part 1: run the report rules on the final rows (the
+# workbook's Findings sheet and the report itself follow the Excel export)
+# =============================================================
+$reportState = $null
+$reportResult = $null
+$reportInfo = $null
+if ($NoReport) {
+    Log ""
+    Log "--- Findings Report ---"
+    Log "  -NoReport: no findings report (report.html, report.pdf, findings.csv)."
+}
+else {
+    $reportInfo = Get-TimelineReportCollectionInfo -InfoJsonPath (Get-CollectionInfo).InfoJsonPath -BuilderInfo (Get-CollectionInfo)
+    $reportState = Invoke-TimelineReportRules -Rows $sorted -RulesPath $script:reportRulesFile -CollectionInfo $reportInfo
+}
+
+# =============================================================
 # Generate Color-Coded Excel (.xlsx) via ImportExcel module
 # =============================================================
 $xlsxFile = $OutputFile -replace '\.csv$', '.xlsx'
@@ -15742,6 +16444,21 @@ if (-not $skipExcel -and (Get-Module -ListAvailable -Name ImportExcel)) {
             }
         }
 
+        # Findings report: a first sheet "Findings" that links to the
+        # evidence rows, and a "Finding" column on the Timeline sheet
+        if ($reportState) {
+            try {
+                Add-TimelineReportWorkbookSheets -Package $excelPkg -Findings $reportState.Findings
+                $reportState.WorkbookUpdated = $true
+                Log-Success "  Findings sheet and Finding column added ($(@($reportState.Findings).Count) finding(s))."
+            }
+            catch {
+                Log-Warning "  Could not add the findings to the workbook: $($_.Exception.Message). The report gives timeline.csv row numbers instead of Excel links."
+                try { if ($excelPkg.Workbook.Worksheets["Findings"]) { $excelPkg.Workbook.Worksheets.Delete("Findings") } }
+                catch { Log-Warning "  Could not remove the incomplete Findings sheet: $($_.Exception.Message)" }
+            }
+        }
+
         Close-ExcelPackage $excelPkg
 
         # Note: Excel may show a "Repaired Records" dialog when opening the xlsx.
@@ -15776,6 +16493,24 @@ if (-not $skipExcel -and (Get-Module -ListAvailable -Name ImportExcel)) {
 }
 
 # =============================================================
+# Findings report, part 2: findings.csv, report.html and report.pdf next to
+# the timeline (after the workbook is final: the report records its hash)
+# =============================================================
+if ($reportState) {
+    $collectionFacts = Get-CollectionInfo
+    # collection_info.json and collection_log.txt go next to the timeline, so
+    # -ReportOnly can rebuild the report without the collection
+    Copy-TimelineReportInputs -Folder (Split-Path ($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputFile)) -Parent) `
+        -Paths @($collectionFacts.InfoJsonPath, $collectionFacts.CollectorLogPath)
+    # The -MftDays window only limits the timeline when the $MFT was parsed
+    $reportMftDays = 0
+    if ($Sources -contains "FileSystem") { $reportMftDays = $MftDays }
+    $reportResult = Complete-TimelineReport -State $reportState -Rows $sorted -TimelinePath $OutputFile -WorkbookPath $xlsxFile `
+        -WorkbookAvailable ($xlsxGenerated -and $reportState.WorkbookUpdated) -CollectionInfo $reportInfo `
+        -CollectorLogPath $collectionFacts.CollectorLogPath -BuilderLogPath $logFile -MftDays $reportMftDays -CollectionPath $script:selectedZipPath
+}
+
+# =============================================================
 # Summary Statistics
 # =============================================================
 $totalTimer.Stop()
@@ -15788,6 +16523,9 @@ Log "  Duplicates removed: $removedCount"
 Log "  Output file      : $OutputFile"
 Log "  File size        : $fileSizeMB MB"
 Log "  Processing time  : $([math]::Round($totalTimer.Elapsed.TotalSeconds, 1)) seconds"
+if ($reportResult) {
+    Log "  Findings report  : $($reportResult.High) High and $($reportResult.Medium) Medium lead(s) to review; $($reportResult.Info) Info item(s)"
+}
 Log ""
 
 # Date range ($sorted is chronological: first and last entries)
@@ -15820,162 +16558,16 @@ Log ""
 Log "  Output files:"
 Log "    CSV: $OutputFile"
 if ($xlsxGenerated) { Log "    Excel (color-coded): $xlsxFile" }
+$reportOpenPath = ""
+if ($reportResult) {
+    $reportOpenPath = $reportResult.OpenPath
+    if ($reportResult.Pdf) { Log "    Findings report (PDF): $($reportResult.Pdf)" }
+    Log "    Findings report (HTML): $($reportResult.Html)"
+    Log "    Findings (CSV): $($reportResult.FindingsCsv)"
+}
 Log ""
 
-if ($Viewer) {
-    # -Viewer given: no menu (scripts, automation, tests)
-    $selectedAction = switch ($Viewer) {
-        "Excel"            { "excel" }
-        "TimelineExplorer" { "te" }
-        "Both"             { "both" }
-        default            { "none" }
-    }
-    if (($selectedAction -eq "excel" -or $selectedAction -eq "both") -and -not $xlsxGenerated) {
-        Log-Warning "  -Viewer ${Viewer}: no Excel file was generated, so Excel is not opened."
-        if ($selectedAction -eq "both") { $selectedAction = "te" } else { $selectedAction = "none" }
-    }
-    Log "  Viewer selection: $Viewer (-Viewer)"
-}
-else {
-    # Build viewer menu dynamically based on what's available
-    Write-Host ""
-    Write-Host "========================================" -ForegroundColor Cyan
-    Write-Host "  How would you like to view the timeline?" -ForegroundColor Cyan
-    Write-Host "========================================" -ForegroundColor Cyan
-    Write-Host ""
-
-    $menuOptions = @()
-
-    if ($xlsxGenerated) {
-        $menuOptions += @{ Key = "1"; Label = "Excel (color-coded .xlsx)"; Action = "excel" }
-        Write-Host "  [1] Excel -- rows pre-colored by EventType, ready to analyze" -ForegroundColor Green
-        Write-Host "       (Logon=Green, Execution=Orange, Persistence=Red, Network=Blue, etc.)" -ForegroundColor DarkGray
-    }
-
-    $teOptionNum = $menuOptions.Count + 1
-    $menuOptions += @{ Key = "$teOptionNum"; Label = "Timeline Explorer (Eric Zimmerman)"; Action = "te" }
-    Write-Host "  [$teOptionNum] Timeline Explorer -- powerful forensic CSV viewer (no colors," -ForegroundColor White
-    Write-Host "       requires manual conditional formatting setup per session)" -ForegroundColor DarkGray
-
-    if ($xlsxGenerated) {
-        $bothOptionNum = $menuOptions.Count + 1
-        $menuOptions += @{ Key = "$bothOptionNum"; Label = "Both"; Action = "both" }
-        Write-Host "  [$bothOptionNum] Both -- open Excel (colored) and Timeline Explorer side by side" -ForegroundColor White
-    }
-
-    $noneOptionNum = $menuOptions.Count + 1
-    $menuOptions += @{ Key = "$noneOptionNum"; Label = "None"; Action = "none" }
-    Write-Host "  [$noneOptionNum] None -- just save the files, don't open anything" -ForegroundColor DarkGray
-    Write-Host ""
-
-    $maxOption = $menuOptions.Count
-    do {
-        $viewerChoice = Read-Host "Select a viewer (1-$maxOption)"
-    } while (-not ($menuOptions.Key -contains $viewerChoice))
-
-    $selectedAction = ($menuOptions | Where-Object { $_.Key -eq $viewerChoice }).Action
-    Log "  Viewer selection: $($($menuOptions | Where-Object { $_.Key -eq $viewerChoice }).Label)"
-}
-
-# --- Helper: ensure Timeline Explorer is available ---
-function Get-TimelineExplorer {
-    $teLocations = @(
-        (Join-Path $PSScriptRoot "tools\TimelineExplorer\TimelineExplorer\TimelineExplorer.exe"),
-        (Join-Path $PSScriptRoot "tools\TimelineExplorer\TimelineExplorer.exe"),
-        (Join-Path $PSScriptRoot "reports\TimelineExplorer\TimelineExplorer\TimelineExplorer.exe"),
-        (Join-Path $PSScriptRoot "reports\TimelineExplorer\TimelineExplorer.exe"),
-        (Join-Path $PSScriptRoot "TimelineExplorer\TimelineExplorer.exe"),
-        (Join-Path $PSScriptRoot "TimelineExplorer.exe")
-    )
-    foreach ($loc in $teLocations) {
-        if (Test-Path $loc) { return $loc }
-    }
-
-    # Not found -- download it
-    Log ""
-    Log "Timeline Explorer not found. Downloading latest from Eric Zimmerman's tools..."
-    Log "  Credit: Timeline Explorer by Eric Zimmerman (https://ericzimmerman.github.io/)"
-    $teDir = Join-Path $PSScriptRoot "tools\TimelineExplorer"
-    $teZip = Join-Path $env:TEMP "TimelineExplorer_download.zip"
-    try {
-        $teUrl = "https://download.ericzimmermanstools.com/net9/TimelineExplorer.zip"
-        try {
-            $page = Invoke-WebRequest -Uri "https://ericzimmerman.github.io/#!index.md" -UseBasicParsing -ErrorAction Stop -TimeoutSec 10
-            $match = [regex]::Match($page.Content, 'https://download\.ericzimmermanstools\.com/[^"'']+TimelineExplorer\.zip')
-            if ($match.Success) {
-                $teUrl = $match.Value
-                Log "  Found latest URL: $teUrl"
-            }
-        }
-        catch {
-            Log "  Could not check for latest version, using known URL."
-        }
-
-        Invoke-WebRequest -Uri $teUrl -OutFile $teZip -UseBasicParsing -ErrorAction Stop
-        New-Item -ItemType Directory -Path $teDir -Force | Out-Null
-        Expand-Archive -Path $teZip -DestinationPath $teDir -Force -ErrorAction Stop
-
-        $found = Get-ChildItem -Path $teDir -Filter "TimelineExplorer.exe" -Recurse | Select-Object -First 1
-        if ($found) {
-            Log-Success "  Downloaded Timeline Explorer to: $($found.FullName)"
-            return $found.FullName
-        }
-    }
-    catch {
-        Log-Warning "  Failed to download Timeline Explorer: $($_.Exception.Message)"
-        Log "  You can manually download from: https://ericzimmerman.github.io/#!index.md"
-    }
-    finally {
-        Remove-Item $teZip -Force -ErrorAction SilentlyContinue
-    }
-    return $null
-}
-
-# --- Launch selected viewer(s) ---
-if ($selectedAction -eq "excel" -or $selectedAction -eq "both") {
-    Log ""
-    Log "--- Opening Color-Coded Timeline in Excel ---"
-    try {
-        Start-Process -FilePath $xlsxFile
-        Log-Success "  Excel launched with color-coded timeline."
-        Log "  NOTE: Excel may prompt to repair the file -- click Yes. This is a known"
-        Log "  ImportExcel library issue. The data and formatting are intact."
-    }
-    catch {
-        Log-Warning "  Could not open Excel: $($_.Exception.Message)"
-    }
-}
-
-if ($selectedAction -eq "te" -or $selectedAction -eq "both") {
-    $teExe = Get-TimelineExplorer
-    if ($teExe) {
-        Log ""
-        Log "Opening timeline in Timeline Explorer (Eric Zimmerman)..."
-        Log "  https://ericzimmerman.github.io/"
-        try {
-            Start-Process -FilePath $teExe -ArgumentList "`"$OutputFile`""
-            Log-Success "  Timeline Explorer launched."
-            Log ""
-            Log "  TIP: Color-code your timeline by EventType for easier analysis:"
-            Log "    1. Right-click any cell in the EventType column"
-            Log "    2. Conditional Formatting -> Highlight Cell Rules -> Text That Contains"
-            Log "    3. Enter an event type (e.g. Logon, Execution, PersistenceChange)"
-            Log "    4. Pick a color and CHECK 'Apply formatting to an entire row'"
-            Log "    5. Repeat for each EventType. File -> Save Session to keep your setup."
-        }
-        catch {
-            Log-Warning "  Could not launch Timeline Explorer: $($_.Exception.Message)"
-            Log "  Open manually: $teExe"
-        }
-    }
-}
-
-if ($selectedAction -eq "none") {
-    Log ""
-    Log "  No viewer launched. Files saved to:"
-    Log "    CSV: $OutputFile"
-    if ($xlsxGenerated) { Log "    Excel: $xlsxFile" }
-}
+Invoke-TimelineViewer -Choice $Viewer -CsvPath $OutputFile -XlsxPath $xlsxFile -XlsxAvailable $xlsxGenerated -ReportPath $reportOpenPath
 
 Log "============================================================="
 

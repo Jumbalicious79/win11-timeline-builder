@@ -1,0 +1,15 @@
+[2026-03-02 04:00:00] === Windows Forensic Triage Collection Started ===
+[2026-03-02 04:00:00] Output directory: C:\Collection
+[2026-03-02 04:00:00] Target drive: C:
+[2026-03-02 04:00:00] Mode: LIVE SYSTEM (full collection with live commands)
+[2026-03-02 04:00:00] Computer: REPORT-FIXTURE (collector host)
+[2026-03-02 04:00:00] User: analyst
+[2026-03-02 04:00:01] OS: Microsoft Windows 11 Pro Build 26100
+[2026-03-02 04:00:01] Time zone: (UTC-08:00) Pacific Time (US & Canada)
+[2026-03-02 04:00:02] WARNING: Could not copy: C:\Windows\System32\config\BBI -- The process cannot access the file because it is being used by another process.
+[2026-03-02 04:05:00] =============================================================
+[2026-03-02 04:05:00]   COLLECTION SUMMARY
+[2026-03-02 04:05:00] =============================================================
+[2026-03-02 04:05:00]   Files collected: 5
+[2026-03-02 04:05:00]   Errors:         0
+[2026-03-02 04:05:00] =============================================================

@@ -1,0 +1,3 @@
+"ThreatID","ThreatName","SeverityID","CategoryID"
+"2147519003","Virus:DOS/EICAR_Test_File","5","42"
+"2147700001","PUA:Win32/FixtureBundler","1","27"

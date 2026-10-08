@@ -2,7 +2,9 @@
 
 A pure PowerShell script that builds a unified, chronological CSV timeline from
 Windows forensic artifacts. Designed as a lightweight alternative to
-log2timeline/plaso, focused specifically on Windows 11 artifacts.
+log2timeline/plaso, focused specifically on Windows 11 artifacts. Each run
+also writes a findings report (PDF and HTML): leads to review, found by
+rules in the timeline, with a plain-English summary page first.
 
 Designed to be used with win11-triage-collector, which collects the forensic
 artifacts this script parses. The timeline builder is a pure parser -- it
@@ -123,7 +125,11 @@ themselves are never committed.
     4. Extracts to a temp folder (cleaned up after)
     5. Builds the timeline (~2 minutes for ~36,000 events)
     6. Generates a color-coded Excel file (rows colored by EventType)
-    7. Asks how you want to view: Excel (colored), Timeline Explorer, Both, None
+    7. Writes the findings report: report.pdf, report.html and findings.csv
+       -- leads to review, each linked to its rows in the Excel file (see
+       "Findings Report")
+    8. Asks how you want to view: Excel (colored), Timeline Explorer, Both,
+       Open report, None
 
   You can also pass a path directly, optionally followed by a comma-separated
   keyword list (both in quotes):
@@ -144,6 +150,12 @@ themselves are never committed.
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -Sources "EventLogs,Prefetch,Registry"
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -Keywords "mimikatz,psexec,powershell -enc"
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -MaxUsnEntries 200000
+  powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -NoReport
+
+  Rebuild only the findings report of an existing timeline (no parsing, no
+  Administrator rights needed), for example after editing the rules:
+  powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -ReportOnly ".\reports\timeline_2026-04-08_09-43-57"
+  powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -ReportOnly ".\reports\timeline_2026-04-08_09-43-57" -ReportRules "D:\my-rules.json" -Viewer Report
 
   With -File, PowerShell passes a list such as "a","b" or a,b to the script as
   one string ("a,b"). The script splits -Sources and -Keywords on commas
@@ -179,9 +191,36 @@ themselves are never committed.
                   unlimited. The USN journal is usually the largest source;
                   see "Known Limitations" for the Excel row limit.
   -Viewer         Viewer to open at the end without the menu: Excel,
-                  TimelineExplorer, Both or None (for scripts and automation).
+                  TimelineExplorer, Both, Report (the findings report:
+                  report.pdf, or report.html when no PDF was made) or None
+                  (for scripts and automation).
   -NoExcel        CSV only: don't generate timeline.xlsx (ImportExcel is then
-                  not needed).
+                  not needed). The findings report is still written; its row
+                  numbers are then rows of timeline.csv. With -ReportOnly:
+                  leave an existing timeline.xlsx as it is.
+  -NoReport       Don't write the findings report (report.pdf, report.html,
+                  findings.csv, report-model.json) and don't add the Findings
+                  sheet and Finding column to timeline.xlsx. The timeline
+                  itself is the same either way. Not with -ReportOnly.
+  -ReportOnly     Rebuild only the findings report from an existing timeline:
+                  the path of a timeline.csv, or of a reports\timeline_*
+                  folder that holds one. Nothing is parsed, the collection
+                  is not needed, and no Administrator rights are needed.
+                  Rewrites report.pdf, report.html, findings.csv and
+                  report-model.json next to the timeline and, when
+                  timeline.xlsx is there with the same rows, replaces its
+                  Findings sheet and Finding column (close it in Excel
+                  first). Logs to report_log.txt in that folder. -Viewer,
+                  -NoExcel and -ReportRules apply; the parsing parameters
+                  (-Sources, -StartDate, -EndDate, -Keywords, -MftDays,
+                  -MaxUsnEntries, -OutputFile) are ignored with a warning.
+                  Cannot be combined with -InputPath, -Browse or -NoReport.
+                  Exit code 1 when no report could be made.
+  -ReportRules    Rules file for the findings report (default:
+                  report\report-rules.json next to the script). See "Report
+                  rules file". A missing or invalid file is logged as a
+                  warning and the run finishes without a report (with
+                  -ReportOnly it is an error).
   -MftDays        $MFT file-system events: only times within this many days
                   before the collection are added. Default 7; 0 = all. A
                   full $MFT can produce millions of rows, and one Windows
@@ -237,15 +276,34 @@ The script creates a timestamped report folder next to the script:
       timeline_2026-04-08_09-43-57\
         timeline_builder_log.txt     -- Full processing log
         timeline.csv                 -- The unified timeline (~12 MB, ~36K events)
-        timeline.xlsx                -- Color-coded Excel version (~2 MB)
+        timeline.xlsx                -- Color-coded Excel version (~2 MB); its
+                                        first sheet "Findings" links to the
+                                        rows of each finding
+        report.pdf                   -- Findings report (printed by Microsoft Edge)
+        report.html                  -- The same report as one offline HTML file
+        findings.csv                 -- The findings with their row numbers
+        report-model.json            -- Everything the report shows, as data
+        collection_info.json         -- Copied from the collection (for -ReportOnly)
+        collection_log.txt           -- Copied from the collection (for -ReportOnly)
+        report_log.txt               -- Log of -ReportOnly runs (only after one)
+    report\
+      report-rules.json              -- The findings report's rules (data)
+      TimelineReport.Engine.ps1      -- Rules engine and report model
+      TimelineReport.Render.ps1      -- report.html and report.pdf
     tools\
       sqlite3\                       -- Auto-downloaded, cached
       TimelineExplorer\              -- Auto-downloaded on first use, cached
 
+The report files are written next to the timeline: with -OutputFile, in
+that file's folder (the builder log stays in reports\timeline_<timestamp>\).
+See "Findings Report".
+
 
 ## Output Format (CSV and Excel)
 
-Both timeline.csv and timeline.xlsx contain the same columns:
+Both timeline.csv and timeline.xlsx contain the same columns (the workbook
+adds a last column, Finding, for the findings report; timeline.csv never
+gets it):
 
   Timestamp     UTC-normalized datetime (yyyy-MM-dd HH:mm:ss.fff)
   Source        Which artifact produced the entry (e.g., Security.evtx, Prefetch)
@@ -346,6 +404,285 @@ Both timeline.csv and timeline.xlsx contain the same columns:
      larger (usually because of a very large USN journal), the .xlsx is not
      generated and a warning is logged; use the CSV, or narrow the run with
      -StartDate, -EndDate, -Sources or -MaxUsnEntries.
+
+
+## Findings Report
+
+Every run ends with a findings report made from the timeline rows. Rules
+look for known signs of attacker activity -- antivirus detections and
+tampering, cleared logs, new accounts and admin-group adds, suspicious
+services, tasks and Run keys, encoded PowerShell, attacker tools, programs
+run from download folders, timestomped files, and more -- and list what
+they find as leads to review. Next to the timeline:
+
+  report.pdf         The report to read, print or send (printed by
+                     Microsoft Edge from report.html)
+  report.html        The same report as one offline HTML file: no scripts,
+                     no external resources, charts drawn inline
+  findings.csv       Per finding a summary line (RowNumber empty), then one
+                     line per evidence row: FindingId, Severity, RuleId,
+                     Title, Category, RowNumber, Timestamp, Source,
+                     Description. UTF-8 with BOM, so Excel opens it directly;
+                     a value starting with = + - or @ gets a leading ' so
+                     Excel never runs it as a formula
+  report-model.json  Everything the report shows, as data (for scripts)
+  timeline.xlsx      Gets a first sheet "Findings" and a "Finding" column
+                     (see below)
+
+-NoReport turns the report off. -ReportOnly rebuilds it later from an
+existing timeline, for example after the rules were tuned. A problem with
+the report (a broken rules file, Edge missing, the workbook open in Excel)
+is logged as a warning; the timeline is never affected.
+
+On a 286,000-row timeline the rules take about 4 seconds; with the
+workbook's Findings sheet, the HTML and the PDF the report adds roughly
+half a minute to a run.
+
+### Two audiences, in this order
+
+  1  Summary page, written for a manager or client:
+       - the bottom line: how many High and Medium leads, and the earliest
+         and latest flagged time (in UTC and the machine's local time);
+       - key facts: computer, operating system, user accounts, when the
+         evidence was collected and how, the machine's time zone, the time
+         span the timeline covers, the Excel workbook;
+       - the top five leads in one plain sentence each;
+       - a box "What this report can't tell you".
+     Then "All leads at a glance": every High and Medium lead in one table
+     with its first row numbers (the rest of the report is for the analyst).
+  2  Evidence coverage and integrity: how far back each source reaches
+     (first and last time, days before the collection), cleared logs,
+     boots and shutdowns, logging that was off (no 4688 process creation,
+     no 4104 script blocks, no Sysmon, the USN journal's span, ...),
+     collector errors, and the Integrity leads
+  3  Antivirus verdicts       4  Access       5  Persistence
+  6  Execution                7  Initial access       8  File system
+     (and "Other leads" when a rule uses another category)
+  9  Activity overview: events per day (and per month when the data
+     reaches back further), the busiest hours, rows per source and per user,
+     with markers on the days and hours that have leads
+  A  Informational items      B  Rules used      C  Method
+  D  Files: timeline.csv, findings.csv, the workbook (and the collection zip
+     in browse mode) with their SHA-256
+
+### Conservative flagging: leads, not a verdict
+
+  Every rule has a severity:
+    High    review first: a strong sign of attacker activity in general
+    Medium  review: often benign, but worth a look
+    Info    context only: listed in Appendix A, never counted as a lead
+  Only High and Medium findings are leads. A lead is a reason to look
+  closer, not proof -- key risk indicators are reasons to look, not
+  indicators of compromise. The report never says that the computer was
+  or was not compromised, and "no leads" does not mean "clean".
+
+### Reading a finding
+
+  Each lead has a card in its category's section:
+    F003  HIGH  Title      the id (F001... numbered High first, then
+                           Medium, then Info, each by first time), the
+                           severity as a label and a color, the title
+    meta line              category, how many rows matched, first and last
+                           time (UTC), the rule id
+    why                    what it means, in plain English
+    Technical detail       what the rule matched, for the analyst
+    What to check next     how to confirm or rule it out
+    Common benign causes   the usual innocent explanations
+    References             MITRE ATT&CK techniques
+    Grouped by             the value the rows were grouped by (a user, a
+                           threat name, a program file name, ...)
+    flags                  "Escalated": a related event soon after raised
+                           the severity (that row is among the evidence);
+                           rows set aside by the allowlist; "Every row is
+                           from during the collection" (maybe the collector
+                           itself)
+    evidence rows          row number, time, source and event type,
+                           description and details, user -- earliest
+                           first, up to the rule's limit ("Showing the first
+                           N of M matching rows" when there are more)
+    In Excel: ...          where to find every row of the finding
+
+  Row numbers are rows of the "Timeline" sheet in timeline.xlsx: the header
+  is row 1, so the first event is row 2. Type one into Excel's Name Box (or
+  press Ctrl+G) to jump to it. Without a workbook (-NoExcel, a timeline over
+  Excel's 1,048,575-row limit, ImportExcel missing) they are rows of
+  timeline.csv counted the same way -- the row Excel shows when it opens
+  the CSV -- and the report labels them "CSV row".
+
+### The workbook: Findings sheet and Finding column
+
+  timeline.xlsx opens on its first sheet, "Findings": for each finding a
+  bold summary row in the severity's color (count, first and last time,
+  group, escalation, how many rows are listed), then one row per evidence
+  row -- finding id, severity, row type (Summary, Evidence or Escalation),
+  Timeline row, time, title, description, source, event type, user,
+  category and rule. Each "Timeline row" cell is a link: click it to jump
+  to that row of the Timeline sheet. The header is frozen and every column
+  has a filter.
+
+  The "Timeline" sheet gets a last column, "Finding", with the ids of every
+  finding the row belongs to ("F001, F004"), colored by the most severe
+  one. Filter it on an id to see all rows of that finding, also those
+  beyond the report's evidence limit. Info findings are tagged too.
+  timeline.csv does not get this column; its columns never change.
+
+### The PDF, Edge and the workbook link
+
+  report.pdf is report.html printed by Microsoft Edge in headless mode
+  (msedge --headless=new --print-to-pdf) with a temporary profile folder
+  that is deleted afterwards. Edge comes with Windows 10 and 11; the builder
+  looks in Program Files (x86), Program Files, %LOCALAPPDATA% and the App
+  Paths registry keys. The paper is Letter, or A4 when Windows' region uses
+  the metric system. The footer has page numbers and the computer's name;
+  the PDF has bookmarks, and the ids on the summary page and in the index
+  link to the cards.
+
+  Without Edge -- or when it fails or needs more than 3 minutes -- a
+  warning is logged and the run goes on: report.html is complete, and any
+  browser can print it to PDF. A report.pdf from an earlier run is removed
+  first, so it never sits next to a newer report.html.
+
+  The report links to the workbook with a relative link (./timeline.xlsx),
+  not with a full path: the PDF holds no local path (or user name), and the
+  link keeps working when the whole folder is moved, copied or zipped. Keep
+  report.pdf and timeline.xlsx in the same folder: a PDF viewer resolves
+  the link against the PDF's own folder (some viewers ask before they open
+  a file, and a viewer in a browser may refuse local files). The link
+  opens the workbook, not a particular row: use the row numbers printed
+  with the evidence, or the Findings sheet, whose cells link to the rows.
+
+### Rebuilding the report: -ReportOnly
+
+  -ReportOnly <timeline folder or timeline.csv> reads the timeline, runs
+  the rules and rewrites report.pdf, report.html, findings.csv and
+  report-model.json in that folder. When timeline.xlsx is there with the
+  same number of rows, its Findings sheet and Finding column are replaced
+  (close it in Excel first; with -NoExcel it is left alone and the report
+  does not link to it). Nothing is parsed, the collection is not needed,
+  and no Administrator rights are needed. It logs to report_log.txt in the
+  folder. On a 286,000-row timeline it takes about 35 seconds, 20 of them
+  for the workbook.
+
+  The collection facts (computer name, collector user, collection time,
+  mode and time zone) come from the collection_info.json and
+  collection_log.txt that every run copies next to the timeline. For a
+  timeline folder made before the report existed, the collection time, mode
+  and time zone are read from its timeline_builder_log.txt and the computer
+  name from the timeline's SystemInfo row.
+
+### Report rules file
+
+  The rules are data: report\report-rules.json, or another file given with
+  -ReportRules. Keyword lists (attacker tools, LOLBins, staging folders,
+  download cradles, ...) live only in this file: Defender's AMSI blocks
+  PowerShell code that contains such names, so never move them into a .ps1
+  file, and edit the JSON in a text editor, not through PowerShell commands
+  that contain the words. Keep the file ASCII.
+
+    {
+      "schemaVersion": 1,
+      "lists": { "stagingExec": ["\\Downloads\\", "\\Users\\Public\\"] },
+      "rules": [ {
+        "id": "EXEC-STAGING",                  unique, shown in the report
+        "title": "A program ran from a user folder: {{group}}",
+        "category": "Execution",               Integrity, Antivirus, Access,
+                                               Persistence, Execution,
+                                               InitialAccess, FileSystem, Other
+        "severity": "Medium",                  High, Medium or Info
+        "match": { "source": "^(Prefetch|BAM|Registry-UserAssist)$" },
+        "anyOf": [ { "description": "{{list:stagingExec}}" } ],
+        "groupBy": "description",              one finding per value
+        "threshold": { "count": 10, "windowMinutes": 5 },
+        "escalate": { "severity": "High", "withinMinutes": 60,
+                      "sameKey": "user", "match": { ... } },
+        "why": "...", "technical": "...", "nextSteps": "...",
+        "falsePositives": "...", "references": ["MITRE ATT&CK T1204.002"],
+        "maxEvidence": 40,                     evidence rows shown (25)
+        "enabled": true                        false turns the rule off
+      } ],
+      "allowlist": [ { "ruleId": "AV-EXCLUSION", "match": { ... },
+                       "reason": "why these rows are benign" } ]
+    }
+
+  match: every condition given must hold. Conditions are case-insensitive
+  .NET regular expressions on the timeline columns: source, eventType,
+  description, details and user, and notSource, notEventType,
+  notDescription, notDetails and notUser, which must NOT match.
+  "duringCollection": true (or false) matches only rows at or after (before)
+  the collection start. {{list:<name>}} in a pattern stands for any entry of
+  that list, as literal text. In JSON a backslash is written twice: the
+  regex \. is "\\." and a literal backslash \\ is "\\\\".
+  anyOf (optional): the match AND at least one of these match objects.
+  groupBy: "rule" (one finding for all rows; the default), "description",
+  "user", "source", "eventType", "detail:<Key>" (a Key=Value of Details;
+  "detail:K1,K2" takes the first that is set) or "capture" (the group
+  (?<key>...) of match.description, or of match.details). {{group}} in the
+  title or why is replaced by the group's value.
+  threshold (optional): a group becomes a finding only when at least
+  "count" rows fall within "windowMinutes".
+  escalate (optional): a row matching escalate.match up to withinMinutes
+  after one of the finding's rows, with the same sameKey value ("user",
+  "source", "description", "eventType", "detail:<Key>" or "none"), raises
+  the finding to escalate.severity and is added to its evidence.
+  Members whose names start with "_", and "comment" and "notes", are
+  comments. Any other unknown member, a bad regular expression or an
+  unknown list stops the report with an error that names the rule and the
+  field; the timeline is not affected.
+
+  Tuning:
+    - Known-benign activity: add an allowlist entry (a ruleId, or "*" for
+      every rule, a match object and a reason). Allowlisted rows are counted
+      on the finding and in the log but never flagged. The collector's own
+      temporary Defender exclusion is allowlisted this way.
+    - A rule you don't want: "enabled": false.
+    - A noisy rule: narrow its match, add a threshold, group it differently
+      or lower its severity. Keep your copy of the file outside the
+      repository and pass it with -ReportRules, so an update does not
+      overwrite it.
+    - Check the effect with -ReportOnly: it needs no new collection.
+    - tests\Test-ReportRules.ps1 checks report\report-rules.json against
+      tests\fixtures\report\rules\cases.csv (a matching and a near-miss row
+      for every rule); add cases there when you change a rule.
+
+### What the report can't tell you
+
+  The summary page lists these limits; they apply to every lead:
+    - Leads are reasons to look, not a verdict on whether the computer was
+      compromised or is clean.
+    - Useful logging is off by default (process command lines 4688, task
+      and remote-session events 4698-4702 and 4778/4779, full PowerShell
+      script logging, file-share access 5140/5145): a missing event proves
+      nothing.
+    - Domain sign-ins are logged on the domain controller (Kerberos and
+      NTLM events 4768, 4769, 4776), not on the computer.
+    - Logs roll over: each reaches back only to its first event.
+    - All times are UTC; a wrong clock or altered file times (timestomping)
+      can put events out of order.
+    - ShimCache and Amcache show that a file existed, not that it ran;
+      Prefetch shows that a program ran, not what it did.
+    - Private browsing leaves no history and clearing history is not
+      logged; App-Bound-encrypted cookies need the live computer; Chrome's
+      own DNS lookups are not in the Windows DNS cache.
+    - Email headers can be forged, and a compromised real mailbox passes
+      SPF, DKIM and DMARC; mailbox and sign-in logs are kept by the mail
+      service (for example Microsoft 365).
+    - Analysis tools run on the collected computer leave their own traces
+      in later collections.
+  Plus, when they apply: credential material in the collection
+  (-IncludeSecrets), the -MftDays window, dropped USN entries, a
+  -StartDate/-EndDate range, collector errors, an unknown time zone or
+  collection time, a mounted-image collection, no workbook.
+
+  And about the report itself:
+    - The rules only know the patterns in the rules file. Everything else
+      is still in the timeline, but not in the report.
+    - Severity says how strongly a pattern is linked to attacker activity
+      in general, not that it happened here. Medium leads are often benign
+      (installers run from Downloads, admin tools, test activity).
+    - Each card shows at most the rule's maxEvidence rows; the workbook's
+      Finding column tags them all.
+    - A timeline narrowed with -Sources, -StartDate/-EndDate, -MftDays or
+      -MaxUsnEntries gives a narrower report.
 
 
 ## What Each Parser Extracts (19 Parsers)
@@ -1003,11 +1340,21 @@ After the timeline builds, the script presents a viewer menu:
   [2] Timeline Explorer -- powerful forensic CSV viewer (no colors,
       requires manual conditional formatting setup per session)
   [3] Both -- open Excel (colored) and Timeline Explorer side by side
-  [4] None -- just save the files, don't open anything
+  [4] Open report -- the findings report (PDF): leads to review,
+      each with its timeline rows (plain-English summary first)
+  [5] None -- just save the files, don't open anything
 
-Both output files are always generated regardless of viewer choice:
+Options that do not apply are left out and the rest renumbered: Excel and
+Both without a workbook, Open report without a report (-NoReport, or a
+report that could not be written). Open report opens report.pdf, or
+report.html when no PDF was made. -Viewer Excel|TimelineExplorer|Both|
+Report|None skips the menu.
+
+The output files are always generated regardless of viewer choice:
   - timeline.csv   -- plain CSV for any tool (Timeline Explorer, SIEM, etc.)
   - timeline.xlsx  -- color-coded Excel with rows pre-formatted by EventType
+  - report.pdf, report.html, findings.csv -- the findings report (see
+    "Findings Report")
 
 
 ### Option 1: Excel (recommended for most users)
@@ -1095,30 +1442,41 @@ Timeline Explorer at the same time.
      Or: Run-TimelineBuilder.bat "path\to\collection" "mimikatz,psexec"
 
   3. REVIEW summary in the console output
-     Total events, date range, per-source breakdown, keyword-flagged count
+     Total events, date range, per-source breakdown, keyword-flagged count,
+     and the findings report's High/Medium/Info counts
 
-  4. CHOOSE a viewer when prompted
+  4. READ the findings report (report.pdf)
+     The summary page says how many leads there are and where to start;
+     each lead lists its evidence rows. In Excel, the Findings sheet links
+     to those rows, and the Finding column of the Timeline sheet filters
+     every row of a lead. Leads are reasons to look, not a verdict.
+
+  5. CHOOSE a viewer when prompted
      Excel: pre-colored rows, ready to analyze immediately
      Timeline Explorer: powerful forensic CSV viewer (manual color setup)
      Both: side by side for maximum flexibility
+     Open report: the findings report
 
-  5. TRIAGE in your chosen viewer
+  6. TRIAGE in your chosen viewer
+     Filter the Finding column for a lead's id to see all of its rows
      Filter EventType to SecurityAlert for AV detections and tampering
      Filter Flagged column to TRUE for keyword hits
      Sort by Timestamp for chronological review
      Group by EventType for category analysis (hide Snapshot rows to see
      only real events)
 
-  6. INVESTIGATE
+  7. INVESTIGATE
      Pivot on timestamps: what else happened +/- 5 minutes?
      Pivot on users: what else did this account do?
      Pivot on processes: where else does this executable appear?
      Check Browser entries for downloads preceding suspicious execution
 
-  7. REFINE if needed
+  8. REFINE if needed
      Re-run with -StartDate/-EndDate to zoom into a timeframe
      Re-run with additional -Keywords based on findings
      Re-run with -Sources to focus on specific artifact types
+     Tune the report's rules (allowlist known-benign activity) and rebuild
+     the report alone with -ReportOnly
 
 
 ## Known Limitations and Expected Warnings
@@ -1238,6 +1596,24 @@ Timeline Explorer at the same time.
     no results on Windows 11 Build 26200+ due to kernel structure changes.
     This is a Volatility compatibility issue, not a script bug.
 
+  - Findings report warnings -- the timeline is always kept; only the report
+    part named in the warning is missing:
+      "Rules file not found" / "The report rules failed: ..." -- a missing
+      -ReportRules file, or a rules file with an error (the message names
+      the rule and field): no report. Fix the file and run -ReportOnly.
+      "PDF not created: ..." -- Microsoft Edge is missing, failed or timed
+      out: report.html is complete; print it to PDF from a browser.
+      "Could not update the workbook: ..." (-ReportOnly) -- timeline.xlsx is
+      open in Excel, ImportExcel is missing, or the workbook does not have
+      the timeline's rows: the report then gives timeline.csv row numbers.
+      "Report rule X: N regular expression match(es) timed out" -- a
+      rule's pattern took over 2 seconds on a row; that row is not flagged.
+
+  - Findings report limits -- see "What the report can't tell you" under
+    "Findings Report". In short: leads are reasons to look, not a verdict;
+    the rules only know the patterns in the rules file; Medium leads are
+    often benign; and a missing event proves nothing.
+
 
 ## Limitations vs. Full Tools (plaso/log2timeline)
 
@@ -1253,7 +1629,8 @@ Timeline Explorer at the same time.
   USN Journal      | Parsed from text export        | Full $UsnJrnl binary parse
   $MFT             | SI/FN, deleted, windowed, MotW | Full $MFT parsing
   Shellbags        | Folder names + key times       | Full shellbag parsing
-  Output formats   | CSV + color-coded XLSX         | CSV, JSON, XLSX, and more
+  Output formats   | CSV + color-coded XLSX +       | CSV, JSON, XLSX, and more
+                   | findings report (PDF/HTML)     |
   Parsers          | 19 parsers (18 + memory opt-in) | 100+ parsers
 
   When to use this: Quick triage, initial timeline, no-install environments,
@@ -1267,7 +1644,10 @@ Timeline Explorer at the same time.
 
   - Windows 10 or Windows 11
   - PowerShell 5.1 or later
-  - Administrator privileges (the .bat launcher handles elevation)
+  - Administrator privileges (the .bat launcher handles elevation); not for
+    -ReportOnly
+  - Microsoft Edge (part of Windows 10 and 11) for report.pdf; without it
+    the findings report is written as report.html only
   - Internet connection on first run (to install ImportExcel module and
     auto-download sqlite3.exe; Timeline Explorer downloaded on first use
     if selected). After first run, cached copies are used offline.
@@ -1494,6 +1874,53 @@ parsing is skipped, and the timeline CSV can be opened manually.
   one builder run. Apart from Test-SrumParsers part 2, they change nothing
   on the system.
 
+  Four scripts test the findings report (CI runs them after the parser
+  tests, in both PowerShell versions). The first three need no admin and do
+  not run the builder:
+
+  tests\Test-ReportEngine.ps1 -- the rules engine and report model
+  (report\TimelineReport.Engine.ps1) on synthetic rows and rules in
+  tests\fixtures\report\engine\: every match condition, lists, grouping,
+  threshold windows, escalation, the allowlist, numbering, evidence limits,
+  row numbers, invalid rules files (each error names the rule and field),
+  the report model, findings.csv and the timeline CSV reader.
+
+  tests\Test-ReportRules.ps1 -- loads report\report-rules.json with the
+  engine and checks it against tests\fixtures\report\rules\cases.csv: rows
+  in timeline format, each tagged with the rules it must (HIT) or must not
+  (MISS) trigger; every enabled rule needs a hit and a near-miss case.
+
+  tests\Test-ReportRender.ps1 -- renders report.html from the synthetic
+  models in tests\fixtures\report\render\ and from in-memory models and
+  checks the sections and their order, the summary page, escaping, the
+  offline page (no scripts or external loads), ASCII output, the charts and
+  the appendix; then prints PDFs with Edge (skipped without Edge) and checks
+  the page size, the relative ./timeline.xlsx link, that no local path is
+  in the PDF and that Edge's temporary profile is removed.
+
+  tests\Test-ReportBuilder.ps1 -- runs the builder on the synthetic
+  collection in tests\fixtures\report\builder\collection\ (Defender
+  detections, Run keys, BAM) and checks findings.csv (the expected rule ids
+  and severities, row numbers that point at the right timeline rows),
+  report-model.json, report.html, report.pdf (skipped without Edge), the
+  copied collection_info.json and collection_log.txt, and the workbook: the
+  first sheet is Findings, every row links to its Timeline row, and the
+  Finding column tags exactly the rows of each finding. Then -ReportOnly
+  (the same findings, no duplicate sheet or column), -ReportOnly with
+  -ReportRules and -NoExcel, a missing rules file, -NoReport and -ReportOnly
+  without a timeline. It needs admin like the builder, or -BuilderPath with
+  a copy without the admin check that has the report\ folder beside it.
+  Like a user run, the builder installs ImportExcel from the PowerShell
+  Gallery when it is missing; if it cannot, the workbook checks are SKIPPED.
+
+    powershell -ExecutionPolicy Bypass -File tests\Test-ReportEngine.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-ReportRules.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-ReportRender.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-ReportBuilder.ps1
+
+  The parser tests above run the builder with its defaults, so they also
+  write a findings report next to their temporary timelines (and remove it).
+
   Run them from an elevated PowerShell; -AllowSystemChanges lets the event
   log, registry and SRUM tests change this machine:
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers.ps1
@@ -1541,6 +1968,10 @@ parsing is skipped, and the timeline CSV can be opened manually.
 
   WScript.Shell COM    Reads LNK shortcut files to extract target paths,
                        arguments, and working directories for Recent Files.
+
+  msedge.exe           Microsoft Edge in headless mode prints report.html
+                       to report.pdf (a temporary profile folder in %TEMP%,
+                       deleted afterwards; no network access is needed).
 
   PowerShell cmdlets   Import-Csv, Export-Csv, Expand-Archive,
                        Invoke-WebRequest, ConvertFrom-Json.
@@ -1618,6 +2049,15 @@ Temporary actions (all cleaned up automatically):
   - Copies SRUDB.dat and its logs to %TEMP%\TimelineSrum_<n> for recovery
     and reading (the copies are made writable) -- deleted after processing
   - Downloads zip files to %TEMP% (first run) -- deleted after extraction
+  - Gives Microsoft Edge a temporary profile folder,
+    %TEMP%\timeline-report-edge-<id>, to print report.pdf -- deleted after
+    printing
+
+The findings report writes only next to the timeline (report.*,
+findings.csv, report-model.json, copies of collection_info.json and
+collection_log.txt) and adds the Findings sheet and Finding column to that
+folder's timeline.xlsx. -ReportOnly rewrites those files in the folder it is
+given and logs to report_log.txt there.
 
 Event log entries (not removed):
   - Only when the in-process recovery of a SRUM database fails, or a copy

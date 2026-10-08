@@ -1,0 +1,4 @@
+"Hive","KeyPath","ValueName","Command","User","KeyLastWriteUtc"
+"HKLM","SOFTWARE\Microsoft\Windows\CurrentVersion\Run","SecurityHealth","%windir%\system32\SecurityHealthSystray.exe","","2026-02-10T08:00:00Z"
+"HKU\alice","Software\Microsoft\Windows\CurrentVersion\Run","FixtureUpdater","C:\Users\Public\fixture-updater.exe /background","alice","2026-03-01T17:20:00Z"
+"HKU\alice","Software\Microsoft\Windows\CurrentVersion\RunOnce","FixtureHelper","powershell.exe -NoProfile -WindowStyle Hidden -enc VwByAGkAdABlAC0ATwB1AHQAcAB1AHQAIAAnAHIAZQBwAG8AcgB0ACAAZgBpAHgAdAB1AHIAZQAnAA==","alice","2026-03-01T17:25:00Z"
