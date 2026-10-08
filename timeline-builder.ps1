@@ -1168,7 +1168,9 @@ function Get-SecuritySidNames {
 # "4624 x805, 4672 x786": events per ID (and provider, with -ByProvider) for the log
 function Format-EvtxEventCounts {
     param([object[]]$Records, [switch]$ByProvider)
-    $groups = @($Records | Group-Object { if ($ByProvider) { "$($_.ProviderName) $($_.Id)" } else { "$($_.Id)" } } | Sort-Object Name)
+    # Read the switch here: PSReviewUnusedParameter does not look inside the script block
+    $perProvider = $ByProvider.IsPresent
+    $groups = @($Records | Group-Object { if ($perProvider) { "$($_.ProviderName) $($_.Id)" } else { "$($_.Id)" } } | Sort-Object Name)
     return (($groups | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ", ")
 }
 
