@@ -85,6 +85,7 @@
 "2026-05-05 12:06:00.000","AppCompatCache","Execution","ShimCache entry: C:\tools\mimikatz.exe","","Time=file last-modified time | CachePosition=5 of 1024","Registry","HIT EXEC-HACKTOOL-PRESENT"
 "2026-05-05 12:06:05.000","AppCompatCache","Execution","ShimCache entry: C:\Windows\explorer.exe","","Time=file last-modified time | CachePosition=50 of 1024","Registry","MISS EXEC-HACKTOOL-PRESENT"
 "2026-05-05 12:07:00.000","Registry-UserAssist","Execution","UserAssist execution: C:\Users\u\Downloads\tool.exe","WS\user","RunCount=1","Registry","HIT EXEC-STAGING"
+"2026-05-05 12:07:02.000","Prefetch","Execution","Prefetch execution: TOOL.EXE (run 1 of 1)","","RunCount=1 Path=\VOLUME{x}\USERS\U\DOWNLOADS\TOOL.EXE PrefetchFile=TOOL.EXE-0A1B2C3D.pf Version=31","Prefetch","HIT EXEC-STAGING"
 "2026-05-05 12:07:05.000","Registry-UserAssist","Execution","UserAssist execution: C:\Windows\System32\notepad.exe","WS\user","RunCount=7","Registry","MISS EXEC-STAGING"
 "2026-05-05 12:08:00.000","Security.evtx","ProcessCreation","New process created: C:\Windows\System32\cmd.exe","WS\user","CommandLine=cmd.exe /c whoami ParentProcess=C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE PID=4321","EventLogs","HIT EXEC-OFFICE-CHILD"
 "2026-05-05 12:08:05.000","Security.evtx","ProcessCreation","New process created: C:\Windows\System32\cmd.exe","WS\user","CommandLine=cmd.exe /c dir ParentProcess=C:\Windows\explorer.exe PID=4322","EventLogs","MISS EXEC-OFFICE-CHILD"

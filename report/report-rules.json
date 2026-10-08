@@ -724,12 +724,13 @@
       "title": "A program ran from a user folder: {{group}}",
       "category": "Execution",
       "severity": "Medium",
-      "match": { "source": "^(Prefetch|BAM|Registry-UserAssist)$" },
+      "match": { "source": "^(Prefetch|BAM|Registry-UserAssist)$", "description": "(?<key>[^\\\\/:|\\s][^\\\\/:|]*?{{list:execExt}})(?![\\w.])" },
       "anyOf": [
         { "description": "{{list:stagingExec}}[^|]*{{list:execExt}}" },
         { "details": "Path=[^|]*{{list:stagingExec}}[^|]*{{list:execExt}}" }
       ],
-      "groupBy": "description",
+      "groupBy": "capture",
+      "_groupBy": "One finding per program file name (case-insensitive), so its Prefetch, BAM and UserAssist rows are one lead, not one each.",
       "why": "A program was run from a download, Public, PerfLogs or Recycle Bin folder rather than a normal install location. Attackers commonly run their tools from these folders.",
       "technical": "Execution evidence (Prefetch/BAM/UserAssist) for an executable or script under Downloads, Users\\Public, PerfLogs or the Recycle Bin.",
       "nextSteps": "Identify the program, confirm it is expected there, and inspect the file.",
@@ -850,7 +851,8 @@
       "nextSteps": "Treat each flagged file as a lead, not proof. Check whether the file also has execution evidence, and compare its times with nearby files.",
       "falsePositives": "Installers, archive extraction and copying can set an earlier Created time legitimately; this flag is a lead only.",
       "references": ["MITRE ATT&CK T1070.006"],
-      "maxEvidence": 100
+      "maxEvidence": 30,
+      "_maxEvidence": "Extracted archives can flag hundreds of files; the report lists 30, and the workbook's Finding column tags them all."
     },
     {
       "id": "FS-RANSOM-RENAME",
