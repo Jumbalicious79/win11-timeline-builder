@@ -690,15 +690,59 @@ Test-Case -Name "User column pass: rows rewritten once per value, a named SID ke
 # In the builder's main flow, the pass runs once, on the collected rows,
 # after the exit for a run without rows and before deduplication (which
 # compares User)
+$outside = { param($node) $p = $node.Parent; while ($p -and $p -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { $p = $p.Parent }; $null -eq $p }
+$passCalls = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq "Update-TimelineUserColumn" }, $true) | Where-Object { & $outside $_ })
+$noRowsExit = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.Extent.Text -eq "Write-RunEndBanner -NoOutput" }, $true) | Where-Object { & $outside $_ })
+$dedupLoop = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.ForEachStatementAst] -and $node.Condition.Extent.Text -eq '$script:timelineEntries' }, $true) | Where-Object { & $outside $_ })
 Test-Case -Name "User column pass in the main flow: after the no-rows exit, before deduplication" -Action {
-    $outside = { param($node) $p = $node.Parent; while ($p -and $p -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { $p = $p.Parent }; $null -eq $p }
-    $passCalls = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq "Update-TimelineUserColumn" }, $true) | Where-Object { & $outside $_ })
-    $noRowsExit = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.Extent.Text -eq "Write-RunEndBanner -NoOutput" }, $true) | Where-Object { & $outside $_ })
-    $dedupLoop = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.ForEachStatementAst] -and $node.Condition.Extent.Text -eq '$script:timelineEntries' }, $true) | Where-Object { & $outside $_ })
     if ($passCalls.Count -ne 1 -or $noRowsExit.Count -ne 1 -or $dedupLoop.Count -ne 1) { throw "found $($passCalls.Count) pass call(s), $($noRowsExit.Count) no-rows exit(s), $($dedupLoop.Count) loop(s) over the rows" }
     if ($passCalls[0].Extent.Text -notmatch '-Entries \$script:timelineEntries\b') { throw "the pass is not given the collected rows: $($passCalls[0].Extent.Text)" }
     $order = "$($noRowsExit[0].Extent.StartOffset -lt $passCalls[0].Extent.StartOffset)|$($passCalls[0].Extent.StartOffset -lt $dedupLoop[0].Extent.StartOffset)"
     if ($order -ne "True|True") { throw "order (no-rows exit < pass | pass < deduplication): $order" }
+} -Expected @()
+
+# The main flow's own User column statements (after the no-rows exit, up to
+# the last that uses $userPass) on synthetic rows, with Log captured: the
+# computer name of collection_info.json is a name of the examined machine
+# only in a live collection (a mounted image is collected on another
+# machine), and the two log lines
+Test-Case -Name "User column pass in the main flow: collection_info.json's computer name only for a live collection, the log lines" -Action {
+    $statement = $passCalls[0]
+    while ($statement.Parent -and $statement.Parent -isnot [System.Management.Automation.Language.NamedBlockAst] -and $statement.Parent -isnot [System.Management.Automation.Language.StatementBlockAst]) { $statement = $statement.Parent }
+    $siblings = @($statement.Parent.Statements)
+    $first = -1
+    $last = -1
+    for ($i = 0; $i -lt $siblings.Count; $i++) {
+        if ($siblings[$i].Extent.StartOffset -le $noRowsExit[0].Extent.StartOffset -and $siblings[$i].Extent.EndOffset -ge $noRowsExit[0].Extent.EndOffset) { $first = $i + 1 }
+        if ($siblings[$i].Extent.Text -match '\$userPass\b') { $last = $i }
+    }
+    if ($first -lt 1 -or $last -lt $first) { throw "the User column statements were not found after the no-rows exit ($first..$last)" }
+    $userStatements = [ScriptBlock]::Create((@($siblings[$first..$last] | ForEach-Object { $_.Extent.Text }) -join "`n"))
+    $collectedRows = $script:timelineEntries
+    try {
+        # @(Mode, User of the "COLLECTORPC\alice" row afterwards, rows changed)
+        foreach ($case in @(@("MountedImage", "COLLECTORPC\alice", 0), @("Live", "alice", 1))) {
+            $script:timelineUserContext = $null
+            $script:collectionInfo = [PSCustomObject]@{ Mode = $case[0]; ComputerName = "COLLECTORPC" }
+            $script:timelineEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
+            foreach ($user in @("COLLECTORPC\alice", "S-1-5-21-1111-2222-3333-1009")) { $script:timelineEntries.Add([PSCustomObject]@{ User = $user; Details = "" }) }
+            $logged = [System.Collections.Generic.List[string]]::new()
+            & {
+                function Log { param([string]$Message) $logged.Add($Message) }
+                . $userStatements
+            }
+            $users = (@($script:timelineEntries | ForEach-Object { $_.User })) -join ", "
+            if ($users -cne "$($case[1]), S-1-5-21-1111-2222-3333-1009") { throw "Mode $($case[0]): rows $users" }
+            $summary = "^  User column: $($case[2]) row\(s\) changed to one form per account \($($case[2]) distinct value\(s\)\); 0 row\(s\) whose SID got a name keep it in Details \(UserSID=\)$"
+            $unnamed = '^  User column: 1 SID\(s\) not named by the sources read in this run \(.*-Sources Registry.*\), left as they are: S-1-5-21-1111-2222-3333-1009 \(1 row\(s\)\)$'
+            if ($logged.Count -ne 2 -or $logged[0] -cnotmatch $summary -or $logged[1] -cnotmatch $unnamed) { throw "Mode $($case[0]): logged $($logged -join ' / ')" }
+        }
+    }
+    finally {
+        $script:timelineEntries = $collectedRows
+        $script:timelineUserContext = $null
+        $script:collectionInfo = $null
+    }
 } -Expected @()
 
 # --- Parse-EventLogs dispatch ---

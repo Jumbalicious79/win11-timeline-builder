@@ -401,24 +401,26 @@ Both timeline.csv and timeline.xlsx contain the same columns:
 
 ### User column
 
-  The user is taken from the collection's own folder layout: Registry\<user>\,
-  UserActivity\<user>\, Browser\<user>\ or a Users\<user>\ folder inside the
-  collection. It is never taken from the analysis machine's path (for
-  example the work folder a zip is extracted to). Rows that do
-  not belong to a specific profile have an empty User.
+  For a per-profile artifact (a user's registry hive, user activity,
+  browser history, a file in a profile) the user is taken from the
+  collection's own folder layout: Registry\<user>\, UserActivity\<user>\,
+  Browser\<user>\ or a Users\<user>\ folder inside the collection. It is
+  never taken from the analysis machine's path (for example the work
+  folder a zip is extracted to). Event logs, scheduled tasks, BAM and
+  other sources write the account their record names, each in its own way
+  (HOST\alice, a SID, LocalSystem, ...). A row with no account has an
+  empty User.
 
-  Event logs, scheduled tasks, BAM and other sources write the account in
-  their own way (HOST\alice, a SID, LocalSystem, ...). After all parsers
-  have run, every User value is put in one form per account, so that a
-  filter on an account finds all of its rows:
+  After all parsers have run, every User value is put in one form per
+  account, so that a filter on an account finds all of its rows:
   - A local account of the examined machine is its name alone (alice, not
     HOST\alice or .\alice, in any case). The machine's names are the
     computer name in collection_info.json (live collections only) and the
     computer and host names in the collected SYSTEM hive.
   - A SID gets the account name from the collected SOFTWARE hive's
     ProfileList (the profile folder name) or from bam_entries.csv, and the
-    SID stays in Details as UserSID=<SID>. A SID with no name in the
-    collection is left as it is; the log lists such SIDs.
+    SID stays in Details as UserSID=<SID>. A SID with no name is left as
+    it is; the log lists such SIDs.
   - The built-in accounts are NT AUTHORITY\SYSTEM (also for SYSTEM,
     LocalSystem and S-1-5-18), NT AUTHORITY\LOCAL SERVICE and NT
     AUTHORITY\NETWORK SERVICE, and Window Manager\DWM-n and Font Driver
@@ -429,6 +431,15 @@ Both timeline.csv and timeline.xlsx contain the same columns:
     (WORKGROUP\HOST$), NT SERVICE\..., NT VIRTUAL MACHINE\... and group
     names.
   The log's "User column:" line says how many rows changed.
+
+  The machine and SID names are read, with no extra hive loads, only by
+  the sources that open those files: ProfileList by Registry (and by
+  PowerShellHistory when it reads BAM from the SYSTEM hive),
+  bam_entries.csv by PowerShellHistory, and the SYSTEM hive's names by
+  Registry and PowerShellHistory (and by USB when it reads MountedDevices
+  from the hive). All of them are in the default -Sources. A run with
+  only some sources (for example -Sources EventLogs) can leave SIDs, and
+  for a mounted image HOST\ prefixes, as they are.
 
 ### Duplicates
 
@@ -1202,7 +1213,8 @@ Timeline Explorer at the same time.
     (live collections only).
 
   - User column -- A SID is named only from the collection (SOFTWARE
-    ProfileList or bam_entries.csv), so the SID of a deleted account stays
+    ProfileList or bam_entries.csv, read only when a source that opens
+    them runs; see "User column"), so the SID of a deleted account stays
     a SID. The name is the profile folder's, which can differ from the
     account name (a renamed account, or a folder such as alice.DOMAIN). An
     account written with an older computer name (before the machine was
@@ -1389,7 +1401,10 @@ parsing is skipped, and the timeline CSV can be opened manually.
   User column: the one form per account for each kind of value, SID names
   from ProfileList and bam_entries.csv, and the pass over all rows
   (UserSID= in Details, the counts, and that it runs before
-  deduplication); the computer name and ProfileList are read from this
+  deduplication). The main flow's own User column statements are run on
+  synthetic rows: the computer name of collection_info.json must strip
+  HOST\ only for a live collection, not for a mounted image, and the log
+  lines are checked. The computer name and ProfileList are read from this
   machine's own SYSTEM and SOFTWARE keys (read only). Part 1 needs no
   admin and always runs. Part 2 generates real events (audit policy, a
   temporary local user and group membership, scheduled task, service and

@@ -11751,7 +11751,7 @@ Log "  User column: $($userPass.Rows) row(s) changed to one form per account ($(
 if ($userPass.Unresolved.Count -gt 0) {
     $sidList = @($userPass.Unresolved | Select-Object -First 20 | ForEach-Object { "$($_.Sid) ($($_.Rows) row(s))" }) -join ", "
     if ($userPass.Unresolved.Count -gt 20) { $sidList += ", and $($userPass.Unresolved.Count - 20) more" }
-    Log "  User column: $($userPass.Unresolved.Count) SID(s) without a name in the collection, left as they are: $sidList"
+    Log "  User column: $($userPass.Unresolved.Count) SID(s) not named by the sources read in this run (SOFTWARE ProfileList is read with -Sources Registry, bam_entries.csv with PowerShellHistory), left as they are: $sidList"
 }
 
 # Deduplicate: an entry is a duplicate only if Timestamp, Source, EventType,

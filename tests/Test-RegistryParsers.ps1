@@ -811,7 +811,7 @@ try {
     # The User column pass logs its summary and the SID it could not name
     $userLines = @($builderOutput | ForEach-Object { "$_" } | Where-Object { $_ -match 'User column: ' })
     if (@($userLines | Where-Object { $_ -match 'row\(s\) changed to one form per account' }).Count -ne 1 -or
-        @($userLines | Where-Object { $_ -match '1 SID\(s\) without a name in the collection, left as they are: S-1-5-21-1111-2222-3333-1009 \(1 row\(s\)\)' }).Count -ne 1) {
+        @($userLines | Where-Object { $_ -match '1 SID\(s\) not named by the sources read in this run \(.*\), left as they are: S-1-5-21-1111-2222-3333-1009 \(1 row\(s\)\)' }).Count -ne 1) {
         Write-TestFailure "User column log lines: $($userLines -join ' / ')"
         $failures++
     }
