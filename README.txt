@@ -371,8 +371,9 @@ Both timeline.csv and timeline.xlsx contain the same columns:
     collector versions have no collection_info.json; the time zone is then
     read from collection_log.txt.
   - Memory dump (Volatility 3): process creation and connection times kept
-    in memory; rows without one get the capture time from the dump header
-    (see "Snapshot rows" and parser #15)
+    in memory; rows without one get the capture time (the SystemTime in the
+    header of a 64-bit crash dump, else the dump file's last-write time; see
+    "Snapshot rows" and parser #15)
 
 ### Snapshot rows
 
@@ -1097,12 +1098,13 @@ Timeline Explorer at the same time.
     and services) at the capture time of the memory dump. Their Timestamp
     is when the state was observed, not when it was created.
 
-  - Memory capture time -- Only 64-bit crash dumps (DumpIt) store when the
-    memory was captured. For raw images (WinPmem, Magnet RAM Capture) and
-    32-bit dumps the dump file's last-write time is used: the end of the
-    acquisition, which for a large dump is minutes after its start. A copy
-    of the dump that does not keep the file's dates (most copies do) gives
-    the time of the copy instead.
+  - Memory capture time -- Only the header of 64-bit crash dumps (DumpIt on
+    x64) is read for when the memory was captured; raw images (WinPmem,
+    Magnet RAM Capture) have no header. For raw images and 32-bit dumps the
+    dump file's last-write time is used: the end of the acquisition, which
+    for a large dump is minutes after its start. A copy of the dump that
+    does not keep the file's dates (most copies do) gives the time of the
+    copy instead.
 
   - Local-time sources -- USN and setupapi times are local-time text. Times
     inside the hour that repeats when daylight saving time ends cannot be
@@ -1387,7 +1389,10 @@ parsing is skipped, and the timeline CSV can be opened manually.
   row's time, EventType and Details (rejected times kept), the counts, and
   that the rows are the same under the de-DE culture. A stub stands in for
   vol.exe to check that its output is read back from a scratch folder with
-  [ ] in its path and deleted. Volatility 3 is not run; no admin needed.
+  [ ] in its path and deleted, and for a whole Memory parser run on an x64
+  dump: the rows at the header's capture time (not the file's last write),
+  the counts per plugin in the log, and the warning for a plugin without
+  output. Volatility 3 is not run; no admin needed.
 
   Run them from an elevated PowerShell; -AllowSystemChanges lets the event
   log and registry tests change this machine:

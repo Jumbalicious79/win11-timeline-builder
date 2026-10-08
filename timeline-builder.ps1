@@ -10501,6 +10501,22 @@ function Add-MemoryPluginRows {
     return [PSCustomObject]@{ Entries = $timed + $snapshot; Timed = $timed; Snapshot = $snapshot }
 }
 
+# Volatility 3 next to the builder (tools\volatility3\, tools\ or the
+# builder's folder). Returns the full path or $null. A function of its own
+# so a test can put a stub in its place.
+function Find-VolatilityExe {
+    $volLocations = @(
+        (Join-Path $PSScriptRoot "tools\volatility3\vol.exe"),
+        (Join-Path $PSScriptRoot "tools\volatility3\volatility3.exe"),
+        (Join-Path $PSScriptRoot "tools\vol.exe"),
+        (Join-Path $PSScriptRoot "vol.exe")
+    )
+    foreach ($loc in $volLocations) {
+        if (Test-Path $loc) { return $loc }
+    }
+    return $null
+}
+
 function Parse-Memory {
     Log "--- Parsing Memory Dump (Volatility 3) ---"
 
@@ -10534,16 +10550,7 @@ function Parse-Memory {
     Log "  Analyzing in-place (not copied to temp)"
 
     # --- Find Volatility 3 ---
-    $volExe = $null
-    $volLocations = @(
-        (Join-Path $PSScriptRoot "tools\volatility3\vol.exe"),
-        (Join-Path $PSScriptRoot "tools\volatility3\volatility3.exe"),
-        (Join-Path $PSScriptRoot "tools\vol.exe"),
-        (Join-Path $PSScriptRoot "vol.exe")
-    )
-    foreach ($loc in $volLocations) {
-        if (Test-Path $loc) { $volExe = $loc; break }
-    }
+    $volExe = Find-VolatilityExe
 
     if (-not $volExe) {
         Log-Warning "  Volatility 3 not found in tools\ directory."

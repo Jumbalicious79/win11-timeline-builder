@@ -20,7 +20,9 @@
 # with a valid time of their own are events, every other row is a Snapshot
 # row at the capture time, a rejected time stays in Details, and the
 # counts. The rows must be the same under the de-DE culture. A stub stands
-# in for vol.exe to check where its output goes (Invoke-VolatilityPlugin).
+# in for vol.exe to check where its output goes (Invoke-VolatilityPlugin),
+# and in a whole Parse-Memory run (rows at the header's capture time, the
+# counts per plugin in the log, the warning for a plugin without output).
 # Volatility 3 is not run.
 # The builder's functions are loaded from its AST, so the script itself (and
 # its Administrator check) does not run: no admin rights needed.
@@ -480,6 +482,51 @@ try {
         Assert-Equal -Name "Volatility output: none, stderr returned for the warning" -Expected "|Unsatisfied requirement plugins.Test.kernel|0" -Actual "$($volResult.Json.Trim())|$($volResult.Errors.Trim())|$left"
     }
     finally { $script:runScratchDir = $null }
+
+    # --- Parse-Memory: from Volatility output to rows -------------------------
+    # A whole Parse-Memory run on an x64 dump whose header time (the capture
+    # time) is two minutes before its last write (the end of the
+    # acquisition): Snapshot rows must be at the header time, and late.exe
+    # (created at the end plus a day) must still be an event. A stub found
+    # in place of vol.exe prints the canned JSON of each plugin; netscan has
+    # none, which must give the warning and no rows.
+    Write-Host "Testing Parse-Memory with a stub for Volatility 3 ..."
+    $parseStub = Join-Path $stubDir "vol-canned.cmd"
+    [System.IO.File]::WriteAllText($parseStub, "@echo off`r`nif not exist `"%~dp0%5.json`" (`r`n  echo No output for %5 1>&2`r`n  exit /b 1`r`n)`r`ntype `"%~dp0%5.json`"`r`n")
+    $parseCases = @($pluginCases | Where-Object { $_.Plugin -ne "windows.netscan" })
+    foreach ($case in $parseCases) { [System.IO.File]::WriteAllText((Join-Path $stubDir "$($case.Plugin).json"), $case.Json) }
+    New-TestDump -Path $rowDump -SystemTime $captureFileTime -LastWriteUtc $endUtc
+    $realFindVolatility = ${function:Find-VolatilityExe}
+    ${function:Find-VolatilityExe} = { return $parseStub }
+    $script:runScratchDir = Join-Path $workDir "work [1]\w1234_120001\scratch"
+    [void][System.IO.Directory]::CreateDirectory($script:runScratchDir)
+    try {
+        Set-TestRunState -Collection (Join-Path $reports $nameC) -DumpPath $rowDump
+        $script:timelineEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
+        $script:artifactStats = @{}
+        Parse-Memory | Out-Null
+        $log = Get-TestLog
+        $left = @(Get-ChildItem -LiteralPath $script:runScratchDir -Force).Count
+    }
+    finally {
+        ${function:Find-VolatilityExe} = $realFindVolatility
+        $script:runScratchDir = $null
+    }
+    $expectedRows = @()
+    foreach ($case in $parseCases) { $expectedRows += @($case.Rows | ForEach-Object { "$($case.Source)|$_" }) }
+    $parsedRows = @($script:timelineEntries | ForEach-Object { "$($_.Source)|$($_.Timestamp)|$($_.EventType)|$($_.Description)|$($_.User)|$($_.Details)" })
+    Assert-Equal -Name "Parse-Memory: rows at the header's capture time, events at their own time (Source, time, EventType, Description, User, Details)" -Expected ($expectedRows -join "`n") -Actual ($parsedRows -join "`n")
+    $expectedLog = @(
+        "Dump time: $captureText UTC (crash dump header)",
+        "Using Volatility 3: $parseStub",
+        "windows.pslist: 9 entries (4 timed, 5 snapshot) in ",
+        "WARNING:     windows.netscan produced no output. Error: No output for windows.netscan",
+        "windows.cmdline: 2 entries (0 timed, 2 snapshot) in ",
+        "windows.svcscan: 2 entries (0 timed, 2 snapshot) in ",
+        "Memory analysis complete: 13 entries from 0 GB dump"
+    )
+    $missingLog = @($expectedLog | Where-Object { -not $log.Contains($_) })
+    Assert-Equal -Name "Parse-Memory: the dump time, the counts per plugin and the netscan warning are logged, the scratch folder is left empty" -Expected "|0" -Actual "$($missingLog -join ' / ')|$left"
 }
 catch {
     Write-TestResult -Name "test run" -Passed $false -Message "$($_.Exception.Message) ($($_.InvocationInfo.PositionMessage))"
