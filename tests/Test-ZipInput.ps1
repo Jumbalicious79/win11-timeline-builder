@@ -11,14 +11,16 @@
 #   lookup, a ".." entry not written outside the folder, nothing extracted
 #   when the zip does not fit), the manifest lookups from an outer folder,
 #   the input-file list of a collection folder and the list of missing
-#   files, the free-space verdict, the temp-folder check (8.3 short paths
-#   too), the end-of-run hive list, the clean-up of work folders left by
+#   files, the setupapi logs the manifest lists but that are gone, the
+#   free-space verdict, the temp-folder check (8.3 short paths too), the
+#   end-of-run hive list, the clean-up of work folders left by
 #   earlier runs, the refusal of a network work folder and the end-of-run
 #   banners (missing input files, unexpected errors).
 # Part 2 -- builder runs: a synthetic collection zip whose entries are dated
 #   2025, with two setupapi logs (USBSTOR devices) under "/" and "\" entry
 #   names and a manifest, passed as -InputPath (-Sources USB):
-#   - both logs are parsed, exit code 0, the extraction and the free-space
+#   - both logs are parsed (USBDevice rows; the USB parser logs "Found 2
+#     SetupAPI log(s)"), exit code 0, the extraction and the free-space
 #     check are in the log;
 #   - the work folder is in %LOCALAPPDATA%\TimelineBuilder, outside every
 #     temp folder, and removed at the end; no TriageExtract_* or
@@ -26,7 +28,9 @@
 #   - with the builder's test hook deleting one extracted file mid-run
 #     (TIMELINE_BUILDER_TEST_DELETE_INPUT; it only deletes inside the work
 #     folder) and -WorkDir: exit code 2, the "MISSING INPUT FILE(S)"
-#     banner, the work folder made in -WorkDir and removed, -WorkDir kept.
+#     banner, the USB parser's warning naming the setupapi log that the
+#     manifest lists but that is gone, the work folder made in -WorkDir
+#     and removed, -WorkDir kept.
 #   Needs Administrator rights, like the builder itself (GitHub Actions
 #   Windows runners are elevated). For a local run without them, pass
 #   -BuilderPath with a copy of the builder that has no admin check, kept
@@ -265,6 +269,26 @@ try {
     Assert-Equal -Name "25 missing files: all 25 names in the log file" -Expected 25 -Actual $logNames.Count
     Assert-Equal -Name "25 missing files: 20 names and a count on the console" -Expected "20 1" -Actual "$(@($console -match 'Browser\\file\d\d\.db$').Count) $(@($console -match '\.\.\. and 5 more \(all listed in the log file\)$').Count)"
 
+    # --- SetupAPI logs the manifest lists (USB parser) --------------------
+    # Only a listed log that is gone is reported; one shortened on
+    # extraction is found under its shorter name
+    $usbColl = Join-Path $testRoot "usb\Coll"
+    $shortSetupApi = Join-Path $usbColl "USB\setupapi.dev.2024~0123ABCD.log"
+    New-Item -ItemType Directory -Path (Join-Path $usbColl "USB") -Force | Out-Null
+    foreach ($file in @((Join-Path $usbColl "USB\setupapi.dev.log"), $shortSetupApi)) { [System.IO.File]::WriteAllText($file, "x") }
+    [System.IO.File]::WriteAllText((Join-Path $usbColl "collection_manifest.csv"),
+        (New-TestManifest -RelativePaths @("USB\setupapi.dev.log", "USB\setupapi.dev.20241201_000000.log", "USB\setupapi.dev.20240101_000000.log", "Registry\SYSTEM")))
+    Set-Variable -Name InputPath -Value (Split-Path $usbColl -Parent) -Scope Script
+    $script:collectionManifest = $null
+    $script:shortenedNames = @{ $shortSetupApi = (Join-Path $usbColl "USB\setupapi.dev.20241201_000000.log") }
+    $foundLogs = @(Get-ChildItem -LiteralPath (Join-Path $usbColl "USB") -Filter "setupapi.dev*.log" -File)
+    $setupApiCheck = Compare-ManifestSetupApiLogs -Found $foundLogs
+    Assert-Equal -Name "SetupAPI logs: listed in the manifest" -Expected "USB\setupapi.dev.20240101_000000.log, USB\setupapi.dev.20241201_000000.log, USB\setupapi.dev.log" -Actual ($setupApiCheck.Listed -join ", ")
+    Assert-Equal -Name "SetupAPI logs: only the one that is gone is missing (shortened one found)" -Expected "USB\setupapi.dev.20240101_000000.log" -Actual ($setupApiCheck.Missing -join ", ")
+    $setupApiCheck = Compare-ManifestSetupApiLogs -Found @()
+    Assert-Equal -Name "SetupAPI logs: none found, all listed are missing" -Expected 3 -Actual $setupApiCheck.Missing.Count
+    $script:shortenedNames = @{}
+
     # --- Free space verdict ----------------------------------------------
     $need = 2GB
     Assert-Equal -Name "free space: below size + 256 MB is an error" -Expected "Error" -Actual (Get-ExtractionSpaceVerdict -FreeBytes ($need + 255MB) -TotalBytes 1000GB -NeededBytes $need -IsSystemDrive $false)
@@ -420,8 +444,9 @@ try {
     if (Test-Path -LiteralPath $csvA) { $rowsA = @(Import-Csv -LiteralPath $csvA) }
     $rowA = @(Get-SetupApiRow -Rows $rowsA -Serial "TESTSERIAL0001")
     $rowB = @(Get-SetupApiRow -Rows $rowsA -Serial "TESTSERIAL0002")
-    Assert-Equal -Name "run A: device from setupapi.dev.log (/ entry name)" -Expected "1 2025-01-02 10:00:00.000 Device install: TestVen DiskA (serial TESTSERIAL0001)" -Actual "$($rowA.Count) $($rowA[0].Timestamp) $($rowA[0].Description)"
-    Assert-Equal -Name "run A: device from the rotated setupapi log (\ entry name)" -Expected "1 2024-11-30 09:00:00.000 Device install: TestVen DiskB (serial TESTSERIAL0002)" -Actual "$($rowB.Count) $($rowB[0].Timestamp) $($rowB[0].Description)"
+    Assert-Equal -Name "run A: device from setupapi.dev.log (/ entry name)" -Expected "1 2025-01-02 10:00:00.000 USBDevice Device install: TestVen DiskA (serial TESTSERIAL0001)" -Actual "$($rowA.Count) $($rowA[0].Timestamp) $($rowA[0].EventType) $($rowA[0].Description)"
+    Assert-Equal -Name "run A: device from the rotated setupapi log (\ entry name)" -Expected "1 2024-11-30 09:00:00.000 USBDevice Device install: TestVen DiskB (serial TESTSERIAL0002)" -Actual "$($rowB.Count) $($rowB[0].Timestamp) $($rowB[0].EventType) $($rowB[0].Description)"
+    Assert-Equal -Name "run A: both SetupAPI logs found, none reported missing" -Expected "True False" -Actual "$($runA.Log -match 'Found 2 SetupAPI log\(s\)\.') $($runA.Log -match 'SetupAPI log\(s\) missing')"
     Assert-Equal -Name "run A: completed successfully" -Expected 1 -Actual @($runA.Lines -match "=== Timeline Builder Completed Successfully ===").Count
     Assert-Equal -Name "run A: extraction written to the log file" -Expected $true -Actual ($runA.Log -match "Extracting the collection zip" -and $runA.Log -match "Zip: .+ 4 file\(s\)" -and $runA.Log -match "Work folder: ")
     Assert-Equal -Name "run A: free space checked before the extraction" -Expected $true -Actual ($runA.Log -match "Free space on |Low free space on |Free space check skipped")
@@ -451,6 +476,7 @@ try {
     $rowsB = @()
     if (Test-Path -LiteralPath $csvB) { $rowsB = @(Import-Csv -LiteralPath $csvB) }
     Assert-Equal -Name "run B: the remaining log is parsed, the deleted one is not" -Expected "1 0" -Actual "$(@(Get-SetupApiRow -Rows $rowsB -Serial 'TESTSERIAL0001').Count) $(@(Get-SetupApiRow -Rows $rowsB -Serial 'TESTSERIAL0002').Count)"
+    Assert-Equal -Name "run B: the USB parser names the SetupAPI log the manifest lists but that is gone" -Expected "True True" -Actual "$($runB.Log -match 'Found 1 SetupAPI log\(s\)\.') $($runB.Log -match 'SetupAPI log\(s\) missing: the collection manifest lists 2, 1 of them are not here -- their device installs are not in the timeline: USB\\setupapi\.dev\.20241201_000000\.log')"
     Write-TestResult -Name "run B: work folder made in -WorkDir" -Passed ($runB.WorkFolder -and (Split-Path $runB.WorkFolder -Parent) -eq $workDirB) -Message "work folder: $($runB.WorkFolder)"
     Write-TestResult -Name "run B: work folder removed, -WorkDir kept" -Passed ($runB.WorkFolder -and -not (Test-Path -LiteralPath $runB.WorkFolder) -and (Test-Path -LiteralPath $workDirB)) -Message "work folder: $($runB.WorkFolder)"
     Assert-Equal -Name "run B: the zip is not changed" -Expected $zipHash -Actual (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash

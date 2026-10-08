@@ -43,8 +43,8 @@ jobs:
           Write-Host "All scripts parse in PowerShell $($PSVersionTable.PSVersion)"
 
   parser-tests:
-    # Runs the builder on the fixture collection in tests\fixtures and
-    # compares the timeline with the expected rows (Windows runners are
+    # Runs the builder on each fixture collection in tests\fixtures and
+    # compares the timelines with the expected rows (Windows runners are
     # elevated, which the builder requires)
     name: Parser tests (${{ matrix.shell }})
     runs-on: windows-latest

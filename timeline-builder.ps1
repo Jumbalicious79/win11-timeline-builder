@@ -8646,6 +8646,34 @@ function Get-DeviceInstanceLabel {
     return "$InstancePath"
 }
 
+# $true for the device instance path of a USB device: USB\VID_..., a USB
+# storage device (USBSTOR\..., also inside a portable-device or volume path
+# like SWD\WPDBUSENUM\_??_USBSTOR#...), or an ID with a USB vendor ID
+# (HID\VID_..., SWC\VID_...). Bluetooth IDs write "_VID&" and do not match.
+function Test-UsbDeviceInstance {
+    param([string]$InstancePath)
+    return ($InstancePath -match '(?i)USBSTOR|^USB\\|VID_[0-9A-F]{4}')
+}
+
+# The setupapi.dev*.log files collection_manifest.csv lists (relative
+# paths): Listed, and Missing = those not among $Found (the files the USB
+# parser found). A missing log was saved by the collector but lost
+# afterwards, and its device installs are not in the timeline. A log
+# shortened on extraction is found under its shorter name. Both are empty
+# without a manifest.
+function Compare-ManifestSetupApiLogs {
+    param([object[]]$Found)
+    $result = [PSCustomObject]@{ Listed = @(); Missing = @() }
+    $manifest = Get-CollectionManifest
+    if (-not $manifest.Path) { return $result }
+    $foundPaths = @($Found | Where-Object { $_ } | ForEach-Object {
+            if ($script:shortenedNames -and $script:shortenedNames.ContainsKey($_.FullName)) { $script:shortenedNames[$_.FullName] } else { $_.FullName }
+        })
+    $result.Listed = @($manifest.RelativePaths | Where-Object { [System.IO.Path]::GetFileName($_) -like "setupapi.dev*.log" } | Sort-Object)
+    $result.Missing = @($result.Listed | Where-Object { $foundPaths -notcontains (Join-Path $manifest.Folder $_) })
+    return $result
+}
+
 # Parse Format-List text ("Name : value" blocks separated by blank lines,
 # long values wrapped onto indented lines) into ordered hashtables
 function ConvertFrom-FormatListBlocks {
@@ -8803,9 +8831,17 @@ function Parse-USB {
 
     # SetupAPI device logs (device first-install times). Windows rotates setupapi.dev.log
     # to setupapi.dev.<yyyymmdd_hhmmss>.log, so every setupapi.dev*.log is parsed.
-    # Times are the examined system's local time.
+    # Times are the examined system's local time. The logs record every device
+    # and driver install (graphics card, audio, Bluetooth, software devices, ...):
+    # USB devices are USBDevice rows, all others Installation rows.
     $setupApiFiles = @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("setupapi.dev*.log") |
         Where-Object { $_.Name -like "setupapi.dev*.log" } | Sort-Object FullName -Unique)
+    Log "  Found $($setupApiFiles.Count) SetupAPI log(s)."
+    # Logs the collector saved but that are not here were lost after collection
+    $setupApiManifest = Compare-ManifestSetupApiLogs -Found $setupApiFiles
+    if ($setupApiManifest.Missing.Count -gt 0) {
+        Log-Warning "  SetupAPI log(s) missing: the collection manifest lists $($setupApiManifest.Listed.Count), $($setupApiManifest.Missing.Count) of them are not here -- their device installs are not in the timeline: $($setupApiManifest.Missing -join ', ')"
+    }
     $seenSetupApi = @{}
     $sectionFormats = [string[]]@("yyyy/MM/dd HH:mm:ss.fff", "yyyy/MM/dd HH:mm:ss")
     foreach ($logFile2 in $setupApiFiles) {
@@ -8813,6 +8849,7 @@ function Parse-USB {
         try {
             $content = [System.IO.File]::ReadAllLines($logFile2.FullName)
             $count = 0
+            $usbCount = 0
             $dupes = 0
             for ($i = 0; $i -lt $content.Length; $i++) {
                 $line = $content[$i]
@@ -8822,8 +8859,9 @@ function Parse-USB {
                 $isDelete = $Matches[1] -eq "Delete Device"
                 $trigger = $Matches[2]
                 $instance = $Matches[3].Trim()
+                $isUsb = Test-UsbDeviceInstance $instance
                 # Deletions are only interesting for USB devices
-                if ($isDelete -and $instance -notmatch '(?i)USBSTOR|^USB\\|VID_[0-9A-F]{4}') { continue }
+                if ($isDelete -and -not $isUsb) { continue }
 
                 # ">>>  Section start 2026/10/06 20:19:08.123" follows the header
                 $localText = $null
@@ -8852,14 +8890,19 @@ function Parse-USB {
                     $desc = "Device install: $label"
                     $details = "Instance=$instance Action=Device Install ($trigger) LogTime=$localText (target local time)"
                 }
-                Add-TimelineEntry -Timestamp $ts -Source "USB-SetupAPI" -EventType "USBDevice" `
+                $eventType = "Installation"
+                if ($isUsb) {
+                    $eventType = "USBDevice"
+                    $usbCount++
+                }
+                Add-TimelineEntry -Timestamp $ts -Source "USB-SetupAPI" -EventType $eventType `
                     -Description $desc `
                     -Details $details `
                     -Artifact "USB" -RawPath $logFile2.FullName
                 $usbParsed = $true
                 $count++
             }
-            Log "  Parsed $count SetupAPI device event(s) ($dupes duplicate(s) from other log files skipped)."
+            Log "  Parsed $count SetupAPI device event(s): $usbCount USB, $($count - $usbCount) other device or driver install(s) ($dupes duplicate(s) from other log files skipped)."
         }
         catch { Log-Warning "  Failed to parse SetupAPI log: $($_.Exception.Message)" }
     }
@@ -11108,7 +11151,7 @@ if (-not $skipExcel -and (Get-Module -ListAvailable -Name ImportExcel)) {
         Log "    Yellow       ServiceChange        -- service state changes"
         Log "    Yellow       ScheduledTaskChange  -- task scheduler changes"
         Log "    Purple       USBDevice            -- USB device connections"
-        Log "    Light Blue   Installation         -- application installs"
+        Log "    Light Blue   Installation         -- application, device and driver installs"
         Log "    Light gray   Snapshot             -- state at collection time, not an event"
     }
     catch {
