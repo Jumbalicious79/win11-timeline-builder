@@ -6228,22 +6228,38 @@ function Find-Sqlite3Exe {
 # file, so recent history not yet checkpointed is included, and its rollback
 # -journal, so a copy taken mid-transaction is rolled back to its last
 # committed state instead of being read half-written). Returns the CSV output
-# lines, decoded as UTF-8.
+# lines, decoded as UTF-8. -Attach: other databases the query reads, as
+# alias -> path; each is attached from its own temporary copy (with its
+# -wal and -journal) under that alias.
 function Invoke-Sqlite3Query {
-    param([string]$Sqlite3Exe, [string]$DbPath, [string]$Query)
+    param([string]$Sqlite3Exe, [string]$DbPath, [string]$Query, [System.Collections.IDictionary]$Attach)
     $tempDb = Join-Path $env:TEMP "timeline_browser_$(Get-Random).db"
+    $tempFiles = New-Object System.Collections.Generic.List[string]
+    $tempFiles.Add($tempDb)
     $prevEncoding = $null
     try {
-        Copy-Item -LiteralPath $DbPath -Destination $tempDb -Force -ErrorAction Stop
-        foreach ($companion in @("-wal", "-journal")) {
-            if (Test-Path -LiteralPath "$DbPath$companion") {
-                Copy-Item -LiteralPath "$DbPath$companion" -Destination "$tempDb$companion" -Force -ErrorAction SilentlyContinue
+        $copies = @(, @($DbPath, $tempDb))
+        $attachSql = ""
+        if ($Attach) {
+            foreach ($alias in $Attach.Keys) {
+                $tempAttach = Join-Path $env:TEMP "timeline_browser_$(Get-Random).db"
+                $tempFiles.Add($tempAttach)
+                $copies += , @($Attach[$alias], $tempAttach)
+                $attachSql += "ATTACH '" + $tempAttach.Replace("'", "''") + "' AS $alias; "
+            }
+        }
+        foreach ($copy in $copies) {
+            Copy-Item -LiteralPath $copy[0] -Destination $copy[1] -Force -ErrorAction Stop
+            foreach ($companion in @("-wal", "-journal")) {
+                if (Test-Path -LiteralPath "$($copy[0])$companion") {
+                    Copy-Item -LiteralPath "$($copy[0])$companion" -Destination "$($copy[1])$companion" -Force -ErrorAction SilentlyContinue
+                }
             }
         }
         # sqlite3 writes UTF-8; without this, titles are decoded with the OEM code page
         try { $prevEncoding = [Console]::OutputEncoding; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 }
         catch { Write-Verbose "Could not set console output encoding to UTF-8: $($_.Exception.Message)" }
-        $output = & $Sqlite3Exe -csv $tempDb $Query 2>&1
+        $output = & $Sqlite3Exe -csv $tempDb ($attachSql + $Query) 2>&1
         if ($LASTEXITCODE -eq 0) { return @($output | Where-Object { $_ -is [string] }) }
         Log-Warning "    sqlite3 error: $output"
         return @()
@@ -6257,8 +6273,10 @@ function Invoke-Sqlite3Query {
             try { [Console]::OutputEncoding = $prevEncoding }
             catch { Write-Verbose "Could not restore console output encoding: $($_.Exception.Message)" }
         }
-        foreach ($tmp in @($tempDb, "$tempDb-wal", "$tempDb-shm", "$tempDb-journal")) {
-            if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        foreach ($tempFile in $tempFiles) {
+            foreach ($tmp in @($tempFile, "$tempFile-wal", "$tempFile-shm", "$tempFile-journal")) {
+                if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+            }
         }
     }
 }
@@ -6289,11 +6307,12 @@ function Get-ChromiumBrowserName {
 }
 
 # Browser profile folder (e.g. "Default") from the collection layout, or "".
-# <profile>\Network\Cookies (current Chromium versions) belongs to <profile>.
+# <profile>\Network\Cookies (current Chromium versions), <profile>\Sessions\*
+# and Firefox's <profile>\sessionstore-backups\* belong to <profile>.
 function Get-BrowserProfileName {
     param([string]$FullPath)
     $rel = Get-RelativeCollectionPath $FullPath
-    if ($rel -and $rel -match '^Browser\\[^\\]+\\[^\\]+\\(.+)\\[^\\]+$') { return ($Matches[1] -replace '(?:^|\\)Network$', '') }
+    if ($rel -and $rel -match '^Browser\\[^\\]+\\[^\\]+\\(.+)\\[^\\]+$') { return ($Matches[1] -replace '(?:^|\\)(?:Network|Sessions|sessionstore-backups)$', '') }
     return ""
 }
 
@@ -7066,6 +7085,1456 @@ function Add-FirefoxPermissionRows {
     return $count
 }
 
+# ----- Extensions, sessions, settings, history snapshots and favicons -----
+# Readers for the binary and compressed browser files, compiled on first
+# use (C# 5: Windows PowerShell 5.1 compiles Add-Type code with the old
+# compiler -- no interpolation, "=>" members, out var, tuples or nameof):
+#   DecompressMozLz4  Firefox session files: "mozLz40\0", uint32 size of
+#                     the data, then one LZ4 block
+#   BlankJsonMembers  sets the values of the named members of a JSON text
+#                     to null before it is parsed, so form data, cookies,
+#                     keys and page state are never read
+#   StripJsonComments removes // and /* */ comments and trailing commas
+#                     outside strings (Chromium accepts them in extension
+#                     manifests; ConvertFrom-Json in Windows PowerShell 5.1
+#                     does not)
+#   ReadSnss          Chromium Session_* / Tabs_* files (an SNSS command
+#                     log: "SNSS", int32 version, then uint16 size + uint8
+#                     id + payload per command): the navigation entries
+#                     (UpdateTabNavigation, a base::Pickle: tab id, index,
+#                     URL, title, page state -- skipped, never decoded --,
+#                     transition, type mask, referrer, referrer policy,
+#                     original URL, user agent flag, time), the selected
+#                     entry of each tab, and the close times. Session
+#                     files (components/sessions session_service_commands):
+#                     SetTabWindow 0 {window id, tab id}, SetSelectedNavigation
+#                     Index 7 {tab id, index}, TabClosed 16 and WindowClosed
+#                     17 {id, int64 time}. Tabs files (tab_restore_service_
+#                     impl): SelectedNavigationInTab 4 {id, index -- among the
+#                     entries kept in the file --, int64 time; the time is 0
+#                     for the tabs of a closed window}, and Window 9 (a
+#                     pickle: window id, selected tab, tab count, int64 close
+#                     time), followed by the commands of its tabs
+function Initialize-BrowserReader {
+    if ($null -ne $script:browserReaderReady) { return $script:browserReaderReady }
+    $script:browserReaderReady = $false
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]'TimelineBrowser.Reader').Type) {
+            Add-Type -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+
+namespace TimelineBrowser
+{
+    // One navigation entry of a Chromium session or tab-restore file
+    public sealed class SnssNavigation
+    {
+        public int TabId;
+        public int Index;
+        public string Url = "";
+        public string Title = "";
+        public string Referrer = "";
+        public int Transition = -1;
+        public long Timestamp;
+    }
+
+    public sealed class SnssFile
+    {
+        public int Version;
+        public int Commands;
+        // In file order (an entry rewritten later comes later)
+        public List<SnssNavigation> Navigations = new List<SnssNavigation>();
+        // Tab (or tab-restore entry) id -> close time (Chromium time)
+        public Dictionary<int, long> ClosedTimes = new Dictionary<int, long>();
+        // Tab id -> window id, and window id -> close time
+        public Dictionary<int, int> TabWindows = new Dictionary<int, int>();
+        public Dictionary<int, long> WindowClosedTimes = new Dictionary<int, long>();
+        // Tab id -> selected entry (Session: navigation index; Tabs: position
+        // among the tab's entries in the file, by index)
+        public Dictionary<int, int> SelectedIndexes = new Dictionary<int, int>();
+        // Tab-restore entries (tabs or windows) the user reopened
+        public HashSet<int> Restored = new HashSet<int>();
+    }
+
+    public static class Reader
+    {
+        const int MaxDecompressedSize = 512 * 1024 * 1024;
+
+        public static byte[] DecompressMozLz4(byte[] data)
+        {
+            byte[] magic = Encoding.ASCII.GetBytes("mozLz40\0");
+            if (data == null || data.Length < 12) { throw new InvalidDataException("file too small"); }
+            for (int i = 0; i < magic.Length; i++)
+            {
+                if (data[i] != magic[i]) { throw new InvalidDataException("no mozLz40 header"); }
+            }
+            int size = BitConverter.ToInt32(data, 8);
+            // LZ4 cannot expand data more than about 255 times
+            if (size < 0 || size > MaxDecompressedSize || (long)size > (long)(data.Length - 12) * 255 + 64)
+            {
+                throw new InvalidDataException("implausible data size " + size);
+            }
+            byte[] output = new byte[size];
+            int ip = 12;
+            int op = 0;
+            while (ip < data.Length)
+            {
+                int token = data[ip++];
+                int literals = token >> 4;
+                if (literals == 15) { literals += ReadLength(data, ref ip); }
+                if (literals > data.Length - ip || literals > size - op) { throw new InvalidDataException("LZ4 literals out of range at offset " + ip); }
+                Buffer.BlockCopy(data, ip, output, op, literals);
+                ip += literals;
+                op += literals;
+                // The last sequence has literals only
+                if (ip >= data.Length) { break; }
+                if (data.Length - ip < 2) { throw new InvalidDataException("LZ4 data ends inside a match offset"); }
+                int offset = data[ip] | (data[ip + 1] << 8);
+                ip += 2;
+                if (offset == 0 || offset > op) { throw new InvalidDataException("LZ4 match offset out of range at offset " + ip); }
+                int matchLength = token & 15;
+                if (matchLength == 15) { matchLength += ReadLength(data, ref ip); }
+                matchLength += 4;
+                if (matchLength > size - op) { throw new InvalidDataException("LZ4 match runs past the data size"); }
+                // Byte by byte: the match may overlap the bytes it produces
+                int from = op - offset;
+                for (int k = 0; k < matchLength; k++) { output[op++] = output[from++]; }
+            }
+            if (op != size) { Array.Resize(ref output, op); }
+            return output;
+        }
+
+        static int ReadLength(byte[] data, ref int ip)
+        {
+            int total = 0;
+            int b;
+            do
+            {
+                if (ip >= data.Length) { throw new InvalidDataException("LZ4 data ends inside a length"); }
+                b = data[ip++];
+                total += b;
+                if (total > MaxDecompressedSize) { throw new InvalidDataException("implausible LZ4 length"); }
+            } while (b == 255);
+            return total;
+        }
+
+        // The JSON text with the value of every member called one of the
+        // names (at any depth) replaced by null
+        public static string BlankJsonMembers(string json, string[] names)
+        {
+            HashSet<string> blank = new HashSet<string>(names, StringComparer.Ordinal);
+            StringBuilder sb = new StringBuilder(json.Length);
+            int n = json.Length;
+            int i = 0;
+            while (i < n)
+            {
+                char c = json[i];
+                if (c != '"') { sb.Append(c); i++; continue; }
+                int end = SkipString(json, i);
+                sb.Append(json, i, end - i);
+                int j = end;
+                while (j < n && char.IsWhiteSpace(json[j])) { j++; }
+                if (j < n && json[j] == ':' && end - i >= 2 && blank.Contains(json.Substring(i + 1, end - i - 2)))
+                {
+                    sb.Append(json, end, j + 1 - end);
+                    int v = j + 1;
+                    while (v < n && char.IsWhiteSpace(json[v])) { v++; }
+                    sb.Append("null");
+                    i = SkipValue(json, v);
+                    continue;
+                }
+                i = end;
+            }
+            return sb.ToString();
+        }
+
+        // The JSON text without // and /* */ comments and without commas
+        // that close a list or object (outside strings)
+        public static string StripJsonComments(string json)
+        {
+            StringBuilder sb = new StringBuilder(json.Length);
+            int n = json.Length;
+            int i = 0;
+            while (i < n)
+            {
+                char c = json[i];
+                if (c == '"')
+                {
+                    int end = SkipString(json, i);
+                    sb.Append(json, i, end - i);
+                    i = end;
+                    continue;
+                }
+                if (c == '/' && i + 1 < n && json[i + 1] == '/')
+                {
+                    while (i < n && json[i] != '\n' && json[i] != '\r') { i++; }
+                    continue;
+                }
+                if (c == '/' && i + 1 < n && json[i + 1] == '*')
+                {
+                    int close = json.IndexOf("*/", i + 2, StringComparison.Ordinal);
+                    i = close < 0 ? n : close + 2;
+                    sb.Append(' ');
+                    continue;
+                }
+                if (c == ',')
+                {
+                    // A comma followed (after blanks and comments) by } or ]
+                    int k = i + 1;
+                    while (k < n)
+                    {
+                        if (char.IsWhiteSpace(json[k])) { k++; continue; }
+                        if (json[k] == '/' && k + 1 < n && json[k + 1] == '/')
+                        {
+                            while (k < n && json[k] != '\n' && json[k] != '\r') { k++; }
+                            continue;
+                        }
+                        if (json[k] == '/' && k + 1 < n && json[k + 1] == '*')
+                        {
+                            int close = json.IndexOf("*/", k + 2, StringComparison.Ordinal);
+                            k = close < 0 ? n : close + 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    if (k < n && (json[k] == '}' || json[k] == ']')) { i++; continue; }
+                }
+                sb.Append(c);
+                i++;
+            }
+            return sb.ToString();
+        }
+
+        // Index after the string that starts at s[i] (a quote)
+        static int SkipString(string s, int i)
+        {
+            i++;
+            while (i < s.Length)
+            {
+                char c = s[i];
+                if (c == '\\') { i += 2; continue; }
+                if (c == '"') { return i + 1; }
+                i++;
+            }
+            return s.Length;
+        }
+
+        // Index after the JSON value that starts at s[i]
+        static int SkipValue(string s, int i)
+        {
+            if (i >= s.Length) { return i; }
+            char c = s[i];
+            if (c == '"') { return SkipString(s, i); }
+            if (c == '{' || c == '[')
+            {
+                int depth = 0;
+                while (i < s.Length)
+                {
+                    char d = s[i];
+                    if (d == '"') { i = SkipString(s, i); continue; }
+                    if (d == '{' || d == '[') { depth++; }
+                    else if (d == '}' || d == ']')
+                    {
+                        depth--;
+                        if (depth == 0) { return i + 1; }
+                    }
+                    i++;
+                }
+                return s.Length;
+            }
+            while (i < s.Length && s[i] != ',' && s[i] != '}' && s[i] != ']' && !char.IsWhiteSpace(s[i])) { i++; }
+            return i;
+        }
+
+        public static SnssFile ReadSnss(byte[] data, bool tabRestore)
+        {
+            if (data == null || data.Length < 8 || data[0] != 0x53 || data[1] != 0x4E || data[2] != 0x53 || data[3] != 0x53)
+            {
+                throw new InvalidDataException("no SNSS header");
+            }
+            SnssFile file = new SnssFile();
+            file.Version = BitConverter.ToInt32(data, 4);
+            if (file.Version == 2 || file.Version == 4) { throw new InvalidDataException("encrypted session file (SNSS version " + file.Version + ")"); }
+            int navigationCommand = tabRestore ? 1 : 6;
+            // Tabs files: the window whose tabs follow, and how many are left
+            int windowId = 0;
+            int windowTabsLeft = 0;
+            int pos = 8;
+            while (data.Length - pos >= 2)
+            {
+                int size = BitConverter.ToUInt16(data, pos);
+                pos += 2;
+                // A file cut off inside a command ends here
+                if (size == 0 || size > data.Length - pos) { break; }
+                int id = data[pos];
+                int start = pos + 1;
+                int length = size - 1;
+                pos += size;
+                file.Commands++;
+                if (id == navigationCommand)
+                {
+                    SnssNavigation navigation = ReadNavigation(data, start, length);
+                    if (navigation != null) { file.Navigations.Add(navigation); }
+                }
+                else if (tabRestore)
+                {
+                    if (id == 4 && length >= 8)
+                    {
+                        int tabId = BitConverter.ToInt32(data, start);
+                        file.SelectedIndexes[tabId] = BitConverter.ToInt32(data, start + 4);
+                        if (length >= 16)
+                        {
+                            long closed = BitConverter.ToInt64(data, start + 8);
+                            if (closed > 0) { file.ClosedTimes[tabId] = closed; }
+                        }
+                        if (windowTabsLeft > 0)
+                        {
+                            file.TabWindows[tabId] = windowId;
+                            windowTabsLeft--;
+                        }
+                    }
+                    else if (id == 9 && length >= 24)
+                    {
+                        // Pickle: uint32 payload size, window id, selected tab,
+                        // tab count, int64 close time, bounds, ...
+                        windowId = BitConverter.ToInt32(data, start + 4);
+                        windowTabsLeft = Math.Max(0, BitConverter.ToInt32(data, start + 12));
+                        long closed = BitConverter.ToInt64(data, start + 16);
+                        if (closed > 0) { file.WindowClosedTimes[windowId] = closed; }
+                    }
+                    else if (id == 2 && length >= 4)
+                    {
+                        file.Restored.Add(BitConverter.ToInt32(data, start));
+                    }
+                }
+                else if (id == 0 && length >= 8)
+                {
+                    file.TabWindows[BitConverter.ToInt32(data, start + 4)] = BitConverter.ToInt32(data, start);
+                }
+                else if (id == 7 && length >= 8)
+                {
+                    file.SelectedIndexes[BitConverter.ToInt32(data, start)] = BitConverter.ToInt32(data, start + 4);
+                }
+                else if ((id == 16 || id == 17) && length >= 16)
+                {
+                    long closed = BitConverter.ToInt64(data, start + 8);
+                    if (closed <= 0) { continue; }
+                    if (id == 16) { file.ClosedTimes[BitConverter.ToInt32(data, start)] = closed; }
+                    else { file.WindowClosedTimes[BitConverter.ToInt32(data, start)] = closed; }
+                }
+            }
+            return file;
+        }
+
+        static SnssNavigation ReadNavigation(byte[] data, int start, int length)
+        {
+            if (length < 12) { return null; }
+            int payloadSize = BitConverter.ToInt32(data, start);
+            int pos = start + 4;
+            int end = start + length;
+            if (payloadSize >= 0 && payloadSize < end - pos) { end = pos + payloadSize; }
+            SnssNavigation navigation = new SnssNavigation();
+            int value;
+            long time;
+            string text;
+            if (!ReadInt(data, ref pos, end, out navigation.TabId) || !ReadInt(data, ref pos, end, out navigation.Index)) { return null; }
+            if (!ReadString(data, ref pos, end, false, out text)) { return null; }
+            navigation.Url = text;
+            // Older versions stop after any of these fields
+            if (!ReadString(data, ref pos, end, true, out text)) { return navigation; }
+            navigation.Title = text;
+            if (!SkipString(data, ref pos, end)) { return navigation; }
+            if (!ReadInt(data, ref pos, end, out value)) { return navigation; }
+            navigation.Transition = value;
+            if (!ReadInt(data, ref pos, end, out value)) { return navigation; }
+            if (!ReadString(data, ref pos, end, false, out text)) { return navigation; }
+            navigation.Referrer = text;
+            if (!ReadInt(data, ref pos, end, out value)) { return navigation; }
+            if (!SkipString(data, ref pos, end)) { return navigation; }
+            if (!ReadInt(data, ref pos, end, out value)) { return navigation; }
+            if (!ReadInt64(data, ref pos, end, out time)) { return navigation; }
+            navigation.Timestamp = time;
+            return navigation;
+        }
+
+        // base::Pickle fields: 4-byte aligned; strings are an int32 length
+        // (UTF-16 strings: in characters) followed by the data
+        static bool ReadInt(byte[] data, ref int pos, int end, out int value)
+        {
+            value = 0;
+            if (end - pos < 4) { return false; }
+            value = BitConverter.ToInt32(data, pos);
+            pos += 4;
+            return true;
+        }
+
+        static bool ReadInt64(byte[] data, ref int pos, int end, out long value)
+        {
+            value = 0;
+            if (end - pos < 8) { return false; }
+            value = BitConverter.ToInt64(data, pos);
+            pos += 8;
+            return true;
+        }
+
+        static bool ReadString(byte[] data, ref int pos, int end, bool utf16, out string value)
+        {
+            value = "";
+            int length;
+            if (!ReadInt(data, ref pos, end, out length) || length < 0) { return false; }
+            int bytes = utf16 ? length * 2 : length;
+            if (length > end - pos || bytes > end - pos) { return false; }
+            value = utf16 ? Encoding.Unicode.GetString(data, pos, bytes) : Encoding.UTF8.GetString(data, pos, bytes);
+            pos += (bytes + 3) & ~3;
+            return true;
+        }
+
+        static bool SkipString(byte[] data, ref int pos, int end)
+        {
+            int length;
+            if (!ReadInt(data, ref pos, end, out length) || length < 0 || length > end - pos) { return false; }
+            pos += (length + 3) & ~3;
+            return true;
+        }
+    }
+}
+'@
+        }
+        $script:browserReaderReady = $true
+    }
+    catch {
+        Log-Warning "  Browser file reader could not be compiled ($($_.Exception.Message)) -- sessions, settings and extensions skipped."
+    }
+    return $script:browserReaderReady
+}
+
+# ConvertFrom-Json for browser files. PowerShell 7 turns strings that look
+# like ISO dates into [datetime] (Windows PowerShell 5.1 does not); from 7.5
+# -DateKind String keeps them as text, so titles and names read the same in
+# both editions (7.0 to 7.4 still convert them).
+$script:jsonDateKindSupported = (Get-Command ConvertFrom-Json).Parameters.ContainsKey("DateKind")
+function ConvertFrom-BrowserJsonText {
+    param([string]$Text)
+    if ($script:jsonDateKindSupported) { return ($Text | ConvertFrom-Json -DateKind String -ErrorAction Stop) }
+    return ($Text | ConvertFrom-Json -ErrorAction Stop)
+}
+
+# Parse a browser JSON file (Preferences, Local State, extensions.json, ...).
+# -Blank: members whose values are set to null first (never read); without
+# the reader that does this, the file is not read at all. -AllowComments:
+# comments and trailing commas are removed first (extension manifest.json
+# and messages.json, which Chromium reads with comments allowed).
+function Read-BrowserJsonFile {
+    param([string]$Path, [string[]]$Blank, [switch]$AllowComments)
+    $text = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+    if ($Blank -or $AllowComments) {
+        if (-not (Initialize-BrowserReader)) { throw "not read (the browser file reader is not available)" }
+        if ($AllowComments) { $text = [TimelineBrowser.Reader]::StripJsonComments($text) }
+        if ($Blank) { $text = [TimelineBrowser.Reader]::BlankJsonMembers($text, $Blank) }
+    }
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    try { return (ConvertFrom-BrowserJsonText $text) }
+    catch { throw "not valid JSON (damaged or incomplete file)" }
+}
+
+# Value at a dotted path ("download.default_directory") in the first of the
+# parsed JSON documents that has it, or $null. Lists are returned as lists.
+function Get-BrowserJsonValue {
+    param([object[]]$Documents, [string]$Path)
+    foreach ($doc in $Documents) {
+        $node = $doc
+        foreach ($name in $Path.Split('.')) {
+            if ($null -eq $node -or $node -isnot [System.Management.Automation.PSCustomObject]) { $node = $null; break }
+            $property = $node.PSObject.Properties[$name]
+            $node = if ($property) { $property.Value } else { $null }
+        }
+        if ($null -ne $node) { return , $node }
+    }
+    return $null
+}
+
+# "a, b, c" from a JSON list (objects by their first member name), cut at
+# -MaxLength characters with the total count
+function Format-BrowserList {
+    param($Items, [int]$MaxLength = 300)
+    $names = @(foreach ($item in @($Items)) {
+        if ($null -eq $item) { continue }
+        if ($item -is [System.Management.Automation.PSCustomObject]) { @($item.PSObject.Properties)[0].Name } else { "$item" }
+    })
+    $text = $names -join ", "
+    if ($text.Length -gt $MaxLength) { $text = $text.Substring(0, $MaxLength) + "... ($($names.Count) in all)" }
+    return $text
+}
+
+# One Snapshot row for a browser setting: "Browser setting: <Setting> = <Value>"
+function Add-BrowserSettingRow {
+    param($Time, [string]$Source, [string]$User, [string]$RawPath, [string]$Setting, [string]$Value, [string]$Pref,
+          [System.Collections.IDictionary]$Extra, [string]$ProfileName)
+    $pairs = [ordered]@{ Setting = $Setting; Value = $Value; Pref = $Pref }
+    if ($Extra) { foreach ($k in $Extra.Keys) { $pairs[$k] = $Extra[$k] } }
+    $pairs["Profile"] = $ProfileName
+    Add-TimelineEntry -Timestamp $Time -Source $Source -EventType "Snapshot" `
+        -Description "Browser setting: $Setting = $Value" `
+        -User $User -Details (Format-ArtifactDetails $pairs) `
+        -Artifact "Browser" -RawPath $RawPath
+}
+
+# Chromium extension install locations (extensions::mojom::ManifestLocation)
+$script:ChromiumExtensionLocations = @{
+    "1" = "Internal"; "2" = "ExternalPref"; "3" = "ExternalRegistry"; "4" = "Unpacked"; "5" = "Component"
+    "6" = "ExternalPrefDownload"; "7" = "ExternalPolicyDownload"; "8" = "CommandLine"; "9" = "ExternalPolicy"; "10" = "ExternalComponent"
+}
+# Chromium extension disable reasons (extensions/browser/disable_reason.h):
+# bit, name (deprecated bits too, for older profiles). Bits not listed are
+# shown as numbers (a browser built on Chromium may add its own).
+$script:ChromiumDisableReasons = @(
+    @(1, "USER_ACTION"), @(2, "PERMISSIONS_INCREASE"), @(4, "RELOAD"), @(8, "UNSUPPORTED_REQUIREMENT"), @(16, "SIDELOAD_WIPEOUT"),
+    @(32, "UNKNOWN_FROM_SYNC"), @(64, "PERMISSIONS_CONSENT"), @(128, "KNOWN_DISABLED"),
+    @(256, "NOT_VERIFIED"), @(512, "GREYLIST"), @(1024, "CORRUPTED"), @(2048, "REMOTE_INSTALL"), @(4096, "INACTIVE_EPHEMERAL_APP"),
+    @(8192, "EXTERNAL_EXTENSION"), @(16384, "UPDATE_REQUIRED_BY_POLICY"), @(32768, "CUSTODIAN_APPROVAL_REQUIRED"), @(65536, "BLOCKED_BY_POLICY"),
+    @(131072, "BLOCKED_MATURE"), @(262144, "REMOTELY_FOR_MALWARE"), @(524288, "REINSTALL"), @(1048576, "NOT_ALLOWLISTED"),
+    @(2097152, "NOT_ASH_KEEPLISTED"), @(4194304, "PUBLISHED_IN_STORE_REQUIRED_BY_POLICY"), @(8388608, "UNSUPPORTED_MANIFEST_VERSION"),
+    @(16777216, "UNSUPPORTED_DEVELOPER_EXTENSION"), @(33554432, "UNKNOWN"), @(67108864, "BLOCKED_BY_CLOUD_POLICY_CHECK"),
+    @(134217728, "BY_ANOTHER_EXTENSION")
+)
+# Members never read from Chromium Preferences, Secure Preferences and Local
+# State: keys, password hashes, MACs, account data and per-site settings
+$script:ChromiumPrefsBlankMembers = @("os_crypt", "password_hash_data_list", "protection", "account_info", "gaia_cookie", "content_settings", "incognito_content_settings")
+
+# Disable reasons of a Chromium extension (a bit mask, or a list in newer
+# versions) as names; unknown bits as numbers
+function Format-ChromiumDisableReasons {
+    param($Value)
+    $mask = 0L
+    foreach ($v in @($Value)) {
+        $n = 0L
+        if ([long]::TryParse("$v", [ref]$n)) { $mask = $mask -bor $n }
+    }
+    if ($mask -eq 0) { return "" }
+    $names = @()
+    foreach ($reason in $script:ChromiumDisableReasons) {
+        $bit = [long]$reason[0]
+        if (($mask -band $bit) -ne 0) { $names += $reason[1]; $mask = $mask -band (-bnot $bit) }
+    }
+    if ($mask -ne 0) { $names += "$mask" }
+    return ($names -join ", ")
+}
+
+# Extension name from its manifest: "__MSG_key__" names are looked up in
+# _locales\<default_locale>\messages.json next to the collected manifest
+# (keys are case-insensitive). Returns the name as found when that fails.
+function Resolve-ChromiumExtensionName {
+    param([string]$Name, [string]$ManifestDir, [string]$Locale)
+    if ($Name -notmatch '^__MSG_(.+)__$' -or -not $ManifestDir -or -not $Locale) { return $Name }
+    $key = $Matches[1]
+    $messagesPath = Join-Path $ManifestDir "_locales\$Locale\messages.json"
+    if (-not (Test-Path -LiteralPath $messagesPath)) { return $Name }
+    try {
+        $messages = Read-BrowserJsonFile -Path $messagesPath -AllowComments
+        foreach ($property in $messages.PSObject.Properties) {
+            if ($property.Name -eq $key -and $property.Value.message) { return [string]$property.Value.message }
+        }
+    }
+    catch { Write-Verbose "Could not read $messagesPath : $($_.Exception.Message)" }
+    return $Name
+}
+
+# Installed extensions of one Chromium profile, from extensions.settings in
+# Secure Preferences and Preferences (Secure Preferences first; an entry in
+# both is merged). Rows: installed (first_install_time, or install_time in
+# older versions) and updated (last_update_time, at least a minute later),
+# EventType Installation; an extension with no install time gets a Snapshot
+# row. Name and version come from the manifest stored in the settings, else
+# from the collected Extensions\<id>\<version>\manifest.json. Component
+# extensions (location Component / ExternalComponent) are part of the browser
+# -- installed and updated with it -- and are only counted in the log; so are
+# entries without a location (permission records of extensions that are not
+# installed). Returns the number of rows added.
+function Add-ChromiumExtensionRows {
+    param([object[]]$Documents, [string]$ProfileDir, [string]$Source, [string]$User, [string]$ProfileName, [string]$RawPath, $SnapshotTime)
+    # id -> settings objects for that id, Secure Preferences first
+    $settings = [ordered]@{}
+    foreach ($doc in $Documents) {
+        $all = Get-BrowserJsonValue -Documents @($doc) -Path "extensions.settings"
+        if ($null -eq $all) { continue }
+        foreach ($property in $all.PSObject.Properties) {
+            if (-not $settings.Contains($property.Name)) { $settings[$property.Name] = @() }
+            $settings[$property.Name] += $property.Value
+        }
+    }
+    $count = 0
+    $builtIn = 0
+    foreach ($id in $settings.Keys) {
+        $entries = $settings[$id]
+        $field = @{}
+        foreach ($name in @("location", "manifest", "path", "first_install_time", "install_time", "last_update_time", "from_webstore",
+                            "was_installed_by_default", "was_installed_by_oem", "state", "disable_reasons", "granted_permissions", "active_permissions")) {
+            $field[$name] = Get-BrowserJsonValue -Documents $entries -Path $name
+        }
+        $locationCode = "$($field['location'])"
+        if (-not $locationCode) { continue }
+        if ($locationCode -eq "5" -or $locationCode -eq "10") { $builtIn++; continue }
+
+        # Manifest: from the settings, else the collected copy
+        $relPath = "$($field['path'])"
+        $manifestDir = $null
+        if ($relPath -and -not [System.IO.Path]::IsPathRooted($relPath)) {
+            $manifestDir = Join-Path $ProfileDir "Extensions\$relPath"
+        }
+        elseif (Test-Path -LiteralPath (Join-Path $ProfileDir "Extensions\$id")) {
+            $found = Get-ChildItem -LiteralPath (Join-Path $ProfileDir "Extensions\$id") -Filter "manifest.json" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) { $manifestDir = $found.DirectoryName }
+        }
+        $manifest = $field["manifest"]
+        if ($null -eq $manifest -and $manifestDir -and (Test-Path -LiteralPath (Join-Path $manifestDir "manifest.json"))) {
+            try { $manifest = Read-BrowserJsonFile -Path (Join-Path $manifestDir "manifest.json") -AllowComments }
+            catch { Log-Warning "    Could not read the manifest of extension $id : $($_.Exception.Message)" }
+        }
+        $name = ""
+        $version = ""
+        $updateUrl = ""
+        $overrides = @()
+        if ($manifest) {
+            $name = Resolve-ChromiumExtensionName -Name "$($manifest.name)" -ManifestDir $manifestDir -Locale "$($manifest.default_locale)"
+            $version = "$($manifest.version)"
+            $updateUrl = "$($manifest.update_url)"
+            foreach ($overrideKey in @("chrome_settings_overrides", "chrome_url_overrides")) {
+                if ($manifest.PSObject.Properties[$overrideKey] -and $manifest.$overrideKey) {
+                    $overrides += @($manifest.$overrideKey.PSObject.Properties | ForEach-Object { $_.Name })
+                }
+            }
+        }
+
+        $permissions = $field["granted_permissions"]
+        if ($null -eq $permissions) { $permissions = $field["active_permissions"] }
+        $apiList = @()
+        $hostList = @()
+        if ($permissions) {
+            $apiList = @($permissions.api) + @($permissions.manifest_permissions)
+            $hostList = @($permissions.explicit_host) + @($permissions.scriptable_host) | Select-Object -Unique
+        }
+        $disabled = Format-ChromiumDisableReasons $field["disable_reasons"]
+        $state = if ($disabled -or "$($field['state'])" -eq "0") { "Disabled" } else { "Enabled" }
+        $location = $script:ChromiumExtensionLocations[$locationCode]
+        if (-not $location) { $location = $locationCode }
+        $installed = ConvertFrom-ChromiumTime $field["first_install_time"]
+        if (-not $installed) { $installed = ConvertFrom-ChromiumTime $field["install_time"] }
+        $updated = ConvertFrom-ChromiumTime $field["last_update_time"]
+        $details = Format-ArtifactDetails ([ordered]@{
+            ID                 = $id
+            Name               = $name
+            Version            = $version
+            Location           = $location
+            LocationCode       = $locationCode
+            State              = $state
+            DisableReasons     = $disabled
+            FromWebstore       = $(if ($field["from_webstore"] -eq $true) { "Yes" } else { "No" })
+            InstalledByDefault = $(if ($field["was_installed_by_default"] -eq $true) { "Yes" } else { "" })
+            InstalledByOEM     = $(if ($field["was_installed_by_oem"] -eq $true) { "Yes" } else { "" })
+            Path               = $(if ([System.IO.Path]::IsPathRooted($relPath)) { $relPath } else { "" })
+            UpdateURL          = $updateUrl
+            Overrides          = ($overrides -join ", ")
+            Permissions        = Format-BrowserList $apiList
+            HostPermissions    = Format-BrowserList $hostList
+            InstallTimeUtc     = Format-UtcDetailTime $installed
+            UpdateTimeUtc      = Format-UtcDetailTime $updated
+            Profile            = $ProfileName
+        })
+        $label = if ($name) { "$name ($id)" } else { $id }
+        $rows = @()
+        if ($installed) {
+            $rows += , @($installed, "Installation", "Browser extension installed: $label")
+            if ($updated -and ($updated - $installed).TotalSeconds -ge 60) { $rows += , @($updated, "Installation", "Browser extension updated: $label") }
+        }
+        elseif ($SnapshotTime) {
+            $rows += , @($SnapshotTime, "Snapshot", "Browser extension present: $label")
+        }
+        foreach ($row in $rows) {
+            Add-TimelineEntry -Timestamp $row[0] -Source $Source -EventType $row[1] `
+                -Description $row[2] `
+                -User $User -Details $details `
+                -Artifact "Browser" -RawPath $RawPath
+            $count++
+        }
+    }
+    if ($builtIn -gt 0) { Log "    $builtIn built-in component extension(s) not listed (installed and updated with the browser)." }
+    return $count
+}
+
+# Chromium session.restore_on_startup (session_startup_pref.h)
+$script:ChromiumStartupModes = @{ "1" = "Restore last session"; "4" = "Open specific pages"; "5" = "New tab page"; "6" = "Restore last session and open specific pages" }
+
+# Leaves (dotted path and value) of a parsed JSON object; lists are leaves
+function Get-BrowserJsonLeaves {
+    param($Node, [string]$Prefix)
+    if ($Node -isnot [System.Management.Automation.PSCustomObject]) {
+        [PSCustomObject]@{ Path = $Prefix; Value = $Node }
+        return
+    }
+    foreach ($property in $Node.PSObject.Properties) {
+        $path = if ($Prefix) { "$Prefix.$($property.Name)" } else { $property.Name }
+        Get-BrowserJsonLeaves -Node $property.Value -Prefix $path
+    }
+}
+
+# Settings of forensic interest from a Chromium profile's Preferences and
+# Secure Preferences, as Snapshot rows at the collection time: proxy (also
+# one an extension set), download directory, startup pages, homepage,
+# default search engine, clearing data on exit (any "clear ... on exit"
+# setting, and cookies kept for the session only), history saving disabled
+# and private browsing forced. Only what the profile stores: settings
+# enforced by policy (the registry) are not here. Chromium on Windows keeps
+# no time of the last "Clear browsing data" (browser.last_clear_browsing_
+# data_time is registered on iOS only), so there is no row for it. Returns
+# the row count.
+function Add-ChromiumSettingRows {
+    param([object[]]$Documents, [string]$Source, [string]$User, [string]$ProfileName, [string]$RawPath, $SnapshotTime)
+    $count = 0
+    $settingRows = New-Object System.Collections.Generic.List[object]
+
+    $proxy = Get-BrowserJsonValue -Documents $Documents -Path "proxy"
+    if ($proxy -and $proxy.mode -and $proxy.mode -ne "system") {
+        $target = @($proxy.server, $proxy.pac_url) | Where-Object { $_ } | Select-Object -First 1
+        $settingRows.Add(@("Proxy", ("$($proxy.mode) $target").Trim(), "proxy", [ordered]@{ Bypass = $proxy.bypass_list }))
+    }
+    # A proxy set by an extension is kept with that extension's settings
+    # (in either file)
+    $extensionProxyPrefs = @()
+    foreach ($doc in $Documents) {
+        $extensionSettings = Get-BrowserJsonValue -Documents @($doc) -Path "extensions.settings"
+        if (-not $extensionSettings) { continue }
+        foreach ($extension in $extensionSettings.PSObject.Properties) {
+            foreach ($scope in @("preferences", "regular_only_preferences", "incognito_preferences")) {
+                $extensionProxy = Get-BrowserJsonValue -Documents @($extension.Value) -Path "$scope.proxy"
+                $pref = "extensions.settings.$($extension.Name).$scope.proxy"
+                if (-not $extensionProxy -or $extensionProxyPrefs -contains $pref) { continue }
+                $extensionProxyPrefs += $pref
+                $mode = Get-BrowserJsonValue -Documents @($extensionProxy) -Path "mode"
+                $target = @((Get-BrowserJsonValue -Documents @($extensionProxy) -Path "server"), (Get-BrowserJsonValue -Documents @($extensionProxy) -Path "pac_url")) |
+                    Where-Object { $_ } | Select-Object -First 1
+                $settingRows.Add(@("Proxy", ("$mode $target").Trim(), $pref, [ordered]@{ SetByExtension = $extension.Name }))
+            }
+        }
+    }
+
+    $downloadDir = Get-BrowserJsonValue -Documents $Documents -Path "download.default_directory"
+    if ($downloadDir) {
+        $prompt = Get-BrowserJsonValue -Documents $Documents -Path "download.prompt_for_download"
+        $settingRows.Add(@("Download directory", "$downloadDir", "download.default_directory", [ordered]@{ PromptForDownload = $(if ($null -ne $prompt) { if ($prompt) { "Yes" } else { "No" } } else { "" }) }))
+    }
+
+    $startupMode = "$(Get-BrowserJsonValue -Documents $Documents -Path 'session.restore_on_startup')"
+    # (Assigned first: @() around the call would wrap the returned list once more)
+    $startupUrls = Get-BrowserJsonValue -Documents $Documents -Path "session.startup_urls"
+    $startupUrls = @($startupUrls | Where-Object { $_ })
+    if ($startupMode -or $startupUrls.Count -gt 0) {
+        $modeName = $script:ChromiumStartupModes[$startupMode]
+        if (-not $modeName) { $modeName = $(if ($startupMode) { "Mode $startupMode" } else { "Open specific pages" }) }
+        $value = if ($startupUrls.Count -gt 0) { "$($modeName): $(Format-BrowserList $startupUrls)" } else { $modeName }
+        $settingRows.Add(@("Startup", $value, "session.restore_on_startup, session.startup_urls", $null))
+    }
+
+    $homepage = Get-BrowserJsonValue -Documents $Documents -Path "homepage"
+    if ($homepage) {
+        $isNewTab = Get-BrowserJsonValue -Documents $Documents -Path "homepage_is_newtabpage"
+        $settingRows.Add(@("Homepage", "$homepage", "homepage", [ordered]@{ HomepageIsNewTabPage = $(if ($isNewTab -eq $true) { "Yes" } elseif ($isNewTab -eq $false) { "No" } else { "" }) }))
+    }
+
+    $engine = Get-BrowserJsonValue -Documents $Documents -Path "default_search_provider_data.template_url_data"
+    if ($engine -and $engine.url) {
+        $engineName = if ($engine.short_name) { "$($engine.short_name) ($($engine.url))" } else { "$($engine.url)" }
+        $settingRows.Add(@("Default search engine", $engineName, "default_search_provider_data.template_url_data", [ordered]@{ Keyword = $engine.keyword }))
+    }
+    else {
+        $legacyUrl = Get-BrowserJsonValue -Documents $Documents -Path "default_search_provider.search_url"
+        if ($legacyUrl) {
+            $legacyName = Get-BrowserJsonValue -Documents $Documents -Path "default_search_provider.name"
+            $settingRows.Add(@("Default search engine", ("$legacyName ($legacyUrl)" -replace '^ \(|\)$', '').Trim(), "default_search_provider.search_url", $null))
+        }
+    }
+
+    # Clearing data on exit: any "clear ... on exit / close / shutdown"
+    # setting that is on -- true, or a list that is not empty (names differ
+    # between Chromium browsers, e.g. Brave's browser.clear_data.
+    # cookies_on_exit; notices, prompts and counters about such a setting
+    # are not the setting) -- and cookies kept for the session only (default
+    # cookie setting 4)
+    $onExit = @()
+    foreach ($doc in $Documents) {
+        foreach ($leaf in @(Get-BrowserJsonLeaves -Node $doc -Prefix "")) {
+            if ($leaf.Path -like "extensions.*" -or $leaf.Path -notmatch '(?i)clear[a-z_.]*on_?(exit|close|shutdown)|(exit|close|shutdown)[a-z_.]*clear') { continue }
+            if (($leaf.Path -split '\.')[-1] -match '(?i)notice|migrat|shown|seen|dismiss|prompt|promo|count|time|version') { continue }
+            $on = ($leaf.Value -is [bool] -and $leaf.Value) -or ($leaf.Value -is [array] -and $leaf.Value.Count -gt 0)
+            if ($on -and $onExit -notcontains $leaf.Path) { $onExit += $leaf.Path }
+        }
+    }
+    if ($onExit.Count -gt 0) {
+        $settingRows.Add(@("Clear data on exit", "On ($(($onExit | ForEach-Object { ($_ -split '\.')[-1] }) -join ', '))", ($onExit -join ", "), $null))
+    }
+    if ("$(Get-BrowserJsonValue -Documents $Documents -Path 'profile.default_content_setting_values.cookies')" -eq "4") {
+        $settingRows.Add(@("Clear data on exit", "On (cookies and site data: kept for the session only)", "profile.default_content_setting_values.cookies", $null))
+    }
+    if ((Get-BrowserJsonValue -Documents $Documents -Path "history.saving_disabled") -eq $true) {
+        $settingRows.Add(@("History disabled", "Yes", "history.saving_disabled", $null))
+    }
+    if ("$(Get-BrowserJsonValue -Documents $Documents -Path 'incognito.mode_availability')" -eq "2") {
+        $settingRows.Add(@("Private browsing always on", "Yes", "incognito.mode_availability", $null))
+    }
+
+    if ($SnapshotTime) {
+        foreach ($s in $settingRows) {
+            Add-BrowserSettingRow -Time $SnapshotTime -Source $Source -User $User -RawPath $RawPath -Setting $s[0] -Value $s[1] -Pref $s[2] -Extra $s[3] -ProfileName $ProfileName
+            $count++
+        }
+    }
+    return $count
+}
+
+# Firefox prefs.js: user_pref("name", value) lines as a hashtable of name ->
+# value (text, bool or number). Prefs named like a secret (token, secret,
+# password, push user agent ID) are not read.
+function Read-FirefoxPrefs {
+    param([string]$Path)
+    $prefs = @{}
+    foreach ($line in [System.IO.File]::ReadAllLines($Path, [System.Text.Encoding]::UTF8)) {
+        if ($line -notmatch '^\s*user_pref\(\s*"((?:[^"\\]|\\.)*)"\s*,\s*(.+?)\s*\)\s*;\s*$') { continue }
+        $name = $Matches[1]
+        if ($name -match '(?i)token|secret|password|useragentid') { continue }
+        $raw = $Matches[2]
+        $value = $raw
+        if ($raw -match '^"(.*)"$') {
+            $value = $Matches[1]
+            try { $value = [regex]::Unescape($value) } catch { Write-Verbose "Could not unescape pref $name" }
+        }
+        elseif ($raw -eq "true") { $value = $true }
+        elseif ($raw -eq "false") { $value = $false }
+        else {
+            $number = 0L
+            if ([long]::TryParse($raw, [ref]$number)) { $value = $number }
+        }
+        $prefs[$name] = $value
+    }
+    return $prefs
+}
+
+# Firefox network.proxy.type and browser.startup.page values
+$script:FirefoxProxyTypes = @{ "0" = "None (direct)"; "1" = "Manual"; "2" = "PAC"; "4" = "Auto-detect (WPAD)"; "5" = "System" }
+$script:FirefoxStartupPages = @{ "0" = "Blank page"; "1" = "Homepage"; "3" = "Restore previous session" }
+# What Firefox clears on shutdown when privacy.sanitize.sanitizeOnShutdown is
+# on: the items of one pref branch and their defaults (browser/app/profile/
+# firefox.js). prefs.js holds only values that differ from the default, so
+# the defaults are overlaid with it. The branch in use: privacy.
+# clearOnShutdown_v2 once Firefox migrated the old prefs (privacy.sanitize.
+# clearOnShutdown.hasMigratedToNewPrefs2 / 3), else privacy.clearOnShutdown.
+$script:FirefoxClearOnShutdownItems = @{
+    "v1"  = [ordered]@{ history = $true; formdata = $true; downloads = $true; cookies = $true; cache = $true; sessions = $true; offlineApps = $false; siteSettings = $false; openWindows = $false }
+    "v2"  = [ordered]@{ historyFormDataAndDownloads = $true; cookiesAndStorage = $true; cache = $true; siteSettings = $false }
+    "v2b" = [ordered]@{ browsingHistoryAndDownloads = $true; formdata = $false; cookiesAndStorage = $true; cache = $true; siteSettings = $false }
+}
+
+# Settings of forensic interest from a Firefox prefs.js (only settings the
+# user changed are in the file), as Snapshot rows at the collection time:
+# proxy (network.proxy.*), homepage and startup (browser.startup.*),
+# download directory (browser.download.dir), clearing data on shutdown
+# (privacy.sanitize.sanitizeOnShutdown with the items cleared and kept, see
+# above; cookies kept for the session only: network.cookie.lifetimePolicy
+# 2), history disabled (places.history.enabled = false) and private
+# browsing always on (browser.privatebrowsing.autostart). Returns the row
+# count.
+function Add-FirefoxSettingRows {
+    param([System.IO.FileInfo]$File)
+    $snapshotTime = Get-SnapshotTimeUtc -File $File
+    if (-not $snapshotTime) { return 0 }
+    $prefs = Read-FirefoxPrefs -Path $File.FullName
+    $settingRows = New-Object System.Collections.Generic.List[object]
+
+    if ($prefs.ContainsKey("network.proxy.type")) {
+        $type = "$($prefs['network.proxy.type'])"
+        $value = $script:FirefoxProxyTypes[$type]
+        if (-not $value) { $value = "Type $type" }
+        if ($type -eq "1") {
+            $servers = foreach ($kind in @("http", "ssl", "socks")) {
+                if ($prefs["network.proxy.$kind"]) { "$kind=$($prefs["network.proxy.$kind"]):$($prefs["network.proxy.$($kind)_port"])" }
+            }
+            if ($servers) { $value += " " + (@($servers) -join " ") }
+        }
+        elseif ($type -eq "2" -and $prefs["network.proxy.autoconfig_url"]) { $value += " $($prefs['network.proxy.autoconfig_url'])" }
+        $settingRows.Add(@("Proxy", $value, "network.proxy.type", [ordered]@{ Bypass = $prefs["network.proxy.no_proxies_on"] }))
+    }
+    if ($prefs["browser.startup.homepage"]) {
+        # Several pages are separated by |
+        $settingRows.Add(@("Homepage", ("$($prefs['browser.startup.homepage'])" -replace '\|', ', '), "browser.startup.homepage", $null))
+    }
+    if ($prefs.ContainsKey("browser.startup.page")) {
+        $page = "$($prefs['browser.startup.page'])"
+        $value = $script:FirefoxStartupPages[$page]
+        if (-not $value) { $value = "Page $page" }
+        $settingRows.Add(@("Startup", $value, "browser.startup.page", $null))
+    }
+    if ($prefs["browser.download.dir"]) {
+        $settingRows.Add(@("Download directory", "$($prefs['browser.download.dir'])", "browser.download.dir", [ordered]@{ FolderList = $prefs["browser.download.folderList"] }))
+    }
+    if ($prefs["privacy.sanitize.sanitizeOnShutdown"] -eq $true) {
+        $set = "v1"
+        $branch = "privacy.clearOnShutdown"
+        if ($prefs["privacy.sanitize.useOldClearHistoryDialog"] -ne $true) {
+            if ($prefs["privacy.sanitize.clearOnShutdown.hasMigratedToNewPrefs3"] -eq $true) { $set = "v2b" }
+            elseif ($prefs["privacy.sanitize.clearOnShutdown.hasMigratedToNewPrefs2"] -eq $true) { $set = "v2" }
+            if ($set -ne "v1") { $branch = "privacy.clearOnShutdown_v2" }
+        }
+        $cleared = @()
+        $kept = @()
+        foreach ($item in $script:FirefoxClearOnShutdownItems[$set].Keys) {
+            $on = $script:FirefoxClearOnShutdownItems[$set][$item]
+            if ($prefs.ContainsKey("$branch.$item") -and $prefs["$branch.$item"] -is [bool]) { $on = $prefs["$branch.$item"] }
+            if ($on) { $cleared += $item } else { $kept += $item }
+        }
+        $value = "On (cleared: $(if ($cleared) { $cleared -join ', ' } else { 'nothing' }))"
+        $settingRows.Add(@("Clear data on exit", $value, "privacy.sanitize.sanitizeOnShutdown",
+            [ordered]@{ Cleared = ($cleared -join ", "); Kept = ($kept -join ", "); PrefBranch = $branch }))
+    }
+    if ("$($prefs['network.cookie.lifetimePolicy'])" -eq "2") {
+        $settingRows.Add(@("Clear data on exit", "On (cookies and site data: kept for the session only)", "network.cookie.lifetimePolicy", $null))
+    }
+    if ($prefs["places.history.enabled"] -eq $false) {
+        $settingRows.Add(@("History disabled", "Yes", "places.history.enabled", $null))
+    }
+    if ($prefs["browser.privatebrowsing.autostart"] -eq $true) {
+        $settingRows.Add(@("Private browsing always on", "Yes", "browser.privatebrowsing.autostart", $null))
+    }
+
+    $user = Get-CollectionUser $File.FullName
+    $profileName = Get-BrowserProfileName $File.FullName
+    foreach ($s in $settingRows) {
+        Add-BrowserSettingRow -Time $snapshotTime -Source "Firefox Preferences" -User $user -RawPath $File.FullName -Setting $s[0] -Value $s[1] -Pref $s[2] -Extra $s[3] -ProfileName $profileName
+    }
+    return $settingRows.Count
+}
+
+# Firefox add-on install locations of add-ons built into Firefox (system
+# add-ons and built-in themes and extensions): only counted in the log
+$script:FirefoxBuiltInAddonLocations = @("app-builtin", "app-builtin-addons", "app-system-defaults", "app-system-addons")
+# AddonManager.SIGNEDSTATE_*
+$script:FirefoxSignedStates = @{ "-2" = "Broken"; "-1" = "Unknown"; "0" = "Missing"; "1" = "Preliminary"; "2" = "Signed"; "3" = "System"; "4" = "Privileged" }
+
+# Firefox extensions.json: the add-ons of a profile (extensions, themes,
+# language packs, dictionaries), with installed and updated rows like the
+# Chromium extensions. Names: defaultLocale.name, else addons.json (the
+# add-ons site data next to it). Returns the number of rows added.
+function Add-FirefoxExtensionRows {
+    param([System.IO.FileInfo]$File)
+    $json = Read-BrowserJsonFile -Path $File.FullName -Blank @("startupData", "locales", "targetApplications", "icons")
+    if (-not $json -or -not $json.PSObject.Properties["addons"]) { return 0 }
+    $siteNames = @{}
+    $addonsJson = Join-Path $File.DirectoryName "addons.json"
+    if (Test-Path -LiteralPath $addonsJson) {
+        try {
+            foreach ($a in @((Read-BrowserJsonFile -Path $addonsJson).addons)) { if ($a -and $a.id -and $a.name) { $siteNames["$($a.id)"] = "$($a.name)" } }
+        }
+        catch { Log-Warning "    Could not read $addonsJson : $($_.Exception.Message)" }
+    }
+    $user = Get-CollectionUser $File.FullName
+    $profileName = Get-BrowserProfileName $File.FullName
+    $count = 0
+    $builtIn = 0
+    foreach ($addon in @($json.addons)) {
+        if ($null -eq $addon -or -not $addon.id) { continue }
+        if ($script:FirefoxBuiltInAddonLocations -contains "$($addon.location)") { $builtIn++; continue }
+        $id = "$($addon.id)"
+        $name = ""
+        if ($addon.defaultLocale -and $addon.defaultLocale.name) { $name = "$($addon.defaultLocale.name)" }
+        elseif ($siteNames.ContainsKey($id)) { $name = $siteNames[$id] }
+        $installed = ConvertFrom-UnixTime $addon.installDate -Unit Milliseconds
+        $updated = ConvertFrom-UnixTime $addon.updateDate -Unit Milliseconds
+        $signed = ""
+        if ($null -ne $addon.signedState) { $signed = Get-AntiVirusCodeName -Names $script:FirefoxSignedStates -Code "$($addon.signedState)" }
+        $details = Format-ArtifactDetails ([ordered]@{
+            ID              = $id
+            Name            = $name
+            Version         = $addon.version
+            Type            = $addon.type
+            Location        = $addon.location
+            Active          = $(if ($addon.active -eq $true) { "Yes" } else { "No" })
+            UserDisabled    = $(if ($addon.userDisabled -eq $true) { "Yes" } else { "" })
+            SignedState     = $signed
+            SourceURI       = $addon.sourceURI
+            ForeignInstall  = $(if ($addon.foreignInstall -eq $true) { "Yes" } else { "" })
+            InstallSource   = $(if ($addon.installTelemetryInfo) { $addon.installTelemetryInfo.source } else { "" })
+            Hidden          = $(if ($addon.hidden -eq $true) { "Yes" } else { "" })
+            Permissions     = $(if ($addon.userPermissions) { Format-BrowserList $addon.userPermissions.permissions } else { "" })
+            HostPermissions = $(if ($addon.userPermissions) { Format-BrowserList $addon.userPermissions.origins } else { "" })
+            InstallTimeUtc  = Format-UtcDetailTime $installed
+            UpdateTimeUtc   = Format-UtcDetailTime $updated
+            Profile         = $profileName
+        })
+        $label = if ($name) { "$name ($id)" } else { $id }
+        $rows = @()
+        if ($installed) {
+            $rows += , @($installed, "Browser extension installed: $label")
+            if ($updated -and ($updated - $installed).TotalSeconds -ge 60) { $rows += , @($updated, "Browser extension updated: $label") }
+        }
+        foreach ($row in $rows) {
+            Add-TimelineEntry -Timestamp $row[0] -Source "Firefox Extensions" -EventType "Installation" `
+                -Description $row[1] `
+                -User $user -Details $details `
+                -Artifact "Browser" -RawPath $File.FullName
+            $count++
+        }
+    }
+    if ($builtIn -gt 0) { Log "    $builtIn built-in Firefox add-on(s) not listed (system add-ons, built-in themes)." }
+    return $count
+}
+
+# Pages that are only a new tab or a blank page: no session rows
+$script:BrowserBlankPagePattern = '^(about:(blank|newtab|home|privatebrowsing|sessionrestore|welcome)|(chrome|edge|brave|vivaldi|opera)://(newtab|new-tab-page|startpage|vivaldi-webui/startpage)/?)$'
+
+# Chromium session files: Session_* (the tabs of the current and last
+# session; older versions: Current/Last Session) and Tabs_* (recently closed
+# tabs and windows; Current/Last Tabs).
+function Test-ChromiumTabRestoreFile {
+    param([System.IO.FileInfo]$File)
+    return ($File.Name -match '^(Tabs_|Current Tabs$|Last Tabs$)')
+}
+
+# Profile folder of a Chromium session file: the parent of Sessions\, else
+# the file's own folder (older versions, Opera)
+function Get-ChromiumSessionProfileDir {
+    param([System.IO.FileInfo]$File)
+    if ($File.Directory.Name -eq "Sessions") { return $File.Directory.Parent.FullName }
+    return $File.DirectoryName
+}
+
+# Visits of a Chromium History between two Chromium times, as URL -> list of
+# visit times (Chromium time), to tell whether a session entry is also in
+# the History. The newest 200,000. $null when the History could not be read
+# (a first row "-1" tells a query that worked from one that failed).
+function Get-ChromiumHistoryVisitTimes {
+    param([string]$Sqlite3Exe, [string]$HistoryPath, [long]$FromTime, [long]$ToTime)
+    $query = "SELECT -1, '' UNION ALL SELECT * FROM (SELECT v.visit_time, u.url FROM visits v JOIN urls u ON u.id = v.url " +
+             "WHERE v.visit_time BETWEEN $FromTime AND $ToTime ORDER BY v.visit_time DESC LIMIT 200000);"
+    $rows = @(Invoke-Sqlite3Query -Sqlite3Exe $Sqlite3Exe -DbPath $HistoryPath -Query $query)
+    if (@($rows | Where-Object { $_ -match '^-1,' }).Count -eq 0) { return $null }
+    $visits = New-Object 'System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[long]]'
+    foreach ($r in ($rows | ConvertFrom-Csv -Header "VisitTime", "Url")) {
+        $time = 0L
+        if (-not $r.Url -or -not [long]::TryParse([string]$r.VisitTime, [ref]$time) -or $time -lt 0) { continue }
+        if (-not $visits.ContainsKey($r.Url)) { $visits[$r.Url] = New-Object 'System.Collections.Generic.List[long]' }
+        $visits[$r.Url].Add($time)
+    }
+    return $visits
+}
+
+# Two kinds of rows from one session file (read with ReadSnss):
+#   - each navigation entry (a page in a tab's back/forward list) at the
+#     time the page was visited: "Browser visit in session tab: <title>",
+#     or "Browser visit in closed tab: <title>" in a Tabs file and for a tab
+#     the Session file records as closed. Current=Yes marks the page the tab
+#     showed. InHistory: Yes when the profile's live History (-HistoryVisits)
+#     has a visit to the URL within a minute of that time, No when it has
+#     none (only the session file still holds that visit), blank when there
+#     was no History to compare with.
+#   - each closed tab with a known close time: "Browser closed tab: <title>"
+#     at that time (as for Firefox), with the page the tab showed, its time
+#     (VisitedUtc) and the number of pages in the tab (Entries). A tab closed
+#     with its window has the window's close time (ClosedWindow=Yes).
+# An entry written more than once (the log rewrites it when the title
+# changes) gives one row, with its last title. New tab pages give no rows.
+# The newest -MaxRows entries. Returns the row count.
+function Add-ChromiumSessionRows {
+    param([System.IO.FileInfo]$File, $Snss, $HistoryVisits, [int]$MaxRows = 20000)
+    $tabRestore = Test-ChromiumTabRestoreFile $File
+    # One object per entry (last write wins), and the last entry written at
+    # each tab position
+    $latest = New-Object 'System.Collections.Generic.Dictionary[string, object]'
+    $atIndex = New-Object 'System.Collections.Generic.Dictionary[string, object]'
+    $tabIndexes = @{}
+    foreach ($navigation in $Snss.Navigations) {
+        $latest["$($navigation.TabId)|$($navigation.Index)|$($navigation.Timestamp)|$($navigation.Url)"] = $navigation
+        $atIndex["$($navigation.TabId)|$($navigation.Index)"] = $navigation
+        if (-not $tabIndexes.ContainsKey($navigation.TabId)) { $tabIndexes[$navigation.TabId] = New-Object 'System.Collections.Generic.SortedSet[int]' }
+        [void]$tabIndexes[$navigation.TabId].Add($navigation.Index)
+    }
+
+    # Per tab: the page it showed, when it was closed, reopened or not
+    $tabs = @{}
+    foreach ($tabId in $tabIndexes.Keys) {
+        $current = $null
+        if ($Snss.SelectedIndexes.ContainsKey($tabId)) {
+            $selected = $Snss.SelectedIndexes[$tabId]
+            if ($tabRestore) {
+                # Tabs files: the position among the tab's entries in the file
+                $indexes = @($tabIndexes[$tabId])
+                if ($selected -ge 0 -and $selected -lt $indexes.Count) { $current = $atIndex["$tabId|$($indexes[$selected])"] }
+            }
+            elseif ($atIndex.ContainsKey("$tabId|$selected")) { $current = $atIndex["$tabId|$selected"] }
+        }
+        if ($null -eq $current) {
+            foreach ($index in $tabIndexes[$tabId]) {
+                $candidate = $atIndex["$tabId|$index"]
+                if ($null -eq $current -or $candidate.Timestamp -gt $current.Timestamp) { $current = $candidate }
+            }
+        }
+        $window = $null
+        if ($Snss.TabWindows.ContainsKey($tabId)) { $window = $Snss.TabWindows[$tabId] }
+        $closed = $null
+        $closedWindow = $false
+        if ($Snss.ClosedTimes.ContainsKey($tabId)) { $closed = ConvertFrom-ChromiumTime $Snss.ClosedTimes[$tabId] }
+        elseif ($null -ne $window -and $Snss.WindowClosedTimes.ContainsKey($window)) {
+            $closed = ConvertFrom-ChromiumTime $Snss.WindowClosedTimes[$window]
+            $closedWindow = $true
+        }
+        $tabs[$tabId] = @{
+            Current      = $current
+            Entries      = $tabIndexes[$tabId].Count
+            Closed       = $closed
+            IsClosed     = ($tabRestore -or $null -ne $closed)
+            ClosedWindow = $(if ($closedWindow -or ($tabRestore -and $null -ne $window)) { "Yes" } else { "" })
+            Reopened     = $(if ($Snss.Restored.Contains($tabId) -or ($null -ne $window -and $Snss.Restored.Contains($window))) { "Yes" } else { "" })
+        }
+    }
+
+    $source = "$(Get-ChromiumBrowserName $File.FullName) Sessions"
+    $user = Get-CollectionUser $File.FullName
+    $profileName = Get-BrowserProfileName $File.FullName
+    $count = 0
+    $noTime = 0
+    foreach ($navigation in @($latest.Values | Sort-Object Timestamp -Descending)) {
+        if (-not $navigation.Url -or $navigation.Url -match $script:BrowserBlankPagePattern) { continue }
+        $ts = ConvertFrom-ChromiumTime $navigation.Timestamp
+        if (-not $ts) { $noTime++; continue }
+        if ($count -ge $MaxRows) { Log-Warning "    More than $MaxRows navigation entries; only the newest $MaxRows were added (cap)."; break }
+        $tab = $tabs[$navigation.TabId]
+        $transition = ""
+        if ($navigation.Transition -ge 0) {
+            $transition = $script:ChromiumTransitions[$navigation.Transition -band 255]
+            if (-not $transition) { $transition = "$($navigation.Transition -band 255)" }
+        }
+        $inHistory = ""
+        if ($null -ne $HistoryVisits) {
+            $inHistory = "No"
+            if ($HistoryVisits.ContainsKey($navigation.Url)) {
+                foreach ($visitTime in $HistoryVisits[$navigation.Url]) {
+                    if ([Math]::Abs($visitTime - $navigation.Timestamp) -le 60000000) { $inHistory = "Yes"; break }
+                }
+            }
+        }
+        $label = if ($navigation.Title) { $navigation.Title } else { $navigation.Url }
+        $where = if ($tab.IsClosed) { "closed tab" } else { "session tab" }
+        Add-TimelineEntry -Timestamp $ts -Source $source -EventType "NetworkConnection" `
+            -Description "Browser visit in $($where): $label" `
+            -User $user `
+            -Details (Format-ArtifactDetails ([ordered]@{
+                URL          = $navigation.Url
+                Title        = $navigation.Title
+                Transition   = $transition
+                Referrer     = $navigation.Referrer
+                Current      = $(if ([object]::ReferenceEquals($navigation, $tab.Current)) { "Yes" } else { "" })
+                InHistory    = $inHistory
+                ClosedUtc    = Format-UtcDetailTime $tab.Closed
+                ClosedWindow = $tab.ClosedWindow
+                Reopened     = $tab.Reopened
+                Profile      = $profileName
+            })) `
+            -Artifact "Browser" -RawPath $File.FullName
+        $count++
+    }
+
+    # Closed tabs, at their close time
+    foreach ($tabId in $tabs.Keys) {
+        $tab = $tabs[$tabId]
+        $page = $tab.Current
+        if ($null -eq $tab.Closed -or $null -eq $page -or -not $page.Url -or $page.Url -match $script:BrowserBlankPagePattern) { continue }
+        $label = if ($page.Title) { $page.Title } else { $page.Url }
+        Add-TimelineEntry -Timestamp $tab.Closed -Source $source -EventType "NetworkConnection" `
+            -Description "Browser closed tab: $label" `
+            -User $user `
+            -Details (Format-ArtifactDetails ([ordered]@{
+                URL          = $page.Url
+                Title        = $page.Title
+                Entries      = $tab.Entries
+                VisitedUtc   = Format-UtcDetailTime (ConvertFrom-ChromiumTime $page.Timestamp)
+                ClosedUtc    = Format-UtcDetailTime $tab.Closed
+                ClosedWindow = $tab.ClosedWindow
+                Reopened     = $tab.Reopened
+                Profile      = $profileName
+            })) `
+            -Artifact "Browser" -RawPath $File.FullName
+        $count++
+    }
+    if ($noTime -gt 0) { Log "    $noTime navigation entr(ies) without a time skipped." }
+    return $count
+}
+
+# Members of a Firefox session file that are never read (set to null before
+# the JSON is parsed): form data, cookies, session storage, POST data, page
+# state, typed text, and bulky members the rows do not use
+$script:FirefoxSessionBlankMembers = @("formdata", "cookies", "storage", "postdata_b64", "structuredCloneState", "scroll", "presState", "children",
+    "userTypedValue", "csp", "referrerInfo", "triggeringPrincipal_base64", "principalToInherit_base64",
+    "partitionedPrincipalToInherit_base64", "image", "iconLoadingPrincipal", "extData", "attributes")
+
+# Firefox session files (sessionstore.jsonlz4, sessionstore-backups\
+# recovery.jsonlz4 / recovery.baklz4 / previous.jsonlz4 / upgrade.jsonlz4-*):
+# open tabs at their lastAccessed time ("Browser session tab"), recently
+# closed tabs and the tabs of recently closed windows at their closedAt time
+# ("Browser closed tab"), each with the page the tab showed (Firefox keeps no
+# time per page of a tab). The members above are blanked before the JSON is
+# parsed. Returns the number of rows added.
+function Add-FirefoxSessionRows {
+    param([System.IO.FileInfo]$File)
+    if (-not (Initialize-BrowserReader)) { return 0 }
+    $bytes = [TimelineBrowser.Reader]::DecompressMozLz4([System.IO.File]::ReadAllBytes($File.FullName))
+    $text = [TimelineBrowser.Reader]::BlankJsonMembers([System.Text.Encoding]::UTF8.GetString($bytes), [string[]]$script:FirefoxSessionBlankMembers)
+    try { $json = ConvertFrom-BrowserJsonText $text }
+    catch { throw "not valid JSON after decompression" }
+    $user = Get-CollectionUser $File.FullName
+    $profileName = Get-BrowserProfileName $File.FullName
+    # Each item: @(tab state, closed time or $null, closed with its window)
+    $tabs = New-Object System.Collections.Generic.List[object]
+    $windows = @(@($json.windows) | ForEach-Object { @{ Window = $_; Closed = $null } }) +
+               @(@($json._closedWindows) | ForEach-Object { @{ Window = $_; Closed = ConvertFrom-UnixTime $_.closedAt -Unit Milliseconds } })
+    foreach ($w in $windows) {
+        if ($null -eq $w.Window) { continue }
+        foreach ($tab in @($w.Window.tabs)) {
+            if ($null -eq $tab) { continue }
+            $tabs.Add(@($tab, $w.Closed, ($null -ne $w.Closed)))
+        }
+        foreach ($closedTab in @($w.Window._closedTabs)) {
+            if ($null -eq $closedTab -or $null -eq $closedTab.state) { continue }
+            $tabs.Add(@($closedTab.state, (ConvertFrom-UnixTime $closedTab.closedAt -Unit Milliseconds), $false))
+        }
+    }
+    $count = 0
+    foreach ($item in $tabs) {
+        $state = $item[0]
+        $closed = $item[1]
+        $entries = @($state.entries | Where-Object { $null -ne $_ })
+        if ($entries.Count -eq 0) { continue }
+        $index = 0
+        if (-not [int]::TryParse("$($state.index)", [ref]$index) -or $index -lt 1 -or $index -gt $entries.Count) { $index = $entries.Count }
+        $entry = $entries[$index - 1]
+        $url = "$($entry.url)"
+        if (-not $url -or $url -match $script:BrowserBlankPagePattern) { continue }
+        $lastAccessed = ConvertFrom-UnixTime $state.lastAccessed -Unit Milliseconds
+        $ts = if ($closed) { $closed } else { $lastAccessed }
+        if (-not $ts) { continue }
+        $title = "$($entry.title)"
+        $label = if ($title) { $title } else { $url }
+        $verb = if ($closed) { "Browser closed tab" } else { "Browser session tab" }
+        Add-TimelineEntry -Timestamp $ts -Source "Firefox Sessions" -EventType "NetworkConnection" `
+            -Description "$($verb): $label" `
+            -User $user `
+            -Details (Format-ArtifactDetails ([ordered]@{
+                URL             = $url
+                Title           = $title
+                Entries         = $entries.Count
+                LastAccessedUtc = Format-UtcDetailTime $lastAccessed
+                ClosedUtc       = Format-UtcDetailTime $closed
+                ClosedWindow    = $(if ($item[2]) { "Yes" } else { "" })
+                Profile         = $profileName
+            })) `
+            -Artifact "Browser" -RawPath $File.FullName
+        $count++
+    }
+    return $count
+}
+
+# Snapshot folder of a Chromium history snapshot file:
+# <browser>\Snapshots\<version>\<profile>\<file>, with <browser> = Browser\
+# <user>\<browser> in a collection (or a User Data folder), <version> a
+# version number and <profile> a profile folder name. Returns the version,
+# the profile and the live profile folder the snapshot was taken from
+# (<browser>\<profile>; Opera, whose folder is its profile: <browser>), or
+# $null for any other file.
+function Get-ChromiumSnapshotInfo {
+    param([string]$FullPath)
+    $snapshotPattern = '\\Snapshots\\(?<version>\d+(?:\.\d+){1,3})\\(?<profile>Default|Profile \d+|Guest Profile)\\[^\\]+$'
+    $rel = Get-RelativeCollectionPath $FullPath
+    if ($rel -and $rel -match ('^(?<root>Browser\\[^\\]+\\[^\\]+)' + $snapshotPattern)) {
+        $root = Join-Path $script:collectionRoot $Matches["root"]
+    }
+    elseif ($FullPath -match ('^(?<root>.+\\User Data)' + $snapshotPattern)) {
+        $root = $Matches["root"]
+    }
+    else { return $null }
+    $version = $Matches["version"]
+    $profileName = $Matches["profile"]
+    $liveDir = Join-Path $root $profileName
+    if (-not (Test-Path -LiteralPath $liveDir) -and (Test-Path -LiteralPath (Join-Path $root "History"))) { $liveDir = $root }
+    return [PSCustomObject]@{
+        Version = $version
+        Profile = $profileName
+        LiveDir = $liveDir
+    }
+}
+
+# Whether a file is anywhere inside a Chromium snapshot profile folder
+# (Snapshots\<version>\<profile>\, also its Sessions\ folder): such copies
+# are not parsed as the profile's own files
+function Test-ChromiumSnapshotPath {
+    param([string]$FullPath)
+    return ($FullPath -match '\\Snapshots\\\d+(?:\.\d+){1,3}\\(?:Default|Profile \d+|Guest Profile)\\')
+}
+
+# Days of history Chromium keeps (older visits expire)
+$script:ChromiumHistoryRetentionDays = 90
+
+# Visits in a Chromium history snapshot (Snapshots\<version>\<profile>\History,
+# a copy the browser makes before an update) that are not in the profile's
+# live History -- same URL and visit time: removed from the History after
+# the snapshot was taken (SnapshotTakenUtc: the snapshot file's creation time
+# from the collection manifest), or expired. Chromium's own "Clear browsing
+# data" also deletes the snapshots taken in the time range it clears, so a
+# visit kept only in a snapshot was removed some other way (deleted from the
+# history page, by an extension or sync, or the database edited outside the
+# browser) or expired. Reason: Deleted (the visit is within the 90 days
+# Chromium keeps, counted back from the last write of the live History --
+# LiveHistoryModifiedUtc, else the collection time -- so it did not expire),
+# Expired or deleted (older), or No live History (the profile's History was
+# not collected). Snapshots are processed newest version first and a visit
+# is reported once per profile (-Reported). The newest 20,000 per snapshot.
+# Returns the row count.
+function Add-ChromiumSnapshotHistoryRows {
+    param([string]$Sqlite3Exe, [System.IO.FileInfo]$File, [System.Collections.Generic.HashSet[string]]$Reported, [int]$MaxRows = 20000)
+    $info = Get-ChromiumSnapshotInfo $File.FullName
+    if (-not $info) { return 0 }
+    $liveHistory = Join-Path $info.LiveDir "History"
+    $attach = $null
+    $notInLive = ""
+    if ((Test-Path -LiteralPath $liveHistory) -and (Test-FileSignature -Path $liveHistory -Signature "SQLite format 3")) {
+        $attach = @{ live = $liveHistory }
+        $notInLive = " WHERE NOT EXISTS (SELECT 1 FROM live.visits lv JOIN live.urls lu ON lu.id = lv.url WHERE lv.visit_time = v.visit_time AND lu.url = u.url)"
+    }
+    $query = "SELECT v.visit_time, u.url, replace(replace(u.title, char(13), ' '), char(10), ' '), u.visit_count, v.transition & 255 " +
+             "FROM visits v JOIN urls u ON u.id = v.url$notInLive ORDER BY v.visit_time DESC LIMIT $($MaxRows + 1);"
+    $rows = @(Invoke-Sqlite3Query -Sqlite3Exe $Sqlite3Exe -DbPath $File.FullName -Query $query -Attach $attach)
+    if ($rows.Count -gt $MaxRows) {
+        Log-Warning "    More than $MaxRows visits only in this snapshot; only the newest $MaxRows were added (cap)."
+        $rows = $rows[0..($MaxRows - 1)]
+    }
+    $snapshotTimes = Get-SourceFileTimes $File.FullName
+    $taken = if ($snapshotTimes) { $snapshotTimes.Created } else { $null }
+    $liveModified = $null
+    if ($attach) {
+        $liveTimes = Get-SourceFileTimes $liveHistory
+        if ($liveTimes) { $liveModified = $liveTimes.Modified }
+    }
+    $reference = $liveModified
+    if (-not $reference) { $reference = (Get-CollectionInfo).CollectionStartUtc }
+    if (-not $reference) { $reference = $File.LastWriteTimeUtc }
+    $retentionStart = $reference.AddDays(-$script:ChromiumHistoryRetentionDays)
+    $source = "$(Get-ChromiumBrowserName $File.FullName) History Snapshot"
+    $user = Get-CollectionUser $File.FullName
+    $count = 0
+    foreach ($r in ($rows | ConvertFrom-Csv -Header "VisitTime", "Url", "Title", "VisitCount", "Type")) {
+        $ts = ConvertFrom-ChromiumTime $r.VisitTime
+        if (-not $ts -or -not $Reported.Add("$($info.LiveDir)|$($r.VisitTime)|$($r.Url)")) { continue }
+        $reason = if (-not $attach) { "No live History" } elseif ($ts -ge $retentionStart) { "Deleted" } else { "Expired or deleted" }
+        $typeName = $script:ChromiumTransitions[[int]$r.Type]
+        $label = if ($r.Title) { $r.Title } else { $r.Url }
+        Add-TimelineEntry -Timestamp $ts -Source $source -EventType "NetworkConnection" `
+            -Description "Browser visit only in history snapshot: $label" `
+            -User $user `
+            -Details (Format-ArtifactDetails ([ordered]@{
+                URL                    = $r.Url
+                Title                  = $r.Title
+                VisitCount             = $r.VisitCount
+                Transition             = $(if ($typeName) { $typeName } else { $r.Type })
+                Reason                 = $reason
+                Snapshot               = $info.Version
+                SnapshotTakenUtc       = Format-UtcDetailTime $taken
+                LiveHistoryModifiedUtc = Format-UtcDetailTime $liveModified
+                Profile                = $info.Profile
+            })) `
+            -Artifact "Browser" -RawPath $File.FullName
+        $count++
+    }
+    return $count
+}
+
+# Chromium Favicons: pages with an icon mapping whose URL is in neither the
+# live History nor the profile's bookmarks. Chromium itself removes a page's
+# icon mappings when it deletes or expires the page's history (unless the
+# page is bookmarked), so such a page was removed from the History some
+# other way (a cleaning tool, the database edited outside the browser), came
+# in another way (e.g. sync), or the two files were copied at different
+# times: a lead, not proof of a deletion, and no reason is given. The row
+# time is when the icon was last stored (favicon_bitmaps.last_updated,
+# IconUpdatedUtc), not a visit to the page: one icon often serves many pages
+# of a site (PagesSharingIcon), and a visit to any of them updates it. To
+# keep out noise: only http(s) pages; never a bookmarked page; only icons
+# stored on a visit ("on-demand" icons, last_updated 0, are fetched without
+# a visit -- for new-tab-page tiles and suggestions, e.g. Edge's default top
+# sites); nothing when the profile's live History was not collected (there
+# is nothing to compare with). For a Favicons file in a history snapshot,
+# pages in that snapshot's History are left out too (reported as snapshot
+# visits). Live Favicons first, then snapshots newest first: a page is
+# reported once per profile (-Reported). The newest 5,000 per file. Returns
+# the number of rows added.
+function Add-ChromiumFaviconRows {
+    param([string]$Sqlite3Exe, [System.IO.FileInfo]$File, [System.Collections.Generic.HashSet[string]]$Reported, [int]$MaxRows = 5000)
+    $snapshot = Get-ChromiumSnapshotInfo $File.FullName
+    $liveDir = if ($snapshot) { $snapshot.LiveDir } else { $File.DirectoryName }
+    $liveHistory = Join-Path $liveDir "History"
+    if (-not (Test-Path -LiteralPath $liveHistory) -or -not (Test-FileSignature -Path $liveHistory -Signature "SQLite format 3")) {
+        Log "    No History of this profile to compare with -- skipped."
+        return 0
+    }
+    $schema = Get-Sqlite3TableColumns -Sqlite3Exe $Sqlite3Exe -DbPath $File.FullName -Tables @("icon_mapping", "favicons", "favicon_bitmaps")
+    if (-not $schema["icon_mapping"] -or -not $schema["favicons"] -or -not $schema["favicon_bitmaps"]) { return 0 }
+    $profileName = if ($snapshot) { $snapshot.Profile } else { Get-BrowserProfileName $File.FullName }
+    $attach = @{ live = $liveHistory }
+    $conditions = @("(m.page_url LIKE 'http://%' OR m.page_url LIKE 'https://%')", "NOT EXISTS (SELECT 1 FROM live.urls hu WHERE hu.url = m.page_url)")
+    $snapshotHistory = Join-Path $File.DirectoryName "History"
+    if ($snapshot -and (Test-Path -LiteralPath $snapshotHistory) -and (Test-FileSignature -Path $snapshotHistory -Signature "SQLite format 3")) {
+        $attach["snap"] = $snapshotHistory
+        $conditions += "NOT EXISTS (SELECT 1 FROM snap.urls hu WHERE hu.url = m.page_url)"
+    }
+    # Per page, the icon stored last: with MAX() as the only aggregate,
+    # SQLite takes the other columns (icon URL and id) from that same row
+    $query = "SELECT t.updated, replace(replace(t.page_url, char(13), ' '), char(10), ' '), replace(replace(t.icon_url, char(13), ' '), char(10), ' '), " +
+             "(SELECT COUNT(DISTINCT m2.page_url) FROM icon_mapping m2 WHERE m2.icon_id = t.icon_id) FROM " +
+             "(SELECT MAX(b.last_updated) AS updated, m.page_url AS page_url, f.url AS icon_url, f.id AS icon_id FROM icon_mapping m " +
+             "JOIN favicons f ON f.id = m.icon_id JOIN favicon_bitmaps b ON b.icon_id = f.id AND b.last_updated > 0 WHERE " + ($conditions -join " AND ") +
+             " GROUP BY m.page_url) t ORDER BY t.updated DESC;"
+    $rows = @(Invoke-Sqlite3Query -Sqlite3Exe $Sqlite3Exe -DbPath $File.FullName -Query $query -Attach $attach)
+
+    # Bookmarked pages of the profile
+    $bookmarked = New-Object 'System.Collections.Generic.HashSet[string]'
+    $bookmarksFile = Join-Path $liveDir "Bookmarks"
+    if (Test-Path -LiteralPath $bookmarksFile) {
+        try {
+            $bookmarks = Get-Content -LiteralPath $bookmarksFile -Raw -Encoding UTF8 -ErrorAction Stop
+            foreach ($m in [regex]::Matches($bookmarks, '"url"\s*:\s*"((?:[^"\\]|\\.)*)"')) { [void]$bookmarked.Add([regex]::Unescape($m.Groups[1].Value)) }
+        }
+        catch { Log-Warning "    Could not read bookmarks $bookmarksFile : $($_.Exception.Message)" }
+    }
+    $source = "$(Get-ChromiumBrowserName $File.FullName) Favicons"
+    $user = Get-CollectionUser $File.FullName
+    $count = 0
+    foreach ($r in ($rows | ConvertFrom-Csv -Header "Updated", "PageUrl", "IconUrl", "Pages")) {
+        if ($bookmarked.Contains($r.PageUrl)) { continue }
+        $ts = ConvertFrom-ChromiumTime $r.Updated
+        if (-not $ts -or -not $Reported.Add("$liveDir|$($r.PageUrl)")) { continue }
+        if ($count -ge $MaxRows) { Log-Warning "    More than $MaxRows favicon pages not in history; only the newest $MaxRows were added (cap)."; break }
+        Add-TimelineEntry -Timestamp $ts -Source $source -EventType "NetworkConnection" `
+            -Description "Browser favicon for page not in history: $($r.PageUrl)" `
+            -User $user `
+            -Details (Format-ArtifactDetails ([ordered]@{
+                URL              = $r.PageUrl
+                IconURL          = $r.IconUrl
+                IconUpdatedUtc   = Format-UtcDetailTime $ts
+                PagesSharingIcon = $r.Pages
+                Snapshot         = $(if ($snapshot) { $snapshot.Version } else { "" })
+                Profile          = $profileName
+            })) `
+            -Artifact "Browser" -RawPath $File.FullName
+        $count++
+    }
+    return $count
+}
+
 function Parse-BrowserHistory {
     Log "--- Parsing Browser History ---"
 
@@ -7073,17 +8542,57 @@ function Parse-BrowserHistory {
     # Newest visits kept per database
     $maxVisits = 20000
 
-    # Find browser history databases (SQLite files only)
+    # Find browser history databases (SQLite files only). A Chromium History
+    # under Snapshots\<version>\<profile>\ is a pre-update copy: only its
+    # visits that are no longer in the live History are added (see
+    # Add-ChromiumSnapshotHistoryRows).
     $chromeHistoryPaths = @()
+    $chromeSnapshotHistoryPaths = @()
     $firefoxHistoryPaths = @()
 
     $historyFiles = Find-ArtifactFiles -BasePath $InputPath -FileNames @("History", "places.sqlite")
     foreach ($f in $historyFiles) {
         if ($f.PSIsContainer) { continue }
         if (-not (Test-FileSignature -Path $f.FullName -Signature "SQLite format 3")) { continue }
-        if ($f.Name -eq "History") { $chromeHistoryPaths += $f }
+        if ($f.Name -eq "History") {
+            if (Get-ChromiumSnapshotInfo $f.FullName) { $chromeSnapshotHistoryPaths += $f } else { $chromeHistoryPaths += $f }
+        }
         if ($f.Name -eq "places.sqlite") { $firefoxHistoryPaths += $f }
     }
+    $chromeFaviconPaths = @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("Favicons") |
+        Where-Object { -not $_.PSIsContainer -and (Test-FileSignature -Path $_.FullName -Signature "SQLite format 3") })
+
+    # Settings, extensions and sessions (JSON and binary files, no sqlite3
+    # needed). Chromium: Preferences and Secure Preferences per profile
+    # folder, Local State per browser, Session_* / Tabs_* (SNSS). Firefox:
+    # extensions.json, prefs.js and the session files (mozLz4) -- in a
+    # Firefox folder only (Thunderbird profiles have files of the same names).
+    # Copies inside a history snapshot folder are not read.
+    $chromePrefsDirs = [ordered]@{}
+    $localStateFiles = @()
+    $firefoxExtensionFiles = @()
+    $firefoxPrefsFiles = @()
+    foreach ($f in (Find-ArtifactFiles -BasePath $InputPath -FileNames @("Preferences", "Secure Preferences", "Local State", "extensions.json", "prefs.js"))) {
+        if ($f.PSIsContainer -or (Test-ChromiumSnapshotPath $f.FullName)) { continue }
+        $inBrowserFolder = "$(Get-RelativeCollectionPath $f.FullName)" -match '^Browser\\'
+        switch ($f.Name) {
+            "extensions.json" { if ($f.FullName -match '\\Firefox\\') { $firefoxExtensionFiles += $f } }
+            "prefs.js"        { if ($f.FullName -match '\\Firefox\\') { $firefoxPrefsFiles += $f } }
+            "Local State"     { if ($inBrowserFolder -or $f.FullName -match '\\User Data\\Local State$|\\Opera[^\\]*\\Local State$') { $localStateFiles += $f } }
+            default {
+                # A browser profile (Electron apps keep a Preferences file too)
+                if (-not $inBrowserFolder -and -not (Test-Path -LiteralPath (Join-Path $f.DirectoryName "History"))) { continue }
+                if (-not $chromePrefsDirs.Contains($f.DirectoryName)) { $chromePrefsDirs[$f.DirectoryName] = @() }
+                $chromePrefsDirs[$f.DirectoryName] += $f
+            }
+        }
+    }
+    $chromeSessionFiles = @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("Session_*", "Tabs_*", "Current Session", "Current Tabs", "Last Session", "Last Tabs") |
+        Where-Object { -not $_.PSIsContainer -and $_.Name -match '^((Session|Tabs)_\d+|(Current|Last) (Session|Tabs))$' -and -not (Test-ChromiumSnapshotPath $_.FullName) -and
+                       (Test-FileSignature -Path $_.FullName -Signature "SNSS") })
+    $firefoxSessionFiles = @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("*lz4*") |
+        Where-Object { -not $_.PSIsContainer -and $_.Name -match '^(sessionstore|recovery|previous|upgrade)\.(jsonlz4|baklz4)' -and $_.FullName -match '\\Firefox\\' -and
+                       (Test-FileSignature -Path $_.FullName -Signature ("mozLz40" + [char]0)) })
 
     # Other Chromium profile files: Shortcuts and Top Sites (SQLite), Bookmarks (JSON)
     $chromeShortcutPaths = @()
@@ -7118,8 +8627,11 @@ function Parse-BrowserHistory {
 
     $totalBrowserFiles = $chromeHistoryPaths.Count + $firefoxHistoryPaths.Count + $chromeShortcutPaths.Count + $chromeTopSitesPaths.Count +
         $chromeLoginPaths.Count + $chromeCookiePaths.Count + $chromeWebDataPaths.Count +
-        $firefoxCookiePaths.Count + $firefoxFormHistoryPaths.Count + $firefoxPermissionPaths.Count
-    if ($totalBrowserFiles + $bookmarkFiles.Count + $firefoxLoginFiles.Count -eq 0) {
+        $firefoxCookiePaths.Count + $firefoxFormHistoryPaths.Count + $firefoxPermissionPaths.Count +
+        $chromeSnapshotHistoryPaths.Count + $chromeFaviconPaths.Count
+    $otherBrowserFiles = $bookmarkFiles.Count + $firefoxLoginFiles.Count + $chromePrefsDirs.Count + $localStateFiles.Count +
+        $firefoxExtensionFiles.Count + $firefoxPrefsFiles.Count + $chromeSessionFiles.Count + $firefoxSessionFiles.Count
+    if ($totalBrowserFiles + $otherBrowserFiles -eq 0) {
         Log-Warning "No browser history databases found. Skipping."
         Log ""
         return
@@ -7145,24 +8657,149 @@ function Parse-BrowserHistory {
         }
         catch { Log-Warning "    Could not read saved logins $($lj.FullName): $($_.Exception.Message)" }
     }
+
+    # Chromium extensions and settings, per profile folder (Secure
+    # Preferences first: Windows keeps extensions.settings and the protected
+    # settings there)
+    foreach ($profileDir in $chromePrefsDirs.Keys) {
+        $prefsFiles = @($chromePrefsDirs[$profileDir] | Sort-Object { if ($_.Name -eq "Secure Preferences") { 0 } else { 1 } })
+        $browserName = Get-ChromiumBrowserName $prefsFiles[0].FullName
+        $user = Get-CollectionUser $prefsFiles[0].FullName
+        $profileName = Get-BrowserProfileName $prefsFiles[0].FullName
+        Log "  Parsing: $browserName Preferences ($user$(if ($profileName) { ", $profileName" }))"
+        $documents = @()
+        foreach ($pf in $prefsFiles) {
+            try {
+                $doc = Read-BrowserJsonFile -Path $pf.FullName -Blank $script:ChromiumPrefsBlankMembers
+                if ($doc) { $documents += $doc }
+            }
+            catch { Log-Warning "    Could not read $($pf.FullName): $($_.Exception.Message)" }
+        }
+        if ($documents.Count -eq 0) { continue }
+        $snapshotTime = Get-SnapshotTimeUtc -File $prefsFiles[0]
+        $settingsPath = ($prefsFiles | Where-Object { $_.Name -eq "Preferences" } | Select-Object -First 1)
+        $settingsPath = if ($settingsPath) { $settingsPath.FullName } else { $prefsFiles[0].FullName }
+        try {
+            $added = Add-ChromiumExtensionRows -Documents $documents -ProfileDir $profileDir -Source "$browserName Extensions" -User $user `
+                -ProfileName $profileName -RawPath $prefsFiles[0].FullName -SnapshotTime $snapshotTime
+            $settingCount = Add-ChromiumSettingRows -Documents $documents -Source "$browserName Preferences" -User $user `
+                -ProfileName $profileName -RawPath $settingsPath -SnapshotTime $snapshotTime
+            Log "    $added extension row(s) and $settingCount setting row(s) added."
+            if ($added + $settingCount -gt 0) { $browserParsed = $true }
+        }
+        catch { Log-Warning "    Could not parse the preferences in $profileDir : $($_.Exception.Message)" }
+    }
+    # Chromium Local State: experimental features turned on (chrome://flags)
+    foreach ($ls in $localStateFiles) {
+        $browserName = Get-ChromiumBrowserName $ls.FullName
+        Log "  Parsing: $browserName Local State ($(Get-CollectionUser $ls.FullName))"
+        try {
+            $doc = Read-BrowserJsonFile -Path $ls.FullName -Blank $script:ChromiumPrefsBlankMembers
+            $flags = Get-BrowserJsonValue -Documents @($doc) -Path "browser.enabled_labs_experiments"
+            $flags = @($flags | Where-Object { $_ })
+            $snapshotTime = Get-SnapshotTimeUtc -File $ls
+            if ($flags.Count -gt 0 -and $snapshotTime) {
+                Add-BrowserSettingRow -Time $snapshotTime -Source "$browserName Local State" -User (Get-CollectionUser $ls.FullName) -RawPath $ls.FullName `
+                    -Setting "Experimental flags" -Value (Format-BrowserList $flags) -Pref "browser.enabled_labs_experiments" -ProfileName ""
+                Log "    1 setting row added."
+                $browserParsed = $true
+            }
+        }
+        catch { Log-Warning "    Could not read $($ls.FullName): $($_.Exception.Message)" }
+    }
+    # Firefox add-ons and settings
+    foreach ($ej in $firefoxExtensionFiles) {
+        Log "  Parsing: Firefox Extensions ($(Get-CollectionUser $ej.FullName))"
+        try {
+            $added = Add-FirefoxExtensionRows -File $ej
+            Log "    $added extension row(s) added."
+            if ($added -gt 0) { $browserParsed = $true }
+        }
+        catch { Log-Warning "    Could not read $($ej.FullName): $($_.Exception.Message)" }
+    }
+    foreach ($pj in $firefoxPrefsFiles) {
+        Log "  Parsing: Firefox Preferences ($(Get-CollectionUser $pj.FullName))"
+        try {
+            $added = Add-FirefoxSettingRows -File $pj
+            Log "    $added setting row(s) added."
+            if ($added -gt 0) { $browserParsed = $true }
+        }
+        catch { Log-Warning "    Could not read $($pj.FullName): $($_.Exception.Message)" }
+    }
+    # --- Ensure sqlite3.exe is available (auto-download if needed): for the
+    # databases, and to compare Chromium session entries with the History ---
+    $sqlite3Exe = $null
+    if ($totalBrowserFiles -gt 0) {
+        Log "  Found $totalBrowserFiles browser database(s)"
+        $sqlite3Exe = Find-Sqlite3Exe
+        if ($sqlite3Exe) { Log "  Using sqlite3: $sqlite3Exe" }
+    }
+
+    # Open and recently closed tabs. Chromium session files are read per
+    # profile, then the profile's History once for their time span (to tell
+    # which session entries it also has, see Add-ChromiumSessionRows).
+    $sessionGroups = [ordered]@{}
+    foreach ($sf in $chromeSessionFiles) {
+        $sessionDir = Get-ChromiumSessionProfileDir $sf
+        if (-not $sessionGroups.Contains($sessionDir)) { $sessionGroups[$sessionDir] = @() }
+        $sessionGroups[$sessionDir] += $sf
+    }
+    foreach ($sessionDir in $sessionGroups.Keys) {
+        if (-not (Initialize-BrowserReader)) { break }
+        # Each item: @(file, parsed file or $null, read error)
+        $parsedFiles = @()
+        $firstTime = 0L
+        $lastTime = 0L
+        foreach ($sf in $sessionGroups[$sessionDir]) {
+            try {
+                $snss = [TimelineBrowser.Reader]::ReadSnss([System.IO.File]::ReadAllBytes($sf.FullName), (Test-ChromiumTabRestoreFile $sf))
+                foreach ($navigation in $snss.Navigations) {
+                    if ($navigation.Timestamp -le 0) { continue }
+                    if ($firstTime -eq 0 -or $navigation.Timestamp -lt $firstTime) { $firstTime = $navigation.Timestamp }
+                    if ($navigation.Timestamp -gt $lastTime) { $lastTime = $navigation.Timestamp }
+                }
+                $parsedFiles += , @($sf, $snss, "")
+            }
+            catch { $parsedFiles += , @($sf, $null, $_.Exception.Message) }
+        }
+        $historyVisits = $null
+        $sessionHistory = Join-Path $sessionDir "History"
+        if ($sqlite3Exe -and $lastTime -gt 0 -and (Test-Path -LiteralPath $sessionHistory) -and (Test-FileSignature -Path $sessionHistory -Signature "SQLite format 3")) {
+            $historyVisits = Get-ChromiumHistoryVisitTimes -Sqlite3Exe $sqlite3Exe -HistoryPath $sessionHistory -FromTime ($firstTime - 60000000) -ToTime ($lastTime + 60000000)
+        }
+        foreach ($item in $parsedFiles) {
+            $sf = $item[0]
+            Log "  Parsing: $(Get-ChromiumBrowserName $sf.FullName) Sessions $($sf.Name) ($(Get-CollectionUser $sf.FullName))"
+            if ($item[2]) { Log-Warning "    Could not read session file $($sf.FullName): $($item[2])"; continue }
+            try {
+                $added = Add-ChromiumSessionRows -File $sf -Snss $item[1] -HistoryVisits $historyVisits
+                Log "    $added tab row(s) added."
+                if ($added -gt 0) { $browserParsed = $true }
+            }
+            catch { Log-Warning "    Could not read session file $($sf.FullName): $($_.Exception.Message)" }
+        }
+    }
+    foreach ($sf in $firefoxSessionFiles) {
+        Log "  Parsing: Firefox Sessions $($sf.Name) ($(Get-CollectionUser $sf.FullName))"
+        try {
+            $added = Add-FirefoxSessionRows -File $sf
+            Log "    $added tab row(s) added."
+            if ($added -gt 0) { $browserParsed = $true }
+        }
+        catch { Log-Warning "    Could not read session file $($sf.FullName): $($_.Exception.Message)" }
+    }
+
     if ($totalBrowserFiles -eq 0) {
         Log "  Browser history parsing complete."
         Log ""
         return
     }
-
-    Log "  Found $totalBrowserFiles browser database(s)"
-
-    # --- Ensure sqlite3.exe is available (auto-download if needed) ---
-    $sqlite3Exe = Find-Sqlite3Exe
     if (-not $sqlite3Exe) {
         Log-Warning "  sqlite3.exe not available. Skipping browser parsing."
         Log "  Browser history parsing complete."
         Log ""
         return
     }
-
-    Log "  Using sqlite3: $sqlite3Exe"
 
     # Parse Chrome/Edge/Brave/Opera/Vivaldi history (Chromium format): one row
     # per visit (visits joined to urls); visit_time = microseconds since 1601 UTC
@@ -7181,6 +8818,35 @@ function Parse-BrowserHistory {
             -TypeNames $script:ChromiumTransitions -RawPath $histDb.FullName -MaxVisits $maxVisits
         Log "    $added visit(s) added."
         if ($added -gt 0) { $browserParsed = $true }
+    }
+
+    # Chromium history snapshots: visits no longer in the live History.
+    # Newest version first, so a visit in several snapshots is reported from
+    # the newest one.
+    $reportedSnapshotVisits = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($histDb in @($chromeSnapshotHistoryPaths | Sort-Object { (Get-ChromiumSnapshotInfo $_.FullName).Version -as [version] } -Descending)) {
+        $snapshot = Get-ChromiumSnapshotInfo $histDb.FullName
+        Log "  Parsing: $(Get-ChromiumBrowserName $histDb.FullName) History Snapshot $($snapshot.Version) ($(Get-CollectionUser $histDb.FullName), $($snapshot.Profile))"
+        try {
+            $added = Add-ChromiumSnapshotHistoryRows -Sqlite3Exe $sqlite3Exe -File $histDb -Reported $reportedSnapshotVisits
+            Log "    $added visit(s) only in this snapshot added."
+            if ($added -gt 0) { $browserParsed = $true }
+        }
+        catch { Log-Warning "    Could not parse history snapshot $($histDb.FullName): $($_.Exception.Message)" }
+    }
+    # Chromium Favicons: pages not in history. Live files first, then
+    # snapshots newest first; a page is reported once per profile.
+    $reportedFaviconPages = New-Object 'System.Collections.Generic.HashSet[string]'
+    $orderedFavicons = @($chromeFaviconPaths | Sort-Object @{ Expression = { $null -ne (Get-ChromiumSnapshotInfo $_.FullName) } },
+        @{ Expression = { (Get-ChromiumSnapshotInfo $_.FullName).Version -as [version] }; Descending = $true })
+    foreach ($db in $orderedFavicons) {
+        Log "  Parsing: $(Get-ChromiumBrowserName $db.FullName) Favicons ($(Get-CollectionUser $db.FullName))"
+        try {
+            $added = Add-ChromiumFaviconRows -Sqlite3Exe $sqlite3Exe -File $db -Reported $reportedFaviconPages
+            Log "    $added page(s) not in history added."
+            if ($added -gt 0) { $browserParsed = $true }
+        }
+        catch { Log-Warning "    Could not parse favicons $($db.FullName): $($_.Exception.Message)" }
     }
 
     # Parse Firefox places.sqlite: visit_date = microseconds since 1970 UTC
