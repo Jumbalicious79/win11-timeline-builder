@@ -1,8 +1,8 @@
 # =============================================================
 # Registry parser test
 # Builds SOFTWARE, SYSTEM and NTUSER.DAT test hives with known values,
-# runs timeline-builder.ps1 (-Sources Registry,ScheduledTasks,USB) on them
-# and checks the rows of the registry parsers: IFEO / SilentProcessExit,
+# runs timeline-builder.ps1 (-Sources Registry,ScheduledTasks,USB,Persistence)
+# on them and checks the rows of the registry parsers: IFEO / SilentProcessExit,
 # Winlogon, AppInit_DLLs, TaskCache, Defender exclusions, LSA packages,
 # WDigest, Office TrustRecords / File MRU / OutlookSecureTempFolder,
 # Terminal Server Client, Open/Save dialog MRUs and WordWheelQuery, and
@@ -13,9 +13,12 @@
 # fixture collection also has a scheduled_tasks.csv (a task listed there
 # still gets its TaskCache registered row; the list's own registration date,
 # author-supplied, gets a row only when it is not that time, and the list's
-# last run time replaces the TaskCache one) and a collection_log.txt (the
-# collector's own Defender exclusion). Hives the builder leaves loaded, and
-# work folders it leaves behind, fail the test and are cleaned up.
+# last run time replaces the TaskCache one), a collection_log.txt (the
+# collector's own Defender exclusion) and a startup_entries.csv whose User
+# values the User column pass must write in one form per account, with
+# the names from SOFTWARE ProfileList and the SYSTEM hive's computer and
+# host names. Hives the builder leaves loaded, and work folders it leaves
+# behind, fail the test and are cleaned up.
 #
 # The hives are made by writing the values below a temporary key,
 # HKCU\Software\TriageTimelineTest_<guid>, and saving its subkeys with
@@ -311,6 +314,24 @@ function New-TestRegistryFixture {
         @("0", [System.Text.Encoding]::Unicode.GetBytes("quarterly report" + [char]0), $binary), @("MRUListEx", (New-MruListEx @(0)), $binary))
 
     New-TestMountedDevicesFixture -System $System
+    New-TestUserNameFixture -Software $Software -System $System
+}
+
+# What the User column pass reads from the hives: SOFTWARE ProfileList
+# (testuser's SID, and SYSTEM's profile folder, which must not become its
+# name) and the SYSTEM hive's computer name, host name and a pending new
+# host name (only the hive has TestHost-New; collection_info.json says
+# TESTHOST)
+function New-TestUserNameFixture {
+    param([Microsoft.Win32.RegistryKey]$Software, [Microsoft.Win32.RegistryKey]$System)
+    $sz = [Microsoft.Win32.RegistryValueKind]::String
+    $expand = [Microsoft.Win32.RegistryValueKind]::ExpandString
+    $profileList = "Microsoft\Windows NT\CurrentVersion\ProfileList"
+    Set-TestKey -Root $Software -Path "$profileList\S-1-5-21-1111-2222-3333-1001" -Values @(, @("ProfileImagePath", "%SystemDrive%\Users\testuser", $expand))
+    Set-TestKey -Root $Software -Path "$profileList\S-1-5-18" -Values @(, @("ProfileImagePath", "%systemroot%\system32\config\systemprofile", $expand))
+    Set-TestKey -Root $Software -Path "$profileList\S-1-5-19" -Values @(, @("ProfileImagePath", "%systemroot%\ServiceProfiles\LocalService", $expand))
+    Set-TestKey -Root $System -Path "ControlSet001\Control\ComputerName\ComputerName" -Values @(, @("ComputerName", "TESTHOST", $sz))
+    Set-TestKey -Root $System -Path "ControlSet001\Services\Tcpip\Parameters" -Values @(@("Hostname", "TestHost", $sz), @("NV Hostname", "TestHost-New", $sz))
 }
 
 # SYSTEM: MountedDevices (at the hive root) with a GPT partition (C:, the
@@ -345,6 +366,7 @@ function Get-ExpectedRegistryRows {
     $collectionTime = "2026-01-01 00:00:00.000"
     $sdVolume = "\??\Volume{00000000-0000-11f0-8000-000000000201}"
     $sdInstance = "InstanceId=USBSTOR\Disk&Ven_Generic-&Prod_SD/MMC&Rev_1.00\FXSERIAL0003&0"
+    $userRun = "HKU\S-1-5-21-1111-2222-3333-1001\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
     # Rows timed with a key's last-write time must say so in Time= (the
     # fallback, the hive file time, falls inside the test window too)
     $rows = @(
@@ -384,10 +406,11 @@ function Get-ExpectedRegistryRows {
             @("Listed=yes (scheduled task list of the collection, without a run time)", "Time=TaskCache DynamicInfo last run time")),
         # scheduled_tasks.csv: the last run of \Folder\ListedTask; its
         # registration date is the TaskCache time, so no row of its own (nor a
-        # Snapshot row); the older date of \Folder\DatedTask is author-supplied
-        @("ScheduledTasks", "Execution", "Scheduled task last run: \Folder\ListedTask", $times.ListedLastRun, "SYSTEM",
+        # Snapshot row); the older date of \Folder\DatedTask is author-supplied.
+        # UserId SYSTEM is written in the User column's form.
+        @("ScheduledTasks", "Execution", "Scheduled task last run: \Folder\ListedTask", $times.ListedLastRun, "NT AUTHORITY\SYSTEM",
             @("Actions=C:\ProgramData\listed.exe", "LastTaskResult=0")),
-        @("ScheduledTasks", "ScheduledTaskChange", "Scheduled task registration date (author-supplied): \Folder\DatedTask", $times.DatedAuthorDate, "SYSTEM",
+        @("ScheduledTasks", "ScheduledTaskChange", "Scheduled task registration date (author-supplied): \Folder\DatedTask", $times.DatedAuthorDate, "NT AUTHORITY\SYSTEM",
             @("Actions=C:\ProgramData\dated.exe", "Time=task XML RegistrationInfo/Date (author-supplied, not recorded by Windows)")),
         @("Registry-DefenderExclusions", "SecurityAlert", "Defender exclusion in effect (Paths): C:\Users\Public\Tools", $null, "",
             @("Key=HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths", "Time=Exclusions\Paths key last write", "this exclusion is older")),
@@ -442,7 +465,21 @@ function Get-ExpectedRegistryRows {
         @("USB-MountedDevices", "Snapshot", "Drive letter F: -> USB storage Generic- SD/MMC (serial FXSERIAL0003)", $collectionTime, "",
             @("VolumeGuid={00000000-0000-11f0-8000-000000000201}", $sdInstance, "SameDataAs=$sdVolume")),
         @("USB-MountedDevices", "Snapshot", "Volume {00000000-0000-11f0-8000-000000000202} -> unrecognized data (6 bytes)", $collectionTime, "",
-            @("Kind=Other", "HexData=010203040506"))
+            @("Kind=Other", "HexData=010203040506")),
+        # startup_entries.csv (Persistence): the User column in one form per
+        # account, with the names from the hives and collection_info.json
+        @("Persistence-Startup", "Snapshot", "Startup entry: TestUpdater [$userRun]", $collectionTime, "testuser",
+            @("Command=C:\ProgramData\updater.exe -silent", "Location=$userRun")),
+        @("Persistence-Startup", "Snapshot", "Startup entry: RenamedHostItem [Startup]", $collectionTime, "testuser",
+            @("Command=C:\ProgramData\renamed.exe")),
+        @("Persistence-Startup", "Snapshot", "Startup entry: SidItem [$userRun]", $collectionTime, "testuser",
+            @("Command=C:\ProgramData\sid.exe", "UserSID=S-1-5-21-1111-2222-3333-1001")),
+        @("Persistence-Startup", "Snapshot", "Startup entry: SystemItem [HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run]", $collectionTime, "NT AUTHORITY\SYSTEM",
+            @("Command=C:\ProgramData\system.exe", "UserSID=S-1-5-18")),
+        @("Persistence-Startup", "Snapshot", "Startup entry: UnknownSidItem [Startup]", $collectionTime, "S-1-5-21-1111-2222-3333-1009",
+            @("Command=C:\ProgramData\unknown.exe")),
+        @("Persistence-Startup", "Snapshot", "Startup entry: OtherHostItem [Startup]", $collectionTime, "OTHERHOST\testuser",
+            @("Command=C:\ProgramData\other.exe"))
     )
     foreach ($r in $rows) {
         [PSCustomObject]@{ Source = $r[0]; EventType = $r[1]; Description = $r[2]; Time = $r[3]; User = $r[4]; Details = $r[5] }
@@ -450,7 +487,8 @@ function Get-ExpectedRegistryRows {
 }
 
 # Sources of the rows covered by this test (registry rows, MountedDevices,
-# and the scheduled_tasks.csv rows next to the TaskCache ones)
+# the scheduled_tasks.csv rows next to the TaskCache ones, and the
+# startup_entries.csv rows for the User column)
 $script:TestedSources = @(
     "Registry-IFEO"
     "Registry-SilentProcessExit"
@@ -469,6 +507,7 @@ $script:TestedSources = @(
     "Registry-WordWheelQuery"
     "USB-MountedDevices"
     "ScheduledTasks"
+    "Persistence-Startup"
 )
 
 # Builder -Sources of the test run
@@ -476,6 +515,7 @@ $script:TestSources = @(
     "Registry"
     "ScheduledTasks"
     "USB"
+    "Persistence"
 )
 
 # Compare the timeline rows (objects with Timestamp, Source, EventType,
@@ -559,6 +599,26 @@ function New-TestScheduledTasksCsv {
             RegistrationDateUtc = $script:FixtureTimes.DatedAuthorDate.ToString($f, $invariant)
             LastRunTimeUtc = ""; NextRunTimeUtc = ""; LastTaskResult = ""
         }
+    )
+    New-Item -ItemType Directory -Path (Split-Path $Path -Parent) -Force | Out-Null
+    $rows | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8
+}
+
+# startup_entries.csv of the fixture collection (Win32_StartupCommand), one
+# row per User form: the computer name of collection_info.json and the
+# SYSTEM hive (TESTHOST), the hive's pending host name (TestHost-New), a SID
+# that ProfileList names, SYSTEM's SID (not its profile folder), a SID with
+# no name in the collection and another computer's account (both kept)
+function New-TestStartupEntriesCsv {
+    param([string]$Path)
+    $userRun = "HKU\S-1-5-21-1111-2222-3333-1001\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+    $rows = @(
+        [PSCustomObject]@{ Name = "TestUpdater"; Command = "C:\ProgramData\updater.exe -silent"; Location = $userRun; User = "TESTHOST\testuser" },
+        [PSCustomObject]@{ Name = "RenamedHostItem"; Command = "C:\ProgramData\renamed.exe"; Location = "Startup"; User = "TestHost-New\testuser" },
+        [PSCustomObject]@{ Name = "SidItem"; Command = "C:\ProgramData\sid.exe"; Location = $userRun; User = "S-1-5-21-1111-2222-3333-1001" },
+        [PSCustomObject]@{ Name = "SystemItem"; Command = "C:\ProgramData\system.exe"; Location = "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"; User = "S-1-5-18" },
+        [PSCustomObject]@{ Name = "UnknownSidItem"; Command = "C:\ProgramData\unknown.exe"; Location = "Startup"; User = "S-1-5-21-1111-2222-3333-1009" },
+        [PSCustomObject]@{ Name = "OtherHostItem"; Command = "C:\ProgramData\other.exe"; Location = "Startup"; User = "OTHERHOST\testuser" }
     )
     New-Item -ItemType Directory -Path (Split-Path $Path -Parent) -Force | Out-Null
     $rows | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8
@@ -701,7 +761,9 @@ try {
     # recognised from collection_log.txt, the scheduled task list decides
     # which TaskCache last run times are new to the timeline and gives
     # registration dates of its own (one the TaskCache time, one older),
-    # and USB\ holds the MountedDevices sources the SYSTEM hive must win over
+    # USB\ holds the MountedDevices sources the SYSTEM hive must win over,
+    # and startup_entries.csv the User forms (the computer name TESTHOST of
+    # this live collection is the examined machine's)
     $info = [ordered]@{
         SchemaVersion = 1; ComputerName = "TESTHOST"; CollectorUser = "TESTHOST\tester"; Mode = "Live"
         TargetDrive = "C"; TargetRoot = "C:\"; CollectionStartUtc = "2026-01-01T00:00:00.0000000Z"
@@ -711,6 +773,7 @@ try {
     New-TestCollectionLog -Path (Join-Path $collection "collection_log.txt")
     New-TestScheduledTasksCsv -Path (Join-Path $collection "Persistence\scheduled_tasks.csv")
     New-TestMountedDevicesFiles -Folder (Join-Path $collection "USB")
+    New-TestStartupEntriesCsv -Path (Join-Path $collection "Persistence\startup_entries.csv")
 
     $timelineCsv = Join-Path $workDir "timeline.csv"
     Write-Host "Running the builder ($powershellExe) on $collection ..."
@@ -745,6 +808,14 @@ try {
         $failures++
     }
     else { Write-Host "PASS: USB-MountedDevices rows from the SYSTEM hive (not the empty mounted_devices.csv or the cut-off .txt)" -ForegroundColor Green }
+    # The User column pass logs its summary and the SID it could not name
+    $userLines = @($builderOutput | ForEach-Object { "$_" } | Where-Object { $_ -match 'User column: ' })
+    if (@($userLines | Where-Object { $_ -match 'row\(s\) changed to one form per account' }).Count -ne 1 -or
+        @($userLines | Where-Object { $_ -match '1 SID\(s\) without a name in the collection, left as they are: S-1-5-21-1111-2222-3333-1009 \(1 row\(s\)\)' }).Count -ne 1) {
+        Write-TestFailure "User column log lines: $($userLines -join ' / ')"
+        $failures++
+    }
+    else { Write-Host "PASS: User column summary and the unnamed SID logged" -ForegroundColor Green }
     if ($failures -gt 0) {
         Write-Host "FAIL: $failures problem(s) in the registry parser rows" -ForegroundColor Red
         exit 1

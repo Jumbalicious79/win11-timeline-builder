@@ -407,10 +407,11 @@ try {
   {"Offset": 4, "Proto": "TCPv4", "LocalAddr": "0.0.0.0", "LocalPort": 0, "ForeignAddr": "0.0.0.0", "ForeignPort": 0, "State": "CLOSED", "PID": 0, "Owner": null, "Created": null, "__children": []}
 ]
 '@
+    # Owner is the process that owns the socket: Details Process=, never User
     $netscanRows = @(
-        "2025-06-30 11:59:01.250|NetworkConnection|Memory network: TCPv4 192.0.2.10:49731 -> 198.51.100.20:443 (ESTABLISHED)|notepad.exe|PID=7340",
-        "$captureText|Snapshot|Memory network: UDPv4 192.0.2.10:5353 -> *:* ()|svchost.exe|PID=2044",
-        "$captureText|Snapshot|Memory network: TCPv6 ::1:8080 -> :::0 (LISTENING)|web.exe|PID=1234 Created=1601-01-01 00:00:00.000",
+        "2025-06-30 11:59:01.250|NetworkConnection|Memory network: TCPv4 192.0.2.10:49731 -> 198.51.100.20:443 (ESTABLISHED)||PID=7340 Process=notepad.exe",
+        "$captureText|Snapshot|Memory network: UDPv4 192.0.2.10:5353 -> *:* ()||PID=2044 Process=svchost.exe",
+        "$captureText|Snapshot|Memory network: TCPv6 ::1:8080 -> :::0 (LISTENING)||PID=1234 Process=web.exe Created=1601-01-01 00:00:00.000",
         "$captureText|Snapshot|Memory network: TCPv4 0.0.0.0:0 -> 0.0.0.0:0 (CLOSED)||PID=0"
     )
     $cmdlineJson = @'

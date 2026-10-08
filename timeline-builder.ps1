@@ -925,6 +925,191 @@ function Get-CollectionUser {
     return ""
 }
 
+# What the User column pass (Update-TimelineUserColumn) needs to know about
+# the examined system, gathered while the parsers read the collection (no
+# hive is loaded for it): the machine's names (MachineNames: the SYSTEM
+# hive's computer and host names; the main body adds the computer name of
+# a live collection) and account names by SID (ProfileSids from SOFTWARE
+# ProfileList, BamSids from bam_entries.csv)
+$script:timelineUserContext = $null
+function Get-TimelineUserContext {
+    if ($null -eq $script:timelineUserContext) {
+        $script:timelineUserContext = [PSCustomObject]@{
+            MachineNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+            ProfileSids  = @{}
+            BamSids      = @{}
+        }
+    }
+    return $script:timelineUserContext
+}
+
+# Keep names of the examined machine: "<name>\account" is a local account
+# of this machine (see ConvertTo-TimelineUserName)
+function Add-TimelineMachineName {
+    param([string[]]$Name)
+    $context = Get-TimelineUserContext
+    foreach ($n in $Name) {
+        $text = "$n".Trim()
+        if ($text) { [void]$context.MachineNames.Add($text) }
+    }
+}
+
+# Keep the account name of a SID for the User column. Only SIDs that say
+# what they are: local and domain accounts (S-1-5-21-...), Entra ID accounts
+# (S-1-12-1-...) and service SIDs (S-1-5-80-..., as NT SERVICE\<name>).
+# Never SYSTEM, LOCAL SERVICE or NETWORK SERVICE: their ProfileList folders
+# (systemprofile, LocalService, NetworkService) are not account names, and
+# ConvertTo-TimelineUserName names them itself. A ProfileList name wins over
+# one from bam_entries.csv (see Get-TimelineSidNames).
+function Add-TimelineSidName {
+    param([string]$Sid, [string]$Name, [switch]$ProfileList)
+    $sidText = "$Sid".Trim()
+    $account = "$Name".Trim()
+    if (-not $account) { return }
+    if ($sidText -match '^S-1-5-80(-\d+)+$') {
+        if ($account -notmatch '\\') { $account = "NT SERVICE\$account" }
+    }
+    elseif ($sidText -notmatch '^S-1-(5-21|12-1)(-\d+)+$') { return }
+    $context = Get-TimelineUserContext
+    if ($ProfileList) { $context.ProfileSids[$sidText] = $account }
+    elseif (-not $context.BamSids.ContainsKey($sidText)) { $context.BamSids[$sidText] = $account }
+}
+
+# SID -> account name for the User column: ProfileList, else bam_entries.csv
+function Get-TimelineSidNames {
+    $context = Get-TimelineUserContext
+    $names = @{}
+    foreach ($sid in $context.BamSids.Keys) { $names[$sid] = $context.BamSids[$sid] }
+    foreach ($sid in $context.ProfileSids.Keys) { $names[$sid] = $context.ProfileSids[$sid] }
+    return $names
+}
+
+# The names Windows writes for its built-in service accounts, in any case
+# (hashtable keys are case-insensitive) -> one form each
+$script:TimelineUserAliases = @{
+    "SYSTEM"                       = "NT AUTHORITY\SYSTEM"
+    "LocalSystem"                  = "NT AUTHORITY\SYSTEM"
+    "NT AUTHORITY\SYSTEM"          = "NT AUTHORITY\SYSTEM"
+    "NT AUTHORITY\LocalSystem"     = "NT AUTHORITY\SYSTEM"
+    "LOCAL SERVICE"                = "NT AUTHORITY\LOCAL SERVICE"
+    "LocalService"                 = "NT AUTHORITY\LOCAL SERVICE"
+    "NT AUTHORITY\LOCAL SERVICE"   = "NT AUTHORITY\LOCAL SERVICE"
+    "NT AUTHORITY\LocalService"    = "NT AUTHORITY\LOCAL SERVICE"
+    "NETWORK SERVICE"              = "NT AUTHORITY\NETWORK SERVICE"
+    "NetworkService"               = "NT AUTHORITY\NETWORK SERVICE"
+    "NT AUTHORITY\NETWORK SERVICE" = "NT AUTHORITY\NETWORK SERVICE"
+    "NT AUTHORITY\NetworkService"  = "NT AUTHORITY\NETWORK SERVICE"
+}
+
+# One form per account for the User column (parsers write what their
+# source gives: "HOST\name", a SID, "LocalSystem", ...). In this order:
+#   1. trim the value and split it at the first "\"; empty and "-" parts
+#      are dropped ("-\-" gives "", "\x" and "-\x" give "x", "X\-" "X")
+#   2. S-1-5-18/19/20 -> NT AUTHORITY\SYSTEM, LOCAL SERVICE, NETWORK SERVICE;
+#      S-1-5-90-0-n -> Window Manager\DWM-n; S-1-5-96-0-n -> Font Driver
+#      Host\UMFD-n
+#   3. any other SID -> its name in $SidNames, else the SID as it is
+#   4. "X\name" -> "name" when X is "." or a name of the examined machine
+#      ($MachineNames, any case): a local account, named the way the
+#      profile folders and the collector name it
+#   5. the built-in service account names ($script:TimelineUserAliases:
+#      SYSTEM, LocalSystem, LocalService, ...) and DWM-n / UMFD-n without a
+#      domain -> the forms of step 2
+#   6. anything else as it is: other domains, MicrosoftAccount\...,
+#      AzureAD\..., the computer account (WORKGROUP\HOST$), NT VIRTUAL
+#      MACHINE\..., NT SERVICE\..., group names
+function ConvertTo-TimelineUserName {
+    param([string]$Value, [hashtable]$SidNames, [string[]]$MachineNames)
+    $text = "$Value".Trim()
+    $domain = ""
+    $name = $text
+    $slash = $text.IndexOf('\')
+    if ($slash -ge 0) {
+        $domain = $text.Substring(0, $slash).Trim()
+        $name = $text.Substring($slash + 1).Trim()
+    }
+    if ($domain -eq "-") { $domain = "" }
+    if ($name -eq "-") { $name = "" }
+    if (-not $name) {
+        $name = $domain
+        $domain = ""
+    }
+    if (-not $name) { return "" }
+
+    if (-not $domain -and $name -match '^S-1-\d+(-\d+)+$') {
+        switch -Regex ($name) {
+            '^S-1-5-18$'         { return "NT AUTHORITY\SYSTEM" }
+            '^S-1-5-19$'         { return "NT AUTHORITY\LOCAL SERVICE" }
+            '^S-1-5-20$'         { return "NT AUTHORITY\NETWORK SERVICE" }
+            '^S-1-5-90-0-(\d+)$' { return "Window Manager\DWM-$($Matches[1])" }
+            '^S-1-5-96-0-(\d+)$' { return "Font Driver Host\UMFD-$($Matches[1])" }
+        }
+        if ($SidNames -and $SidNames.ContainsKey($name) -and $SidNames[$name]) { return [string]$SidNames[$name] }
+        return $name
+    }
+
+    if ($domain -and ($domain -eq "." -or ($MachineNames -and $MachineNames -contains $domain))) { $domain = "" }
+    $text = if ($domain) { "$domain\$name" } else { $name }
+    if ($script:TimelineUserAliases -and $script:TimelineUserAliases.ContainsKey($text)) { return $script:TimelineUserAliases[$text] }
+    if (-not $domain -and $name -match '^DWM-\d+$') { return "Window Manager\$name" }
+    if (-not $domain -and $name -match '^UMFD-\d+$') { return "Font Driver Host\$name" }
+    return $text
+}
+
+# The User column pass, after all parsers and before deduplication: each
+# row's User through ConvertTo-TimelineUserName (once per distinct value,
+# compared exactly). A row whose User was a SID that now has a name keeps
+# the SID in Details as UserSID=<sid>, unless Details already has it as a
+# SID field (UserSID=, SID=, ...). Returns Rows (rows changed), SidRows
+# (rows given UserSID=), Transitions (From, To and Rows per changed value,
+# most rows first) and Unresolved (Sid and Rows per SID left as it is).
+function Update-TimelineUserColumn {
+    param($Entries, [hashtable]$SidNames, [string[]]$MachineNames)
+    # Value -> its new form and the SID it is (if it is one)
+    $cache = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::Ordinal)
+    $changedRows = New-Object 'System.Collections.Generic.Dictionary[string,int]' ([System.StringComparer]::Ordinal)
+    $unresolvedRows = New-Object 'System.Collections.Generic.Dictionary[string,int]' ([System.StringComparer]::Ordinal)
+    $rows = 0
+    $sidRows = 0
+    foreach ($entry in $Entries) {
+        $value = [string]$entry.User
+        if (-not $value) { continue }
+        $known = $null
+        if (-not $cache.TryGetValue($value, [ref]$known)) {
+            $sid = ""
+            if ($value.Trim() -match '^S-1-\d+(-\d+)+$') { $sid = $value.Trim() }
+            $known = [PSCustomObject]@{ New = (ConvertTo-TimelineUserName -Value $value -SidNames $SidNames -MachineNames $MachineNames); Sid = $sid }
+            $cache[$value] = $known
+        }
+        $new = $known.New
+        $sid = $known.Sid
+        $count = 0
+        if ($sid -and $new -ceq $sid) {
+            [void]$unresolvedRows.TryGetValue($sid, [ref]$count)
+            $unresolvedRows[$sid] = $count + 1
+        }
+        if ($new -ceq $value) { continue }
+
+        $entry.User = $new
+        $rows++
+        $count = 0
+        [void]$changedRows.TryGetValue($value, [ref]$count)
+        $changedRows[$value] = $count + 1
+        if ($sid -and $new -cne $sid) {
+            $details = [string]$entry.Details
+            if ($details -notmatch ('SID=' + [regex]::Escape($sid) + '(?![\d-])')) {
+                $entry.Details = if ($details) { "$details | UserSID=$sid" } else { "UserSID=$sid" }
+                $sidRows++
+            }
+        }
+    }
+    $transitions = @($changedRows.Keys | ForEach-Object { [PSCustomObject]@{ From = $_; To = $cache[$_].New; Rows = $changedRows[$_] } } |
+        Sort-Object -CaseSensitive -Property @{ Expression = "Rows"; Descending = $true }, @{ Expression = "From"; Descending = $false })
+    $unresolved = @($unresolvedRows.Keys | ForEach-Object { [PSCustomObject]@{ Sid = $_; Rows = $unresolvedRows[$_] } } |
+        Sort-Object -CaseSensitive -Property @{ Expression = "Rows"; Descending = $true }, @{ Expression = "Sid"; Descending = $false })
+    return [PSCustomObject]@{ Rows = $rows; SidRows = $sidRows; Transitions = $transitions; Unresolved = $unresolved }
+}
+
 function Get-TimeZoneById {
     param([string]$Id)
     if (-not $Id) { return $null }
@@ -990,6 +1175,8 @@ function Get-CollectionInfo {
         CollectorTimeZone  = [System.TimeZoneInfo]::Local
         TargetTimeZone     = $null
         CollectorCulture   = $null
+        # The collector host's name: the examined system only in a live collection
+        ComputerName       = ""
     }
 
     $jsonFile = Get-ChildItem -Path $InputPath -Filter "collection_info.json" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -1000,6 +1187,7 @@ function Get-CollectionInfo {
             $j = Get-Content -Path $jsonFile.FullName -Raw -ErrorAction Stop | ConvertFrom-Json
             $info.Source = "collection_info.json"
             if ($j.Mode) { $info.Mode = [string]$j.Mode }
+            if ($j.ComputerName) { $info.ComputerName = [string]$j.ComputerName }
             $info.CollectionStartUtc = ConvertFrom-UtcText $j.CollectionStartUtc
             $tz = Get-TimeZoneById ([string]$j.CollectorTimeZoneId)
             if ($tz) { $info.CollectorTimeZone = $tz }
@@ -2187,49 +2375,49 @@ function Parse-EventLogs {
                             }
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "Logon" `
                                 -Description "Successful logon ($logonTypeDesc)" `
-                                -User "$($eventData['TargetDomainName'])\$($eventData['TargetUserName'])" `
+                                -User (Join-EvtxAccountName $eventData['TargetDomainName'] $eventData['TargetUserName']) `
                                 -Details "LogonType=$logonType Source=$($eventData['IpAddress']):$($eventData['IpPort']) LogonID=$($eventData['TargetLogonId'])" `
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
                         4625 {
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "Logon" `
                                 -Description "Failed logon attempt (Status=$($eventData['Status']))" `
-                                -User "$($eventData['TargetDomainName'])\$($eventData['TargetUserName'])" `
+                                -User (Join-EvtxAccountName $eventData['TargetDomainName'] $eventData['TargetUserName']) `
                                 -Details "FailureReason=$($eventData['SubStatus']) Source=$($eventData['IpAddress'])" `
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
                         4648 {
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "Logon" `
                                 -Description "Logon using explicit credentials" `
-                                -User "$($eventData['SubjectDomainName'])\$($eventData['SubjectUserName'])" `
+                                -User (Join-EvtxAccountName $eventData['SubjectDomainName'] $eventData['SubjectUserName']) `
                                 -Details "TargetUser=$($eventData['TargetDomainName'])\$($eventData['TargetUserName']) TargetServer=$($eventData['TargetServerName'])" `
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
                         4672 {
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "Logon" `
                                 -Description "Special privileges assigned to new logon" `
-                                -User "$($eventData['SubjectDomainName'])\$($eventData['SubjectUserName'])" `
+                                -User (Join-EvtxAccountName $eventData['SubjectDomainName'] $eventData['SubjectUserName']) `
                                 -Details "Privileges=$($eventData['PrivilegeList'])" `
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
                         4688 {
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "ProcessCreation" `
                                 -Description "New process created: $($eventData['NewProcessName'])" `
-                                -User "$($eventData['SubjectDomainName'])\$($eventData['SubjectUserName'])" `
+                                -User (Join-EvtxAccountName $eventData['SubjectDomainName'] $eventData['SubjectUserName']) `
                                 -Details "CommandLine=$($eventData['CommandLine']) ParentProcess=$($eventData['ParentProcessName']) PID=$($eventData['NewProcessId'])" `
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
                         4720 {
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "AccountChange" `
                                 -Description "User account created: $($eventData['TargetUserName'])" `
-                                -User "$($eventData['SubjectDomainName'])\$($eventData['SubjectUserName'])" `
+                                -User (Join-EvtxAccountName $eventData['SubjectDomainName'] $eventData['SubjectUserName']) `
                                 -Details (Format-ArtifactDetails ([ordered]@{ NewAccount = "$($eventData['TargetDomainName'])\$($eventData['TargetUserName'])"; AccountSID = $eventData['TargetSid'] })) `
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
                         4726 {
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "AccountChange" `
                                 -Description "User account deleted: $($eventData['TargetUserName'])" `
-                                -User "$($eventData['SubjectDomainName'])\$($eventData['SubjectUserName'])" `
+                                -User (Join-EvtxAccountName $eventData['SubjectDomainName'] $eventData['SubjectUserName']) `
                                 -Details (Format-ArtifactDetails ([ordered]@{ DeletedAccount = "$($eventData['TargetDomainName'])\$($eventData['TargetUserName'])"; AccountSID = $eventData['TargetSid'] })) `
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
@@ -2324,14 +2512,20 @@ function Parse-EventLogs {
                         }
                     }
 
+                    # The account is the event's own UserID (a SID; the User
+                    # column pass names it): 4104 has no user field, and 4103
+                    # has the user only inside its ContextInfo text
                     switch ($evt.Id) {
                         4104 {
                             $scriptBlock = $eventData['ScriptBlockText']
                             if ($scriptBlock.Length -gt 500) { $scriptBlock = $scriptBlock.Substring(0, 500) + "..." }
+                            # Path: the script file; empty for a command typed or passed with -Command
+                            $details = "ScriptBlock=$scriptBlock ScriptBlockId=$($eventData['ScriptBlockId'])"
+                            if ($eventData['Path']) { $details += " Path=$($eventData['Path'])" }
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "Execution" `
                                 -Description "PowerShell script block executed" `
-                                -User $eventData['UserName'] `
-                                -Details "ScriptBlock=$scriptBlock Path=$($eventData['ScriptBlockId'])" `
+                                -User "$($evt.UserId)" `
+                                -Details $details `
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
                         4103 {
@@ -2339,6 +2533,7 @@ function Parse-EventLogs {
                             if ($payload -and $payload.Length -gt 500) { $payload = $payload.Substring(0, 500) + "..." }
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "Execution" `
                                 -Description "PowerShell module logging event" `
+                                -User "$($evt.UserId)" `
                                 -Details "Payload=$payload" `
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
@@ -2608,6 +2803,7 @@ function Parse-EventLogs {
                         $what = if ($evt.Id -eq 59) { "started" } else { "stopped" }
                         Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "NetworkConnection" `
                             -Description "BITS transfer ${what}: $($f['name']) -> $($f['url'])" `
+                            -User "$($evt.UserId)" `
                             -Details (Format-ArtifactDetails ([ordered]@{ EventID = $evt.Id; JobId = $f["Id"]; Url = $f["url"]; Result = $hr; BytesTransferred = $f["bytesTransferred"]; BytesTotal = $f["bytesTotal"]; UserSID = $evt.UserId })) `
                             -Artifact "EventLogs" -RawPath $filePath
                     }
@@ -5685,12 +5881,15 @@ function Parse-Registry {
 
             $mount = Mount-TimelineHive -HiveFile $hiveFile -Prefix $(if ($hiveName -eq "SOFTWARE") { "TEMP_TLSW" } else { "TEMP_TLSYS" })
             if ($mount -and $mount.Root) {
+                # Account and machine names for the User column too
                 if ($hiveName -eq "SOFTWARE") {
                     $rowCount = Read-SoftwareHive -HiveRoot $mount.Root -RawPath $hiveFile.FullName -FallbackTime $hiveTime `
                         -CollectorFolder (Get-CollectorOutputFolder) -ListedTasks (Get-CollectedTaskNames)
+                    Add-OfflineProfileNames $mount.Root
                 }
                 else {
                     $rowCount = Read-SystemHive -HiveRoot $mount.Root -RawPath $hiveFile.FullName -FallbackTime $hiveTime
+                    Add-TimelineMachineName (Get-OfflineComputerNames $mount.Root)
                 }
                 Log "  Added $rowCount row(s) from the $hiveName hive."
                 $registryParsed = $true
@@ -8902,6 +9101,8 @@ function Read-CollectionMountedDevices {
         try {
             $mount = Mount-TimelineHive -HiveFile $systemHive -Prefix "TEMP_TLUSB"
             if ($mount -and $mount.Root) {
+                # The machine's names for the User column too
+                Add-TimelineMachineName (Get-OfflineComputerNames $mount.Root)
                 $rows = @(Get-OfflineMountedDeviceRows -SystemRoot $mount.Root)
                 if ($rows.Count -gt 0) {
                     $result.Rows = $rows
@@ -9904,6 +10105,43 @@ function Get-OfflineControlSetName {
     return $null
 }
 
+# Names of the examined machine from a loaded SYSTEM hive, for the User
+# column: the computer name (NetBIOS) and the TCP/IP host names (Hostname,
+# and NV Hostname, the name after a pending rename) of the current control
+# set. Anything but a registry key (no hive) gives none; a key that cannot
+# be read gives fewer names and a warning, never an error.
+function Get-OfflineComputerNames {
+    param($SystemRoot)
+    $names = @()
+    if ($SystemRoot -isnot [Microsoft.Win32.RegistryKey]) { return $names }
+    try {
+        $controlSet = Get-OfflineControlSetName $SystemRoot
+        if ($controlSet) {
+            foreach ($item in @(@("Control\ComputerName\ComputerName", "ComputerName"), @("Services\Tcpip\Parameters", "Hostname"), @("Services\Tcpip\Parameters", "NV Hostname"))) {
+                $key = $SystemRoot.OpenSubKey("$controlSet\$($item[0])")
+                if (-not $key) { continue }
+                try { $names += "$($key.GetValue($item[1]))".Trim() }
+                finally { $key.Close() }
+            }
+        }
+    }
+    catch { Log-Warning "  Could not read the computer name from the SYSTEM hive (User column): $($_.Exception.Message)" }
+    return @($names | Where-Object { $_ })
+}
+
+# Account names by SID from a loaded SOFTWARE hive's ProfileList, kept for
+# the User column (Add-TimelineSidName). Anything but a registry key gives
+# none; a ProfileList that cannot be read gives a warning, never an error.
+function Add-OfflineProfileNames {
+    param($SoftwareRoot)
+    if ($SoftwareRoot -isnot [Microsoft.Win32.RegistryKey]) { return }
+    try {
+        $profiles = Get-ProfileListMap $SoftwareRoot
+        foreach ($sid in $profiles.Keys) { Add-TimelineSidName -Sid $sid -Name $profiles[$sid] -ProfileList }
+    }
+    catch { Log-Warning "  Could not read ProfileList from the SOFTWARE hive (User column): $($_.Exception.Message)" }
+}
+
 # BAM/DAM values from a loaded SYSTEM hive: one object per value whose data
 # starts with a FILETIME (Sid, Path, LastExecutionUtc, Source, Key).
 # Windows 10 1809+ uses Services\bam\State\UserSettings, older builds
@@ -10113,6 +10351,8 @@ function Parse-PowerShellHistory {
         try {
             $mount = Mount-TimelineHive -HiveFile $systemHive -Prefix "TEMP_TLSYS"
             if ($mount -and $mount.Root) {
+                # The machine's names for the User column too
+                Add-TimelineMachineName (Get-OfflineComputerNames $mount.Root)
                 $controlSet = Get-OfflineControlSetName $mount.Root
                 if ($controlSet) {
                     Log "  SYSTEM hive current control set: $controlSet"
@@ -10139,6 +10379,8 @@ function Parse-PowerShellHistory {
             foreach ($row in (Import-Csv -LiteralPath $csv.FullName -ErrorAction Stop)) {
                 if (-not $row.Path) { continue }
                 $bamUser = [string]$row.User
+                # The collector's name for the SID, for the User column
+                Add-TimelineSidName -Sid $row.Sid -Name $bamUser
                 if (-not $bamUser) { $bamUser = Resolve-BamUser -Sid $row.Sid -SidNames @{} }
                 $ts = ConvertFrom-UtcText $row.LastExecutionUtc
                 if ($ts) {
@@ -10171,7 +10413,11 @@ function Parse-PowerShellHistory {
             $swMount = $null
             try {
                 $swMount = Mount-TimelineHive -HiveFile $softwareHive -Prefix "TEMP_TLSW"
-                if ($swMount -and $swMount.Root) { $sidNames = Get-ProfileListMap $swMount.Root }
+                if ($swMount -and $swMount.Root) {
+                    $sidNames = Get-ProfileListMap $swMount.Root
+                    # For the User column too
+                    foreach ($sid in $sidNames.Keys) { Add-TimelineSidName -Sid $sid -Name $sidNames[$sid] -ProfileList }
+                }
             }
             catch { Log-Warning "  Failed to read ProfileList from SOFTWARE hive: $($_.Exception.Message)" }
             finally { Dismount-TimelineHive $swMount }
@@ -10516,8 +10762,9 @@ function Add-MemoryPluginRows {
                 $foreignAddr = if ($entry.ForeignAddr) { "$($entry.ForeignAddr):$(Get-MemoryFieldText $entry.ForeignPort)" } else { "" }
                 $state = if ($entry.State) { $entry.State } else { "" }
                 $procId = Get-MemoryFieldText $entry.PID
-                $owner = if ($entry.Owner) { $entry.Owner } else { "" }
+                # Owner is the process that owns the socket, not an account
                 $details = "PID=$procId"
+                if ($entry.Owner) { $details += " Process=$($entry.Owner)" }
                 if ($null -ne $created.TimeUtc) {
                     $ts = $created.TimeUtc
                     $eventType = "NetworkConnection"
@@ -10530,7 +10777,7 @@ function Add-MemoryPluginRows {
 
                 Add-TimelineEntry -Timestamp $ts -Source $Source -EventType $eventType `
                     -Description "Memory network: $proto $localAddr -> $foreignAddr ($state)" `
-                    -User $owner -Details $details `
+                    -Details $details `
                     -Artifact "MemoryDump" -RawPath $DumpPath
             }
             "windows.cmdline" {
@@ -11491,6 +11738,20 @@ if ($entryCount -eq 0) {
     Log-Warning "No timeline entries were collected. Check input path and selected sources."
     if (Write-RunEndBanner -NoOutput) { exit 2 }
     exit 0
+}
+
+# User column: one form per account (ConvertTo-TimelineUserName), with the
+# names gathered while parsing. Before deduplication, so rows are compared
+# in that form. The computer name the collector recorded is the examined
+# system's only in a live collection (a mounted image is collected on
+# another machine).
+if ((Get-CollectionInfo).Mode -eq "Live") { Add-TimelineMachineName (Get-CollectionInfo).ComputerName }
+$userPass = Update-TimelineUserColumn -Entries $script:timelineEntries -SidNames (Get-TimelineSidNames) -MachineNames @((Get-TimelineUserContext).MachineNames)
+Log "  User column: $($userPass.Rows) row(s) changed to one form per account ($($userPass.Transitions.Count) distinct value(s)); $($userPass.SidRows) row(s) whose SID got a name keep it in Details (UserSID=)"
+if ($userPass.Unresolved.Count -gt 0) {
+    $sidList = @($userPass.Unresolved | Select-Object -First 20 | ForEach-Object { "$($_.Sid) ($($_.Rows) row(s))" }) -join ", "
+    if ($userPass.Unresolved.Count -gt 20) { $sidList += ", and $($userPass.Unresolved.Count - 20) more" }
+    Log "  User column: $($userPass.Unresolved.Count) SID(s) without a name in the collection, left as they are: $sidList"
 }
 
 # Deduplicate: an entry is a duplicate only if Timestamp, Source, EventType,
