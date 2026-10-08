@@ -1386,13 +1386,14 @@ parsing is skipped, and the timeline CSV can be opened manually.
   also with [ ] in the path and while another program has the file open),
   and the "Dump time" line of the Memory parser. It turns canned Volatility
   JSON for pslist, netscan, cmdline and svcscan into rows and checks each
-  row's time, EventType and Details (rejected times kept), the counts, and
-  that the rows are the same under the de-DE culture. A stub stands in for
-  vol.exe to check that its output is read back from a scratch folder with
-  [ ] in its path and deleted, and for a whole Memory parser run on an x64
-  dump: the rows at the header's capture time (not the file's last write),
-  the counts per plugin in the log, and the warning for a plugin without
-  output. Volatility 3 is not run; no admin needed.
+  row's time, EventType and Details (rejected times kept; a PID, PPID,
+  Threads, SessionId or port of 0 is kept, not left empty), the counts,
+  and that the rows are the same under the de-DE culture. A stub stands
+  in for vol.exe to check that its output is read back from a scratch
+  folder with [ ] in its path and deleted, and for a whole Memory parser
+  run on an x64 dump: the rows at the header's capture time (not the
+  file's last write), the counts per plugin in the log, and the warning
+  for a plugin without output. Volatility 3 is not run; no admin needed.
 
   Run them from an elevated PowerShell; -AllowSystemChanges lets the event
   log and registry tests change this machine:
