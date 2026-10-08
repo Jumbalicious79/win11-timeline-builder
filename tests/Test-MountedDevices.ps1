@@ -7,10 +7,12 @@
 # ("..." and the ellipsis character), the Description and Details of each
 # row (VolumeGuid, SameDataAs, SameDisk, PnPRecord, CollectorDrive), and,
 # by running Parse-USB on synthetic collections, which source is used:
-# mounted_devices.csv before mounted_devices.txt, the .txt only when the
-# CSV has no row, and no rows from the decoded .txt of newer collectors.
-# Reading MountedDevices from a collected SYSTEM hive needs reg load
-# (admin); tests\Test-RegistryParsers.ps1 covers it.
+# mounted_devices.csv with rows first, then the SYSTEM hive (also after an
+# empty CSV), then mounted_devices.txt, and no rows from the decoded .txt
+# of newer collectors. The hive is not loaded when the CSV has rows and is
+# unloaded also after a read error. Loading and reading a real hive needs
+# reg load (admin), so stubs stand in for them here;
+# tests\Test-RegistryParsers.ps1 reads a real SYSTEM hive.
 # The builder's functions are loaded from its AST, so the script itself (and
 # its Administrator check) does not run: no admin rights needed.
 # Exit code 0 = pass, 1 = fail.
@@ -225,16 +227,51 @@ try {
     $utf8Bom = New-Object System.Text.UTF8Encoding($true)
     $utf8 = New-Object System.Text.UTF8Encoding($false)
 
+    # The SYSTEM hive step without reg load: the collection's
+    # Registry\SYSTEM is only the "regf" signature (enough for
+    # Find-OfflineHiveFile), and stubs replace the functions that load,
+    # read and unload it. They record their calls in $script:stubHiveCalls; the
+    # read returns $script:stubHiveRows, or throws $script:stubHiveError.
+    function Mount-TimelineHive {
+        param([System.IO.FileInfo]$HiveFile, [string]$Prefix = "TEMP_TL")
+        $script:stubHiveCalls += "mount $Prefix $($HiveFile.Name)"
+        return [PSCustomObject]@{ Name = "$($Prefix)_stub"; TempDir = ""; Root = "stub root" }
+    }
+    function Get-OfflineMountedDeviceRows {
+        param($SystemRoot)
+        $script:stubHiveCalls += "read $SystemRoot"
+        if ($script:stubHiveError) { throw $script:stubHiveError }
+        return $script:stubHiveRows
+    }
+    function Dismount-TimelineHive {
+        param($Mount)
+        $script:stubHiveCalls += "unload $($Mount.Name)"
+    }
+    # MountedDevices of the stub hive: I:, a volume and E: (1 MBR, 2 device
+    # paths), so the row count tells it from the CSV (4) and the .txt (6)
+    $hiveRows = @($rows[4..6])
+    $hiveCallsDone = "mount TEMP_TLUSB SYSTEM,read stub root,unload TEMP_TLUSB_stub"
+
     # Runs Parse-USB on a new collection with the given USB\ files (name ->
-    # @(text, encoding)); returns its rows and log text
+    # @(text, encoding)) and, with -SystemHive, a Registry\SYSTEM whose
+    # MountedDevices values are $HiveRows (or whose read throws $HiveError);
+    # returns its rows, their RawPaths, the log text and the hive stub calls
     function Invoke-ParseUsb {
-        param([string]$Name, [System.Collections.IDictionary]$Files, [string]$Mode = "Live")
+        param([string]$Name, [System.Collections.IDictionary]$Files, [string]$Mode = "Live",
+            [switch]$SystemHive, [object[]]$HiveRows = @(), [string]$HiveError = "")
         $collection = Join-Path $workDir $Name
         New-Item -ItemType Directory -Path (Join-Path $collection "USB") -Force | Out-Null
         $info = '{ "SchemaVersion": 1, "Mode": "' + $Mode + '", "CollectionStartUtc": "2025-06-30T12:00:00Z", "CollectorTimeZoneId": "UTC", "TargetTimeZoneId": "UTC" }'
         [System.IO.File]::WriteAllText((Join-Path $collection "collection_info.json"), $info)
         [System.IO.File]::WriteAllText((Join-Path $collection "collection_log.txt"), "[2025-06-30 12:00:00] Output directory: c:\TriageOut\TriageCollection_2025-06-30_12-00`r`n")
         foreach ($file in $Files.Keys) { [System.IO.File]::WriteAllText((Join-Path $collection "USB\$file"), $Files[$file][0], $Files[$file][1]) }
+        if ($SystemHive) {
+            New-Item -ItemType Directory -Path (Join-Path $collection "Registry") -Force | Out-Null
+            [System.IO.File]::WriteAllBytes((Join-Path $collection "Registry\SYSTEM"), [byte[]](0x72, 0x65, 0x67, 0x66, 0, 0, 0, 0))
+        }
+        $script:stubHiveCalls = @()
+        $script:stubHiveRows = $HiveRows
+        $script:stubHiveError = $HiveError
         $script:InputPath = $collection
         $script:collectionRoot = $collection
         $script:collectionInfo = $null
@@ -244,10 +281,13 @@ try {
         $script:logFile = Join-Path $workDir "$Name.log"
         $script:timelineEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
         Parse-USB 6>$null | Out-Null
+        $mountedRows = @($script:timelineEntries | Where-Object { $_.Source -eq "USB-MountedDevices" })
         return [PSCustomObject]@{
-            Rows = @($script:timelineEntries | Where-Object { $_.Source -eq "USB-MountedDevices" })
-            Log  = [System.IO.File]::ReadAllText($script:logFile)
-            Path = $collection
+            Rows      = $mountedRows
+            RawPaths  = @($mountedRows | ForEach-Object { $_.RawPath } | Select-Object -Unique) -join ","
+            Log       = [System.IO.File]::ReadAllText($script:logFile)
+            Path      = $collection
+            HiveCalls = $script:stubHiveCalls -join ","
         }
     }
 
@@ -275,7 +315,26 @@ try {
     Assert-Equal -Name "decoded .txt of a newer collector alone: no rows" -Expected "0|False" -Actual "$($run.Rows.Count)|$($run.Log.Contains('Parsed 0 mounted'))"
 
     $run = Invoke-ParseUsb -Name "none" -Files ([ordered]@{})
-    Assert-Equal -Name "no MountedDevices source: no rows, nothing logged about it" -Expected "0|False" -Actual "$($run.Rows.Count)|$($run.Log -match 'mounted|MountedDevices')"
+    Assert-Equal -Name "no MountedDevices source: no rows, nothing logged about it" -Expected "0|False|" -Actual "$($run.Rows.Count)|$($run.Log -match 'mounted|MountedDevices')|$($run.HiveCalls)"
+
+    # The SYSTEM hive (stubs): between the CSV and the old .txt
+    $run = Invoke-ParseUsb -Name "hive-oldtxt" -SystemHive -HiveRows $hiveRows -Files ([ordered]@{ "mounted_devices.txt" = @($oldText, $utf8Bom) })
+    $hiveFile = Join-Path $run.Path "Registry\SYSTEM"
+    Assert-Equal -Name "SYSTEM hive and old .txt: the rows come from the hive" -Expected "3|$hiveFile|0" -Actual "$($run.Rows.Count)|$($run.RawPaths)|$(@($run.Rows | Where-Object { $_.Description -like '*(value cut off)' }).Count)"
+    Assert-Equal -Name "SYSTEM hive: loaded as TEMP_TLUSB, read and unloaded" -Expected $hiveCallsDone -Actual $run.HiveCalls
+    Assert-Equal -Name "SYSTEM hive: log line, the old .txt not read" -Expected "True|False" -Actual "$($run.Log.Contains("Parsed 3 mounted device value(s) (0 GPT, 1 MBR, 2 device path) from the SYSTEM hive $hiveFile"))|$($run.Log.Contains('mounted_devices.txt'))"
+
+    $run = Invoke-ParseUsb -Name "emptycsv-hive" -SystemHive -HiveRows $hiveRows -Files ([ordered]@{ "mounted_devices.csv" = @($headerOnly, $utf8Bom); "mounted_devices.txt" = @($oldText, $utf8Bom) })
+    Assert-Equal -Name "empty CSV, SYSTEM hive and old .txt: the rows come from the hive" -Expected "3|$(Join-Path $run.Path 'Registry\SYSTEM')|$hiveCallsDone" -Actual "$($run.Rows.Count)|$($run.RawPaths)|$($run.HiveCalls)"
+
+    $run = Invoke-ParseUsb -Name "csv-hive" -SystemHive -HiveRows $hiveRows -Files ([ordered]@{ "mounted_devices.csv" = @($csvText, $utf8Bom); "mounted_devices.txt" = @($oldText, $utf8Bom) })
+    Assert-Equal -Name "CSV and SYSTEM hive: the rows come from the CSV, the hive is not loaded" -Expected "4|$(Join-Path $run.Path 'USB\mounted_devices.csv')|" -Actual "$($run.Rows.Count)|$($run.RawPaths)|$($run.HiveCalls)"
+
+    $run = Invoke-ParseUsb -Name "hive-error" -SystemHive -HiveError "stub read error" -Files ([ordered]@{ "mounted_devices.txt" = @($oldText, $utf8Bom) })
+    Assert-Equal -Name "SYSTEM hive read error: warning, hive unloaded, rows from the old .txt" -Expected "True|$hiveCallsDone|6|$(Join-Path $run.Path 'USB\mounted_devices.txt')" -Actual "$($run.Log.Contains('Failed to read MountedDevices from the SYSTEM hive: stub read error'))|$($run.HiveCalls)|$($run.Rows.Count)|$($run.RawPaths)"
+
+    $run = Invoke-ParseUsb -Name "hive-nokey" -SystemHive -Files ([ordered]@{ "mounted_devices.txt" = @($oldText, $utf8Bom) })
+    Assert-Equal -Name "SYSTEM hive without MountedDevices: hive unloaded, rows from the old .txt" -Expected "True|$hiveCallsDone|6|$(Join-Path $run.Path 'USB\mounted_devices.txt')" -Actual "$($run.Log.Contains('No MountedDevices values in the SYSTEM hive.'))|$($run.HiveCalls)|$($run.Rows.Count)|$($run.RawPaths)"
 }
 catch {
     Write-TestResult -Name "test run" -Passed $false -Message "$($_.Exception.Message) ($($_.InvocationInfo.PositionMessage))"

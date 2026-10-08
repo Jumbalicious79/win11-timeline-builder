@@ -1264,7 +1264,9 @@ parsing is skipped, and the timeline CSV can be opened manually.
   HKCU\Software\TriageTimelineTest_<guid>, saves them as SOFTWARE, SYSTEM
   and NTUSER.DAT hives with reg save, deletes the key, runs the builder
   with -Sources Registry,ScheduledTasks,USB and checks the rows and times
-  (the MountedDevices rows come from the SYSTEM hive). Needs admin;
+  (the MountedDevices rows must come from the SYSTEM hive, not from the
+  empty mounted_devices.csv or the cut-off mounted_devices.txt of an older
+  collector next to it). Needs admin;
   because it writes to the registry it runs only in GitHub Actions or with
   -AllowSystemChanges (otherwise it prints SKIP).
 
@@ -1293,9 +1295,11 @@ parsing is skipped, and the timeline CSV can be opened manually.
   the instance ID rebuilt from a device path (Prod_SD#MMC -> SD/MMC), the
   salvage of the cut-off mounted_devices.txt of older collectors ("..."
   and the ellipsis character), each row's Description and Details, and
-  which source Parse-USB uses (mounted_devices.csv before the .txt; no
-  rows from the decoded .txt of newer collectors). No admin needed;
-  reading MountedDevices from a SYSTEM hive is covered by
+  which source Parse-USB uses (mounted_devices.csv with rows first, then
+  the SYSTEM hive, also after an empty CSV, then the .txt; the hive is
+  unloaded also after a read error; no rows from the decoded .txt of newer
+  collectors). No admin needed: stubs stand in for loading and reading
+  the hive; reading a real SYSTEM hive is covered by
   Test-RegistryParsers.ps1.
 
   Run them from an elevated PowerShell; -AllowSystemChanges lets the event

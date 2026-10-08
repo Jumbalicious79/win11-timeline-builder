@@ -7,7 +7,9 @@
 # WDigest, Office TrustRecords / File MRU / OutlookSecureTempFolder,
 # Terminal Server Client, Open/Save dialog MRUs and WordWheelQuery, and
 # the USB parser's MountedDevices rows read from the SYSTEM hive (the
-# collection has no mounted_devices.csv). The
+# collection's USB\mounted_devices.csv has no rows and its
+# mounted_devices.txt is the cut-off one of older collectors: the hive
+# must win over both). The
 # fixture collection also has a scheduled_tasks.csv (a task listed there
 # gets no TaskCache rows) and a collection_log.txt (the collector's own
 # Defender exclusion). Hives the builder leaves loaded, and work folders it
@@ -528,6 +530,32 @@ function New-TestScheduledTasksCsv {
     $row | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8
 }
 
+# USB\ of the fixture collection: MountedDevices sources the builder must
+# NOT use while the SYSTEM hive has the key -- a mounted_devices.csv with
+# the header only, and the mounted_devices.txt of older collectors
+# (Format-List output with only the first 4 bytes of each value, cut off
+# with "..." or the ellipsis character). Rows from the .txt would say
+# "(value cut off)" and miss the expected Descriptions.
+function New-TestMountedDevicesFiles {
+    param([string]$Folder)
+    New-Item -ItemType Directory -Path $Folder -Force | Out-Null
+    $columns = @("Name", "Kind", "DiskSignature", "PartitionOffset", "PartitionGuid", "DevicePath", "DataLength", "HexData", "KeyLastWriteUtc")
+    $utf8Bom = New-Object System.Text.UTF8Encoding($true)
+    [System.IO.File]::WriteAllText((Join-Path $Folder "mounted_devices.csv"), '"' + ($columns -join '","') + '"' + "`r`n", $utf8Bom)
+    $lines = @(
+        "",
+        "\DosDevices\C:                                   : {68, 77, 73, 79...}",
+        "\DosDevices\H:                                   : {61, 44, 27, 10...}",
+        "\DosDevices\I:                                   : {61, 44, 27, 10$([char]0x2026)}",
+        "\??\Volume{00000000-0000-11f0-8000-000000000201} : {95, 0, 63, 0...}",
+        "\DosDevices\F:                                   : {95, 0, 63, 0$([char]0x2026)}",
+        "\??\Volume{00000000-0000-11f0-8000-000000000202} : {1, 2, 3, 4...}",
+        "PSChildName                                      : MountedDevices",
+        ""
+    )
+    [System.IO.File]::WriteAllText((Join-Path $Folder "mounted_devices.txt"), ($lines -join "`r`n"), $utf8Bom)
+}
+
 # collection_log.txt of the fixture collection: the output folder and the
 # removal of the Defender exclusion, written in the encoding the OTHER
 # PowerShell edition's Add-Content uses (ANSI from Windows PowerShell 5.1,
@@ -637,7 +665,8 @@ try {
 
     # Collector metadata: the Defender exclusion of the output folder is
     # recognised from collection_log.txt, the scheduled task list decides
-    # which TaskCache times are new to the timeline
+    # which TaskCache times are new to the timeline, and USB\ holds the
+    # MountedDevices sources the SYSTEM hive must win over
     $info = [ordered]@{
         SchemaVersion = 1; ComputerName = "TESTHOST"; CollectorUser = "TESTHOST\tester"; Mode = "Live"
         TargetDrive = "C"; TargetRoot = "C:\"; CollectionStartUtc = "2026-01-01T00:00:00.0000000Z"
@@ -646,6 +675,7 @@ try {
     [System.IO.File]::WriteAllText((Join-Path $collection "collection_info.json"), ($info | ConvertTo-Json))
     New-TestCollectionLog -Path (Join-Path $collection "collection_log.txt")
     New-TestScheduledTasksCsv -Path (Join-Path $collection "Persistence\scheduled_tasks.csv")
+    New-TestMountedDevicesFiles -Folder (Join-Path $collection "USB")
 
     $timelineCsv = Join-Path $workDir "timeline.csv"
     Write-Host "Running the builder ($powershellExe) on $collection ..."
@@ -672,6 +702,14 @@ try {
 
     $rows = @(Import-Csv -LiteralPath $timelineCsv)
     $failures += Test-RegistryRows -Rows $rows -WindowStart $windowStart -WindowEnd $windowEnd
+    # The MountedDevices rows come from the SYSTEM hive, not from the empty
+    # mounted_devices.csv or the cut-off mounted_devices.txt next to it
+    $mountedPaths = @($rows | Where-Object { $_.Source -eq "USB-MountedDevices" } | ForEach-Object { $_.RawPath } | Select-Object -Unique)
+    if ($mountedPaths.Count -ne 1 -or $mountedPaths[0] -notlike "*\Registry\SYSTEM") {
+        Write-TestFailure "USB-MountedDevices rows from '$($mountedPaths -join "', '")' (expected the SYSTEM hive, not USB\mounted_devices.csv or .txt)"
+        $failures++
+    }
+    else { Write-Host "PASS: USB-MountedDevices rows from the SYSTEM hive (not the empty mounted_devices.csv or the cut-off .txt)" -ForegroundColor Green }
     if ($failures -gt 0) {
         Write-Host "FAIL: $failures problem(s) in the registry parser rows" -ForegroundColor Red
         exit 1
