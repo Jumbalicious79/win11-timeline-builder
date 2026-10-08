@@ -2123,14 +2123,14 @@ function New-ReportModel {
     # --- Caveats: what this report can't tell you ---
     $caveats = New-Object System.Collections.Generic.List[string]
     @(
-        "These are leads to review, not a verdict: the report does not say whether this computer was compromised or is clean."
-        "Some useful Windows logging is off by default: process command lines (Security 4688), detailed scheduled-task and remote-session events (4698-4702, 4778/4779), full PowerShell script logging and file-share access (5140/5145). A missing event proves nothing."
-        "Sign-ins with a domain account are checked and logged on the domain controller (Kerberos and NTLM events 4768, 4769, 4776), not on this computer."
-        "Logs roll over: each log reaches back only to its first event (see Evidence coverage). Older activity may be gone."
-        "All times are UTC. The computer's time zone is shown on the summary page. A wrong clock or altered file times (timestomping) can put events out of order."
-        "ShimCache and Amcache show that a file existed, not that it ran. Prefetch shows that a program ran, not what it did."
-        "Private browser windows leave no history, clearing the history is not logged, encrypted cookies (App-Bound Encryption) can only be read on the live computer, and Chrome's own DNS lookups are missing from the Windows DNS cache."
-        "Email headers can be forged, and mail from a real but compromised mailbox passes SPF, DKIM and DMARC checks. Mailbox and sign-in logs are kept by the mail service (for example Microsoft 365), not on this computer."
+        "These are leads to review, not a verdict on whether this computer was compromised or is clean."
+        "Useful logging is off by default (process command lines 4688, task and remote-session events 4698-4702 and 4778/4779, full PowerShell script logging, file-share access 5140/5145): a missing event proves nothing."
+        "Domain sign-ins are logged on the domain controller (Kerberos and NTLM events 4768, 4769, 4776), not on this computer."
+        "Logs roll over: each reaches back only to its first event (see Evidence coverage), so older activity may be gone."
+        "All times are UTC (the computer's time zone is under Key facts). A wrong clock or altered file times (timestomping) can put events out of order."
+        "ShimCache and Amcache show that a file existed, not that it ran; Prefetch shows that a program ran, not what it did."
+        "Private browsing leaves no history and clearing history is not logged; encrypted cookies (App-Bound Encryption) need the live computer; Chrome's own DNS lookups are not in the Windows DNS cache."
+        "Email headers can be forged, and a real but compromised mailbox passes SPF, DKIM and DMARC. Mailbox and sign-in logs are kept by the mail service (for example Microsoft 365)."
         "Analysis tools run on the collected computer leave their own traces in later collections."
     ) | ForEach-Object { $caveats.Add($_) }
     if ($null -eq $CollectionInfo -or -not $collectionStart) {
@@ -2146,7 +2146,7 @@ function New-ReportModel {
         $caveats.Add("This collection was made with -IncludeSecrets: it holds keys that can decrypt saved passwords and cookies. Store and share it like a password vault.")
     }
     if ($MftDays -gt 0) {
-        $caveats.Add("File-system times from the `$MFT were limited to the $MftDays day(s) before the collection (-MftDays $MftDays); older file activity shows only where another artifact recorded it.")
+        $caveats.Add("File times from the `$MFT cover only the $MftDays day(s) before the collection (-MftDays $MftDays); older file activity shows only where another artifact recorded it.")
     }
     if ($builderLog.UsnDropped) {
         $caveats.Add("The oldest USN journal entries were dropped (-MaxUsnEntries): older file changes are not in the timeline.")
@@ -2165,7 +2165,7 @@ function New-ReportModel {
     $workbookExists = [bool]($WorkbookPath -and (Test-Path -LiteralPath $WorkbookPath -PathType Leaf))
     $workbookOk = if ($PSBoundParameters.ContainsKey("WorkbookAvailable")) { [bool]$WorkbookAvailable } else { $workbookExists }
     if (-not $workbookOk) {
-        $caveats.Add("The Excel workbook ($workbookName) was not created, so the Excel links in this report do not open. Find the rows in $timelineName by their time instead.")
+        $caveats.Add("The Excel workbook ($workbookName) was not created or not updated for this report, so the report has no Excel links. Its row numbers are the rows of $timelineName (the header is row 1, as Excel shows it).")
     }
     $findingsName = if ($FindingsCsvPath) { Split-Path -Leaf $FindingsCsvPath } else { "findings.csv" }
     $hashes = New-Object System.Collections.Generic.List[object]
@@ -2226,7 +2226,8 @@ function New-ReportModel {
             "The report is built from the $($table.Count) rows of the timeline ($timelineName), the same rows as the Timeline sheet of the workbook."
             "Each rule matches rows by their source, event type, description, details and user. Matching rows are grouped into findings; some rules need several rows within a time window, and some raise the severity when a related event follows soon after."
             "High and Medium findings are leads to review. Info findings are listed in the appendix. Rows matching the allowlist (known benign activity) are counted but not flagged."
-            "Row numbers are Excel row numbers on the Timeline sheet (row 1 is the header)."
+            $(if ($workbookOk) { "Row numbers are Excel row numbers on the Timeline sheet (row 1 is the header)." }
+                else { "Row numbers are row numbers in $timelineName (row 1 is the header), as Excel shows them." })
         )
         Workbook      = [PSCustomObject]@{ FileName = $workbookName; Available = $workbookOk; TimelineSheet = "Timeline"; FindingsSheet = "Findings" }
         Files         = [PSCustomObject]@{ TimelineCsv = $timelineName; FindingsCsv = $findingsName; Hashes = $hashes.ToArray() }

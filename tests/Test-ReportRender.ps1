@@ -247,6 +247,21 @@ try {
     $memoryJson = [System.IO.File]::ReadAllText($memoryHtmlPath)
     Write-TestResult -Succeeded ($memoryJson.Contains("Report made 2026-10-08 14:20 UTC") -and $memoryJson.Contains("2026-10-07 14:20:05 UTC")) -Message "the same model after ConvertTo-Json / ConvertFrom-Json renders the same times ($($PSVersionTable.PSEdition))"
 
+    # Fields the engine's model adds: Files.Hashes (used, not listed as a
+    # file), a finding seen only during the collection, and no workbook
+    $finding.DuringCollection = $true
+    $memoryModel.Workbook = [ordered]@{ FileName = "timeline.xlsx"; Available = $false; TimelineSheet = "Timeline"; FindingsSheet = "Findings" }
+    $csvHash = "0123456789ABCDEF" * 4
+    $zipHash = "FEDCBA9876543210" * 4
+    $memoryModel.Files = [ordered]@{ TimelineCsv = "timeline.csv"; FindingsCsv = "findings.csv"; Hashes = @(
+            [ordered]@{ Name = "timeline.csv"; Bytes = 10; Sha256 = $csvHash },
+            [ordered]@{ Name = "collection.zip"; Bytes = 20; Sha256 = $zipHash }) }
+    Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath
+    $engineShape = [System.IO.File]::ReadAllText($memoryHtmlPath)
+    Write-TestResult -Succeeded ($engineShape.Contains($csvHash) -and $engineShape.Contains("Collection (zip)</td><td>collection.zip</td>") -and $engineShape.Contains($zipHash) -and -not $engineShape.Contains(">Hashes<")) -Message "Appendix D uses the model's Files.Hashes (timeline.csv, the collection zip) and does not list Hashes as a file"
+    Write-TestResult -Succeeded ($engineShape.Contains("Every row is from during the collection")) -Message "a lead whose rows are all from during the collection says it may be the collector's own activity"
+    Write-TestResult -Succeeded ($engineShape.Contains(">CSV row</th>") -and -not $engineShape.Contains(">Excel row</th>") -and $engineShape.Contains("Rows are numbered as in timeline.csv")) -Message "without the workbook, row numbers are labelled as timeline.csv rows"
+
     # --- PDF with Microsoft Edge ---
     $result = @(ConvertTo-ReportPdf -HtmlPath $fullHtmlPath -PdfPath (Join-Path $fullDir "nope.pdf") -EdgePath (Join-Path $workDir "no-such-folder\msedge.exe"))
     Write-TestResult -Succeeded ($result.Count -eq 1 -and $result[0] -is [bool] -and -not $result[0] -and

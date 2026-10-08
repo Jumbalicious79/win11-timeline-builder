@@ -312,6 +312,9 @@ function New-ReportHtmlContext {
     $hostName = [string](Get-ReportHtmlField -Object $collection -Name "ComputerName")
     $timeZoneId = [string](Get-ReportHtmlField -Object $collection -Name "TargetTimeZoneId")
     $rules = Get-ReportHtmlList -Object $Model -Name "Rules"
+    # Without the workbook, row numbers are those of timeline.csv (header = 1)
+    $timelineCsv = [System.IO.Path]::GetFileName([string](Get-ReportHtmlField -Object (Get-ReportHtmlField -Object $Model -Name "Files") -Name "TimelineCsv"))
+    if (-not $timelineCsv) { $timelineCsv = "timeline.csv" }
 
     $counts = Get-ReportHtmlField -Object $Model -Name "Counts"
     $high = @($findings | Where-Object { (Get-ReportHtmlSeverityKey (Get-ReportHtmlField $_ "Severity")) -eq "high" }).Count
@@ -340,6 +343,8 @@ function New-ReportHtmlContext {
         WorkbookAvailable  = $workbookAvailable
         WorkbookName       = [System.IO.Path]::GetFileName($workbookName)
         WorkbookHref       = $(if ($workbookAvailable) { Get-ReportHtmlWorkbookHref -FileName $workbookName } else { "" })
+        TimelineCsv        = $timelineCsv
+        RowHeading         = $(if ($workbookAvailable) { "Excel row" } else { "CSV row" })
         TimelineSheet      = $timelineSheet
         FindingsSheet      = $findingsSheet
         OutputDirectory    = $OutputDirectory
@@ -608,10 +613,10 @@ table.fields td { border: 0; padding: 2px 0; white-space: pre-line; }
 .flag { display: inline-block; font-size: 8pt; padding: 1px 6px; border-radius: 3px; background: var(--panel); border: 1px solid var(--line); margin: 2px 6px 2px 0; }
 .flag-escalated { background: var(--high-bg); color: var(--high-ink); border-color: #F19CA6; }
 table.evidence col.c-row { width: 8%; }
-table.evidence col.c-time { width: 21%; }
-table.evidence col.c-src { width: 18%; }
-table.evidence col.c-desc { width: 41%; }
-table.evidence col.c-user { width: 12%; }
+table.evidence col.c-time { width: 18%; }
+table.evidence col.c-src { width: 15%; }
+table.evidence col.c-desc { width: 49%; }
+table.evidence col.c-user { width: 10%; }
 .evidence .src { font-size: 8pt; }
 .evidence .et { color: var(--muted); font-size: 7.5pt; }
 .evidence .desc { white-space: pre-line; }
@@ -642,6 +647,20 @@ ul.plain li { margin: 2px 0; }
   section.page { margin: 0; padding: 0; border-radius: 0; box-shadow: none; break-before: page; page-break-before: always; }
   section.page.first { break-before: auto; page-break-before: auto; }
   section.page.flow { break-before: auto; page-break-before: auto; margin-top: 22px; }
+  /* After a section with no leads (a few lines that may have spilled onto a
+     new page), the next section follows it instead of leaving that page
+     nearly empty */
+  section.page.flow + section.page { break-before: auto; page-break-before: auto; margin-top: 22px; }
+  /* The summary fills at least its sheet, and the leads index follows it
+     directly: a summary that fits pushes the index to page 2, and one that
+     runs over continues on page 2 with the index after it, never leaving a
+     nearly empty page */
+  section.page.first { min-height: __SUMMARY_MIN_HEIGHT__; }
+  section.page.after-first { break-before: auto; page-break-before: auto; padding-top: 10px; }
+  section.first ol.top { font-size: 9pt; }
+  section.first ol.top li { margin: 1px 0 3px; }
+  section.first .caveats ul { font-size: 7.6pt; line-height: 1.28; }
+  section.first .facts { font-size: 8.8pt; }
   a { text-decoration: none; }
   a.xl { text-decoration: underline; }
 }
@@ -714,11 +733,14 @@ function Add-ReportHtmlFinding {
     if ($allowlisted -gt 0) {
         $flags.Add('<span class="flag">' + (Format-ReportHtmlCount -Value $allowlisted -Singular "more matching row was" -Plural "more matching rows were") + ' set aside by the allowlist as known benign</span>')
     }
+    if ([bool](Get-ReportHtmlField $Finding "DuringCollection")) {
+        $flags.Add('<span class="flag">Every row is from during the collection: this may be the collector&#39;s own activity</span>')
+    }
     if ($flags.Count -gt 0) { $null = $Builder.AppendLine('<div>' + ($flags -join "") + '</div>') }
 
     if ($evidence.Count -gt 0) {
         $null = $Builder.AppendLine('<table class="evidence"><colgroup><col class="c-row"><col class="c-time"><col class="c-src"><col class="c-desc"><col class="c-user"></colgroup>')
-        $null = $Builder.AppendLine('<thead><tr><th class="num">Excel row</th><th>Time (UTC)</th><th>Source / event type</th><th>Description / details</th><th>User</th></tr></thead><tbody>')
+        $null = $Builder.AppendLine('<thead><tr><th class="num">' + $Context.RowHeading + '</th><th>Time (UTC)</th><th>Source / event type</th><th>Description / details</th><th>User</th></tr></thead><tbody>')
         foreach ($row in $evidence) {
             $rowNumber = Get-ReportHtmlField $row "RowNumber"
             $rowText = ""
@@ -748,6 +770,9 @@ function Add-ReportHtmlFinding {
     if ($Context.WorkbookAvailable) {
         $excel.Add('In Excel: <a class="xl" href="' + $Context.WorkbookHref + '">' + (ConvertTo-ReportHtmlText $Context.WorkbookName) + '</a>, sheet &quot;' +
             (ConvertTo-ReportHtmlText $Context.FindingsSheet) + '&quot;, or filter the &quot;Finding&quot; column of the &quot;' + (ConvertTo-ReportHtmlText $Context.TimelineSheet) + '&quot; sheet for ' + (ConvertTo-ReportHtmlText $id) + '.')
+    }
+    else {
+        $excel.Add('Rows are numbered as in ' + (ConvertTo-ReportHtmlText $Context.TimelineCsv) + ' (the header is row 1, as Excel shows it); findings.csv lists the evidence rows of ' + (ConvertTo-ReportHtmlText $id) + '.')
     }
     if ($excel.Count -gt 0) { $null = $Builder.AppendLine('<p class="excel">' + ($excel -join " ") + '</p>') }
     $null = $Builder.AppendLine('</article>')
@@ -802,7 +827,18 @@ function Add-ReportHtmlSummary {
         $facts.Add(@("User accounts", $usersText))
     }
     $start = Get-ReportHtmlField $collection "CollectionStartUtc"
-    if ($null -ne $start) { $facts.Add(@("Evidence collected", (Format-ReportHtmlUtcAndLocal -Value $start -TimeZone $tz))) }
+    $mode = ConvertTo-ReportHtmlText (Get-ReportHtmlField $collection "Mode")
+    $collector = ConvertTo-ReportHtmlText (Get-ReportHtmlField $collection "CollectorUser")
+    $how = @()
+    if ($mode) { $how += $mode + " collection" }
+    if ($collector) { $how += "run by " + $collector }
+    # One row for when and how (the summary must fit one page)
+    if ($null -ne $start) {
+        $collectedText = Format-ReportHtmlUtcAndLocal -Value $start -TimeZone $tz
+        if ($how.Count -gt 0) { $collectedText += "; " + ($how -join ", ") }
+        $facts.Add(@("Evidence collected", $collectedText))
+    }
+    elseif ($how.Count -gt 0) { $facts.Add(@("Collection", ($how -join ", "))) }
     if ($Context.TimeZoneId) {
         $tzText = ConvertTo-ReportHtmlText $Context.TimeZoneId
         if ($tz) {
@@ -825,14 +861,6 @@ function Add-ReportHtmlSummary {
         if ($bulk) { $spanText += "; 99% of the rows fall between " + $bulk.First + " and " + $bulk.Last }
         $facts.Add(@("Time span covered", $spanText.Trim()))
     }
-    $mode = ConvertTo-ReportHtmlText (Get-ReportHtmlField $collection "Mode")
-    $collector = ConvertTo-ReportHtmlText (Get-ReportHtmlField $collection "CollectorUser")
-    if ($mode -or $collector) {
-        $how = @()
-        if ($mode) { $how += $mode + " collection" }
-        if ($collector) { $how += "run by " + $collector }
-        $facts.Add(@("Collection", ($how -join ", ")))
-    }
     if ([bool](Get-ReportHtmlField $collection "SecretsIncluded")) {
         $facts.Add(@("Sensitive material", "This collection includes credential material (made with -IncludeSecrets). Store and share it as sensitive."))
     }
@@ -841,7 +869,8 @@ function Add-ReportHtmlSummary {
         $facts.Add(@("Excel workbook", $workbookText))
     }
     else {
-        $facts.Add(@("Excel workbook", "Not created for this timeline (CSV only). Row numbers in this report count the header as row 1, as Excel would."))
+        $facts.Add(@("Excel workbook", "Not created for this timeline (CSV only), or not updated for this report. Row numbers in this report are rows of " +
+            (ConvertTo-ReportHtmlText $Context.TimelineCsv) + ", counting the header as row 1, as Excel would."))
     }
     foreach ($fact in $facts) { $null = $Builder.AppendLine('<tr><th>' + $fact[0] + '</th><td>' + $fact[1] + '</td></tr>') }
     $null = $Builder.AppendLine('</tbody></table>')
@@ -863,12 +892,17 @@ function Add-ReportHtmlSummary {
         $null = $Builder.AppendLine('<h3>' + $heading + '</h3><ol class="top">')
         foreach ($finding in $top) {
             $id = Get-ReportHtmlField $finding "Id"
-            $why = ConvertTo-ReportHtmlText (Get-ReportHtmlField $finding "Why")
+            # One plain sentence per lead: the first sentence of its "why"
+            # (the whole text is on the lead's card)
+            $whyText = ([string](Get-ReportHtmlField $finding "Why")).Trim()
+            $sentence = [regex]::Match($whyText, '^.+?[.!?](?=\s+[A-Z(])', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+            if ($sentence.Success) { $whyText = $sentence.Value }
+            $why = ConvertTo-ReportHtmlText $whyText -MaxLength 300
             $when = Format-ReportHtmlTime (Get-ReportHtmlField $finding "FirstSeenUtc") "yyyy-MM-dd HH:mm"
             $whenText = ""
             if ($when) { $whenText = ' <span class="muted small nowrap">(first seen ' + $when + ' UTC)</span>' }
             $null = $Builder.AppendLine('<li>' + (New-ReportHtmlSeverityBadge (Get-ReportHtmlField $finding "Severity")) + ' <a class="t" href="#' + (ConvertTo-ReportHtmlAnchor $id) + '">' +
-                (ConvertTo-ReportHtmlText (Get-ReportHtmlField $finding "Title")) + '</a> &ndash; ' + $why + $whenText + '</li>')
+                (ConvertTo-ReportHtmlText (Get-ReportHtmlField $finding "Title") -MaxLength 110) + '</a> &ndash; ' + $why + $whenText + '</li>')
         }
         $null = $Builder.AppendLine('</ol>')
     }
@@ -912,10 +946,10 @@ function Get-ReportHtmlBulkSpan {
 function Add-ReportHtmlLeadIndex {
     param([System.Text.StringBuilder]$Builder, [hashtable]$Context)
     if ($Context.Findings.Count -eq 0) { return }
-    Add-ReportHtmlSectionStart -Builder $Builder -Context $Context -Id "leads" -Number "" -Title "All leads at a glance" `
-        -Intro "Every High and Medium lead, most severe first. Click an id to jump to its details. Excel rows are the first evidence rows on the timeline sheet."
+    Add-ReportHtmlSectionStart -Builder $Builder -Context $Context -Id "leads" -Number "" -Title "All leads at a glance" -ExtraClass "after-first" `
+        -Intro ("Every High and Medium lead, most severe first. Click an id to jump to its details. " + $Context.RowHeading + "s are the first evidence rows of each lead.")
     $null = $Builder.AppendLine('<table><colgroup><col style="width:7%"><col style="width:11%"><col style="width:33%"><col style="width:12%"><col style="width:7%"><col style="width:15%"><col style="width:15%"></colgroup>')
-    $null = $Builder.AppendLine('<thead><tr><th>Id</th><th>Severity</th><th>Lead</th><th>Category</th><th class="num">Rows</th><th>First seen (UTC)</th><th>Excel rows</th></tr></thead><tbody>')
+    $null = $Builder.AppendLine('<thead><tr><th>Id</th><th>Severity</th><th>Lead</th><th>Category</th><th class="num">Rows</th><th>First seen (UTC)</th><th>' + $Context.RowHeading + 's</th></tr></thead><tbody>')
     foreach ($finding in $Context.Findings) {
         $id = Get-ReportHtmlField $finding "Id"
         $null = $Builder.AppendLine('<tr><td><a href="#' + (ConvertTo-ReportHtmlAnchor $id) + '">' + (ConvertTo-ReportHtmlText $id) + '</a></td><td>' + (New-ReportHtmlSeverityBadge (Get-ReportHtmlField $finding "Severity")) +
@@ -971,7 +1005,7 @@ function Add-ReportHtmlCoverage {
     $null = $Builder.AppendLine('<h3>Event log clears</h3>')
     if ($logClears.Count -gt 0) {
         $null = $Builder.AppendLine('<table><colgroup><col style="width:8%"><col style="width:21%"><col style="width:21%"><col style="width:36%"><col style="width:14%"></colgroup>')
-        $null = $Builder.AppendLine('<thead><tr><th class="num">Excel row</th><th>Time (UTC)</th><th>Source</th><th>Description</th><th>User</th></tr></thead><tbody>')
+        $null = $Builder.AppendLine('<thead><tr><th class="num">' + $Context.RowHeading + '</th><th>Time (UTC)</th><th>Source</th><th>Description</th><th>User</th></tr></thead><tbody>')
         foreach ($row in $logClears) {
             $rowNumber = Get-ReportHtmlField $row "RowNumber"
             $rowText = ""
@@ -1203,7 +1237,7 @@ function Add-ReportHtmlAppendix {
         -Intro "Context that rules recorded at Info level: usually normal, but useful when piecing a story together. They are not leads."
     if ($Context.InfoFindings.Count -gt 0) {
         $null = $Builder.AppendLine('<table><colgroup><col style="width:7%"><col style="width:42%"><col style="width:12%"><col style="width:7%"><col style="width:17%"><col style="width:15%"></colgroup>')
-        $null = $Builder.AppendLine('<thead><tr><th>Id</th><th>Item</th><th>Category</th><th class="num">Rows</th><th>First / last seen (UTC)</th><th>Excel rows</th></tr></thead><tbody>')
+        $null = $Builder.AppendLine('<thead><tr><th>Id</th><th>Item</th><th>Category</th><th class="num">Rows</th><th>First / last seen (UTC)</th><th>' + $Context.RowHeading + 's</th></tr></thead><tbody>')
         foreach ($finding in $Context.InfoFindings) {
             $id = Get-ReportHtmlField $finding "Id"
             $why = ConvertTo-ReportHtmlText (Get-ReportHtmlField $finding "Why") -MaxLength 300
@@ -1245,7 +1279,12 @@ function Add-ReportHtmlAppendix {
     $findingsSheet = ConvertTo-ReportHtmlText $Context.FindingsSheet
     $null = $Builder.AppendLine('<ul class="plain">')
     $null = $Builder.AppendLine('<li>The timeline builder parsed the collected artifacts into one timeline (one row per event, all times in UTC), removed duplicates and sorted it by time. This report was made from those rows.</li>')
-    $null = $Builder.AppendLine('<li>Row numbers are the rows of the &quot;' + $timelineSheet + '&quot; sheet in the Excel workbook: the header is row 1, so the first event is row 2. The &quot;' + $findingsSheet + '&quot; sheet links to each evidence row, and the &quot;Finding&quot; column on the timeline sheet tags them for filtering.</li>')
+    if ($Context.WorkbookAvailable) {
+        $null = $Builder.AppendLine('<li>Row numbers are the rows of the &quot;' + $timelineSheet + '&quot; sheet in the Excel workbook: the header is row 1, so the first event is row 2. The &quot;' + $findingsSheet + '&quot; sheet links to each evidence row, and the &quot;Finding&quot; column on the timeline sheet tags every row of each finding for filtering.</li>')
+    }
+    else {
+        $null = $Builder.AppendLine('<li>There is no Excel workbook for this report, so row numbers are the rows of ' + (ConvertTo-ReportHtmlText $Context.TimelineCsv) + ': the header is row 1, so the first event is row 2 (the row Excel shows when it opens the CSV).</li>')
+    }
     $null = $Builder.AppendLine('<li>Each rule (Appendix B) describes the rows to look for by source, event type, description, details and user, with case-insensitive patterns. A rule may group its rows (for example by user or by threat name), need several rows within a time window, or raise the severity when a related event follows soon after.</li>')
     $null = $Builder.AppendLine('<li>Rows that match the allowlist (known benign activity, such as the collector&#39;s own temporary antivirus exclusion) are set aside and counted, not reported.</li>')
     $null = $Builder.AppendLine('<li>Severity: <b>High</b> &ndash; review first; <b>Medium</b> &ndash; review; <b>Info</b> &ndash; context only (Appendix A). Severity says how strongly a pattern is linked to attacker activity in general, not that it happened here.</li>')
@@ -1257,10 +1296,20 @@ function Add-ReportHtmlAppendix {
     Add-ReportHtmlSectionStart -Builder $Builder -Context $Context -Id "appendix-files" -Number "D" -Title "Files" -Intro "" -ExtraClass "flow"
     $files = New-Object System.Collections.Generic.List[object]
     $filesObject = Get-ReportHtmlField $model "Files"
+    # Files.Hashes (from the report model): [{Name, Bytes, Sha256}] measured
+    # when the model was built; used instead of hashing the files again
+    $knownHashes = @{}
+    foreach ($entry in (Get-ReportHtmlList $filesObject "Hashes")) {
+        $hashName = [System.IO.Path]::GetFileName([string](Get-ReportHtmlField $entry "Name"))
+        $hashValue = [string](Get-ReportHtmlField $entry "Sha256")
+        if ($hashName -and $hashValue -and -not $knownHashes.ContainsKey($hashName)) { $knownHashes[$hashName] = $hashValue }
+    }
+    $listed = @{}
     if ($null -ne $filesObject) {
         $names = @()
         if ($filesObject -is [System.Collections.IDictionary]) { $names = @($filesObject.Keys) } else { $names = @($filesObject.PSObject.Properties | ForEach-Object { $_.Name }) }
         foreach ($name in $names) {
+            if ([string]$name -eq "Hashes") { continue }
             $value = Get-ReportHtmlField $filesObject $name
             if ($null -eq $value) { continue }
             $label = switch ([string]$name) { "TimelineCsv" { "Timeline (CSV)" } "FindingsCsv" { "Findings (CSV)" } default { [string]$name } }
@@ -1271,10 +1320,26 @@ function Add-ReportHtmlAppendix {
                 if (-not $file) { $file = Get-ReportHtmlField $value "Path" }
                 $hash = Get-ReportHtmlField $value "Sha256"
             }
+            if (-not $file) { continue }
+            $leaf = [System.IO.Path]::GetFileName([string]$file)
+            if (-not $hash -and $knownHashes.ContainsKey($leaf)) { $hash = $knownHashes[$leaf] }
+            $listed[$leaf] = $true
             $files.Add(@{ Label = $label; File = [string]$file; Hash = $hash })
         }
     }
-    if ($Context.WorkbookAvailable) { $files.Add(@{ Label = "Timeline workbook (Excel)"; File = $Context.WorkbookName; Hash = $null }) }
+    if ($Context.WorkbookAvailable) {
+        $hash = $null
+        if ($knownHashes.ContainsKey($Context.WorkbookName)) { $hash = $knownHashes[$Context.WorkbookName] }
+        $listed[$Context.WorkbookName] = $true
+        $files.Add(@{ Label = "Timeline workbook (Excel)"; File = $Context.WorkbookName; Hash = $hash })
+    }
+    # Other hashed files, such as the collection zip
+    foreach ($hashName in @($knownHashes.Keys | Sort-Object)) {
+        if ($listed.ContainsKey($hashName)) { continue }
+        $label = "File"
+        if ($hashName -match '\.zip$') { $label = "Collection (zip)" }
+        $files.Add(@{ Label = $label; File = $hashName; Hash = $knownHashes[$hashName] })
+    }
     if ($files.Count -gt 0) {
         $null = $Builder.AppendLine('<table><colgroup><col style="width:22%"><col style="width:28%"><col style="width:50%"></colgroup><thead><tr><th>File</th><th>Name</th><th>SHA-256 (when the report was made)</th></tr></thead><tbody>')
         foreach ($entry in $files) {
@@ -1332,7 +1397,11 @@ function Export-ReportHtml {
     if ($hostName.Length -gt 60) { $hostName = $hostName.Substring(0, 60) }
     $footer = "Timeline report"
     if ($hostName) { $footer += " - " + $hostName }
-    $css = $script:ReportHtmlCss.Replace("__PAGE_SIZE__", "size: " + $size.ToLowerInvariant() + ";").Replace("__FOOTER_TEXT__", (ConvertTo-ReportHtmlCssString $footer))
+    # The printable height of one page (paper minus the @page margins of 16 and
+    # 17 mm), less 3 mm so rounding never spills the summary onto a new page
+    $summaryHeight = "243mm"
+    if ($size -eq "A4") { $summaryHeight = "261mm" }
+    $css = $script:ReportHtmlCss.Replace("__PAGE_SIZE__", "size: " + $size.ToLowerInvariant() + ";").Replace("__FOOTER_TEXT__", (ConvertTo-ReportHtmlCssString $footer)).Replace("__SUMMARY_MIN_HEIGHT__", $summaryHeight)
 
     # Body first (it records the sections for the menu), then the page
     $body = New-Object System.Text.StringBuilder (262144)
