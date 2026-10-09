@@ -137,6 +137,81 @@ function Log-Success {
 }
 
 # =============================================================
+# Console QuickEdit
+# With QuickEdit on (the console's default), a click in the window starts
+# a text selection, and while it is shown every write to the console
+# waits. The Log functions write to the console before the log file, so a
+# stray click stopped the whole run (no CPU, no new log lines) until the
+# selection was ended or the window was closed. QuickEdit is turned off
+# for the run (at the start of the main body), mouse input with it, and
+# the console's own mode is put back at the end (its finally block). Text
+# can still be copied with the window menu (Edit > Mark) or after the
+# run. Without console input (input redirected, a CI runner) nothing is
+# changed.
+# =============================================================
+$script:consoleModeToRestore = $null   # console input mode before Disable-ConsoleQuickEdit changed it
+
+# The console input mode for the run: ENABLE_QUICK_EDIT_MODE (0x0040) and
+# ENABLE_MOUSE_INPUT (0x0010) cleared and ENABLE_EXTENDED_FLAGS (0x0080)
+# set, without which SetConsoleMode leaves QuickEdit as it is. Mouse input
+# goes with QuickEdit: with mouse input on and QuickEdit off, the console
+# passes the mouse wheel and clicks to the script, which never reads them,
+# so the wheel stops scrolling the window, and Windows Terminal switches
+# to mouse reporting (a drag selects text only with Shift). Every other
+# bit is kept. A mode with QuickEdit already off (and that flag set) comes
+# back as it is.
+function Get-ConsoleModeWithoutQuickEdit {
+    param([uint32]$Mode)
+    if (([long]$Mode -band [long]0x00C0) -eq [long]0x0080) { return $Mode }
+    return [uint32](([long]$Mode -band (-bnot [long]0x0050)) -bor [long]0x0080)
+}
+
+# Turn QuickEdit (and mouse input) off in this process's console. Returns
+# the console input mode from before the change, for Restore-ConsoleMode,
+# or $null when nothing was changed: no console input (redirected, a CI
+# runner), QuickEdit already off, or a call that failed. Never throws.
+function Disable-ConsoleQuickEdit {
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]'TimelineNative.ConsoleMode').Type) {
+            Add-Type -Namespace TimelineNative -Name ConsoleMode -ErrorAction Stop -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern IntPtr GetStdHandle(int nStdHandle);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+'@
+        }
+        $handle = [TimelineNative.ConsoleMode]::GetStdHandle(-10)   # STD_INPUT_HANDLE
+        $mode = [uint32]0
+        # Fails for anything but console input: nothing to change
+        if (-not [TimelineNative.ConsoleMode]::GetConsoleMode($handle, [ref]$mode)) { return $null }
+        $newMode = Get-ConsoleModeWithoutQuickEdit $mode
+        if ($newMode -eq $mode) { return $null }
+        if (-not [TimelineNative.ConsoleMode]::SetConsoleMode($handle, $newMode)) { return $null }
+        return $mode
+    }
+    catch {
+        Write-Verbose "Console QuickEdit left as it is: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+# Put back the console input mode Disable-ConsoleQuickEdit returned
+# ($null: it changed nothing, so nothing to do). Never throws.
+function Restore-ConsoleMode {
+    param($Mode)
+    if ($null -eq $Mode) { return }
+    try {
+        $handle = [TimelineNative.ConsoleMode]::GetStdHandle(-10)   # STD_INPUT_HANDLE
+        if (-not [TimelineNative.ConsoleMode]::SetConsoleMode($handle, [uint32]$Mode)) {
+            Write-Verbose "Could not restore the console mode (SetConsoleMode failed)"
+        }
+    }
+    catch { Write-Verbose "Could not restore the console mode: $($_.Exception.Message)" }
+}
+
+# =============================================================
 # Work folder and input files
 # A collection zip is extracted into a per-run work folder,
 # <base>\w<PID>_<HHmmss>, outside every temp folder: Windows Storage
@@ -759,15 +834,15 @@ Log ""
 
 # =============================================================
 # Main body. Everything from here to the end of the script runs inside
-# this try block, which starts as soon as the work folder exists. Its
-# finally block (at the end) unloads any hive this run left loaded and
-# deletes the work folder on every exit path: normal end, exit, Ctrl+C
-# and terminating errors. The body is intentionally NOT re-indented so
-# the diff stays small. (Closing the console window kills the process
+# this try block, which starts right before console QuickEdit is turned
+# off and the work folder is made. Its finally block (at the end) unloads
+# any hive this run left loaded, deletes the work folder and puts the
+# console's mode back on every exit path: normal end, exit, Ctrl+C and
+# terminating errors. The body is intentionally NOT re-indented so the
+# diff stays small. (Closing the console window kills the process
 # outright; that cannot be caught.)
 # =============================================================
 if ($WorkDir) { $WorkDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($WorkDir) }
-$script:runWorkDir = New-RunWorkFolder -BaseFolder $WorkDir
 try {
 
 # Inside a try block, a statement-terminating error (a .NET exception or a
@@ -786,6 +861,15 @@ trap {
     continue
 }
 
+# QuickEdit off before the first step that can take long (making the work
+# folder removes the work folders of killed runs); the prompts before this
+# point wait for input anyway. Read-Host works the same with it off.
+$script:consoleModeToRestore = Disable-ConsoleQuickEdit
+if ($null -ne $script:consoleModeToRestore) {
+    Log "Console QuickEdit is off for this run, so a click in the window cannot pause it (copy text with the window menu: Edit > Mark)."
+}
+
+$script:runWorkDir = New-RunWorkFolder -BaseFolder $WorkDir
 if (-not $script:runWorkDir) {
     Log-Error "Could not create a work folder. Pass -WorkDir with a writable folder on a local drive that is not a temp folder."
     exit 1
@@ -17907,7 +17991,13 @@ if ($timelineIncomplete) { exit 2 }
 # on normal completion, on exit, on Ctrl+C and on terminating errors.
 }
 finally {
-    # Hives first: their scratch copies are in the work folder
-    Dismount-RunHives
-    Remove-RunWorkFolder
+    try {
+        # Hives first: their scratch copies are in the work folder
+        Dismount-RunHives
+        Remove-RunWorkFolder
+    }
+    finally {
+        # Last, so a click cannot pause the clean-up either
+        Restore-ConsoleMode $script:consoleModeToRestore
+    }
 }
