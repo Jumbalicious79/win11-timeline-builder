@@ -26,8 +26,9 @@
 # it prints SKIPPED. With Administrator rights it also saves a SOFTWARE hive
 # with a ProfileList entry (a temporary HKCU key and reg save, undone
 # afterwards) so a SID is named from it; without them that check is SKIPPED.
-# Every run checks that the collection's files are not changed and that the
-# builder's temp copies are removed.
+# Every run checks that the collection's files are not changed, that no
+# SRUM copy is left in %TEMP% and that each builder run's work folder,
+# which holds the copies, is removed.
 #
 # Needs Administrator rights, like the builder itself (GitHub Actions
 # Windows runners are elevated). For a local run without them, pass
@@ -80,13 +81,20 @@ if (-not $BuilderPath -and -not $isAdmin) {
 # Run the builder with the same PowerShell edition as this script
 $powershellExe = (Get-Process -Id $PID).Path
 
+# The work folder of every builder run (the log names it), checked at the end
+$script:builderWorkFolders = New-Object System.Collections.Generic.List[string]
+
 # Runs the builder on a collection (SRUM source, CSV only); returns its output
 function Invoke-TimelineBuilder {
     param([string]$CollectionPath, [string]$OutputFile)
     $ErrorActionPreference = "Continue"
     $output = & $powershellExe -NoProfile -ExecutionPolicy Bypass -File $builder `
         -InputPath $CollectionPath -Sources "SRUM" -OutputFile $OutputFile -NoExcel -Viewer None 2>&1
-    return , @($output | ForEach-Object { "$_" })
+    $lines = @($output | ForEach-Object { "$_" })
+    foreach ($line in $lines) {
+        if ($line -cmatch '\] Work folder: (.+)$') { $script:builderWorkFolders.Add($Matches[1].Trim()) }
+    }
+    return , $lines
 }
 
 # --- ESE test writer -------------------------------------------------------
@@ -870,9 +878,13 @@ try {
         }
     }
 
-    # The builder's temp copies are removed
+    # The builder's copies are made in its work folder, not in %TEMP% (which
+    # Windows cleans up during a run), and the work folder is removed
     $tempLeft = @(Get-ChildItem -LiteralPath $env:TEMP -Directory -Filter "TimelineSrum_*" -ErrorAction SilentlyContinue | Where-Object { $tempBefore -notcontains $_.FullName })
-    Write-TestResult -Succeeded ($tempLeft.Count -eq 0) -Message "the builder removed its SRUM temp copies$(if ($tempLeft) { ': left ' + (($tempLeft | ForEach-Object { $_.Name }) -join ', ') })"
+    Write-TestResult -Succeeded ($tempLeft.Count -eq 0) -Message "no SRUM copy left in %TEMP%$(if ($tempLeft) { ': found ' + (($tempLeft | ForEach-Object { $_.Name }) -join ', ') })"
+    $workLeft = @($script:builderWorkFolders | Where-Object { Test-Path -LiteralPath $_ })
+    Write-TestResult -Succeeded ($script:builderWorkFolders.Count -gt 0 -and $workLeft.Count -eq 0) `
+        -Message "the builder removed its work folder with the SRUM copies ($($script:builderWorkFolders.Count) run(s))$(if ($workLeft) { ': left ' + ($workLeft -join ', ') })"
 }
 catch {
     Write-TestResult -Succeeded $false -Message "test error: $($_.Exception.Message)"

@@ -8,8 +8,8 @@
 # Terminal Server Client, Open/Save dialog MRUs and WordWheelQuery. The
 # fixture collection also has a scheduled_tasks.csv (a task listed there
 # gets no TaskCache rows) and a collection_log.txt (the collector's own
-# Defender exclusion). Hives the builder leaves loaded fail the test and
-# are unloaded.
+# Defender exclusion). Hives the builder leaves loaded, and work folders it
+# leaves behind, fail the test and are cleaned up.
 #
 # The hives are made by writing the values below a temporary key,
 # HKCU\Software\TriageTimelineTest_<guid>, and saving its subkeys with
@@ -484,12 +484,21 @@ function New-TestCollectionLog {
     [System.IO.File]::WriteAllText($Path, $text, $encoding)
 }
 
-# Hives the builder loads (HKLM\TEMP_TL*) and their temp copies
-# (%TEMP%\TimelineHive_*)
+# Hives the builder loads (HKLM\TEMP_TL*, HKLM\TEMP_AMCACHE_*), its per-run
+# work folders that hold their scratch copies (%LOCALAPPDATA%\TimelineBuilder\w*,
+# or work\w* next to the builder) and the %TEMP% copies older builders made
 function Get-BuilderHiveState {
+    $folders = @(
+        @{ Path = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) "TimelineBuilder"); Filter = "w*" },
+        @{ Path = (Join-Path (Split-Path $builder -Parent) "work"); Filter = "w*" },
+        @{ Path = $env:TEMP; Filter = "TimelineHive_*" },
+        @{ Path = $env:TEMP; Filter = "AmcacheRepair_*" }
+    )
     return [PSCustomObject]@{
-        Hives = @([Microsoft.Win32.Registry]::LocalMachine.GetSubKeyNames() | Where-Object { $_ -like "TEMP_TL*" })
-        Dirs  = @(Get-ChildItem -LiteralPath $env:TEMP -Directory -Filter "TimelineHive_*" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+        Hives = @([Microsoft.Win32.Registry]::LocalMachine.GetSubKeyNames() | Where-Object { $_ -like "TEMP_TL*" -or $_ -like "TEMP_AMCACHE_*" })
+        Dirs  = @(foreach ($folder in $folders) {
+                Get-ChildItem -LiteralPath $folder.Path -Directory -Filter $folder.Filter -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+            })
     }
 }
 
@@ -508,7 +517,7 @@ function Remove-BuilderHiveLeftovers {
     }
     foreach ($dir in $now.Dirs) {
         if ($Before.Dirs -contains $dir) { continue }
-        $left += "temp hive copy $dir"
+        $left += "work folder or temp hive copy $dir"
         Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
     }
     return $left
@@ -590,7 +599,8 @@ try {
         exit 1
     }
     # Every hive must be unloaded again (open key handles block reg unload)
-    # and its temp copy deleted; leftovers are cleaned up here
+    # and the work folder with its scratch copy deleted; leftovers are
+    # cleaned up here
     foreach ($line in @($builderOutput | Where-Object { "$_" -match 'Failed to unload hive|Could not load hive' })) {
         Write-TestFailure "builder: $line"
         $failures++

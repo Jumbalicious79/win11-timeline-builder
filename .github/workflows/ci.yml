@@ -110,6 +110,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: ./tests/Test-SrumParsers.ps1
 
+      - name: Run zip input test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-ZipInput.ps1
+
   analyze:
     name: PSScriptAnalyzer
     runs-on: windows-latest

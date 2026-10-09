@@ -120,15 +120,18 @@ themselves are never committed.
     1. Finds triage collection .zip files from sibling triage-collector\reports\
     2. Lists them with size and date, newest first
     3. You pick a number
-    4. Extracts to a temp folder (cleaned up after)
+    4. Extracts it into a work folder in %LOCALAPPDATA%\TimelineBuilder,
+       not %TEMP% (deleted after; see "Work folder" below)
     5. Builds the timeline (~2 minutes for ~36,000 events)
     6. Generates a color-coded Excel file (rows colored by EventType)
     7. Asks how you want to view: Excel (colored), Timeline Explorer, Both, None
 
-  You can also pass a path directly, optionally followed by a comma-separated
+  You can also pass a collection folder or a collection .zip directly (or
+  drop either on the .bat), optionally followed by a comma-separated
   keyword list (both in quotes):
 
   Run-TimelineBuilder.bat "path\to\triage\collection"
+  Run-TimelineBuilder.bat "path\to\TriageCollection_2026-04-08_09-30.zip"
   Run-TimelineBuilder.bat "path\to\collection" "mimikatz,psexec"
 
   The launcher asks for Administrator rights (UAC) and restarts itself
@@ -140,6 +143,7 @@ themselves are never committed.
 
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -Browse
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection"
+  powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\TriageCollection_2025-01-20_14-05.zip" -WorkDir "D:\Work"
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -StartDate "2025-01-15" -EndDate "2025-01-20"
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -Sources "EventLogs,Prefetch,Registry"
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -Keywords "mimikatz,psexec,powershell -enc"
@@ -155,7 +159,9 @@ themselves are never committed.
 
   -Browse         Auto-find triage zips in sibling triage-collector\reports\
                   and present a numbered menu to select one. No InputPath needed.
-  -InputPath      Path to a triage collection directory or any directory
+  -InputPath      Path to a triage collection directory, a collection .zip
+                  (extracted into the work folder, as in browse mode; a
+                  memory dump next to it is found too), or any directory
                   containing supported artifacts.
   -OutputFile     Output CSV path. Defaults to reports\timeline_<timestamp>\timeline.csv
   -StartDate      Only include events after this date (UTC).
@@ -188,6 +194,13 @@ themselves are never committed.
                   update alone can add hundreds of thousands. Possible
                   timestomping and Mark-of-the-Web (downloaded or
                   extracted file) rows are always reported (see parser #8).
+  -WorkDir        Folder in which this run's work folder is made (the
+                  extracted zip and scratch copies; see "Work folder").
+                  Default %LOCALAPPDATA%\TimelineBuilder. Use a folder on
+                  another local drive when the system drive is low on
+                  space, and never a temp folder. A network share or mapped
+                  network drive is refused (reg load cannot load hives
+                  from there).
 
 
 ## Auto-Downloaded Dependencies
@@ -225,7 +238,8 @@ installed as PowerShell modules -- no manual installation needed.
   Eric Zimmerman's tools: https://ericzimmerman.github.io/
 
 All downloads happen once. On subsequent runs, cached copies are reused.
-All temp files (download zips, extraction dirs) are cleaned up automatically.
+Download zips are deleted from %TEMP% after extraction; the work folder
+(extracted collection, scratch copies) is deleted at the end of every run.
 
 
 ## Output
@@ -241,6 +255,76 @@ The script creates a timestamped report folder next to the script:
     tools\
       sqlite3\                       -- Auto-downloaded, cached
       TimelineExplorer\              -- Auto-downloaded on first use, cached
+
+### Work folder
+
+  A collection zip is extracted, and hives, browser databases and SRUM
+  databases are copied for reading, into a work folder that exists only
+  while the builder runs:
+
+    %LOCALAPPDATA%\TimelineBuilder\w<PID>_<HHmmss>\
+      .lock                          -- held open for the whole run
+      in\                            -- the extracted collection zip
+      scratch\                       -- copies for reg load, sqlite3 and
+                                        the SRUM reader
+
+  It is deleted at the end of every run, also after an error or Ctrl+C. A
+  folder left by a run that was killed (window closed, crash) is deleted by
+  the next run, once no builder holds its .lock. -WorkDir makes the work
+  folder in another folder; if %LOCALAPPDATA% cannot be written, work\ next
+  to the script is used. The log names the work folder. It must be on a
+  local drive: reg load only loads a hive from a local file, so a network
+  share (\\server\share) or a mapped network drive is not used, and with
+  such a -WorkDir the run stops at the start.
+
+  Copied email attachments (Email\<user>\Outlook\SecureTemp\ and
+  Email\<user>\NewOutlook\Attachments\) stay in the zip: no parser reads
+  them (their rows come from the manifest and the email listings), and
+  antivirus on this machine may quarantine them. The log gives their
+  number.
+
+  Why not %TEMP%: Windows Storage Sense deletes files older than 7 days from
+  temp folders when disk space runs low, and extracted files keep the dates
+  stored in the zip, which are often months old. This once deleted setupapi
+  logs and browser databases while a timeline was being built. The builder
+  warns when the work folder, or a folder passed as -InputPath, is inside a
+  temp folder.
+
+  Before extracting, the free space on the work folder's drive is checked:
+  the builder stops below the zip's uncompressed size plus 256 MB, and warns
+  below the size plus 1 GB, or when the system drive would be left with
+  less than 10% free.
+
+### Incomplete timeline (exit code 2)
+
+  Missing input files. Every input file is recorded when the run starts:
+  each file extracted from the zip, or, for a collection folder, each file
+  listed in collection_manifest.csv that is present (memory dumps and
+  copied email attachments excepted: the attachments are not read, so
+  antivirus removing one does not make the timeline incomplete). Files
+  that disappear right after the extraction (e.g. antivirus) stop the
+  run. After the parsers have run, all of them must still be there; files
+  that disappeared are listed by collection folder (USB\, Browser\, ...;
+  the console shows 20 names per folder, the log file all of them), and
+  the run ends with
+
+    === Timeline Builder Completed WITH N MISSING INPUT FILE(S) -- timeline incomplete ===
+
+  The timeline is still written, but rows from those files may be missing.
+  The check runs once, after all parsers, so a file deleted after its
+  parser read it is listed too, although its rows are in the timeline.
+
+  Unexpected errors. An error the builder does not handle itself (a bug,
+  or input it does not expect) is logged as "Unexpected error at line N
+  (rest of this step skipped)", and the rest of that step -- usually the
+  rest of one parser -- is skipped. The run goes on with the next step and
+  ends with
+
+    === Timeline Builder Completed WITH N UNEXPECTED ERROR(S) -- timeline may be incomplete ===
+
+  In both cases the exit code is 2 instead of 0. Exit code 1 means the run
+  stopped early (input not found, a bad zip, no work folder, files gone
+  right after the extraction).
 
 
 ## Output Format (CSV and Excel)
@@ -308,9 +392,8 @@ Both timeline.csv and timeline.xlsx contain the same columns:
   The user is taken from the collection's own folder layout: Registry\<user>\,
   UserActivity\<user>\, Browser\<user>\, Email\<user>\ or a Users\<user>\
   folder inside the collection. It is never taken from the analysis
-  machine's path (for example the %TEMP% folder a browse-mode zip is
-  extracted to). Rows that do not belong to a specific profile have an
-  empty User.
+  machine's path (for example the work folder a zip is extracted to). Rows
+  that do not belong to a specific profile have an empty User.
 
 ### Duplicates
 
@@ -932,7 +1015,8 @@ Not parsed: OST/PST contents (deferred), the new Outlook's and Windows
 Mail's mail stores (listed only), and other listed files (WebView data,
 .msf summaries, logs). The attachment copies can have any name, so no other
 parser reads them: an attached .lnk, .evtx or $MFT is not this system's
-shortcut, event log or MFT.
+shortcut, event log or MFT. They are not extracted from a collection zip
+(see "Work folder").
 
 ### Collections made with the collector's -IncludeSecrets switch
 A collection made with -IncludeSecrets holds two things this builder treats
@@ -981,14 +1065,17 @@ tools. Artifact SRUM:
     (app); Records, FirstRecordUtc, LastRecordUtc, Interfaces (Wi-Fi,
     Ethernet, ...), L2ProfileIds (not resolved to network names), and
     Database=... and Partial=yes when they apply
-  - The database is read from a temp copy; the collection is never
-    changed. A copy of an open database is normally in "dirty shutdown"
-    state: the collected logs are replayed into the copy in the builder's
-    own process ("Database=soft recovery (in-process)"); if that fails,
-    with esentutl /r, then by repairing the copy with esentutl /p
-    ("Database=repair (esentutl /p)"), which can lose the newest records.
-    A damaged page stops the reading of a table; its rows then carry
-    "Partial=yes (read error; later records of this table are missing)"
+  - The database is read from a scratch copy in the work folder (see "Work
+    folder"); the collection is never changed. A transaction log listed in
+    collection_manifest.csv but no longer in the collection is reported
+    ("Transaction log missing: ..."). A copy of an open database is
+    normally in "dirty shutdown" state: the collected logs are replayed
+    into the copy in the builder's own process ("Database=soft recovery
+    (in-process)"); if that fails, with esentutl /r, then by repairing the
+    copy with esentutl /p ("Database=repair (esentutl /p)"), which can lose
+    the newest records. A damaged page stops the reading of a table; its
+    rows then carry "Partial=yes (read error; later records of this table
+    are missing)"
   - Not parsed: the Network Connectivity, energy and push-notification
     tables. SRUM keeps hourly totals per application, not connections: a
     row says how much an app sent and received that day, not where to
@@ -1143,6 +1230,30 @@ Timeline Explorer at the same time.
     collector dropped these hidden files by mistake, so collections made
     with them often hit this warning and Amcache parsing is skipped.
     Re-collect with the current collector to get the logs.
+
+  - "Transaction log missing: ..." -- A hive's .LOG1/.LOG2 file, or a SRUM
+    database's SRU*.log file, is listed in collection_manifest.csv but is
+    not in the collection any more. The hive or database is read without
+    it, so changes Windows had not yet written into the hive or database
+    file are missing.
+
+  - "Completed WITH N MISSING INPUT FILE(S) -- timeline incomplete" (exit
+    code 2) -- Input files were deleted while the timeline was being built,
+    usually by a cleanup tool or antivirus; the log lists them. Rows from
+    them may be missing (a browser store also logs "sqlite3 query skipped,
+    input file missing"); a file deleted after its parser read it is listed
+    too, although its rows are there. Copied email attachments are not
+    input files (no parser reads them), so antivirus quarantining one does
+    not cause this. Build the timeline again from the zip, or from a copy
+    of the collection outside any temp folder.
+
+  - "Completed WITH N UNEXPECTED ERROR(S) -- timeline may be incomplete"
+    (exit code 2) -- The log has an "Unexpected error at line N (rest of
+    this step skipped)" line for each. The rest of that step, often the
+    rest of one parser, produced no rows. Such an error used to skip only
+    its own statement; since the main body runs in try/finally (to clean up
+    the work folder on every exit), it skips the rest of the step, so the
+    run says so. Please report it with the log line.
 
   - "No service data found" -- Appears for mounted-image collections, which
     have no services.csv (it needs live queries). Scheduled tasks of mounted
@@ -1376,8 +1487,9 @@ parsing is skipped, and the timeline CSV can be opened manually.
   After an intended change to the parser output, regenerate the expected rows
   with -UpdateExpected and review the diff before committing.
 
-  Nine more scripts test the event log, browser, registry, $MFT, email,
-  SRUM and Defender parsers. CI runs them after Test-Parsers.ps1 in both
+  The scripts below test the event log, browser, registry, $MFT, email,
+  SRUM and Defender parsers and how the builder handles its input
+  (secrets, zip input). CI runs them after Test-Parsers.ps1 in both
   PowerShell versions (GitHub Actions runners are elevated):
 
   tests\Test-EventLogParsers.ps1 -- Part 1 feeds the Security, System,
@@ -1494,6 +1606,24 @@ parsing is skipped, and the timeline CSV can be opened manually.
   one builder run. Apart from Test-SrumParsers part 2, they change nothing
   on the system.
 
+  tests\Test-ZipInput.ps1 -- Part 1 loads the builder's functions and checks
+  the zip extraction ("/" and "\" entry names, entry dates kept, over-long
+  names shortened, no ".." entry written outside the folder, copied email
+  attachments left in the zip, nothing extracted when the zip does not
+  fit), the manifest lookups, the list of input files, the free-space and
+  temp-folder checks, the refusal of a network work folder, the clean-up
+  of work folders left by killed runs, the SRUM database copy (made in the
+  work folder; a missing transaction log reported) and the end-of-run
+  banners; it needs no admin. Part 2 runs the builder on a synthetic
+  collection zip dated 2025 with two setupapi logs: both must be parsed,
+  the free space must be checked, the work folder must be outside %TEMP%
+  and removed afterwards, and an input file deleted during the run (by a
+  test hook) must give exit code 2 and the MISSING INPUT FILE(S) banner.
+  A zip with a copied email attachment must give exit code 0 and the
+  attachment's rows without extracting it. Part 2 needs admin like the
+  builder (or -BuilderPath with a copy without the admin check); it
+  changes nothing on the system.
+
   Run them from an elevated PowerShell; -AllowSystemChanges lets the event
   log, registry and SRUM tests change this machine:
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers.ps1
@@ -1505,6 +1635,7 @@ parsing is skipped, and the timeline CSV can be opened manually.
     powershell -ExecutionPolicy Bypass -File tests\Test-SrumParsers.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-DefenderParsers.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-MftParser.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-ZipInput.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers.ps1 -AllowSystemChanges
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers2.ps1 -AllowSystemChanges
     powershell -ExecutionPolicy Bypass -File tests\Test-RegistryParsers.ps1 -AllowSystemChanges
@@ -1531,12 +1662,12 @@ parsing is skipped, and the timeline CSV can be opened manually.
                        OAlerts and antivirus product logs.
 
   esent.dll            The Windows ESE database engine. Reads the SRUM
-                       database (SRUDB.dat) from a temp copy and replays its
-                       transaction logs into that copy, with event logging
-                       off.
+                       database (SRUDB.dat) from a scratch copy in the work
+                       folder and replays its transaction logs into that
+                       copy, with event logging off.
 
   esentutl.exe         Fallback only: recovery (/r) or repair (/p) of the
-                       temp copy of a SRUM database, when the recovery in
+                       scratch copy of a SRUM database, when the recovery in
                        the builder's process fails or the copy is damaged.
 
   WScript.Shell COM    Reads LNK shortcut files to extract target paths,
@@ -1601,27 +1732,33 @@ parsing is skipped, and the timeline CSV can be opened manually.
 ## What It Modifies
 
 This script is read-only with respect to the target system's artifacts. It only
-creates files in its own reports\ directory and temp folders (cleaned up after).
-No system files, registry keys, or artifacts are modified. The one lasting
-trace: when a SRUM database needs esentutl, it writes entries to this
-machine's Application event log (see below).
+creates files in its own reports\ directory, in its work folder
+(%LOCALAPPDATA%\TimelineBuilder\w<PID>_<HHmmss>, or inside -WorkDir; deleted
+at the end of the run) and in %TEMP% for downloads. No system files, registry
+keys, or artifacts are modified. The one lasting trace: when a SRUM database
+needs esentutl, it writes entries to this machine's Application event log
+(see below).
 
 One-time actions (first run only):
   - Installs ImportExcel PowerShell module (CurrentUser scope)
 
-Temporary actions (all cleaned up automatically):
-  - Extracts triage zip to %TEMP% (browse mode) -- deleted after processing
+Temporary actions (all cleaned up automatically, also after an error or Ctrl+C):
+  - Extracts a collection zip (browse mode, or a .zip as -InputPath) into the
+    work folder, with the dates stored in the zip, except copied email
+    attachments -- deleted after processing
   - Copies registry hives (NTUSER.DAT, UsrClass.dat, SOFTWARE, SYSTEM,
-    Amcache.hve) to %TEMP% for reg load -- unloaded and deleted after
+    Amcache.hve) into the work folder for reg load -- unloaded and deleted
+    after processing (a hive a parser left loaded is unloaded at the end)
+  - Copies browser DBs into the work folder for sqlite3 -- deleted after
     processing
-  - Copies browser DBs to %TEMP% for sqlite3 -- deleted after processing
-  - Copies SRUDB.dat and its logs to %TEMP%\TimelineSrum_<n> for recovery
-    and reading (the copies are made writable) -- deleted after processing
+  - Copies SRUDB.dat and its logs into the work folder
+    (scratch\TimelineSrum_<n>) for recovery and reading (the copies are
+    made writable) -- deleted after processing
   - Downloads zip files to %TEMP% (first run) -- deleted after extraction
 
 Event log entries (not removed):
   - Only when the in-process recovery of a SRUM database fails, or a copy
-    has to be repaired, esentutl.exe runs on the temp copy. It writes
+    has to be repaired, esentutl.exe runs on the scratch copy. It writes
     ESENT events (information, and for a repair also warnings and an
     error) to the Application event log of the machine running the
     builder. If that machine is collected later, its timeline shows them

@@ -76,8 +76,13 @@ $functions = $ast.FindAll({ param($node) $node -is [System.Management.Automation
 }
 foreach ($function in $functions) { . ([ScriptBlock]::Create($function.Extent.Text)) }
 $tableNames = @("xmlInvalidPattern", "xmlInvalidRegex", "ThirdPartyAvProviders")
-$tables = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and $node.Parent.Parent -is [System.Management.Automation.Language.ScriptBlockAst] -and $null -eq $node.Parent.Parent.Parent }, $true) |
-    Where-Object { $_.Left.Extent.Text -match '^\$script:(\w+)$' -and $tableNames -contains $Matches[1] } | Sort-Object { $_.Extent.StartOffset }
+# Any assignment that is not inside a function: most of the builder runs
+# inside its main try block, so the tables are not top-level statements
+$tables = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true) | Where-Object {
+    $parent = $_.Parent
+    while ($parent -and $parent -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { $parent = $parent.Parent }
+    $null -eq $parent -and $_.Left.Extent.Text -match '^\$script:(\w+)$' -and $tableNames -contains $Matches[1]
+} | Sort-Object { $_.Extent.StartOffset }
 foreach ($table in $tables) { . ([ScriptBlock]::Create($table.Extent.Text)) }
 foreach ($name in $tableNames) {
     if ($null -eq (Get-Variable -Name $name -Scope Script -ErrorAction SilentlyContinue)) {
