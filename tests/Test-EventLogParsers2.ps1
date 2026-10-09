@@ -91,7 +91,6 @@ foreach ($name in $tableNames) {
 }
 
 $script:timelineEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
-$script:artifactStats = @{}
 $logFile = Join-Path ([System.IO.Path]::GetTempPath()) ("evtx2-unit-" + [guid]::NewGuid().ToString("N") + ".log")
 $script:nextRecordId = 0
 $eventNs = "http://schemas.microsoft.com/win/2004/08/events/event"

@@ -567,7 +567,6 @@ try {
     $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and $tableNames -contains $node.Left.Extent.Text }, $false) |
         Sort-Object { $_.Extent.StartOffset } | ForEach-Object { . ([scriptblock]::Create($_.Extent.Text)) }
     $script:timelineEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
-    $script:artifactStats = @{}
     $script:manifestTimes = @{}
     $script:collectionRoot = $collection
     $script:logFile = Join-Path $workDir "unit.log"
