@@ -143,13 +143,14 @@ themselves are never committed.
   click in the window cannot pause the run. (With QuickEdit on, a click
   starts a text selection, and every write to the window -- and with it
   the whole run, log file included -- waits until the selection ends.)
-  The log says "Console QuickEdit is off for this run ...". To copy text
-  during the run, use the window menu (the icon at the top left, or
-  Alt+Space): Edit > Mark, select, then Enter to copy; that selection
-  pauses the run too until Enter or Esc ends it. Or copy from the log
-  file or the window after the run. The console's own setting comes back
-  when the run ends. In Windows Terminal a selection does not pause the
-  run, and text is selected and copied as usual.
+  The console's mouse input is turned off with it, so the mouse wheel
+  still scrolls the window. The log says "Console QuickEdit is off for
+  this run ...". To copy text during the run, use the window menu (the
+  icon at the top left, or Alt+Space): Edit > Mark, select, then Enter to
+  copy; that selection pauses the run too until Enter or Esc ends it. Or
+  copy from the log file or the window after the run. The console's own
+  setting comes back when the run ends. In Windows Terminal a selection
+  does not pause the run, and text is selected and copied as usual.
 
   The collection's memory dump is found as well, also when the collector
   wrote it to another drive (e.g. D:\TriageMemory\ when the system drive
@@ -2113,16 +2114,17 @@ parsing is skipped, and the timeline CSV can be opened manually.
 
   tests\Test-ConsoleMode.ps1 -- checks how the builder turns console
   QuickEdit off for a run: the mode without QuickEdit for known console
-  modes (QuickEdit cleared, the extended-flags bit set, other bits kept);
-  in a child PowerShell with redirected input (as in CI), that turning it
-  off and back changes nothing and writes nothing; in a child with a new
-  hidden console of its own, that QuickEdit is off afterwards, stays off
-  through a Read-Host, and that the mode from before comes back (skipped
-  when the child gets no console of its own). In the builder's syntax
-  tree it checks that QuickEdit is turned off first in the main body,
-  before its first long step and every exit, with the log line, and put
-  back last in its finally block. The console the test runs in is never
-  changed. No admin needed.
+  modes (QuickEdit and mouse input cleared, the extended-flags bit set,
+  other bits kept, a mode with QuickEdit already off unchanged); in a
+  child PowerShell with redirected input (as in CI), that turning it off
+  and back changes nothing and writes nothing; in a child with a new
+  hidden console of its own, that QuickEdit and mouse input are off
+  afterwards, stay off through a Read-Host, and that the mode from before
+  comes back (skipped when the child gets no console of its own). In the
+  builder's syntax tree it checks that QuickEdit is turned off first in
+  the main body, before its first long step and every exit, with the log
+  line, and put back last in its finally block. The console the test runs
+  in is never changed. No admin needed.
 
   Run them from an elevated PowerShell; -AllowSystemChanges lets the event
   log, registry and SRUM tests change this machine:
@@ -2264,8 +2266,9 @@ Temporary actions (all cleaned up automatically, also after an error or Ctrl+C):
   - Writes Volatility 3's JSON output (Memory parser) into the work folder
     -- deleted after each plugin
   - Downloads zip files to %TEMP% (first run) -- deleted after extraction
-  - Turns QuickEdit off in its console window, so a click cannot pause the
-    run (see Quick Start) -- the console's own mode is put back at the end
+  - Turns QuickEdit and mouse input off in its console window, so a click
+    cannot pause the run (see Quick Start) -- the console's own mode is
+    put back at the end
 
 Event log entries (not removed):
   - Only when the in-process recovery of a SRUM database fails, or a copy

@@ -143,25 +143,33 @@ function Log-Success {
 # waits. The Log functions write to the console before the log file, so a
 # stray click stopped the whole run (no CPU, no new log lines) until the
 # selection was ended or the window was closed. QuickEdit is turned off
-# for the run (at the start of the main body) and the console's own mode
-# is put back at the end (its finally block). Text can still be copied
-# with the window menu (Edit > Mark) or after the run. Without console
-# input (input redirected, a CI runner) nothing is changed.
+# for the run (at the start of the main body), mouse input with it, and
+# the console's own mode is put back at the end (its finally block). Text
+# can still be copied with the window menu (Edit > Mark) or after the
+# run. Without console input (input redirected, a CI runner) nothing is
+# changed.
 # =============================================================
 $script:consoleModeToRestore = $null   # console input mode before Disable-ConsoleQuickEdit changed it
 
-# The console input mode with QuickEdit off: ENABLE_QUICK_EDIT_MODE
-# (0x0040) cleared and ENABLE_EXTENDED_FLAGS (0x0080) set, without which
-# SetConsoleMode leaves QuickEdit as it is. Every other bit is kept.
+# The console input mode for the run: ENABLE_QUICK_EDIT_MODE (0x0040) and
+# ENABLE_MOUSE_INPUT (0x0010) cleared and ENABLE_EXTENDED_FLAGS (0x0080)
+# set, without which SetConsoleMode leaves QuickEdit as it is. Mouse input
+# goes with QuickEdit: with mouse input on and QuickEdit off, the console
+# passes the mouse wheel and clicks to the script, which never reads them,
+# so the wheel stops scrolling the window, and Windows Terminal switches
+# to mouse reporting (a drag selects text only with Shift). Every other
+# bit is kept. A mode with QuickEdit already off (and that flag set) comes
+# back as it is.
 function Get-ConsoleModeWithoutQuickEdit {
     param([uint32]$Mode)
-    return [uint32](([long]$Mode -band (-bnot [long]0x0040)) -bor [long]0x0080)
+    if (([long]$Mode -band [long]0x00C0) -eq [long]0x0080) { return $Mode }
+    return [uint32](([long]$Mode -band (-bnot [long]0x0050)) -bor [long]0x0080)
 }
 
-# Turn QuickEdit off in this process's console. Returns the console input
-# mode from before the change, for Restore-ConsoleMode, or $null when
-# nothing was changed: no console input (redirected, a CI runner),
-# QuickEdit already off, or a call that failed. Never throws.
+# Turn QuickEdit (and mouse input) off in this process's console. Returns
+# the console input mode from before the change, for Restore-ConsoleMode,
+# or $null when nothing was changed: no console input (redirected, a CI
+# runner), QuickEdit already off, or a call that failed. Never throws.
 function Disable-ConsoleQuickEdit {
     try {
         if (-not ([System.Management.Automation.PSTypeName]'TimelineNative.ConsoleMode').Type) {

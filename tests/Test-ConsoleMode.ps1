@@ -5,14 +5,17 @@
 # Log functions write to the console before the log file, so a stray
 # click stopped whole runs. The builder turns QuickEdit off for the run
 # and puts the console's mode back at the end. Checks:
-#  - Get-ConsoleModeWithoutQuickEdit on known modes: QuickEdit cleared,
-#    ENABLE_EXTENDED_FLAGS set (needed for the change), other bits kept;
+#  - Get-ConsoleModeWithoutQuickEdit on known modes: QuickEdit and mouse
+#    input cleared (with mouse input on and QuickEdit off, the mouse wheel
+#    no longer scrolls the window), ENABLE_EXTENDED_FLAGS set (needed for
+#    the change), other bits kept, a mode with QuickEdit already off
+#    unchanged;
 #  - Disable-ConsoleQuickEdit and Restore-ConsoleMode in a child
 #    PowerShell whose input is redirected (as in CI or a script run with
 #    redirected input): nothing changed, no error and no output, also
 #    when called twice (the type is compiled once);
 #  - the same in a child with a new, hidden console of its own (never the
-#    console this test runs in): QuickEdit off after
+#    console this test runs in): QuickEdit and mouse input off after
 #    Disable-ConsoleQuickEdit, still off after a Read-Host (the child
 #    types the answer into its own console), and the mode from before
 #    after Restore-ConsoleMode. Skipped when the child gets no console of
@@ -176,8 +179,8 @@ namespace TimelineConsoleTest {
             $result.Status = "console shared with another process"
         }
         else {
-            # A known start: QuickEdit on
-            $start = [uint32]($initial -bor 0xC0)
+            # A known start: QuickEdit and mouse input on
+            $start = [uint32]($initial -bor 0xD0)
             [void][TimelineConsoleTest.Native]::SetMode($start)
             $result.Start = Format-Mode ([TimelineConsoleTest.Native]::GetMode())
             $original = Disable-ConsoleQuickEdit
@@ -212,19 +215,22 @@ try {
     Write-Host "Testing Get-ConsoleModeWithoutQuickEdit ($($PSVersionTable.PSEdition) $($PSVersionTable.PSVersion)) ..."
     . ([scriptblock]::Create((Get-BuilderFunction "Get-ConsoleModeWithoutQuickEdit").Extent.Text))
     $cases = @(
-        @{ Name = "QuickEdit on (a console's usual mode)"; Mode = 0x01F7; Expected = 0x01B7 },
-        @{ Name = "QuickEdit already off: unchanged"; Mode = 0x01B7; Expected = 0x01B7 },
+        @{ Name = "QuickEdit on (a console's usual mode): mouse input off with it"; Mode = 0x01F7; Expected = 0x01A7 },
+        @{ Name = "QuickEdit on, mouse input already off"; Mode = 0x01E7; Expected = 0x01A7 },
+        @{ Name = "QuickEdit already off: unchanged, mouse input included"; Mode = 0x01B7; Expected = 0x01B7 },
+        @{ Name = "QuickEdit and mouse input already off: unchanged"; Mode = 0x01A7; Expected = 0x01A7 },
         @{ Name = "extended flag missing: added, so the change takes effect"; Mode = 0x0007; Expected = 0x0087 },
+        @{ Name = "extended flag missing, mouse input on: mouse input off"; Mode = 0x0017; Expected = 0x0087 },
         @{ Name = "QuickEdit on, extended flag missing"; Mode = 0x0047; Expected = 0x0087 },
-        @{ Name = "virtual terminal input and other bits kept"; Mode = 0x03F7; Expected = 0x03B7 },
+        @{ Name = "virtual terminal input and other bits kept"; Mode = 0x03F7; Expected = 0x03A7 },
         @{ Name = "no bits"; Mode = 0x0000; Expected = 0x0080 },
-        @{ Name = "every bit (no sign trouble in 5.1)"; Mode = [uint32]::MaxValue; Expected = [uint32]0xFFFFFFBFL }
+        @{ Name = "every bit (no sign trouble in 5.1)"; Mode = [uint32]::MaxValue; Expected = [uint32]0xFFFFFFAFL }
     )
     foreach ($case in $cases) {
         $actual = Get-ConsoleModeWithoutQuickEdit ([uint32]$case.Mode)
         Assert-Equal -Name "mode without QuickEdit: $($case.Name) ($(Format-Mode $case.Mode))" -Expected (Format-Mode $case.Expected) -Actual (Format-Mode $actual)
     }
-    Assert-Equal -Name "mode without QuickEdit: a UInt32, as SetConsoleMode takes it" -Expected "System.UInt32" -Actual (Get-ConsoleModeWithoutQuickEdit 0x01F7).GetType().FullName
+    Assert-Equal -Name "mode without QuickEdit: a UInt32, as SetConsoleMode takes it (changed and unchanged)" -Expected "System.UInt32 System.UInt32" -Actual "$((Get-ConsoleModeWithoutQuickEdit 0x01F7).GetType().FullName) $((Get-ConsoleModeWithoutQuickEdit 0x01B7).GetType().FullName)"
 
     # --- No console input: a child with redirected input -----------------------
     Write-Host "Testing Disable-ConsoleQuickEdit and Restore-ConsoleMode with redirected input ..."
@@ -293,11 +299,14 @@ try {
             else {
                 $start = [Convert]::ToUInt32("$($result.Start)".Substring(2), 16)
                 Assert-Equal -Name "new console: Disable-ConsoleQuickEdit returns the mode from before" -Expected $result.Start -Actual $result.Returned
-                Assert-Equal -Name "new console: QuickEdit off, extended flags on, other bits kept" -Expected (Format-Mode (Get-ConsoleModeWithoutQuickEdit $start)) -Actual $result.AfterDisable
+                Assert-Equal -Name "new console: QuickEdit and mouse input off, extended flags on, other bits kept" -Expected (Format-Mode (Get-ConsoleModeWithoutQuickEdit $start)) -Actual $result.AfterDisable
+                # The bits themselves, not only what the function says
+                $afterDisable = [Convert]::ToUInt32("$($result.AfterDisable)".Substring(2), 16)
+                Assert-Equal -Name "new console: the console reports QuickEdit off, mouse input off (the wheel keeps scrolling), extended flags on" -Expected "0x0000 0x0000 0x0080" -Actual "$(Format-Mode ($afterDisable -band 0x40)) $(Format-Mode ($afterDisable -band 0x10)) $(Format-Mode ($afterDisable -band 0x80))"
                 Assert-Equal -Name "new console: a second call changes nothing (returns null)" -Expected "null" -Actual $result.SecondReturned
                 Assert-Equal -Name "new console: Read-Host reads the answer with QuickEdit off" -Expected "42" -Actual $result.ReadHost
                 $afterReadHost = [Convert]::ToUInt32("$($result.AfterReadHost)".Substring(2), 16)
-                Assert-Equal -Name "new console: QuickEdit still off after Read-Host" -Expected "0x0000 0x0080" -Actual "$(Format-Mode ($afterReadHost -band 0x40)) $(Format-Mode ($afterReadHost -band 0x80))"
+                Assert-Equal -Name "new console: QuickEdit and mouse input still off after Read-Host" -Expected "0x0000 0x0000 0x0080" -Actual "$(Format-Mode ($afterReadHost -band 0x40)) $(Format-Mode ($afterReadHost -band 0x10)) $(Format-Mode ($afterReadHost -band 0x80))"
                 Assert-Equal -Name "new console: Restore-ConsoleMode puts back the mode from before" -Expected $result.Start -Actual $result.AfterRestore
             }
         }
