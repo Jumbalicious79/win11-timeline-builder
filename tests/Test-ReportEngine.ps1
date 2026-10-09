@@ -10,10 +10,17 @@
 #     ordering, evidence caps and Excel row numbers, maxFindings roll-ups,
 #     activityTime, and the stop of a rule whose pattern keeps timing out;
 #   - invalid rules files fail with an error that names the rule and field;
+#   - {{list:...}} is expanded in the C# helper (a synthetic list of
+#     harmless words, used several times) and fails closed: a blocked call,
+#     no regex or an empty one is a rules-file error; the shipped rules
+#     import with no error and no empty condition;
 #   - the report model: coverage per source, log clears, boots, audit notes,
-#     collector errors and warnings, activity per day / hour / source / user,
-#     caveats (assumed time zone, stale workbook), top findings (one per
-#     rule first), the lead window, rule titles, file hashes;
+#     collector errors and warnings, activity per day / hour / source / user
+#     (accounts as the User column names them, unnamed service SIDs, file
+#     times), caveats (assumed time zone, stale workbook, mounted image), the
+#     examined computer of a mounted image, an incomplete builder run (exit
+#     code 2), top findings (one per rule first), the lead window, rule
+#     titles, file hashes;
 #   - findings.csv, report-model.json and Import-TimelineCsvForReport
 #     (fields with line breaks, quotes and commas).
 # Needs no Administrator rights and does not run the builder.
@@ -138,7 +145,16 @@ try {
         @("ScriptBlock=Get-Process | Select-Object Name Path=abc", "Path", "abc"),
         @("Command=cmd /c a | b | Key=HKLM\Run", "Command", "cmd /c a | b"),
         @("Command=cmd /c a | b | Key=HKLM\Run", "Key", "HKLM\Run"),
-        @("Command=x | Key=y", "Missing", "")
+        @("Command=x | Key=y", "Missing", ""),
+        # The User column pass appends " | UserSID=<sid>" to space-separated
+        # Details (4104 script blocks): the pair does not switch the row to
+        # " | " style, so the space-separated keys are still read
+        @("ScriptBlock=Get-ChildItem C:\Users ScriptBlockId=0f1e Path=C:\Users\Public\stage.ps1 | UserSID=S-1-5-21-1-2-3-1001", "Path", "C:\Users\Public\stage.ps1"),
+        @("ScriptBlock=Get-ChildItem C:\Users ScriptBlockId=0f1e Path=C:\Users\Public\stage.ps1 | UserSID=S-1-5-21-1-2-3-1001", "ScriptBlockId", "0f1e"),
+        @("ScriptBlock=Get-ChildItem C:\Users ScriptBlockId=0f1e Path=C:\Users\Public\stage.ps1 | UserSID=S-1-5-21-1-2-3-1001", "UserSID", "S-1-5-21-1-2-3-1001"),
+        @("FailureReason=0xc000006a Source=203.0.113.9 | UserSID=S-1-5-21-1-2-3-1001 | Occurrences=2", "Source", "203.0.113.9"),
+        @("JobId={1} | Url=http://x/a b | Result=0x0 | UserSID=S-1-5-21-1-2-3-1001", "Url", "http://x/a b"),
+        @("JobId={1} | Url=http://x/a b | Result=0x0 | UserSID=S-1-5-21-1-2-3-1001", "UserSID", "S-1-5-21-1-2-3-1001")
     )
     foreach ($case in $detailCases) {
         Assert-Equal ([TimelineReport.DetailParser]::Get($case[0], $case[1])) $case[2] -Message "Details '$($case[0])' -> $($case[1])"
@@ -389,6 +405,88 @@ try {
     Write-TestResult -Succeeded ($message -match 'not found') -Message "a missing rules file is refused ($message)"
 
     # =========================================================
+    # {{list:...}} expansion: in the C# helper, and fail closed
+    # (PowerShell 7 hands .NET method arguments to AMSI, which blocked a
+    # second expansion of a keyword list; an expansion that fails must
+    # never leave a condition that matches every row). Harmless words only.
+    # =========================================================
+    $listRulesPath = Join-Path $workDir "list-rules.json"
+    New-TestTextFile $listRulesPath ('{ "schemaVersion": 1, "lists": { "fruit": [ "apple", "pear.x", "kiwi (gold)" ] }, "rules": [ ' +
+        '{ "id": "FRUIT-A", "title": "A", "category": "Other", "severity": "Medium", "why": "w", "anyOf": [ { "source": "^S$", "details": "\\b{{list:fruit}}\\b" }, { "source": "^T$", "details": "^{{list:fruit}}$" } ] }, ' +
+        '{ "id": "FRUIT-B", "title": "B", "category": "Other", "severity": "Medium", "why": "w", "match": { "description": "{{list:fruit}}" } } ] }')
+    $listErrors = $null
+    $listRules = Import-ReportRules -Path $listRulesPath -ErrorVariable listErrors
+    $fruitA = ($listRules.Rules | Where-Object { $_.Id -eq "FRUIT-A" }).Compiled
+    $fruitB = ($listRules.Rules | Where-Object { $_.Id -eq "FRUIT-B" }).Compiled
+    Assert-Equal "$(@($listErrors).Count)|$($fruitA.AnyOf[0].Details)|$($fruitA.AnyOf[1].Details)|$($fruitB.Match.Description)" ("0|\b(?:apple|pear\.x|kiwi\ \(gold\))\b|^(?:apple|pear\.x|kiwi\ \(gold\))$|(?:apple|pear\.x|kiwi\ \(gold\))") -Message "a list used three times expands every time, escaped, with no error"
+    $listRows = @(
+        @{ Timestamp = "2026-01-01 00:00:01.000"; Source = "S"; EventType = "E"; Description = "d"; User = ""; Details = "one pear.x here" },
+        @{ Timestamp = "2026-01-01 00:00:02.000"; Source = "S"; EventType = "E"; Description = "d"; User = ""; Details = "one pearyx here" },
+        @{ Timestamp = "2026-01-01 00:00:03.000"; Source = "T"; EventType = "E"; Description = "kiwi (gold)"; User = ""; Details = "kiwi (gold)" },
+        @{ Timestamp = "2026-01-01 00:00:04.000"; Source = "U"; EventType = "E"; Description = "plain"; User = ""; Details = "plain" }
+    )
+    $listFindings = @(Invoke-ReportRules -Rows $listRows -Rules $listRules)
+    Assert-Equal (@($listFindings | ForEach-Object { "$($_.RuleId):$(@($_.RowNumbers) -join '+')" }) -join ",") "FRUIT-A:2+4,FRUIT-B:4" -Message "expanded lists match their literal values only ('pear.x' is not 'pearyx'), and no row that holds none"
+    $options = [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+    $direct = [TimelineReport.RulePattern]::Compile("x{{list:fruit}}y", @{ fruit = [string[]]@("a|b") }, $options, [TimeSpan]::FromSeconds(1))
+    Assert-Equal "$direct" "x(?:a\|b)y" -Message "RulePattern.Compile expands a list in C# (escaped)"
+    foreach ($case in @(
+            @("{{list:none}}", @{ fruit = [string[]]@("a") }, "unknown list 'none'"),
+            @("{{list:fruit}}", @{ fruit = [string[]]@() }, "list 'fruit' has no values"),
+            @("{{list:fruit}}", @{ fruit = $null }, "unknown list 'fruit'"),
+            @("", @{}, "is empty"),
+            @("(", @{}, "invalid regular expression"))) {
+        $message = ""
+        try { $null = [TimelineReport.RulePattern]::Compile($case[0], $case[1], $options, [TimeSpan]::FromSeconds(1)) } catch { $message = $_.Exception.InnerException.Message }
+        Write-TestResult -Succeeded ($message.Contains($case[2])) -Message "RulePattern.Compile refuses '$($case[0])': $message"
+    }
+    Assert-Equal "$([TimelineReport.RulePattern]::IsEmpty([regex]::new(''))):$([TimelineReport.RulePattern]::IsEmpty($null)):$([TimelineReport.RulePattern]::IsEmpty([regex]::new('a')))" "True:True:False" -Message "RulePattern.IsEmpty: an empty or missing regex"
+    # A call that is blocked (as AMSI blocked it), or that gives no regex or
+    # an empty one: a rules-file error naming the rule and field. The
+    # stand-in replaces the helper only inside its script block: a pattern
+    # without a list compiles as usual, one with a list gets -OnList.
+    function Get-StandInImportError {
+        param([scriptblock]$OnList)
+        $onListResult = $OnList
+        return & {
+            function New-ReportEngineRuleRegex {
+                param([string]$Pattern, [hashtable]$Lists, [System.Text.RegularExpressions.RegexOptions]$Options, [TimeSpan]$Timeout)
+                if ($Pattern.Contains("{{list:")) { return (& $onListResult) }
+                return [TimelineReport.RulePattern]::Compile($Pattern, $Lists, $Options, $Timeout)
+            }
+            try { $null = Import-ReportRules -Path $listRulesPath; "" } catch { $_.Exception.Message }
+        }
+    }
+    $listField = "rule 'FRUIT-A' (rules[0]).anyOf[0].details"
+    $blockedMessage = Get-StandInImportError { throw "This script contains malicious content and has been blocked by your antivirus software." }
+    Write-TestResult -Succeeded ($blockedMessage.Contains($listField) -and $blockedMessage.Contains("could not be compiled") -and $blockedMessage.Contains("blocked by your antivirus")) -Message "a blocked expansion fails closed with a rules-file error ($blockedMessage)"
+    $nullMessage = Get-StandInImportError { $null }
+    Write-TestResult -Succeeded ($nullMessage.Contains($listField) -and $nullMessage.Contains("no regular expression")) -Message "an expansion that gives no regex fails closed ($nullMessage)"
+    $emptyMessage = Get-StandInImportError { [regex]::new("") }
+    Write-TestResult -Succeeded ($emptyMessage.Contains($listField) -and $emptyMessage.Contains("would match every row")) -Message "an expansion that gives an empty regex (it would match every row) fails closed ($emptyMessage)"
+    # A statement-terminating error inside the call (outside a try it would
+    # only skip its own statement, and the next one would give a regex)
+    $silentMessage = Get-StandInImportError { [void][int]::Parse("not a number"); [regex]::new("ok") }
+    Write-TestResult -Succeeded ($silentMessage.Contains($listField) -and $silentMessage.Contains("could not be compiled")) -Message "an error inside the call is not skipped over ($silentMessage)"
+    Write-TestResult -Succeeded ((Get-StandInImportError { [regex]::new("ok") }) -eq "") -Message "the stand-in itself imports the rules when its call works"
+
+    # The shipped rules import with no error, and no compiled condition is an
+    # empty regex (one that would match every row)
+    $shippedErrors = $null
+    $shipped = Import-ReportRules -Path (Join-Path $repoRoot "report\report-rules.json") -ErrorVariable shippedErrors
+    $emptyConditions = New-Object System.Collections.Generic.List[string]
+    $conditionNames = @("Source", "EventType", "Description", "Details", "User", "NotSource", "NotEventType", "NotDescription", "NotDetails", "NotUser")
+    foreach ($shippedRule in $shipped.Rules) {
+        $specs = @($shippedRule.Compiled.Match) + @($shippedRule.Compiled.AnyOf) + @($shippedRule.Compiled.EscalateMatch) + @($shippedRule.Compiled.Allowlist)
+        foreach ($spec in @($specs | Where-Object { $null -ne $_ })) {
+            foreach ($name in $conditionNames) {
+                if ($null -ne $spec.$name -and [TimelineReport.RulePattern]::IsEmpty($spec.$name)) { $emptyConditions.Add("$($shippedRule.Id).$name") }
+            }
+        }
+    }
+    Assert-Equal "$(@($shippedErrors).Count)|$(@($shipped.Rules).Count -gt 40)|$($emptyConditions -join ',')" "0|True|" -Message "report-rules.json: imports with no error, and no compiled condition is empty"
+
+    # =========================================================
     # findings.csv (written before the model, which hashes it)
     # =========================================================
     $findingsCsv = Join-Path $workDir "findings.csv"
@@ -422,7 +520,9 @@ try {
     Assert-Equal "$($c.ComputerName)|$($c.OS)|$($c.Mode)|$($c.TargetTimeZoneId)|$(Format-TestUtc $c.CollectionStartUtc)|$($c.CollectorUser)|$($c.SecretsIncluded)|$($c.ThunderbirdIndexIncluded)" `
         "WS01|Microsoft Windows 11 Pro (build 26100)|Live|Pacific Standard Time|2026-03-10 12:00:00|CORP\examiner|True|False" -Message "model.Collection from collection_info.json and the SystemInfo row"
     $users = @($c.Users)
-    Write-TestResult -Succeeded (($users -contains "alice") -and ($users -contains "bob") -and ($users -contains "admin1") -and ($users -contains "carol") -and -not ($users -contains "SYSTEM")) -Message "model.Collection.Users: people, domain removed, no system accounts ($($users -join ', '))"
+    Write-TestResult -Succeeded (($users -contains "alice") -and ($users -contains "CORP\alice") -and ($users -contains "CORP\bob") -and ($users -contains "CORP\admin1") -and ($users -contains "CORP\carol") -and
+        -not ($users -contains "bob") -and -not ($users -contains "NT AUTHORITY\SYSTEM") -and -not ($users -contains "SYSTEM")) -Message "model.Collection.Users: people as the User column names them (the local alice and CORP\alice apart), no system accounts ($($users -join ', '))"
+    Assert-Equal "$($c.ComputerNameSource)|$($c.CollectorHost)" "collection_info.json|" -Message "model.Collection: a live collection's computer name comes from collection_info.json, and there is no separate collector host"
 
     Assert-Equal "$(Format-TestUtc $model.TimeSpan.FirstUtc)|$(Format-TestUtc $model.TimeSpan.LastUtc)|$($model.TimeSpan.Rows)" "2026-03-09 08:00:00|2026-03-10 12:10:00|69" -Message "model.TimeSpan"
     Assert-Equal "$($model.Counts.High)|$($model.Counts.Medium)|$($model.Counts.Info)" "6|7|8" -Message "model.Counts"
@@ -456,7 +556,7 @@ try {
     # Activity, against an independent count
     $zone = [System.TimeZoneInfo]::FindSystemTimeZoneById("Pacific Standard Time")
     $perDay = @($expectedRows | Group-Object { $_.Timestamp.Substring(0, 10) } | Sort-Object Name | ForEach-Object {
-        "$($_.Name)=$($_.Count)/$(@($_.Group | Where-Object { $_.EventType -ne 'FileAccess' -and $_.EventType -ne 'Snapshot' }).Count)"
+        "$($_.Name)=$($_.Count)/$(@($_.Group | Where-Object { $_.EventType -ne 'FileAccess' -and $_.EventType -ne 'FileLastModified' -and $_.EventType -ne 'Snapshot' }).Count)"
     })
     Assert-Equal (@($model.Activity.PerDay | ForEach-Object { "$($_.Day)=$($_.Rows)/$($_.NonFileRows)" }) -join ",") ($perDay -join ",") -Message "model.Activity.PerDay (rows / rows that are not file-system or snapshot)"
     $hoursUtc = New-Object int[] 24
@@ -471,10 +571,16 @@ try {
     Assert-Equal $model.Activity.LocalTimeZoneId "Pacific Standard Time" -Message "model.Activity.LocalTimeZoneId"
     $topSource = $expectedRows | Group-Object Source | Sort-Object @{ Expression = { $_.Count }; Descending = $true }, Name | Select-Object -First 1
     Assert-Equal "$($model.Activity.TopSources[0].Source)=$($model.Activity.TopSources[0].Rows)" "$($topSource.Name)=$($topSource.Count)" -Message "model.Activity.TopSources: busiest source first"
-    $aliceRows = @($expectedRows | Where-Object { $_.User -eq "alice" -or $_.User -eq "CORP\alice" }).Count
+    # One entry per account as the User column names it: the local alice and
+    # the domain account CORP\alice are different accounts
+    $localAliceRows = @($expectedRows | Where-Object { $_.User -eq "alice" }).Count
+    $domainAliceRows = @($expectedRows | Where-Object { $_.User -eq "CORP\alice" }).Count
     $alice = $model.Activity.PerUser | Where-Object { $_.User -eq "alice" }
-    Assert-Equal "$($alice.Rows)|$($alice.IsSystem)" "$aliceRows|False" -Message "model.Activity.PerUser merges 'CORP\alice' and 'alice'"
-    Assert-Equal ($model.Activity.PerUser | Where-Object { $_.User -eq "SYSTEM" }).IsSystem "True" -Message "model.Activity.PerUser marks system accounts"
+    $corpAlice = $model.Activity.PerUser | Where-Object { $_.User -eq "CORP\alice" }
+    Assert-Equal "$($alice.Rows)|$($alice.IsSystem)|$($corpAlice.Rows)|$($corpAlice.IsSystem)" "$localAliceRows|False|$domainAliceRows|False" -Message "model.Activity.PerUser keeps 'alice' and 'CORP\alice' apart ($localAliceRows and $domainAliceRows rows)"
+    Assert-Equal ($model.Activity.PerUser | Where-Object { $_.User -eq "NT AUTHORITY\SYSTEM" }).IsSystem "True" -Message "model.Activity.PerUser shows NT AUTHORITY\SYSTEM as the timeline names it and marks it as a system account"
+    Write-TestResult -Succeeded (-not @($model.Activity.PerUser | Where-Object { $_.User -eq "SYSTEM" -or $_.User -eq "bob" }).Count) -Message "model.Activity.PerUser: no name without its domain (SYSTEM, bob)"
+    Write-TestResult -Succeeded (@($model.Coverage.Notes | Where-Object { $_ -match '^3 account SID\(s\) in the User column have no name' }).Count -eq 1) -Message "model.Coverage.Notes: the builder log's 'User column: 3 SID(s) not named' line"
 
     # Caveats: the static list plus the ones this collection needs
     $caveats = @($model.Caveats)
@@ -499,18 +605,88 @@ try {
     $logOnlyCaveats = @($logOnly.Caveats)
     Write-TestResult -Succeeded ((@($logOnlyCaveats | Where-Object { $_ -match 'time zone is unknown' }).Count -eq 1) -and (@($logOnlyCaveats | Where-Object { $_ -match 'metadata' }).Count -eq 1) -and -not (@($logOnlyCaveats | Where-Object { $_ -match 'workbook|MftDays' }).Count)) -Message "caveats: unknown time zone and metadata; none for an existing workbook or -MftDays 0"
     Write-TestResult -Succeeded (@($logOnly.Files.Hashes | Where-Object { $_.Name -eq "timeline.xlsx" }).Count -eq 1) -Message "an available workbook is hashed"
+    # Get-CollectionInfo's shape: for a mounted image its ComputerName is the
+    # computer the collector ran on, not the examined one
     $builderInfo = [PSCustomObject]@{
         Source = "collection_info.json"; Mode = "MountedImage"; CollectionStartUtc = [datetime]::new(2026, 3, 10, 12, 0, 0, [System.DateTimeKind]::Utc)
-        TargetTimeZone = $zone; SecretsIncluded = $false; ThunderbirdIndexIncluded = $false
+        TargetTimeZone = $zone; SecretsIncluded = $false; ThunderbirdIndexIncluded = $false; ComputerName = "COLLECTORPC"
     }
     $builderModel = New-ReportModel -Rows $rows -Findings $findings -CollectionInfo $builderInfo
-    Assert-Equal "$($builderModel.Collection.TargetTimeZoneId)|$(Format-TestUtc $builderModel.Collection.CollectionStartUtc)|$($builderModel.Collection.Mode)|$($builderModel.Collection.ComputerName)" "Pacific Standard Time|2026-03-10 12:00:00|MountedImage|WS01" -Message "model from the builder's Get-CollectionInfo object"
+    Assert-Equal "$($builderModel.Collection.TargetTimeZoneId)|$(Format-TestUtc $builderModel.Collection.CollectionStartUtc)|$($builderModel.Collection.Mode)|$($builderModel.Collection.ComputerName)|$($builderModel.Collection.ComputerNameSource)|$($builderModel.Collection.CollectorHost)" "Pacific Standard Time|2026-03-10 12:00:00|MountedImage|WS01|systeminfo.txt|COLLECTORPC" -Message "model from the builder's Get-CollectionInfo object: a mounted image's computer from the SystemInfo row, not the collector host"
     Write-TestResult -Succeeded (@($builderModel.Caveats | Where-Object { $_ -match 'mounted disk image' }).Count -eq 1) -Message "caveats: a mounted-image collection"
     $builderInfo | Add-Member -NotePropertyName TargetTimeZoneAssumed -NotePropertyValue $true
     $assumedModel = New-ReportModel -Rows $rows -Findings $findings -CollectionInfo $builderInfo -WorkbookPath $workbook -WorkbookAvailable:$false
     Write-TestResult -Succeeded ($assumedModel.Collection.TargetTimeZoneAssumed -and @($assumedModel.Caveats | Where-Object { $_.Contains("time zone was not recorded in the collection: Pacific Standard Time") }).Count -eq 1) -Message "an assumed time zone is marked in the model and named in a caveat"
     Write-TestResult -Succeeded (@($assumedModel.Caveats | Where-Object { $_.Contains("any Findings sheet or Finding column in it is from an earlier report") }).Count -eq 1 -and -not @($assumedModel.Files.Hashes | Where-Object { $_.Name -eq "timeline.xlsx" }).Count) -Message "a workbook that exists but was not updated: the caveat says its findings are stale, and it is not hashed"
     Assert-Equal (($model.Rules | Where-Object { $_.Id -eq "T-SVC" }).Title) "Suspicious service" -Message "model.Rules: titles without the {{group}} placeholder"
+
+    # --- Users, file times and Snapshot rows (synthetic rows) ---
+    function New-TestRow {
+        param([string]$Time, [string]$User = "", [string]$Source = "Prefetch", [string]$EventType = "Execution", [string]$Description = "Prefetch execution: A.EXE")
+        return @{ Timestamp = $Time; Source = $Source; EventType = $EventType; Description = $Description; User = $User; Details = "" }
+    }
+    $userRows = @(
+        (New-TestRow "2026-02-01 10:00:00.000" "WS01\alice"), (New-TestRow "2026-02-01 10:00:01.000" "alice"), (New-TestRow "2026-02-01 10:00:02.000" ".\Alice"),
+        (New-TestRow "2026-02-01 10:00:03.000" "OTHERHOST\alice"), (New-TestRow "2026-02-01 10:00:04.000" "CONTOSO\alice"), (New-TestRow "2026-02-01 10:00:05.000" "CONTOSO\alice"),
+        (New-TestRow "2026-02-01 10:00:06.000" "S-1-5-80-1111-2222-3333-4444-5555"), (New-TestRow "2026-02-01 10:00:07.000" "S-1-5-82-1-2-3-4-5"),
+        (New-TestRow "2026-02-01 10:00:08.000" "S-1-5-83-1-2-3-4-5"), (New-TestRow "2026-02-01 10:00:09.000" "S-1-5-90-0-3"), (New-TestRow "2026-02-01 10:00:10.000" "S-1-5-21-1-2-3-1001"),
+        (New-TestRow "2026-02-01 10:00:11.000" "NT AUTHORITY\SYSTEM"), (New-TestRow "2026-02-01 10:00:12.000" "MicrosoftAccount\alice@example.com"),
+        (New-TestRow -Time "2019-05-01 08:00:00.000" -Source "AppCompatCache" -EventType "FileLastModified" -Description "ShimCache entry (file last modified): C:\tools\x.exe"),
+        (New-TestRow -Time "2026-02-01 11:00:00.000" -Source "Memory-Processes" -EventType "Snapshot" -Description "Process in memory: x.exe (PID: 1, PPID: 0)")
+    )
+    $userModel = New-ReportModel -Rows $userRows -CollectionInfo ([PSCustomObject]@{ Mode = "Live"; ComputerName = "WS01" })
+    $perUser = @{}
+    foreach ($entry in $userModel.Activity.PerUser) { $perUser[$entry.User] = "$($entry.Rows)/$($entry.IsSystem)" }
+    Assert-Equal "$($perUser['alice'])|$($perUser['OTHERHOST\alice'])|$($perUser['CONTOSO\alice'])|$($perUser['MicrosoftAccount\alice@example.com'])|$($perUser['NT AUTHORITY\SYSTEM'])" "3/False|1/False|2/False|1/False|1/True" -Message "PerUser: an older timeline's WS01\alice and .\Alice count with alice (the examined computer); OTHERHOST\alice, CONTOSO\alice and MicrosoftAccount\... stay apart"
+    Assert-Equal "$($perUser['S-1-5-80-1111-2222-3333-4444-5555'])|$($perUser['S-1-5-82-1-2-3-4-5'])|$($perUser['S-1-5-83-1-2-3-4-5'])|$($perUser['S-1-5-90-0-3'])|$($perUser['S-1-5-21-1-2-3-1001'])" "1/True|1/True|1/True|1/True|1/False" -Message "PerUser: unnamed service, AppPool, virtual machine and Window Manager SIDs are not people; an account SID is"
+    Assert-Equal (@($userModel.Collection.Users) -join ",") "alice,CONTOSO\alice,MicrosoftAccount\alice@example.com,OTHERHOST\alice" -Message "Key facts users: one entry per account, no system accounts or SIDs"
+    $oldDay = $userModel.Activity.PerDay | Where-Object { $_.Day -eq "2019-05-01" }
+    Assert-Equal "$($oldDay.Rows)|$($oldDay.NonFileRows)" "1|0" -Message "PerDay: a ShimCache FileLastModified row (a file time) is not counted as activity (NonFileRows)"
+    Write-TestResult -Succeeded (@($userModel.Coverage.Notes | Where-Object { $_ -eq "1 row(s) are Snapshot rows: the state when the evidence was collected (or when a memory dump was captured), not events." }).Count -eq 1) -Message "Notes: Snapshot rows are the state when collected or when the memory dump was captured"
+
+    # --- The examined computer of a mounted-image collection ---
+    $imageJson = [PSCustomObject]@{ Mode = "MountedImage"; ComputerName = "COLLECTORPC"; CollectionStartUtc = "2026-02-02T00:00:00Z" }
+    $imageModel = New-ReportModel -Rows $userRows -CollectionInfo $imageJson
+    $imageCaveats = @($imageModel.Caveats)
+    Assert-Equal "$($imageModel.Collection.ComputerName)|$($imageModel.Collection.ComputerNameSource)|$($imageModel.Collection.CollectorHost)" "||COLLECTORPC" -Message "mounted image, name not known: no computer name (collection_info.json names only the collector host)"
+    Write-TestResult -Succeeded (@($imageCaveats | Where-Object { $_.StartsWith("The examined computer's name is not known") -and $_.Contains("COLLECTORPC is the computer the collection was made on, not the examined one") }).Count -eq 1) -Message "caveats: the examined computer's name is not known, and the collector host is named as such"
+    Write-TestResult -Succeeded (@($imageCaveats | Where-Object { $_.Contains("running programs and network connections come only from the memory dump") }).Count -eq 1 -and -not @($imageCaveats | Where-Object { $_.Contains("live state (running programs") }).Count) -Message "caveats: a mounted image with memory rows says running programs come from the memory dump"
+    Write-TestResult -Succeeded (@($imageModel.Activity.PerUser | Where-Object { $_.User -eq "WS01\alice" }).Count -eq 1) -Message "PerUser: without the examined computer's name, an older HOST\alice stays as it is"
+    $hiveLog = Join-Path $workDir "hive_builder_log.txt"
+    New-TestTextFile $hiveLog ("[2026-02-02 01:00:00] === Windows 11 Forensic Timeline Builder Started ===`r`n" +
+        "[2026-02-02 01:00:05]   Examined computer name (SYSTEM hive): WS01`r`n[2026-02-02 01:00:06]   Examined computer name (SYSTEM hive): LATER`r`n")
+    $hiveModel = New-ReportModel -Rows $userRows -CollectionInfo $imageJson -BuilderLogPath $hiveLog
+    Assert-Equal "$($hiveModel.Collection.ComputerName)|$($hiveModel.Collection.ComputerNameSource)|$($hiveModel.Collection.CollectorHost)|$(@($hiveModel.Caveats | Where-Object { $_ -match 'name is not known' }).Count)" "WS01|SYSTEM hive|COLLECTORPC|0" -Message "mounted image: the computer name from the builder log's SYSTEM hive line (-ReportOnly), the collector host kept apart"
+    Assert-Equal (($hiveModel.Activity.PerUser | Where-Object { $_.User -eq "alice" }).Rows) 3 -Message "PerUser: with the hive's name, an older WS01\alice counts with alice"
+    $reportView = [PSCustomObject]@{ Mode = "MountedImage"; ComputerName = "IMAGED-PC"; ComputerNameSource = "SYSTEM hive"; CollectorHost = "COLLECTORPC"; ExaminedComputerName = "IMAGED-PC" }
+    $viewModel = New-ReportModel -Rows $userRows -CollectionInfo $reportView -BuilderLogPath $hiveLog
+    Assert-Equal "$($viewModel.Collection.ComputerName)|$($viewModel.Collection.ComputerNameSource)|$($viewModel.Collection.CollectorHost)" "IMAGED-PC|SYSTEM hive|COLLECTORPC" -Message "mounted image: the builder's report view (a name with its source) is used as it is"
+    $againModel = New-ReportModel -Rows $userRows -CollectionInfo $viewModel.Collection
+    Assert-Equal "$($againModel.Collection.ComputerName)|$($againModel.Collection.CollectorHost)" "IMAGED-PC|COLLECTORPC" -Message "an earlier model's Collection gives the same computer and collector host"
+
+    # --- A builder run that ended incomplete (exit code 2) ---
+    $incompleteLog = Join-Path $workDir "incomplete_builder_log.txt"
+    New-TestTextFile $incompleteLog ("[2026-02-02 01:00:00] === Windows 11 Forensic Timeline Builder Started ===`r`n" +
+        "[2026-02-02 01:00:10] ERROR: Unexpected error at line 4321 (rest of this step skipped): Exception calling ""Open"" with ""1"" argument(s).`r`n" +
+        "[2026-02-02 01:00:20] ERROR: Unexpected error at line 9876 (rest of this step skipped): You cannot call a method on a null-valued expression.`r`n" +
+        "[2026-02-02 01:00:30] ERROR: 2 of 40 input file(s) disappeared during the run -- rows from them may be missing from the timeline (not if a file was deleted after its parser read it):`r`n" +
+        "[2026-02-02 01:00:30] WARNING:   Missing in USB\: 2 file(s)`r`n")
+    $incomplete = New-ReportModel -Rows $userRows -CollectionInfo ([PSCustomObject]@{ Mode = "Live"; ComputerName = "WS01" }) -BuilderLogPath $incompleteLog
+    $completeness = $incomplete.Coverage.TimelineCompleteness
+    Assert-Equal "$($completeness.Incomplete)|$($completeness.MissingInputFiles)|$($completeness.UnexpectedErrors)|$(@($completeness.Lines).Count)" "True|2|2|2" -Message "Coverage.TimelineCompleteness: input files gone and unexpected errors from the builder log"
+    $incompleteCaveats = @($incomplete.Caveats)
+    Write-TestResult -Succeeded ($incompleteCaveats[1].StartsWith("The timeline is incomplete: 2 input file(s) disappeared while it was built (the builder ended with exit code 2)") -and
+        $incompleteCaveats[2].StartsWith("The builder hit 2 unexpected error(s) and skipped the rest of those steps")) -Message "caveats: the incomplete timeline right after the leads-not-verdict caveat"
+    Write-TestResult -Succeeded (@($incomplete.Coverage.Notes | Where-Object { $_.StartsWith("The timeline is incomplete:") }).Count -eq 1) -Message "Coverage.Notes: the incomplete timeline"
+    $bannerLog = Join-Path $workDir "banner_builder_log.txt"
+    New-TestTextFile $bannerLog ("[2026-02-02 01:00:30] ERROR: 3 of 40 input file(s) disappeared during the run -- rows from them may be missing`r`n" +
+        "[2026-02-02 01:05:00] ERROR: === Timeline Builder Completed WITH 4 MISSING INPUT FILE(S) -- timeline incomplete ===`r`n" +
+        "[2026-02-02 01:05:00] ERROR: === Timeline Builder Completed WITH 1 UNEXPECTED ERROR(S) -- timeline may be incomplete ===`r`n")
+    $banner = (New-ReportModel -Rows $userRows -BuilderLogPath $bannerLog).Coverage.TimelineCompleteness
+    Assert-Equal "$($banner.Incomplete)|$($banner.MissingInputFiles)|$($banner.UnexpectedErrors)" "True|4|1" -Message "-ReportOnly: the end banners of the original run's log count (the larger count wins)"
+    $passed = (New-ReportModel -Rows $userRows -MissingInputFiles 5 -UnexpectedErrors 0).Coverage.TimelineCompleteness
+    Assert-Equal "$($passed.Incomplete)|$($passed.MissingInputFiles)|$($passed.UnexpectedErrors)|$(@($passed.Lines).Count)" "True|5|0|1" -Message "the builder's own counts (-MissingInputFiles) without a log"
+    Assert-Equal "$($model.Coverage.TimelineCompleteness.Incomplete)|$(@($model.Caveats | Where-Object { $_ -match 'incomplete' }).Count)" "False|0" -Message "a complete run: no incomplete caveat"
 
     # =========================================================
     # report-model.json

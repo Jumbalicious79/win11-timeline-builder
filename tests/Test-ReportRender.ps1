@@ -15,6 +15,10 @@
 #     (ISO 8601, "/Date(ms)/", the timeline's text, [datetime]) are shown;
 #   - the minimal model (no findings, no workbook) renders the "no leads"
 #     wording and no workbook link;
+#   - a mounted image: an unknown examined computer is "Not known" (the
+#     collector host named only as such, never the title or footer), a
+#     SYSTEM-hive name is the title with its source; an incomplete builder
+#     run shows "Timeline incomplete" first in Evidence coverage;
 #   - with Microsoft Edge installed (skipped with a message otherwise): the
 #     PDFs exist, start with %PDF, have a sensible page count and paper size,
 #     a valid xref table after the link rewrite, the workbook link in the
@@ -308,6 +312,33 @@ try {
     Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath -NoFileHashes
     $warned = [System.IO.File]::ReadAllText($memoryHtmlPath)
     Write-TestResult -Succeeded ($warned.Contains("The collector logged 0 errors and 1 warning.") -and $warned.Contains("WARNING: Could not copy BBI")) -Message "collector warnings are counted as warnings, not errors"
+    Write-TestResult -Succeeded (-not $warned.Contains("Timeline incomplete") -and -not $warned.Contains('class="incomplete"')) -Message "a model without TimelineCompleteness (or a complete run) shows no incomplete-timeline block"
+
+    # --- A mounted image: the examined computer, not the collector host ---
+    $memoryModel.Collection.Mode = "MountedImage"
+    $memoryModel.Collection.ComputerName = ""
+    $memoryModel.Collection.ComputerNameSource = ""
+    $memoryModel.Collection.CollectorHost = "ANALYST-WS"
+    Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath -NoFileHashes
+    $image = [System.IO.File]::ReadAllText($memoryHtmlPath)
+    Write-TestResult -Succeeded ($image.Contains("<h1>Unknown computer</h1>") -and $image.Contains("<th>Computer</th><td>Not known: the collection was made from a mounted disk image, and the image&#39;s computer name was not found (its SYSTEM hive was not read). The collection was made on ANALYST-WS, which is not the examined computer.</td>")) -Message "a mounted image whose computer name is not known says so, and names the collector host only as such"
+    Write-TestResult -Succeeded (-not $image.Contains("Timeline report - ANALYST-WS") -and -not $image.Contains("<h1>ANALYST-WS")) -Message "the collector host is not the report's title or page footer"
+    $memoryModel.Collection.ComputerName = "IMAGED-PC"
+    $memoryModel.Collection.ComputerNameSource = "SYSTEM hive"
+    Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath -NoFileHashes
+    $imageNamed = [System.IO.File]::ReadAllText($memoryHtmlPath)
+    Write-TestResult -Succeeded ($imageNamed.Contains("<h1>IMAGED-PC</h1>") -and $imageNamed.Contains("<th>Computer</th><td>IMAGED-PC <span class=""muted small"">(from the image&#39;s SYSTEM hive)</span></td>") -and $imageNamed.Contains("Timeline report - IMAGED-PC")) -Message "a mounted image's computer name from its SYSTEM hive is the title, the key fact (with its source) and the page footer"
+
+    # --- A timeline that ended incomplete (builder exit code 2) ---
+    $memoryModel.Coverage.TimelineCompleteness = [ordered]@{ Incomplete = $true; MissingInputFiles = 2; UnexpectedErrors = 1
+        Lines = @("The timeline is incomplete: 2 input file(s) disappeared while it was built (the builder ended with exit code 2), so rows from them may be missing and a missing event proves even less.",
+            "The builder hit 1 unexpected error(s) and skipped the rest of those steps (exit code 2): the timeline may be incomplete.") }
+    Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath -NoFileHashes
+    $incomplete = [System.IO.File]::ReadAllText($memoryHtmlPath)
+    $coverageStart = $incomplete.IndexOf('id="coverage"')
+    $incompleteAt = $incomplete.IndexOf("<h3>Timeline incomplete</h3>")
+    Write-TestResult -Succeeded ($coverageStart -gt 0 -and $incompleteAt -gt $coverageStart -and $incompleteAt -lt $incomplete.IndexOf("<h3>Integrity leads</h3>") -and
+        $incomplete.Contains("<p><b>The timeline is incomplete: 2 input file(s) disappeared while it was built") -and $incomplete.Contains("<p><b>The builder hit 1 unexpected error(s)")) -Message "an incomplete timeline is the first thing in Evidence coverage and integrity, one paragraph per problem"
 
     # --- PDF with Microsoft Edge ---
     $result = @(ConvertTo-ReportPdf -HtmlPath $fullHtmlPath -PdfPath (Join-Path $fullDir "nope.pdf") -EdgePath (Join-Path $workDir "no-such-folder\msedge.exe"))

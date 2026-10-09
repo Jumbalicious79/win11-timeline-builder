@@ -808,9 +808,11 @@ if ($Browse) {
     # Extracted into this run's work folder once the log is set up (below)
     $InputPath = $selectedZip.FullName
     Write-Host ""
-} elseif ((Test-Path -LiteralPath $InputPath -PathType Leaf) -and [System.IO.Path]::GetExtension($InputPath) -eq ".zip") {
+} elseif ($InputPath -and (Test-Path -LiteralPath $InputPath -PathType Leaf) -and [System.IO.Path]::GetExtension($InputPath) -eq ".zip") {
     # A collection zip passed as -InputPath is extracted like a browse-mode
-    # pick; Find-MemoryDump also looks for the memory dump next to it
+    # pick; Find-MemoryDump also looks for the memory dump next to it.
+    # ($InputPath is empty with -ReportOnly, and Windows PowerShell's
+    # Test-Path prints a binding error for an empty path, hence the check.)
     $script:selectedZipPath = (Resolve-Path -LiteralPath $InputPath).ProviderPath
 }
 
@@ -885,14 +887,23 @@ $script:reportSeverityColors = @{
 }
 
 # What the report says about the collection. collection_info.json gives the
-# computer name and the collector's user (Get-CollectionInfo does not keep
-# them); the builder's own view of the collection (-BuilderInfo, the
-# Get-CollectionInfo object) wins over it. -ReportOnly has no builder view, so
-# the "Collection metadata" line of the original run's log stands in for it.
+# computer name and the collector's user; the builder's own view of the
+# collection (-BuilderInfo, the Get-CollectionInfo object) wins over it.
+# -ReportOnly has no builder view, so the "Collection metadata" line of the
+# original run's log stands in for it.
+# The report names the examined computer. collection_info.json's
+# ComputerName is the computer the collector ran on: the examined one only
+# in a live collection. For a mounted image it becomes CollectorHost, and
+# the examined computer's name is the one the image's SYSTEM hive gave this
+# run (-ExaminedComputerName; -ReportOnly: the engine reads the original
+# run's "Examined computer name (SYSTEM hive)" log line), or none.
 function Get-TimelineReportCollectionInfo {
-    param([string]$InfoJsonPath, $BuilderInfo, [string]$BuilderLogPath)
+    param([string]$InfoJsonPath, $BuilderInfo, [string]$BuilderLogPath, [string]$ExaminedComputerName)
     $info = [ordered]@{
         ComputerName             = ""
+        ComputerNameSource       = ""
+        CollectorHost            = ""
+        ExaminedComputerName     = ""
         CollectorUser            = ""
         Mode                     = ""
         TargetTimeZoneId         = ""
@@ -939,6 +950,23 @@ function Get-TimelineReportCollectionInfo {
             }
             elseif ($line -match '\] Collection made with -IncludeSecrets') { $info.SecretsIncluded = $true }
             elseif ($line -match '\] WARNING: Target time zone unknown -- assuming') { $info.TargetTimeZoneAssumed = $true }
+        }
+    }
+    # The computer: the examined one only for a live collection (or one
+    # whose mode is not recorded, as before)
+    if ($BuilderInfo -and $BuilderInfo.PSObject.Properties["ComputerName"] -and $BuilderInfo.ComputerName) { $info.ComputerName = [string]$BuilderInfo.ComputerName }
+    if ($info.ComputerName) {
+        if (-not $info.Mode -or $info.Mode -eq "Live") { $info.ComputerNameSource = "collection_info.json" }
+        else {
+            $info.CollectorHost = $info.ComputerName
+            $info.ComputerName = ""
+        }
+    }
+    if ($ExaminedComputerName) {
+        $info.ExaminedComputerName = $ExaminedComputerName
+        if (-not $info.ComputerName) {
+            $info.ComputerName = $ExaminedComputerName
+            $info.ComputerNameSource = "SYSTEM hive"
         }
     }
     return [PSCustomObject]$info
@@ -1212,7 +1240,10 @@ function Update-TimelineReportWorkbook {
 
 # Writes findings.csv, report-model.json, report.html and report.pdf next to
 # the timeline. Call it after the workbook is final (the model records its
-# hash). Returns the files and counts, or $null (after a warning).
+# hash). -MissingInputFiles and -UnexpectedErrors: this run's counts (exit
+# code 2: the report says the timeline is incomplete; -ReportOnly finds them
+# in the original run's log). Returns the files and counts, or $null (after
+# a warning).
 function Complete-TimelineReport {
     param(
         $State,
@@ -1224,7 +1255,9 @@ function Complete-TimelineReport {
         [string]$CollectorLogPath,
         [string]$BuilderLogPath,
         [int]$MftDays = -1,
-        [string]$CollectionPath
+        [string]$CollectionPath,
+        [int]$MissingInputFiles = 0,
+        [int]$UnexpectedErrors = 0
     )
     Log ""
     Log "--- Writing Findings Report ---"
@@ -1242,7 +1275,7 @@ function Complete-TimelineReport {
         $model = New-ReportModel -Rows $Rows -Findings $State.Findings -CollectionInfo $CollectionInfo -CollectorLogPath $CollectorLogPath `
             -BuilderLogPath $BuilderLogPath -TimelinePath $timelineFull -WorkbookPath $workbookFull -WorkbookAvailable:$WorkbookAvailable `
             -Rules $State.Rules -RuleStatistics $State.Statistics -FindingsCsvPath $findingsCsv -MftDays $MftDays -CollectionPath $CollectionPath `
-            -WarningVariable modelWarnings -WarningAction SilentlyContinue
+            -MissingInputFiles $MissingInputFiles -UnexpectedErrors $UnexpectedErrors -WarningVariable modelWarnings -WarningAction SilentlyContinue
         foreach ($warning in @($modelWarnings)) { Log-Warning "  $warning" }
         Export-ReportModelJson -Model $model -Path (Join-Path $folder "report-model.json")
         Export-ReportHtml -Model $model -Path $htmlPath
@@ -1253,6 +1286,7 @@ function Complete-TimelineReport {
     }
     Log-Success "  Findings (CSV): $findingsCsv"
     Log-Success "  Report (HTML) : $htmlPath"
+    if ($model.Coverage.TimelineCompleteness.Incomplete) { Log "  The report says that the timeline is incomplete (input files gone or unexpected errors; see its caveats and Evidence coverage)." }
     # A PDF from an earlier run must not sit next to a newer report.html. When
     # it cannot be removed (open in a PDF viewer), the new PDF gets its own
     # name and the old one is reported as out of date.
@@ -1475,61 +1509,86 @@ function Invoke-TimelineViewer {
 
 # =============================================================
 # -ReportOnly: rebuild the findings report from an existing timeline
-# (nothing is parsed; the collection is not needed)
+# (nothing is parsed; the collection is not needed). A function, so that
+# console QuickEdit is off while it runs and the console's mode is put
+# back in its finally block, as in the main body: the rules, the workbook
+# update and the PDF take about half a minute on a large timeline, and a
+# click in the window would pause them. -BoundParameterNames: the
+# script's bound parameters (those that parse are ignored, with a
+# warning). Returns the exit code: 0, or 1 when no report was made.
 # =============================================================
-if ($ReportOnly) {
-    Log "=== Timeline Report Rebuild (-ReportOnly) Started ==="
-    Log "Timeline   : $OutputFile"
-    Log "Rules      : $($script:reportRulesFile)"
-    $boundNames = @($PSBoundParameters.Keys)
-    $ignoredParameters = @(foreach ($name in @("OutputFile", "StartDate", "EndDate", "Sources", "Keywords", "MaxUsnEntries", "MftDays")) { if ($boundNames -contains $name) { "-$name" } })
-    if ($ignoredParameters.Count -gt 0) { Log-Warning "-ReportOnly parses nothing, so these are ignored: $($ignoredParameters -join ', ')" }
-    Log ""
-    if (-not $script:reportScriptsLoaded) {
-        Log-Error "The report scripts in report\ could not be loaded: $($script:reportLoadError)"
-        exit 1
-    }
-    $reportOnlyTimer = [System.Diagnostics.Stopwatch]::StartNew()
-    Log "--- Reading the Timeline ---"
-    try { $reportRows = @(Import-TimelineCsvForReport -Path $OutputFile) }
-    catch {
-        Log-Error "Could not read the timeline: $($_.Exception.Message)"
-        exit 1
-    }
-    Log "  $($reportRows.Count) row(s) read in $([math]::Round($reportOnlyTimer.Elapsed.TotalSeconds, 1)) s."
-    if ($reportRows.Count -eq 0) {
-        Log-Error "The timeline has no rows, so there is nothing to report."
-        exit 1
-    }
-    $reportInfo = Get-TimelineReportCollectionInfo -InfoJsonPath (Join-Path $reportDir "collection_info.json") -BuilderLogPath (Join-Path $reportDir "timeline_builder_log.txt")
-    $reportState = Invoke-TimelineReportRules -Rows $reportRows -RulesPath $script:reportRulesFile -CollectionInfo $reportInfo
-    if (-not $reportState) {
-        Log-Error "No report was made."
-        exit 1
-    }
-
-    $xlsxFile = $OutputFile -replace '\.csv$', '.xlsx'
-    $workbookReady = $false
-    if ($xlsxFile -ne $OutputFile -and (Test-Path -LiteralPath $xlsxFile -PathType Leaf)) {
+function Invoke-TimelineReportOnly {
+    param([string[]]$BoundParameterNames)
+    $consoleMode = Disable-ConsoleQuickEdit
+    try {
+        Log "=== Timeline Report Rebuild (-ReportOnly) Started ==="
+        if ($null -ne $consoleMode) {
+            Log "Console QuickEdit is off for this run, so a click in the window cannot pause it (copy text with the window menu: Edit > Mark)."
+        }
+        Log "Timeline   : $OutputFile"
+        Log "Rules      : $($script:reportRulesFile)"
+        $ignoredParameters = @(foreach ($name in @("OutputFile", "StartDate", "EndDate", "Sources", "Keywords", "MaxUsnEntries", "MftDays", "WorkDir", "MemoryDumpPath")) {
+                if ($BoundParameterNames -contains $name) { "-$name" }
+            })
+        if ($ignoredParameters.Count -gt 0) { Log-Warning "-ReportOnly parses nothing, so these are ignored: $($ignoredParameters -join ', ')" }
         Log ""
-        Log "--- Adding the Findings to the Excel Workbook ---"
-        if ($NoExcel) { Log-Warning "  -NoExcel: the workbook is left as it is, so the report does not link to it. Its Findings sheet and Finding column (if any) are from an earlier report and do not match this report's finding ids." }
-        else { $workbookReady = Update-TimelineReportWorkbook -Path $xlsxFile -Findings $reportState.Findings -RowCount $reportRows.Count }
-    }
-    else {
-        Log "  No workbook next to the timeline: the report gives timeline.csv row numbers."
-    }
+        if (-not $script:reportScriptsLoaded) {
+            Log-Error "The report scripts in report\ could not be loaded: $($script:reportLoadError)"
+            return 1
+        }
+        $reportOnlyTimer = [System.Diagnostics.Stopwatch]::StartNew()
+        Log "--- Reading the Timeline ---"
+        try { $reportRows = @(Import-TimelineCsvForReport -Path $OutputFile) }
+        catch {
+            Log-Error "Could not read the timeline: $($_.Exception.Message)"
+            return 1
+        }
+        Log "  $($reportRows.Count) row(s) read in $([math]::Round($reportOnlyTimer.Elapsed.TotalSeconds, 1)) s."
+        if ($reportRows.Count -eq 0) {
+            Log-Error "The timeline has no rows, so there is nothing to report."
+            return 1
+        }
+        $reportInfo = Get-TimelineReportCollectionInfo -InfoJsonPath (Join-Path $reportDir "collection_info.json") -BuilderLogPath (Join-Path $reportDir "timeline_builder_log.txt")
+        $reportState = Invoke-TimelineReportRules -Rows $reportRows -RulesPath $script:reportRulesFile -CollectionInfo $reportInfo
+        if (-not $reportState) {
+            Log-Error "No report was made."
+            return 1
+        }
 
-    $reportResult = Complete-TimelineReport -State $reportState -Rows $reportRows -TimelinePath $OutputFile -WorkbookPath $xlsxFile `
-        -WorkbookAvailable $workbookReady -CollectionInfo $reportInfo -CollectorLogPath (Join-Path $reportDir "collection_log.txt") `
-        -BuilderLogPath (Join-Path $reportDir "timeline_builder_log.txt")
-    Log ""
-    Log "=== Report rebuild finished in $([math]::Round($reportOnlyTimer.Elapsed.TotalSeconds, 1)) s ==="
-    $reportOpenPath = ""
-    if ($reportResult) { $reportOpenPath = $reportResult.OpenPath }
-    Invoke-TimelineViewer -Choice $Viewer -CsvPath $OutputFile -XlsxPath $xlsxFile -XlsxAvailable (Test-Path -LiteralPath $xlsxFile -PathType Leaf) -ReportPath $reportOpenPath
-    if ($reportResult) { exit 0 }
-    exit 1
+        $xlsxFile = $OutputFile -replace '\.csv$', '.xlsx'
+        $workbookReady = $false
+        if ($xlsxFile -ne $OutputFile -and (Test-Path -LiteralPath $xlsxFile -PathType Leaf)) {
+            Log ""
+            Log "--- Adding the Findings to the Excel Workbook ---"
+            if ($NoExcel) { Log-Warning "  -NoExcel: the workbook is left as it is, so the report does not link to it. Its Findings sheet and Finding column (if any) are from an earlier report and do not match this report's finding ids." }
+            else { $workbookReady = Update-TimelineReportWorkbook -Path $xlsxFile -Findings $reportState.Findings -RowCount $reportRows.Count }
+        }
+        else {
+            Log "  No workbook next to the timeline: the report gives timeline.csv row numbers."
+        }
+
+        # The original run's log says whether that timeline ended incomplete
+        # (exit code 2); the report reads it from there
+        $reportResult = Complete-TimelineReport -State $reportState -Rows $reportRows -TimelinePath $OutputFile -WorkbookPath $xlsxFile `
+            -WorkbookAvailable $workbookReady -CollectionInfo $reportInfo -CollectorLogPath (Join-Path $reportDir "collection_log.txt") `
+            -BuilderLogPath (Join-Path $reportDir "timeline_builder_log.txt")
+        Log ""
+        Log "=== Report rebuild finished in $([math]::Round($reportOnlyTimer.Elapsed.TotalSeconds, 1)) s ==="
+        $reportOpenPath = ""
+        if ($reportResult) { $reportOpenPath = $reportResult.OpenPath }
+        Invoke-TimelineViewer -Choice $Viewer -CsvPath $OutputFile -XlsxPath $xlsxFile -XlsxAvailable (Test-Path -LiteralPath $xlsxFile -PathType Leaf) -ReportPath $reportOpenPath
+        if ($reportResult) { return 0 }
+        return 1
+    }
+    finally {
+        Restore-ConsoleMode $consoleMode
+    }
+}
+
+if ($ReportOnly) {
+    # The exit code is the function's last output
+    $reportOnlyExitCode = @(Invoke-TimelineReportOnly -BoundParameterNames @($PSBoundParameters.Keys)) | Select-Object -Last 1
+    exit ([int]$reportOnlyExitCode)
 }
 
 # =============================================================
@@ -1604,6 +1663,22 @@ if ($tempFolder) {
 
 if (-not (Test-Path -LiteralPath $InputPath)) {
     Log-Error "Input path does not exist: $InputPath"
+    exit 1
+}
+
+# The parsers find the collection's files with -Path, which reads [ ] * ?
+# as wildcards: under a folder whose path has them they find nothing, and
+# the run would end without a timeline (or with an incomplete one) as if
+# the collection were empty. A zip is extracted into the work folder, so
+# that path counts; a collection folder is read where it is.
+$collectionFolderToCheck = if ($script:selectedZipPath) { $script:runWorkDir } else { (Get-LongPath $InputPath) }
+if ([System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters($collectionFolderToCheck)) {
+    if ($script:selectedZipPath) {
+        Log-Error "The work folder's path has [ ], * or ? in it, which PowerShell reads as wildcards, so the collection extracted there could not be read: $($script:runWorkDir). Pass -WorkDir with a folder whose path has none of them."
+    }
+    else {
+        Log-Error "The collection folder's path has [ ], * or ? in it, which PowerShell reads as wildcards, so its files could not be read: $InputPath. Rename the folder (or a folder above it), copy the collection to a path without them, or pass the collection .zip as -InputPath."
+    }
     exit 1
 }
 
@@ -1816,14 +1891,18 @@ function Get-CollectionUser {
 # hive is loaded for it): the machine's names (MachineNames: the SYSTEM
 # hive's computer and host names; the main body adds the computer name of
 # a live collection) and account names by SID (ProfileSids from SOFTWARE
-# ProfileList, BamSids from bam_entries.csv)
+# ProfileList, BamSids from bam_entries.csv). HiveComputerName is the first
+# name read from the SYSTEM hive: the findings report names the examined
+# computer with it (a mounted image's collection_info.json names only the
+# computer the collector ran on).
 $script:timelineUserContext = $null
 function Get-TimelineUserContext {
     if ($null -eq $script:timelineUserContext) {
         $script:timelineUserContext = [PSCustomObject]@{
-            MachineNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-            ProfileSids  = @{}
-            BamSids      = @{}
+            MachineNames     = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+            ProfileSids      = @{}
+            BamSids          = @{}
+            HiveComputerName = ""
         }
     }
     return $script:timelineUserContext
@@ -7801,7 +7880,7 @@ function Parse-Registry {
                 }
                 else {
                     $rowCount = Read-SystemHive -HiveRoot $mount.Root -RawPath $hiveFile.FullName -FallbackTime $hiveTime
-                    Add-TimelineMachineName (Get-OfflineComputerNames $mount.Root)
+                    Add-OfflineMachineNames $mount.Root
                 }
                 Log "  Added $rowCount row(s) from the $hiveName hive."
                 $registryParsed = $true
@@ -13349,7 +13428,7 @@ function Read-CollectionMountedDevices {
             $mount = Mount-TimelineHive -HiveFile $systemHive -Prefix "TEMP_TLUSB"
             if ($mount -and $mount.Root) {
                 # The machine's names for the User column too
-                Add-TimelineMachineName (Get-OfflineComputerNames $mount.Root)
+                Add-OfflineMachineNames $mount.Root
                 $rows = @(Get-OfflineMountedDeviceRows -SystemRoot $mount.Root)
                 if ($rows.Count -gt 0) {
                     $result.Rows = $rows
@@ -15724,6 +15803,22 @@ function Get-OfflineComputerNames {
     return @($names | Where-Object { $_ })
 }
 
+# The examined machine's names from a loaded SYSTEM hive, kept for the User
+# column (Add-TimelineMachineName). The first one (the computer name, else
+# the host name) is also kept for the findings report and logged once:
+# "Examined computer name (SYSTEM hive): <name>" (-ReportOnly reads it back
+# from the log).
+function Add-OfflineMachineNames {
+    param($SystemRoot)
+    $names = @(Get-OfflineComputerNames $SystemRoot)
+    Add-TimelineMachineName $names
+    $context = Get-TimelineUserContext
+    if ($names.Count -gt 0 -and -not $context.HiveComputerName) {
+        $context.HiveComputerName = [string]$names[0]
+        Log "  Examined computer name (SYSTEM hive): $($context.HiveComputerName)"
+    }
+}
+
 # Account names by SID from a loaded SOFTWARE hive's ProfileList, kept for
 # the User column (Add-TimelineSidName). Anything but a registry key gives
 # none; a ProfileList that cannot be read gives a warning, never an error.
@@ -15947,7 +16042,7 @@ function Parse-PowerShellHistory {
             $mount = Mount-TimelineHive -HiveFile $systemHive -Prefix "TEMP_TLSYS"
             if ($mount -and $mount.Root) {
                 # The machine's names for the User column too
-                Add-TimelineMachineName (Get-OfflineComputerNames $mount.Root)
+                Add-OfflineMachineNames $mount.Root
                 $controlSet = Get-OfflineControlSetName $mount.Root
                 if ($controlSet) {
                     Log "  SYSTEM hive current control set: $controlSet"
@@ -18300,7 +18395,8 @@ if ($NoReport) {
     Log "  -NoReport: no findings report (report.html, report.pdf, findings.csv)."
 }
 else {
-    $reportInfo = Get-TimelineReportCollectionInfo -InfoJsonPath (Get-CollectionInfo).InfoJsonPath -BuilderInfo (Get-CollectionInfo)
+    $reportInfo = Get-TimelineReportCollectionInfo -InfoJsonPath (Get-CollectionInfo).InfoJsonPath -BuilderInfo (Get-CollectionInfo) `
+        -ExaminedComputerName (Get-TimelineUserContext).HiveComputerName
     $reportState = Invoke-TimelineReportRules -Rows $sorted -RulesPath $script:reportRulesFile -CollectionInfo $reportInfo
 }
 
@@ -18529,7 +18625,8 @@ if ($reportState) {
     if ($Sources -contains "FileSystem") { $reportMftDays = $MftDays }
     $reportResult = Complete-TimelineReport -State $reportState -Rows $sorted -TimelinePath $OutputFile -WorkbookPath $xlsxFile `
         -WorkbookAvailable ($xlsxGenerated -and $reportState.WorkbookUpdated) -CollectionInfo $reportInfo `
-        -CollectorLogPath $collectionFacts.CollectorLogPath -BuilderLogPath $logFile -MftDays $reportMftDays -CollectionPath $script:selectedZipPath
+        -CollectorLogPath $collectionFacts.CollectorLogPath -BuilderLogPath $logFile -MftDays $reportMftDays -CollectionPath $script:selectedZipPath `
+        -MissingInputFiles $script:missingInputCount -UnexpectedErrors $script:unexpectedErrorCount
 }
 
 # =============================================================
