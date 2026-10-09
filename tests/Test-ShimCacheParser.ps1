@@ -134,7 +134,6 @@ function Invoke-ShimCacheParser {
     $script:collectionManifest = $null
     $script:manifestTimes = $null
     $script:shortenedNames = @{}
-    $script:artifactStats = @{}
     $script:logFile = Join-Path $testRoot "$Name.log"
     $script:timelineEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
     Parse-PowerShellHistory 6>$null | Out-Null
