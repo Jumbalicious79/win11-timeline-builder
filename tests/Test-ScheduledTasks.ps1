@@ -120,6 +120,8 @@ function Invoke-ScheduledTasksParser {
     $script:collectionManifest = $null
     $script:manifestTimes = $null
     $script:shortenedNames = @{}
+    # The builder looks up the collection's Secrets\ folder once per run
+    $script:secretsRoot = $null
     $script:logFile = Join-Path $testRoot ("parser-" + [guid]::NewGuid().ToString("N") + ".log")
     $script:timelineEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
     $script:taskCacheRegistered = $CacheTimes
