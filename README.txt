@@ -290,6 +290,12 @@ The script creates a timestamped report folder next to the script:
   share (\\server\share) or a mapped network drive is not used, and with
   such a -WorkDir the run stops at the start.
 
+  Copied email attachments (Email\<user>\Outlook\SecureTemp\ and
+  Email\<user>\NewOutlook\Attachments\) stay in the zip: no parser reads
+  them (their rows come from the manifest and the email listings), and
+  antivirus on this machine may quarantine them. The log gives their
+  number.
+
   Why not %TEMP%: Windows Storage Sense deletes files older than 7 days from
   temp folders when disk space runs low, and extracted files keep the dates
   stored in the zip, which are often months old. This once deleted setupapi
@@ -306,12 +312,14 @@ The script creates a timestamped report folder next to the script:
 
   Missing input files. Every input file is recorded when the run starts:
   each file extracted from the zip, or, for a collection folder, each file
-  listed in collection_manifest.csv that is present (memory dumps
-  excepted). Files that disappear right after the extraction (e.g.
-  antivirus) stop the run. After the parsers have run, all of them must
-  still be there; files that disappeared are listed by collection folder
-  (USB\, Browser\, ...; the console shows 20 names per folder, the log file
-  all of them), and the run ends with
+  listed in collection_manifest.csv that is present (memory dumps and
+  copied email attachments excepted: the attachments are not read, so
+  antivirus removing one does not make the timeline incomplete). Files
+  that disappear right after the extraction (e.g. antivirus) stop the
+  run. After the parsers have run, all of them must still be there; files
+  that disappeared are listed by collection folder (USB\, Browser\, ...;
+  the console shows 20 names per folder, the log file all of them), and
+  the run ends with
 
     === Timeline Builder Completed WITH N MISSING INPUT FILE(S) -- timeline incomplete ===
 
@@ -1066,7 +1074,8 @@ Not parsed: OST/PST contents (deferred), the new Outlook's and Windows
 Mail's mail stores (listed only), and other listed files (WebView data,
 .msf summaries, logs). The attachment copies can have any name, so no other
 parser reads them: an attached .lnk, .evtx or $MFT is not this system's
-shortcut, event log or MFT.
+shortcut, event log or MFT. They are not extracted from a collection zip
+(see "Work folder").
 
 ### Collections made with the collector's -IncludeSecrets switch
 A collection made with -IncludeSecrets holds two things this builder treats
@@ -1294,8 +1303,10 @@ Timeline Explorer at the same time.
     usually by a cleanup tool or antivirus; the log lists them. Rows from
     them may be missing (a browser store also logs "sqlite3 query skipped,
     input file missing"); a file deleted after its parser read it is listed
-    too, although its rows are there. Build the timeline again from the
-    zip, or from a copy of the collection outside any temp folder.
+    too, although its rows are there. Copied email attachments are not
+    input files (no parser reads them), so antivirus quarantining one does
+    not cause this. Build the timeline again from the zip, or from a copy
+    of the collection outside any temp folder.
 
   - "Completed WITH N UNEXPECTED ERROR(S) -- timeline may be incomplete"
     (exit code 2) -- The log has an "Unexpected error at line N (rest of
@@ -1708,19 +1719,21 @@ parsing is skipped, and the timeline CSV can be opened manually.
 
   tests\Test-ZipInput.ps1 -- Part 1 loads the builder's functions and checks
   the zip extraction ("/" and "\" entry names, entry dates kept, over-long
-  names shortened, no ".." entry written outside the folder, nothing
-  extracted when the zip does not fit), the manifest lookups, the list of
-  input files, the free-space and temp-folder checks, the refusal of a
-  network work folder, the clean-up of work folders left by killed runs,
-  the SRUM database copy (made in the work folder; a missing transaction
-  log reported) and the end-of-run banners; it needs no admin. Part 2
-  runs the builder on a synthetic collection zip dated 2025 with two
-  setupapi logs: both must be parsed, the free space must be checked, the
-  work folder must be outside %TEMP% and removed afterwards, and an input
-  file deleted during the run (by a test hook) must give exit code 2 and
-  the MISSING INPUT FILE(S) banner. Part 2 needs admin like the builder
-  (or -BuilderPath with a copy without the admin check); it changes
-  nothing on the system.
+  names shortened, no ".." entry written outside the folder, copied email
+  attachments left in the zip, nothing extracted when the zip does not
+  fit), the manifest lookups, the list of input files, the free-space and
+  temp-folder checks, the refusal of a network work folder, the clean-up
+  of work folders left by killed runs, the SRUM database copy (made in the
+  work folder; a missing transaction log reported) and the end-of-run
+  banners; it needs no admin. Part 2 runs the builder on a synthetic
+  collection zip dated 2025 with two setupapi logs: both must be parsed,
+  the free space must be checked, the work folder must be outside %TEMP%
+  and removed afterwards, and an input file deleted during the run (by a
+  test hook) must give exit code 2 and the MISSING INPUT FILE(S) banner.
+  A zip with a copied email attachment must give exit code 0 and the
+  attachment's rows without extracting it. Part 2 needs admin like the
+  builder (or -BuilderPath with a copy without the admin check); it
+  changes nothing on the system.
 
   tests\Test-MountedDevices.ps1 -- loads the builder's functions and checks
   the MountedDevices decoder (GPT, MBR, device paths, unrecognized values),
@@ -1871,7 +1884,8 @@ One-time actions (first run only):
 
 Temporary actions (all cleaned up automatically, also after an error or Ctrl+C):
   - Extracts a collection zip (browse mode, or a .zip as -InputPath) into the
-    work folder, with the dates stored in the zip -- deleted after processing
+    work folder, with the dates stored in the zip, except copied email
+    attachments -- deleted after processing
   - Copies registry hives (NTUSER.DAT, UsrClass.dat, SOFTWARE, SYSTEM,
     Amcache.hve) into the work folder for reg load -- unloaded and deleted
     after processing (a hive a parser left loaded is unloaded at the end)
