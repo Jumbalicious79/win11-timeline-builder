@@ -448,9 +448,9 @@ Both timeline.csv and timeline.xlsx contain the same columns:
   PowerShellHistory and SRUM, and the SYSTEM hive's names by Registry and
   PowerShellHistory (and by USB when it reads MountedDevices from the
   hive). SRUM names its rows' SIDs the same way. All of them are in the
-  default -Sources. A run with
-  only some sources (for example -Sources EventLogs) can leave SIDs, and
-  for a mounted image HOST\ prefixes, as they are.
+  default -Sources. A run with only some sources (for example -Sources
+  EventLogs) can leave SIDs, and for a mounted image HOST\ prefixes, as
+  they are.
 
 ### Duplicates
 
