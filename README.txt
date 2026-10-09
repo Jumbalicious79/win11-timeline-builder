@@ -168,11 +168,11 @@ themselves are never committed.
   -StartDate      Only include events after this date (UTC).
   -EndDate        Only include events before this date (UTC).
   -Sources        Parsers to run, as an array or a comma-separated string.
-                  Defaults to all 16 (Memory excluded).
+                  Defaults to all 18 (Memory excluded).
                   Valid: EventLogs, Prefetch, RecentFiles, Registry, FileSystem,
                   Browser, ScheduledTasks, Services, Network, USB, Persistence,
                   UsnJournal, Amcache, PowerShellHistory, SystemInfo,
-                  AntiVirus, Memory
+                  AntiVirus, Email, SRUM, Memory
                   Note: Memory is opt-in. Requires Volatility 3 in tools\ and
                   a memory dump in or next to the collection, or
                   -MemoryDumpPath (see parser #15). Adds 5-30 minutes.
@@ -271,14 +271,16 @@ The script creates a timestamped report folder next to the script:
 
 ### Work folder
 
-  A collection zip is extracted, and hives and browser databases are copied
-  for reading, into a work folder that exists only while the builder runs:
+  A collection zip is extracted, and hives, browser databases and SRUM
+  databases are copied for reading, into a work folder that exists only
+  while the builder runs:
 
     %LOCALAPPDATA%\TimelineBuilder\w<PID>_<HHmmss>\
       .lock                          -- held open for the whole run
       in\                            -- the extracted collection zip
-      scratch\                       -- copies for reg load and sqlite3,
-                                        Volatility 3 output
+      scratch\                       -- copies for reg load, sqlite3 and
+                                        the SRUM reader, Volatility 3
+                                        output
 
   It is deleted at the end of every run, also after an error or Ctrl+C. A
   folder left by a run that was killed (window closed, crash) is deleted by
@@ -370,6 +372,12 @@ Both timeline.csv and timeline.xlsx contain the same columns:
     the examined system's zone for setupapi). Collections from older
     collector versions have no collection_info.json; the time zone is then
     read from collection_log.txt.
+  - Email attachments, OST/PST files and Thunderbird mail folders: the
+    original file times the collector recorded (manifest and listing CSVs);
+    Thunderbird messages: the Date header (the sender's clock)
+  - SRUM: the last hourly SRUM record of each UTC day
+  - Defender DetectionHistory and quarantine entries: the times stored in
+    the files
   - Memory dump (Volatility 3): process creation and connection times kept
     in memory; rows without one get the capture time (the SystemTime in the
     header of a 64-bit crash dump, else the dump file's last-write time; see
@@ -379,26 +387,27 @@ Both timeline.csv and timeline.xlsx contain the same columns:
 
   Some artifacts describe the state of the system when it was collected, not
   an event: the service and driver list, DNS and ARP cache, current TCP
-  connections, shares, Wi-Fi profiles, loaded DLLs, the drive letters and
-  volumes in MountedDevices, and scheduled tasks, services or run keys that
-  have no usable time of their own. These rows have EventType "Snapshot"
-  and the collection time as their Timestamp. The memory dump is read the
-  same way: services and process command lines found in memory, and
-  processes or connections without a valid time of their own, are Snapshot
-  rows at the time the memory was captured (parser #15). A few context
-  rows are Snapshot rows at a time of their own: a security product
-  reported ON to Security Center (event time), the Outlook attachment
-  folder and the triage collector's own Defender exclusion (registry key
-  last-write time). Snapshot rows are colored light gray in Excel. Filter
-  them out (EventType <> Snapshot) to see only real events.
+  connections, shares, Wi-Fi profiles, loaded DLLs, browser settings, email
+  accounts, the drive letters and volumes in MountedDevices, and scheduled
+  tasks, services, run keys or browser extensions that have no usable time
+  of their own. These rows have EventType "Snapshot" and the collection
+  time as their Timestamp. The memory dump is read the same way: services
+  and process command lines found in memory, and processes or connections
+  without a valid time of their own, are Snapshot rows at the time the
+  memory was captured (parser #15). A few context rows are Snapshot rows at
+  a time of their own: a security product reported ON to Security Center
+  (event time), the Outlook attachment folder and the triage collector's
+  own Defender exclusion (registry key last-write time). Snapshot rows are
+  colored light gray in Excel. Filter them out (EventType <> Snapshot) to
+  see only real events.
 
 ### User column
 
   The user is taken from the collection's own folder layout: Registry\<user>\,
-  UserActivity\<user>\, Browser\<user>\ or a Users\<user>\ folder inside the
-  collection. It is never taken from the analysis machine's path (for
-  example the work folder a zip is extracted to). Rows that do
-  not belong to a specific profile have an empty User.
+  UserActivity\<user>\, Browser\<user>\, Email\<user>\ or a Users\<user>\
+  folder inside the collection. It is never taken from the analysis
+  machine's path (for example the work folder a zip is extracted to). Rows
+  that do not belong to a specific profile have an empty User.
 
 ### Duplicates
 
@@ -436,7 +445,7 @@ Both timeline.csv and timeline.xlsx contain the same columns:
      -StartDate, -EndDate, -Sources or -MaxUsnEntries.
 
 
-## What Each Parser Extracts (17 Parsers)
+## What Each Parser Extracts (19 Parsers)
 
 ### 1. Event Logs
 Parses .evtx files using Get-WinEvent. Targets high-value forensic events
@@ -458,6 +467,9 @@ Parses .evtx files using Get-WinEvent. Targets high-value forensic events
     PersistenceChange); scheduled task registered, updated, deleted,
     enabled or disabled (4698/4702/4699/4700/4701, ScheduledTaskChange,
     with Command, Arguments and RunAs from the task XML)
+  - Security 4624 Details: LogonType, Source (address:port), LogonID,
+    IpAddress, WorkstationName, AuthenticationPackageName, LmPackageName
+    and KeyLength; LmPackageName "NTLM V1" is an NTLMv1 logon
   - System: Service crashes (7034), state changes (7036), start type changes
     (7040, with the service name), new service installs (7045), shutdowns
     (1074/6008), event log cleared (104, SecurityAlert, with the log name
@@ -501,6 +513,67 @@ Parses .evtx files using Get-WinEvent. Targets high-value forensic events
   - Defender support logs (MPLog-*.log): detections and remediations,
     exclusion lists and exclusion/protection-setting changes
     (EventType SecurityAlert; MPLog times are UTC)
+  - Defender DetectionHistory files and quarantine entries are read by the
+    Antivirus parser (#17), not here
+  - Windows PowerShell (classic log, EventType Execution): engine started
+    (400) with HostApplication (the command line that started PowerShell,
+    kept whole, cut to 1000 characters), EngineVersion, HostId and
+    RunspaceId, and for -EncodedCommand (-enc, -e, ...) the decoded script
+    in EncodedCommand; a 2.0 engine reads "PowerShell 2.0 engine started
+    (possible downgrade)". Engine stopped (403) is folded into its 400 as
+    Stopped. Pipeline details (800): one row per session, "PowerShell
+    pipeline executed: <first command line>", with CommandLines, Commands,
+    Count and LastSeen (a 2.0 engine: one row per pipeline). Without module
+    logging Windows writes 800 only for Add-Type, and these often outlive
+    the PowerShell/Operational log
+  - WMI-Activity: permanent event subscriptions (5861, PersistenceChange,
+    "WMI permanent event subscription: filter "<name>" -> <consumer>") with
+    the filter's query, the consumer and what it runs (CommandLineTemplate,
+    ExecutablePath, ScriptText, ...), FilterCreatorSID and
+    ConsumerCreatorSID (User: the consumer's creator); temporary
+    subscriptions (5860, Execution) with the query, user and process. 5861
+    is written again at every WMI service start, so repeats are folded into
+    the first row (Count, LastSeen); Windows' own "SCM Event Log"
+    subscription is marked "(Windows default)"; 5857-5859 are only counted
+  - TerminalServices-RDPClient (NetworkConnection): outbound RDP
+    connections from this machine, "Outbound RDP connection to <server>:
+    ..." -- connecting and connected (1024/1025), multi-transport (1102),
+    domain and session (1027), user name hash (1029), credentials not
+    accepted (1009) and disconnected with the reason (1026, e.g. 2055 login
+    failed). The server is found through the connection's ActivityID
+  - NTLM Operational (only when NTLM auditing is on): outgoing NTLM
+    authentication (8001, 4020/4021; NetworkConnection), incoming (8002,
+    8003, 4022/4023; Logon), authentication passed to or processed by a
+    domain controller (8004-8006, 4030-4033; Logon), a failed NTLMv1
+    attempt (4013) and use of NTLMv1-derived credentials (4024). The 40xx
+    events (Windows 11 24H2 / Server 2025) give NtlmVersion; NTLMv1 rows
+    say "(NTLMv1" in the Description
+  - Windows Firewall: rule added, modified or deleted (2004-2006 on older
+    Windows 10; 2071/2097, 2073/2099 and 2052 later; PersistenceChange,
+    with RuleName, ApplicationPath, Direction, Action, Protocol, ports,
+    RemoteAddresses, Profiles, Origin, ModifyingApplication and
+    ModifyingUser); all rules deleted (2033/2059), reset to defaults
+    (2032/2060) and profile or global setting changes (2003/2082,
+    2002/2083, e.g. "Enable firewall = No") are SecurityAlert. A change
+    that failed reads "... failed (error N)". Only counted: changes to a
+    rule that does not exist (ErrorCode 2), the Store app rules of the
+    firewall service (NT SERVICE\mpssvc) and app-package (MSIX) rules that
+    svchost.exe adds and removes as SYSTEM
+  - Shell-Core (Execution): commands Explorer starts at logon (9707 with
+    its 9708, placed by the 9705/9706 key and 62170/62171 task markers):
+    "Run key command started at logon", "RunOnce key command started at
+    logon", "Active Setup command started at logon" or "Command started at
+    logon (key unknown)", with Command, ProcessId, RegistryKey and Finished.
+    Windows logs neither the hive (HKLM or HKCU) nor the folder of the
+    command, only the part after its last backslash
+  - OAlerts (Execution): alerts shown by Office applications (300, "Office
+    alert (<application>): <text>", with the document) and Office add-in
+    events ("Office add-in event (<what>): <add-in>")
+  - Antivirus products' own event logs collected under AntiVirus\
+    (Symantec_SEP_EventLog.evtx, CrowdStrike_EventLog.evtx): every event
+    goes through the same filter and wording as the antivirus events of the
+    Application log (SecurityAlert, Artifact AntiVirus; read with -Sources
+    EventLogs)
 
 ### 2. Prefetch
 Extracts execution evidence from the .pf files:
@@ -646,14 +719,87 @@ state. Sources are "<Browser> <store>", for example "Edge History",
   - Firefox site permissions ("Firefox Permissions", permissions.sqlite):
     notifications, camera, microphone, location, pop-ups, add-on installs
     and more, with the value set (ALLOW, DENY, PROMPT) and when
+  - Extensions ("<Browser> Extensions", "Firefox Extensions"; EventType
+    Installation): "Browser extension installed: <name> (<id>)" and, when
+    at least a minute later, "Browser extension updated: <name> (<id>)".
+    Chromium: extensions.settings in Secure Preferences and Preferences,
+    name and version from the manifest stored there or the collected
+    manifest.json ("__MSG_" names resolved). Details: ID, Name, Version,
+    Location (Internal, ExternalPref, ExternalRegistry, Unpacked,
+    ExternalPolicy, ...), State, DisableReasons (Chromium's names, e.g.
+    USER_ACTION, EXTERNAL_EXTENSION), FromWebstore, InstalledByDefault,
+    Path (unpacked and command-line extensions), UpdateURL, Overrides
+    (homepage, search_provider, startup_pages, newtab, ...), Permissions,
+    HostPermissions, InstallTimeUtc, UpdateTimeUtc. An extension with no
+    install time gets a Snapshot row "Browser extension present: ...".
+    Firefox (extensions.json; names also from addons.json): ID, Name,
+    Version, Type, Location, Active, UserDisabled, SignedState, SourceURI,
+    ForeignInstall (sideloaded), InstallSource, Hidden, Permissions,
+    HostPermissions. Add-ons that are part of the browser (Chromium
+    component extensions, Firefox built-in and system add-ons) are only
+    counted in the log
+  - Settings ("<Browser> Preferences", "<Browser> Local State", "Firefox
+    Preferences"; Snapshot rows at the collection time): "Browser setting:
+    <Setting> = <Value>" (Details: Setting, Value, Pref, Profile) for
+    Proxy (also one set by an extension: SetByExtension), Download
+    directory, Startup, Homepage, Default search engine (Chromium), Clear
+    data on exit (Firefox: Cleared and Kept items; also cookies kept for the
+    session only), History disabled, Private browsing always on, and
+    Experimental flags (Local State)
+  - Sessions ("<Browser> Sessions", "Firefox Sessions"; NetworkConnection).
+    Chromium Session_* / Tabs_*: "Browser visit in session tab: <title>"
+    or "Browser visit in closed tab: <title>" for each page in a tab's
+    back/forward list at its visit time, and "Browser closed tab: <title>"
+    at the tab's close time. Details: URL, Title, Transition, Referrer,
+    Current=Yes (the page the tab showed), InHistory (No: the profile's
+    live History has no visit to the URL within a minute -- only the
+    session file still holds it), ClosedUtc, ClosedWindow, Reopened.
+    Firefox (sessionstore.jsonlz4 and its backups): "Browser session tab:
+    <title>" for an open tab at its last access time and "Browser closed
+    tab: <title>" for recently closed tabs and the tabs of closed windows
+    (Firefox keeps no time per page). New-tab and blank pages are left out
+  - History snapshots ("<Browser> History Snapshot"): visits in a
+    Snapshots\<version>\<profile>\History copy (made before an update) that
+    are not in the live History: "Browser visit only in history snapshot:
+    <title>". Details: Snapshot (the browser version), SnapshotTakenUtc,
+    LiveHistoryModifiedUtc and Reason: Deleted (within the 90 days Chromium
+    keeps, so it did not expire), Expired or deleted, or No live History.
+    The visit was removed between those two times. Chromium's own "Clear
+    browsing data" also deletes the snapshots of the range it clears, so
+    such a visit was removed some other way (history page, extension, sync,
+    database edited outside the browser) or expired
+  - Favicons ("<Browser> Favicons"): "Browser favicon for page not in
+    history: <URL>" for an http(s) page whose icon mapping is in Favicons
+    but that is in neither the live History nor the bookmarks. A lead, not
+    proof of a deletion: Chromium removes a page's icon mappings itself
+    when it deletes or expires its history. The row time is when the icon
+    was last stored (IconUpdatedUtc), not a visit: one icon often serves
+    many pages of a site (PagesSharingIcon). Icons fetched without a visit
+    (new-tab tiles) are left out; nothing when the profile's History was
+    not collected; the newest 5,000 pages per file
   - User from the collection folder (Browser\<user>\)
-Downloads are FileAccess rows (a download writes a file to disk); all other
-browser rows are NetworkConnection (Top Sites: Snapshot).
+Downloads are FileAccess rows (a download writes a file to disk); extension
+installs and updates are Installation; settings, Top Sites and extensions
+without an install time are Snapshot; all other browser rows are
+NetworkConnection.
 The credential, cookie and form stores are read as metadata only: saved
 passwords, cookie values, autofill and form values, payment cards,
 addresses and Firefox's encrypted user names and passwords are never read
 (the queries never select them, and in logins.json they are blanked before
-parsing). key4.db is never opened.
+parsing). key4.db is never opened. The same holds for the newer files: in
+Preferences, Secure Preferences and Local State the members os_crypt,
+password_hash_data_list, protection, account_info, gaia_cookie, the
+per-site content settings, keystore_encryption_key_state and every member
+whose name contains encrypted_key, _encrypted_data, token or _salt are
+blanked before the JSON is parsed; Firefox session cookies, form data,
+session storage, POST data, typed text and page state likewise; Chromium
+session page state is skipped unread; and Firefox prefs named like a secret
+(token, secret, password, userAgentID) are not read.
+
+This blanking happens before the file is parsed, so it holds even when the
+collection was made with the collector's -IncludeSecrets switch, which copies
+these browser files UNREDACTED (see below): no secret value reaches the
+timeline. The members blanked here cover every member the collector blanks.
 
 ### 6. Scheduled Tasks
 Parses scheduled_tasks.csv from the triage collection (live collections):
@@ -860,7 +1006,7 @@ Parses systeminfo.txt and the firewall rule list:
   - One Snapshot row with OS name, version, build, system type and domain
   - Enabled inbound Allow firewall rules (Snapshot rows)
 
-### 17. Antivirus Logs (third-party)
+### 17. Antivirus Logs
 Parses the third-party AV logs the collector copies to AntiVirus\<vendor>\
 into SecurityAlert rows (detections, blocks, quarantines, failures; routine
 scan/update lines are skipped):
@@ -875,6 +1021,139 @@ Built and tested against public sample logs from the plaso project
 (CrowdStrike, SentinelOne, Carbon Black, Kaspersky, Malwarebytes, ...) are
 collected but not parsed: no public sample logs, and several keep their
 detections in the vendor's cloud console rather than in local logs.
+Also reads Microsoft Defender's own detection files (the collector copies
+them to AntiVirus\Defender\; any DetectionHistory folder, and any Entries
+folder inside a Quarantine folder, is read; files over 1 MB are not):
+  - DetectionHistory (Source Defender-DetectionHistory, SecurityAlert): one
+    row per detection, "Defender detection (DetectionHistory): <threat> on
+    <path>", at the initial detection time. The path is the detected file,
+    else the container or web download, else the file a behavior detection
+    names, else the registry key, run key, startup item, service or task;
+    without one there is no "on <path>". Details: ThreatName, ThreatID,
+    Severity, CategoryID, Status, Path, Resources, User, Process, SHA256,
+    StatusChangeUtc, RemediationUtc, DetectionID
+  - Quarantine entries (Source Defender-Quarantine, SecurityAlert): one row
+    per quarantined file or registry item, "Defender quarantined: <path>
+    (<threat>)", at the quarantine time. Details: ThreatName, ThreatID,
+    Path, ResourceType and, when the entry has them, PhysicalPath (only if
+    it differs from Path), ResourceID, FileSize, FileCreatedUtc and
+    FileModifiedUtc. The entries are RC4-encrypted with a static key
+    published by security researchers; only these metadata files are
+    decrypted, never the quarantined files (Quarantine\ResourceData)
+  - A time missing from a file, or before 1980 (damaged), is replaced by
+    the next one available, ending with the file's original creation time
+    from the collection manifest; TimeNote in Details says which
+One detection can also appear as an event log row (1116/1117), a
+defender_detections.csv row and an MPLog row. The Source column tells them
+apart; DetectionID (event log, CSV, DetectionHistory) and ThreatID (CSV,
+DetectionHistory, quarantine) link them.
+
+### 18. Email
+Parses what the triage collector's Email category writes (Email\<user>\;
+User is that <user> folder; Artifact Email):
+  - Attachments ("Email-Attachments", FileAccess): "Outlook attachment in
+    temp folder: <name>" (classic Outlook, Content.Outlook), "New Outlook
+    attachment file: <name>" (Olk\Attachments) or "Windows Mail attachment
+    in mail store: <name>", at the file's created time, and "... modified:
+    <name>" at its modified time when that is at least a second later.
+    Details: Program, Origin, Folder, Size, SHA256 (copied files),
+    Collected, Status (why a file was not copied) and the created, modified
+    and accessed times. Origin: "Opened from a message" (classic Outlook),
+    "Opened, sent or received (not proof of opening)" (new Outlook) or
+    "Stored with a message (not proof of opening)" (Windows Mail). Copied
+    files are timed with the original file times in the manifest
+  - Data files ("Email-DataFiles", FileAccess): OST/PST files ("Outlook
+    data file created: <name>" / "Outlook data file last modified: <name>";
+    an OST's last modified time is roughly its last sync) and the Windows
+    Mail databases (HxStore.hxd, store.vol: "Windows Mail store file
+    created / last modified"). Details: Program, Type, Path, Size, times
+  - Thunderbird mail folders ("Email-MailFolders", FileAccess):
+    "Thunderbird mail folder created / last modified: <account>/<folder>"
+    and "Thunderbird message filter rules created / last modified:
+    <account>" (a change can mean a new forwarding or delete rule).
+    Details: Profile, Account, Storage (Mail = POP3 and Local Folders,
+    ImapMail = IMAP), Folder, Path
+  - Accounts ("Email-Accounts", Snapshot rows at the collection time): "New
+    Outlook account: <address>" (UserSettings.json) and "Thunderbird
+    account: <address> (<TYPE> <host>)" (prefs.js; Details: ServerType,
+    Host, Port, UserName, Security, AuthMethod, Email, SmtpHost, SmtpUser).
+    Saved passwords and tokens are never read
+  - Messages ("Email-Messages", NetworkConnection): Thunderbird's search
+    index (global-messages-db.sqlite; in a collection only when the
+    collector ran with -IncludeThunderbirdIndex): "Email (Thunderbird):
+    <subject>" at the message's Date header, the newest 20,000 per index.
+    Details: From, To, Cc, Bcc (the addresses Thunderbird stores per
+    message), Attachments (names), Folder, FolderURI, MessageID, Deleted,
+    TimeSource. Read with sqlite3.exe (3.38 or later for the addresses);
+    the message text is never selected
+Not parsed: OST/PST contents (deferred), the new Outlook's and Windows
+Mail's mail stores (listed only), and other listed files (WebView data,
+.msf summaries, logs). The attachment copies can have any name, so no other
+parser reads them: an attached .lnk, .evtx or $MFT is not this system's
+shortcut, event log or MFT.
+
+### Collections made with the collector's -IncludeSecrets switch
+A collection made with -IncludeSecrets holds two things this builder treats
+specially (collection_info.json records SecretsIncluded: true, and the builder
+logs one line about it at the start):
+  - A top-level Secrets\ folder with DPAPI credential material (per-user and
+    system master keys, Credentials, Vault). No parser ever reads anything
+    there: the Secrets\ exclusion is applied at the Find-ArtifactFiles choke
+    point (so all of its callers skip it), on every other recursive search
+    that walks the whole collection -- the $MFT search, the ScheduledTasks_XML
+    folders, the SRUDB.dat search and the AntiVirus vendor / Defender folders
+    -- and on the setupapi logs whose names were shortened on extraction.
+    A $MFT, Preferences, Task XML, SRUDB.dat or antivirus file left in Secrets\
+    is not parsed. Only the collection's own top-level Secrets\ folder (next to
+    collection_info.json) is excluded, so a user profile folder named "Secrets"
+    is unaffected. Nothing from Secrets\ reaches the timeline, and no row has a
+    RawPath under it.
+  - UNREDACTED browser settings and session files (the collector did not blank
+    them). The builder blanks the secret members itself, before the JSON is
+    parsed (see "Browser" above), so no key, token, salt, password hash,
+    cookie, form value or page state reaches the timeline either way. The
+    builder's blank set covers every member the collector would have blanked.
+collection_info.json also carries ThunderbirdIndexIncluded. Both fields are
+additive (SchemaVersion stays 1); collections from older collectors lack them
+and are treated as false.
+
+### 19. SRUM (System Resource Usage Monitor)
+Parses Execution\SRUM\SRUDB.dat, the ESE database in which Windows records,
+about once an hour, the network bytes and CPU/disk use of each application
+per user (usually the last 30-60 days). Read with the Windows ESE engine
+(esent.dll) through a small C# reader compiled at run time; no third-party
+tools. Artifact SRUM:
+  - "SRUM network usage: <app> sent 120.4 MB, received 3.2 MB" (Source
+    SRUM-Network, NetworkConnection): one row per application, user and UTC
+    day from the Network Data Usage table
+  - "SRUM app activity: <app>" (Source SRUM-AppUsage, Execution): one row
+    per application, user and UTC day from the Application Resource Usage
+    table
+  - The row time is the day's last SRUM record. The app is shown as SRUM
+    stores it (a \device\harddiskvolumeN\... path, a packaged app or a
+    service name). User is the account name when the collection gives one
+    (well-known SIDs, bam_entries.csv, the SOFTWARE hive's ProfileList),
+    otherwise the SID
+  - Details: Day, App, AppId, UserSid; BytesSent and BytesRecvd (network)
+    or ForegroundCycleTime, BackgroundCycleTime, FaceTime, the foreground
+    and background bytes read and written, BytesRead and BytesWritten
+    (app); Records, FirstRecordUtc, LastRecordUtc, Interfaces (Wi-Fi,
+    Ethernet, ...), L2ProfileIds (not resolved to network names), and
+    Database=... and Partial=yes when they apply
+  - The database is read from a scratch copy in the work folder (see "Work
+    folder"); the collection is never changed. A transaction log listed in
+    collection_manifest.csv but no longer in the collection is reported
+    ("Transaction log missing: ..."). A copy of an open database is
+    normally in "dirty shutdown" state: the collected logs are replayed
+    into the copy in the builder's own process ("Database=soft recovery
+    (in-process)"); if that fails, with esentutl /r, then by repairing the
+    copy with esentutl /p ("Database=repair (esentutl /p)"), which can lose
+    the newest records. A damaged page stops the reading of a table; its
+    rows then carry "Partial=yes (read error; later records of this table
+    are missing)"
+  - Not parsed: the Network Connectivity, energy and push-notification
+    tables. SRUM keeps hourly totals per application, not connections: a
+    row says how much an app sent and received that day, not where to
 
 
 ## Viewing the Timeline
@@ -1008,6 +1287,16 @@ Timeline Explorer at the same time.
 
 ## Known Limitations and Expected Warnings
 
+  - Secrets are never decrypted. The builder reads credential, cookie and
+    form stores as metadata only and blanks secret members before parsing
+    (see "Browser"); it never decrypts saved passwords or cookies and never
+    reads the Secrets\ folder of a collection made with the collector's
+    -IncludeSecrets switch. Decrypting those is a separate, offline step with
+    other tools (the collector's README explains what is needed). In
+    particular, Chrome/Edge App-Bound Encryption can only be undone on the
+    live machine, so App-Bound-protected passwords and cookies cannot be
+    recovered from a collection at all; this builder does not attempt it.
+
   - USN journal size -- All USN rows are kept by default. On a very busy
     system the timeline can exceed Excel's row limit (see above); use
     -MaxUsnEntries N to keep only the newest N rows. The log says how many
@@ -1019,10 +1308,11 @@ Timeline Explorer at the same time.
     with them often hit this warning and Amcache parsing is skipped.
     Re-collect with the current collector to get the logs.
 
-  - "Transaction log missing: ..." -- A hive's .LOG1/.LOG2 file is listed
-    in collection_manifest.csv but is not in the collection any more. The
-    hive is loaded without it, so changes Windows had not yet written into
-    the hive file are missing.
+  - "Transaction log missing: ..." -- A hive's .LOG1/.LOG2 file, or a SRUM
+    database's SRU*.log file, is listed in collection_manifest.csv but is
+    not in the collection any more. The hive or database is read without
+    it, so changes Windows had not yet written into the hive or database
+    file are missing.
 
   - "Completed WITH N MISSING INPUT FILE(S) -- timeline incomplete" (exit
     code 2) -- Input files were deleted while the timeline was being built,
@@ -1077,6 +1367,34 @@ Timeline Explorer at the same time.
     database has. A Chromium store too old to have the key columns (e.g. a
     History downloads table without target_path, an autofill table without
     date_created) is skipped with "0 row(s) added" in the log.
+
+  - SRUM: "Soft recovery in this process failed: ... -- trying esentutl /r"
+    and "Repair was needed: ..." -- the database was collected without its
+    logs, or with logs from another moment. A repair can lose the newest
+    records; those rows say "Database=repair (esentutl /p)". esentutl
+    writes ESENT events to the Application event log of the machine
+    running the builder (see "What It Modifies"): build timelines on an
+    analysis machine, not on the system under investigation.
+
+  - "SRUM <table>: read error after N record(s): ..." -- a damaged page in
+    the SRUM database; that table's rows carry Partial=yes and lack the
+    later records.
+
+  - Defender DetectionHistory and quarantine entries do not last: Defender
+    deletes DetectionHistory files after ScanPurgeItemsAfterDelay days (15
+    by default), and a quarantine entry goes when the item is restored or
+    deleted. A missing file does not prove there was no detection.
+
+  - Email -- Thunderbird message times are the Date header, set by the
+    sender's clock (it can be wrong or forged). A new Outlook attachment
+    file is not proof it was opened: that folder also keeps sent and
+    received attachments. OST/PST contents are not parsed.
+
+  - Logs that record less than they seem -- the NTLM log is written only
+    when NTLM auditing is on; Shell-Core logs neither the hive (HKLM or
+    HKCU) nor the folder of a logon command. Browsers store only settings
+    that differ from the default, and settings enforced by policy
+    (registry) are not in their files, so neither gives a row.
 
   - Collections from older collector versions -- Still supported, with less
     precise times: no collection_info.json (the time zone and collection
@@ -1162,7 +1480,7 @@ Timeline Explorer at the same time.
   $MFT             | SI/FN, deleted, windowed, MotW | Full $MFT parsing
   Shellbags        | Folder names + key times       | Full shellbag parsing
   Output formats   | CSV + color-coded XLSX         | CSV, JSON, XLSX, and more
-  Parsers          | 17 parsers (16 + memory opt-in) | 100+ parsers
+  Parsers          | 19 parsers (18 + memory opt-in) | 100+ parsers
 
   When to use this: Quick triage, initial timeline, no-install environments,
   USB kit deployment, when you need results in minutes not hours.
@@ -1212,7 +1530,8 @@ installation or configuration is needed.
   License:    Public domain (https://www.sqlite.org/copyright.html)
   Cached at:  tools\sqlite3\sqlite3.exe
   Size:       ~6 MB (zip), ~2 MB (exe)
-  Used by:    Parser #5 (Browser History)
+  Used by:    Parser #5 (Browser History) and #18 (Email: Thunderbird
+              search index)
 
 ### Timeline Explorer
   Purpose:    Forensic CSV viewer with filtering, sorting, grouping, and
@@ -1302,9 +1621,11 @@ parsing is skipped, and the timeline CSV can be opened manually.
   creates expected.csv for a new fixture folder) and review the diff before
   committing.
 
-  The scripts below test more parsers and how the builder handles its
-  input. CI runs them after Test-Parsers.ps1 in both PowerShell versions
-  (GitHub Actions runners are elevated):
+  The scripts below test the event log, browser, registry, $MFT, email,
+  SRUM and Defender parsers, the USB parser's mounted devices, where the
+  Memory parser finds the dump, and how the builder handles its input
+  (secrets, zip input). CI runs them after Test-Parsers.ps1 in both
+  PowerShell versions (GitHub Actions runners are elevated):
 
   tests\Test-EventLogParsers.ps1 -- Part 1 feeds the Security, System,
   Defender and Application handlers synthetic event records and checks
@@ -1344,19 +1665,100 @@ parsing is skipped, and the timeline CSV can be opened manually.
   No admin needed: it loads the builder's functions without running the
   script.
 
+  tests\Test-EventLogParsers2.ps1 -- the Phase 2 logs (Windows PowerShell,
+  WMI-Activity, RDP client, NTLM, Windows Firewall, Shell-Core, OAlerts,
+  AntiVirus\*.evtx) and the 4624 details. Part 1 feeds the handlers
+  synthetic records laid out like real ones and checks every row and which
+  event IDs each log reads (no admin). Part 2 exports the last 30 days of
+  these logs from this machine with wevtutil, runs the builder and checks
+  that every Windows PowerShell 400 has its row and that every log parses;
+  it only reads, but needs a builder that runs (admin, or -BuilderPath),
+  otherwise it is SKIPPED. Part 3 needs admin and runs only in GitHub
+  Actions or with -AllowSystemChanges: it starts Windows PowerShell with an
+  encoded command, adds, changes and deletes a disabled firewall rule and
+  changes the Public profile's log size and back; in GitHub Actions only,
+  it also creates a temporary WMI event subscription, turns on NTLM
+  auditing for a loopback SMB connection and starts the Remote Desktop
+  client against an unused loopback address. All of it is undone; the
+  event records stay in the logs.
+
+  tests\Test-BrowserExtrasParsers.ps1 -- builds synthetic Chromium
+  Preferences, Secure Preferences, Local State, extension manifests, SNSS
+  session files, history snapshots and Favicons, and Firefox
+  extensions.json, addons.json, prefs.js and mozLz4 session files, runs
+  the builder with -Sources Browser and checks every row, its time and its
+  Details, and that built-in add-ons, on-demand favicons, bookmarked pages
+  and pages still in history give no rows. A canary string in every secret
+  or private field must not appear in the timeline, the log or the output.
+
+  tests\Test-SecretsHandling.ps1 -- builds a synthetic collection made as if
+  by the collector's -IncludeSecrets switch: UNREDACTED Chromium Local State,
+  Preferences and Secure Preferences, Firefox prefs.js and Chromium/Firefox
+  session files that still hold canary secret values, collection_info.json
+  with SecretsIncluded true, and a top-level Secrets\ folder with DPAPI
+  credential material (plus a $MFT, a Preferences file, a ScheduledTasks_XML
+  task, a SRUDB.dat and an AntiVirus vendor folder planted there, to exercise
+  every exclusion). A control user profile named "Secrets" holds ordinary
+  artifacts that must still be parsed. Runs the builder with -Sources
+  Browser,FileSystem,ScheduledTasks,SRUM,AntiVirus and checks that the canary
+  appears nowhere in the timeline, log or output (the builder blanks the secret
+  members before parsing), that no row has a RawPath under the top-level
+  Secrets\ folder (no parser reads it: the $MFT search, ScheduledTasks_XML,
+  SRUDB.dat, AntiVirus and the Find-ArtifactFiles callers all skip it), that
+  the "Secrets" control user's artifacts still produced rows, that the "made
+  with -IncludeSecrets" log line appears, and that non-secret settings and URLs
+  still produced rows (so the canary-free result is not vacuous).
+
+  tests\Test-EmailParsers.ps1 -- lays out a synthetic Email\<user>\
+  collection (listing CSVs, copied attachments, manifest,
+  UserSettings.json, prefs.js and a global-messages-db.sqlite built with
+  sqlite3.exe), runs the builder with -Sources Email,RecentFiles and checks
+  every email row, its time and its Details. A message text, a saved
+  password and tokens hold a canary that must not appear in the output,
+  and a .lnk or $MFT copied as an attachment must not be parsed as the
+  system's own.
+
+  tests\Test-SrumParsers.ps1 -- builds SRUM-like ESE databases with the
+  Windows ESE engine, runs the builder with -Sources SRUM and checks every
+  row, its time, User and Details; also a database in dirty-shutdown state
+  collected read-only with its logs (recovered in the builder's process,
+  the collection unchanged), a damaged page (Partial rows), a SRUDB.dat
+  that is not an ESE database, and that the builder's own ESE use writes
+  no ESENT events. Part 2 checks the esentutl /p repair. esentutl writes
+  ESENT events to the Application event log, so part 2 runs only in GitHub
+  Actions or with -AllowSystemChanges; as Administrator it also saves a
+  temporary HKCU key as a SOFTWARE hive to check SID names from
+  ProfileList.
+
+  tests\Test-DefenderParsers.ps1 -- builds synthetic DetectionHistory files
+  and quarantine entries (encrypted with the test's own RC4 code), runs the
+  builder with -Sources AntiVirus and checks every row and its Details,
+  the fallback times, damaged, foreign and oversize files, and that files
+  under Quarantine\ResourceData and Quarantine\Resources are never read.
+  Thousands of truncated and corrupted copies must read without an
+  exception.
+
+  The browser extras, secrets, email, SRUM and Defender tests need admin like
+  the builder, or -BuilderPath with a copy without the admin check (kept under
+  the git-ignored reports\ folder); a missing sqlite3.exe is downloaded by
+  one builder run. Apart from Test-SrumParsers part 2, they change nothing
+  on the system.
+
   tests\Test-ZipInput.ps1 -- Part 1 loads the builder's functions and checks
   the zip extraction ("/" and "\" entry names, entry dates kept, over-long
   names shortened, no ".." entry written outside the folder, nothing
   extracted when the zip does not fit), the manifest lookups, the list of
   input files, the free-space and temp-folder checks, the refusal of a
-  network work folder, the clean-up of work folders left by killed runs
-  and the end-of-run banners; it needs no admin. Part 2 runs the builder
-  on a synthetic collection zip dated 2025 with two setupapi logs: both
-  must be parsed, the free space must be checked, the work folder must be
-  outside %TEMP% and removed afterwards, and an input file deleted during
-  the run (by a test hook) must give exit code 2 and the MISSING INPUT
-  FILE(S) banner. Part 2 needs admin like the builder (or -BuilderPath
-  with a copy without the admin check); it changes nothing on the system.
+  network work folder, the clean-up of work folders left by killed runs,
+  the SRUM database copy (made in the work folder; a missing transaction
+  log reported) and the end-of-run banners; it needs no admin. Part 2
+  runs the builder on a synthetic collection zip dated 2025 with two
+  setupapi logs: both must be parsed, the free space must be checked, the
+  work folder must be outside %TEMP% and removed afterwards, and an input
+  file deleted during the run (by a test hook) must give exit code 2 and
+  the MISSING INPUT FILE(S) banner. Part 2 needs admin like the builder
+  (or -BuilderPath with a copy without the admin check); it changes
+  nothing on the system.
 
   tests\Test-MountedDevices.ps1 -- loads the builder's functions and checks
   the MountedDevices decoder (GPT, MBR, device paths, unrecognized values),
@@ -1366,15 +1768,17 @@ parsing is skipped, and the timeline CSV can be opened manually.
   which source Parse-USB uses (mounted_devices.csv with rows first, then
   the SYSTEM hive, also after an empty CSV, then the .txt; the hive is
   unloaded also after a read error; no rows from the decoded .txt of newer
-  collectors). No admin needed: stubs stand in for loading and reading
-  the hive; reading a real SYSTEM hive is covered by
+  collectors; no CSV or SYSTEM hive read from the Secrets\ folder or the
+  email attachment copies). No admin needed: stubs stand in for loading
+  and reading the hive; reading a real SYSTEM hive is covered by
   Test-RegistryParsers.ps1.
 
   tests\Test-MemoryParser.ps1 -- loads the builder's functions and checks
   where the memory dump is found, on synthetic folders: -MemoryDumpPath
   first (also a relative path and one with [ ] in it; a missing file or
   a folder gives one warning, then the other places are searched), next
-  to the collection zip (.dmp or .raw), Memory\ inside the collection,
+  to the collection zip (.dmp or .raw), Memory\ inside the collection
+  (nothing from the Secrets\ folder or the email attachment copies),
   and next to the collection folder or -InputPath only under the
   collection folder's name (another collection's dump in the same folder
   is not used; also with collection_manifest.csv below -InputPath, an
@@ -1396,15 +1800,23 @@ parsing is skipped, and the timeline CSV can be opened manually.
   for a plugin without output. Volatility 3 is not run; no admin needed.
 
   Run them from an elevated PowerShell; -AllowSystemChanges lets the event
-  log and registry tests change this machine:
+  log, registry and SRUM tests change this machine:
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers2.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-BrowserParsers.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-BrowserExtrasParsers.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-SecretsHandling.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-EmailParsers.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-SrumParsers.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-DefenderParsers.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-MftParser.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-ZipInput.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-MountedDevices.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-MemoryParser.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers.ps1 -AllowSystemChanges
+    powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers2.ps1 -AllowSystemChanges
     powershell -ExecutionPolicy Bypass -File tests\Test-RegistryParsers.ps1 -AllowSystemChanges
+    powershell -ExecutionPolicy Bypass -File tests\Test-SrumParsers.ps1 -AllowSystemChanges
 
 
 ## Windows Built-In Tools Used
@@ -1423,7 +1835,18 @@ parsing is skipped, and the timeline CSV can be opened manually.
                        Used for targeted extraction of high-value Security,
                        System, Application, PowerShell, Sysmon, Task
                        Scheduler, TerminalServices (RDP), Windows Defender
-                       and BITS events.
+                       and BITS events, and the Windows PowerShell,
+                       WMI-Activity, RDP client, NTLM, Firewall, Shell-Core,
+                       OAlerts and antivirus product logs.
+
+  esent.dll            The Windows ESE database engine. Reads the SRUM
+                       database (SRUDB.dat) from a scratch copy in the work
+                       folder and replays its transaction logs into that
+                       copy, with event logging off.
+
+  esentutl.exe         Fallback only: recovery (/r) or repair (/p) of the
+                       scratch copy of a SRUM database, when the recovery in
+                       the builder's process fails or the copy is damaged.
 
   WScript.Shell COM    Reads LNK shortcut files to extract target paths,
                        arguments, and working directories for Recent Files.
@@ -1490,7 +1913,9 @@ This script is read-only with respect to the target system's artifacts. It only
 creates files in its own reports\ directory, in its work folder
 (%LOCALAPPDATA%\TimelineBuilder\w<PID>_<HHmmss>, or inside -WorkDir; deleted
 at the end of the run) and in %TEMP% for downloads. No system files, registry
-keys, or artifacts are modified.
+keys, or artifacts are modified. The one lasting trace: when a SRUM database
+needs esentutl, it writes entries to this machine's Application event log
+(see below).
 
 One-time actions (first run only):
   - Installs ImportExcel PowerShell module (CurrentUser scope)
@@ -1503,6 +1928,19 @@ Temporary actions (all cleaned up automatically, also after an error or Ctrl+C):
     after processing (a hive a parser left loaded is unloaded at the end)
   - Copies browser DBs into the work folder for sqlite3 -- deleted after
     processing
+  - Copies SRUDB.dat and its logs into the work folder
+    (scratch\TimelineSrum_<n>) for recovery and reading (the copies are
+    made writable) -- deleted after processing
   - Writes Volatility 3's JSON output (Memory parser) into the work folder
     -- deleted after each plugin
   - Downloads zip files to %TEMP% (first run) -- deleted after extraction
+
+Event log entries (not removed):
+  - Only when the in-process recovery of a SRUM database fails, or a copy
+    has to be repaired, esentutl.exe runs on the scratch copy. It writes
+    ESENT events (information, and for a repair also warnings and an
+    error) to the Application event log of the machine running the
+    builder. If that machine is collected later, its timeline shows them
+    as "ESE database attached/detached: ...\TimelineSrum_<n>\SRUDB.dat"
+    rows. Reading a SRUM database and the normal in-process recovery run
+    with event logging off.
