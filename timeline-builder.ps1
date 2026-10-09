@@ -15166,6 +15166,17 @@ function Get-MemoryEntryTime {
     return $result
 }
 
+# A number of a Volatility 3 entry (PID, PPID, Threads, SessionId, a port)
+# as text for a row: "" when it is absent (null, empty or N/A). 0 is a
+# value and is kept: PID 0, PPID 0 (System), SessionId 0 (services),
+# Threads 0 (a process that has exited), port 0.
+function Get-MemoryFieldText {
+    param($Value)
+    $text = "$Value".Trim()
+    if ($text -eq "N/A") { return "" }
+    return $text
+}
+
 # Timeline rows for the entries of one Volatility 3 plugin (its JSON output
 # through ConvertFrom-Json). Every row starts as a Snapshot row at the
 # dump's capture time and is an event only when its entry has a valid time
@@ -15200,11 +15211,11 @@ function Add-MemoryPluginRows {
         switch ($Plugin) {
             "windows.pslist" {
                 $created = Get-MemoryEntryTime -Value $entry.CreateTime -LatestUtc $latestUtc
-                $procId = if ($entry.PID) { $entry.PID } else { "" }
-                $ppid = if ($entry.PPID) { $entry.PPID } else { "" }
+                $procId = Get-MemoryFieldText $entry.PID
+                $ppid = Get-MemoryFieldText $entry.PPID
                 $name = if ($entry.ImageFileName) { $entry.ImageFileName } else { "Unknown" }
-                $threads = if ($entry.Threads) { $entry.Threads } else { "" }
-                $session = if ($entry.SessionId) { $entry.SessionId } else { "" }
+                $threads = Get-MemoryFieldText $entry.Threads
+                $session = Get-MemoryFieldText $entry.SessionId
                 $details = "Threads=$threads SessionId=$session"
                 if ($null -ne $created.TimeUtc) {
                     $ts = $created.TimeUtc
@@ -15224,10 +15235,10 @@ function Add-MemoryPluginRows {
             "windows.netscan" {
                 $created = Get-MemoryEntryTime -Value $entry.Created -LatestUtc $latestUtc
                 $proto = if ($entry.Proto) { $entry.Proto } else { "" }
-                $localAddr = if ($entry.LocalAddr) { "$($entry.LocalAddr):$($entry.LocalPort)" } else { "" }
-                $foreignAddr = if ($entry.ForeignAddr) { "$($entry.ForeignAddr):$($entry.ForeignPort)" } else { "" }
+                $localAddr = if ($entry.LocalAddr) { "$($entry.LocalAddr):$(Get-MemoryFieldText $entry.LocalPort)" } else { "" }
+                $foreignAddr = if ($entry.ForeignAddr) { "$($entry.ForeignAddr):$(Get-MemoryFieldText $entry.ForeignPort)" } else { "" }
                 $state = if ($entry.State) { $entry.State } else { "" }
-                $procId = if ($entry.PID) { $entry.PID } else { "" }
+                $procId = Get-MemoryFieldText $entry.PID
                 $owner = if ($entry.Owner) { $entry.Owner } else { "" }
                 $details = "PID=$procId"
                 if ($null -ne $created.TimeUtc) {
@@ -15246,7 +15257,7 @@ function Add-MemoryPluginRows {
                     -Artifact "MemoryDump" -RawPath $DumpPath
             }
             "windows.cmdline" {
-                $procId = if ($entry.PID) { $entry.PID } else { "" }
+                $procId = Get-MemoryFieldText $entry.PID
                 $procName = if ($entry.Process) { $entry.Process } else { "" }
                 $cmdArgs = if ($entry.Args) { $entry.Args } else { "" }
                 if (-not $cmdArgs -or $cmdArgs -eq "N/A") { continue }
@@ -15263,7 +15274,7 @@ function Add-MemoryPluginRows {
                 $binary = if ($entry.Binary) { $entry.Binary } else { "" }
                 $state = if ($entry.State) { $entry.State } else { "" }
                 $start = if ($entry.Start) { $entry.Start } else { "" }
-                $procId = if ($entry.PID) { $entry.PID } else { "" }
+                $procId = Get-MemoryFieldText $entry.PID
 
                 Add-TimelineEntry -Timestamp $ts -Source $Source -EventType $eventType `
                     -Description "Service in memory: $display ($svcName)" `
