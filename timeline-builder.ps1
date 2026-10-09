@@ -14265,43 +14265,41 @@ function Invoke-SrumEsentutl {
     finally { $process.Dispose() }
 }
 
-# SID -> account name for the SRUM user SIDs: well-known SIDs, the
-# collector's bam_entries.csv (Sid,User), then ProfileList in the collected
-# SOFTWARE hive (loaded only if a user SID is still unknown); else the SID
+# SID -> account name for the SRUM user SIDs, in the User column's form
+# (ConvertTo-TimelineUserName: NT AUTHORITY\SYSTEM for S-1-5-18, ...): the
+# collector's bam_entries.csv (Sid,User) and ProfileList in the collected
+# SOFTWARE hive (loaded only if a user SID is still unknown) are added to
+# the User column's SID names (Add-TimelineSidName), and the SIDs are named
+# from those, with what the parsers before SRUM gathered (ProfileList wins
+# over bam_entries.csv); else the SID
 function Get-SrumSidNames {
     param([string[]]$Sids)
-    $names = @{}
     foreach ($csv in (Find-ArtifactFiles -BasePath $InputPath -FileNames @("bam_entries.csv"))) {
         try {
             foreach ($row in (Import-Csv -LiteralPath $csv.FullName -ErrorAction Stop)) {
-                $sid = Get-ArtifactRowValue $row @("Sid")
-                $user = Get-ArtifactRowValue $row @("User")
-                if ($sid -and $user -and -not $names.ContainsKey($sid)) { $names[$sid] = $user }
+                Add-TimelineSidName -Sid (Get-ArtifactRowValue $row @("Sid")) -Name (Get-ArtifactRowValue $row @("User"))
             }
         }
         catch { Log-Warning "  Could not read $($csv.FullName) for SID names: $($_.Exception.Message)" }
     }
-    $unknown = @($Sids | Where-Object { $_ -match '^S-1-(5-21|12-1)-' -and -not $names.ContainsKey($_) })
+    $known = Get-TimelineSidNames
+    $unknown = @($Sids | Where-Object { $_ -match '^S-1-(5-21|12-1)-' -and -not $known.ContainsKey($_) })
     if ($unknown.Count -gt 0) {
         $softwareHive = Find-OfflineHiveFile "SOFTWARE"
         if ($softwareHive) {
             $mount = $null
             try {
                 $mount = Mount-TimelineHive -HiveFile $softwareHive -Prefix "TEMP_TLSRUM"
-                if ($mount -and $mount.Root) {
-                    $profiles = Get-ProfileListMap $mount.Root
-                    foreach ($sid in $unknown) {
-                        if ($profiles.ContainsKey($sid)) { $names[$sid] = $profiles[$sid] }
-                    }
-                }
+                if ($mount -and $mount.Root) { Add-OfflineProfileNames $mount.Root }
             }
             catch { Log-Warning "  Failed to read ProfileList from SOFTWARE hive: $($_.Exception.Message)" }
             finally { Dismount-TimelineHive $mount }
         }
     }
+    $names = Get-TimelineSidNames
     $result = @{}
     foreach ($sid in $Sids) {
-        $name = Resolve-BamUser -Sid $sid -SidNames $names
+        $name = ConvertTo-TimelineUserName -Value $sid -SidNames $names
         if ($name -and $name -ne $sid) { $result[$sid] = $name }
     }
     return $result

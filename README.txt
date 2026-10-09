@@ -443,10 +443,12 @@ Both timeline.csv and timeline.xlsx contain the same columns:
 
   The machine and SID names are read, with no extra hive loads, only by
   the sources that open those files: ProfileList by Registry (and by
-  PowerShellHistory when it reads BAM from the SYSTEM hive),
-  bam_entries.csv by PowerShellHistory, and the SYSTEM hive's names by
-  Registry and PowerShellHistory (and by USB when it reads MountedDevices
-  from the hive). All of them are in the default -Sources. A run with
+  PowerShellHistory when it reads BAM from the SYSTEM hive, and by SRUM
+  when one of its user SIDs has no name yet), bam_entries.csv by
+  PowerShellHistory and SRUM, and the SYSTEM hive's names by Registry and
+  PowerShellHistory (and by USB when it reads MountedDevices from the
+  hive). SRUM names its rows' SIDs the same way. All of them are in the
+  default -Sources. A run with
   only some sources (for example -Sources EventLogs) can leave SIDs, and
   for a mounted image HOST\ prefixes, as they are.
 
@@ -1199,7 +1201,8 @@ tools. Artifact SRUM:
     stores it (a \device\harddiskvolumeN\... path, a packaged app or a
     service name). User is the account name when the collection gives one
     (well-known SIDs, bam_entries.csv, the SOFTWARE hive's ProfileList),
-    otherwise the SID
+    in the User column's one form per account (NT AUTHORITY\SYSTEM for
+    S-1-5-18; see "User column"), otherwise the SID
   - Details: Day, App, AppId, UserSid; BytesSent and BytesRecvd (network)
     or ForegroundCycleTime, BackgroundCycleTime, FaceTime, the foreground
     and background bytes read and written, BytesRead and BytesWritten
@@ -1721,7 +1724,8 @@ parsing is skipped, and the timeline CSV can be opened manually.
   their rows and which event IDs and providers each log reads, and the User
   of the Security, PowerShell (4104/4103) and BITS rows. It also checks the
   User column: the one form per account for each kind of value, SID names
-  from ProfileList and bam_entries.csv, and the pass over all rows
+  from ProfileList and bam_entries.csv (also as the SRUM parser reads and
+  writes them), and the pass over all rows
   (UserSID= in Details, the counts, and that it runs before
   deduplication). The main flow's own User column statements are run on
   synthetic rows: the computer name of collection_info.json must strip

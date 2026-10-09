@@ -587,6 +587,8 @@ try {
                 $script:collectionManifest = $null
                 $script:manifestTimes = $null
                 $script:shortenedNames = @{}
+                # The builder looks up the collection's Secrets\ folder once per run
+                $script:secretsRoot = $null
                 Parse-PowerShellHistory 6>$null | Out-Null
             }
             $names = Get-TimelineSidNames
@@ -596,11 +598,50 @@ try {
         finally {
             $script:timelineUserContext = $null
             $script:collectionInfo = $null
+            $script:secretsRoot = $null
         }
     } -Expected @(
         @{ Source = "BAM"; EventType = "Execution"; Description = "BAM execution: \Device\HarddiskVolume3\Tools\a.exe"; User = "carol" },
         @{ Source = "BAM"; EventType = "Execution"; Description = "BAM execution: \Device\HarddiskVolume3\Windows\b.exe"; User = "SYSTEM" }
     )
+
+    # The SRUM parser names its user SIDs the same way (Get-SrumSidNames):
+    # in the User column's form, from the names the parsers before it
+    # gathered (here a ProfileList name for alice, which wins over
+    # bam_entries.csv) and from bam_entries.csv, which it adds to them. The
+    # collection has no SOFTWARE hive, so the unknown SID stays unnamed.
+    Test-Case -Name "User column: Get-SrumSidNames names SRUM's SIDs in the User column's form and keeps the bam_entries.csv names" -Action {
+        $script:timelineUserContext = $null
+        try {
+            Add-TimelineSidName -Sid "S-1-5-21-1111-2222-3333-1001" -Name "alice" -ProfileList
+            [System.IO.File]::AppendAllText((Join-Path $bamDir "Execution\bam_entries.csv"),
+                '"S-1-5-21-1111-2222-3333-1001","alice-bam","\Device\HarddiskVolume3\Tools\c.exe","2026-01-05T10:02:00Z"' + "`r`n")
+            $srumSids = @("S-1-5-21-1111-2222-3333-1001", "S-1-5-21-1111-2222-3333-1003", "S-1-5-21-1111-2222-3333-1009", "S-1-5-18", "S-1-5-19", "S-1-5-90-0-2")
+            $srumNames = & {
+                Set-Variable -Name InputPath -Value $bamDir
+                $script:collectionRoot = $bamDir
+                $script:collectionInfo = $null
+                $script:secretsRoot = $null
+                Get-SrumSidNames -Sids $srumSids
+            }
+            $keys = [string[]]@($srumNames.Keys)
+            [Array]::Sort($keys, [System.StringComparer]::Ordinal)
+            $text = (@($keys | ForEach-Object { "$_=$($srumNames[$_])" })) -join ", "
+            $expected = "S-1-5-18=NT AUTHORITY\SYSTEM, S-1-5-19=NT AUTHORITY\LOCAL SERVICE, S-1-5-21-1111-2222-3333-1001=alice, " +
+                "S-1-5-21-1111-2222-3333-1003=carol, S-1-5-90-0-2=Window Manager\DWM-2"
+            if ($text -cne $expected) { throw "Get-SrumSidNames gave: $text" }
+            $names = Get-TimelineSidNames
+            $keys = [string[]]@($names.Keys)
+            [Array]::Sort($keys, [System.StringComparer]::Ordinal)
+            $text = (@($keys | ForEach-Object { "$_=$($names[$_])" })) -join ", "
+            if ($text -cne "S-1-5-21-1111-2222-3333-1001=alice, S-1-5-21-1111-2222-3333-1003=carol") { throw "Get-TimelineSidNames gave: $text" }
+        }
+        finally {
+            $script:timelineUserContext = $null
+            $script:collectionInfo = $null
+            $script:secretsRoot = $null
+        }
+    } -Expected @()
 }
 finally {
     Remove-Item -LiteralPath $bamDir -Recurse -Force -ErrorAction SilentlyContinue

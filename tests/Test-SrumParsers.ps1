@@ -665,9 +665,10 @@ try {
                 "ForegroundCycleTime=4000 | BackgroundCycleTime=1000 | FaceTime=1800000000 | ForegroundBytesRead=8192 | ForegroundBytesWritten=2048 | BackgroundBytesRead=2048 | BackgroundBytesWritten=512",
                 "BytesRead=10240 | BytesWritten=2560 | Records=2 | FirstRecordUtc=2026-03-01 10:00:00 | LastRecordUtc=2026-03-01 12:00:00")
             Lacks = @("BytesSent=", "Interfaces=") }
-        @{ Time = "2026-03-01 08:00:00.000"; Source = "SRUM-AppUsage"; Type = "Execution"; User = "SYSTEM"
+        # S-1-5-18 in the User column's form
+        @{ Time = "2026-03-01 08:00:00.000"; Source = "SRUM-AppUsage"; Type = "Execution"; User = "NT AUTHORITY\SYSTEM"
             Text = "SRUM app activity: DiagTrack"
-            Has = @("App=DiagTrack | AppId=4 | UserSid=S-1-5-18 | User=SYSTEM", "ForegroundCycleTime=0 | BackgroundCycleTime=50000 | FaceTime=0", "BytesRead=1048576 | BytesWritten=2097152 | Records=1") }
+            Has = @("App=DiagTrack | AppId=4 | UserSid=S-1-5-18 | User=NT AUTHORITY\SYSTEM", "ForegroundCycleTime=0 | BackgroundCycleTime=50000 | FaceTime=0", "BytesRead=1048576 | BytesWritten=2097152 | Records=1") }
     )
     Test-TimelineRows -Rows $rows -Expected $expected -Label "clean" -Exact
 
