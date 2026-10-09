@@ -1646,7 +1646,8 @@ parsing is skipped, and the timeline CSV can be opened manually.
   The scripts below test the event log, browser, registry, $MFT, email,
   SRUM and Defender parsers, the USB parser's mounted devices, the Memory
   parser (where it finds the dump, the dump's capture time and the rows
-  made from Volatility's output), and how the builder handles its input
+  made from Volatility's output), the ShimCache rows of the
+  PowerShellHistory parser, and how the builder handles its input
   (secrets, zip input). CI runs them after Test-Parsers.ps1 in both
   PowerShell versions (GitHub Actions runners are elevated):
 
