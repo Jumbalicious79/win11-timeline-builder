@@ -69,12 +69,18 @@ param(
     [Parameter(Mandatory = $false)]
     [string]$WorkDir,
 
-    # Memory dump file (.dmp or .raw) of this collection, for a dump moved
-    # after the collection. Not needed otherwise: Find-MemoryDump finds the
-    # dump where the collector saved it (the path in collection_manifest.csv,
-    # also on another drive: -MemoryOutputPath or the drive picked at the
-    # collector's memory prompt), next to the collection zip or folder, and
-    # in the collection. Used before all of these.
+    # Memory dump file (.dmp or .raw) of this collection, used before every
+    # other place. Needed only for a dump Find-MemoryDump does not find or
+    # does not use: one moved to another folder after the collection, one
+    # on a network share that is not next to the collection zip or folder,
+    # or one whose size is not the one collection_manifest.csv lists.
+    # Without it, Find-MemoryDump finds the dump where the collector saved
+    # it (the path in collection_manifest.csv, also on another drive:
+    # -MemoryOutputPath or the drive picked at the collector's memory
+    # prompt, also when that drive has another letter now), next to the
+    # collection zip or folder, and in the collection. A dump copied next
+    # to the zip as <zip name>_memory_dump.dmp (.raw) is found from
+    # Run-TimelineBuilder.bat too, which cannot pass this parameter.
     [Parameter(Mandatory = $false)]
     [string]$MemoryDumpPath
 )
@@ -15311,8 +15317,106 @@ function Parse-PowerShellHistory {
 # 15. Memory Dump Parser (Volatility 3)
 # ----------------------------------------------------------
 $script:memoryDumpPathWarned = $false   # Find-MemoryDump has reported a bad -MemoryDumpPath
-$script:manifestDumpNoticeLogged = $false   # Find-MemoryDump has logged what it did with the manifest's dump
+$script:memoryDumpNotices = New-Object 'System.Collections.Generic.HashSet[string]'   # the lines Find-MemoryDump has logged in this run
 $script:memoryDumpFromManifest = $false   # the last dump Find-MemoryDump returned is the manifest's
+$script:memoryDumpListedPath = ""   # ... found on a drive with another letter: the path the manifest lists
+
+# Logs a line of Find-MemoryDump once per run: a dump that is offered and
+# then analyzed is looked for twice
+function Write-MemoryDumpNotice {
+    param([string]$Text, [switch]$Warning)
+    if ($null -eq $script:memoryDumpNotices) { $script:memoryDumpNotices = New-Object 'System.Collections.Generic.HashSet[string]' }
+    if (-not $script:memoryDumpNotices.Add($Text)) { return }
+    if ($Warning) { Log-Warning $Text }
+    else { Log $Text }
+}
+
+# Ready fixed and removable drives, as roots ("E:\"): the drives the
+# collector's memory prompt offers for the dump. A function of its own so
+# the tests can stand in for the machine's drives
+function Get-MemoryDumpDriveRoots {
+    $roots = @()
+    try {
+        foreach ($drive in [System.IO.DriveInfo]::GetDrives()) {
+            try {
+                if ($drive.IsReady -and ($drive.DriveType -eq [System.IO.DriveType]::Fixed -or $drive.DriveType -eq [System.IO.DriveType]::Removable)) {
+                    $roots += $drive.RootDirectory.FullName
+                }
+            }
+            catch { Write-Verbose "Checking drive $($drive.Name): $($_.Exception.Message)" }
+        }
+    }
+    catch { Write-Verbose "Listing drives: $($_.Exception.Message)" }
+    return $roots
+}
+
+# The file at a path that may come from collection_manifest.csv, or $null
+# when there is none (also for a path Windows PowerShell 5.1 refuses, e.g.
+# one with | in it)
+function Get-MemoryDumpFile {
+    param([string]$Path)
+    try {
+        $file = New-Object System.IO.FileInfo($Path)
+        if ($file.Exists) { return $file }
+    }
+    catch { Write-Verbose "Memory dump ${Path}: $($_.Exception.Message)" }
+    return $null
+}
+
+# Where Find-MemoryDump looks for the dump next to the collection, by name.
+# -Zip: next to the selected zip (browse mode, or a zip as -InputPath),
+# <zip name>_memory_dump.dmp and .raw. -Folder: next to the collection
+# folder (the folder of collection_manifest.csv, else -InputPath) and next
+# to -InputPath (an outer folder that holds the collection), only under
+# the collection folder's name: a folder such as the collector's reports\
+# holds the dumps of other collections too. Windows "Extract All" of
+# <name>.zip makes <name>\<name>\, so the dump next to the zip is then
+# next to the outer folder.
+function Get-MemoryDumpSiblingPaths {
+    param([switch]$Zip, [switch]$Folder)
+    $extensions = @("dmp", "raw")
+    $paths = @()
+    if ($Zip -and $script:selectedZipPath -and (Test-Path -LiteralPath $script:selectedZipPath)) {
+        $zipDir = Split-Path $script:selectedZipPath -Parent
+        $zipBaseName = [System.IO.Path]::GetFileNameWithoutExtension($script:selectedZipPath)
+        foreach ($ext in $extensions) { $paths += Join-Path $zipDir "${zipBaseName}_memory_dump.$ext" }
+    }
+    if ($Folder) {
+        $root = Get-CollectionRootFolder
+        $collectionName = [System.IO.Path]::GetFileName($root)
+        $parentDir = [System.IO.Path]::GetDirectoryName($root)
+        if ($collectionName -and $parentDir) {
+            $dumpDirs = @($parentDir)
+            $outerParentDir = [System.IO.Path]::GetDirectoryName($parentDir)
+            if ($outerParentDir -and [System.IO.Path]::GetFileName($parentDir) -eq $collectionName) { $dumpDirs += $outerParentDir }
+            $inputDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($InputPath).TrimEnd('\')
+            $inputParentDir = [System.IO.Path]::GetDirectoryName($inputDir)
+            if ($inputParentDir -and $dumpDirs -notcontains $inputParentDir) { $dumpDirs += $inputParentDir }
+            foreach ($dumpDir in $dumpDirs) {
+                foreach ($ext in $extensions) { $paths += Join-Path $dumpDir "${collectionName}_memory_dump.$ext" }
+            }
+        }
+    }
+    return $paths
+}
+
+# The size collection_manifest.csv lists for the dump (SizeBytes) against
+# a file's length: "" when they are the same, else "<length> bytes, but
+# collection_manifest.csv lists <size> bytes" (or "no size")
+function Get-MemoryDumpSizeMismatch {
+    param([object]$Listed, [long]$Length)
+    $listedSize = [long]-1
+    if ([long]::TryParse($Listed.SizeBytes, [System.Globalization.NumberStyles]::None, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$listedSize) -and $listedSize -eq $Length) { return "" }
+    $listedText = "no size"
+    if ($Listed.SizeBytes) { $listedText = "$($Listed.SizeBytes) bytes" }
+    return "$Length bytes, but collection_manifest.csv lists $listedText"
+}
+
+# The end of the log line for a dump of the size the manifest lists
+function Get-MemoryDumpHashNote {
+    param([object]$Listed)
+    return "SHA-256 in the manifest: $($Listed.Sha256) -- the dump is not hashed again here (it is as large as RAM); Get-FileHash -Algorithm SHA256 checks it."
+}
 
 # The memory dump collection_manifest.csv lists: the collector records a
 # complete dump as "(memory dump via DumpIt)" (WinPmem, MagnetRAM), with
@@ -15324,19 +15428,32 @@ $script:memoryDumpFromManifest = $false   # the last dump Find-MemoryDump return
 #   other checks find it next to the zip).
 # - outside it (RelativePath empty): DestPath, the folder of the
 #   collector's -MemoryOutputPath or of the drive picked at its memory
-#   prompt, e.g. D:\TriageMemory\<collection>_memory_dump.dmp.
+#   prompt, e.g. D:\TriageMemory\<collection>_memory_dump.dmp (a collector
+#   that changes the row when it moves the dump names the path next to the
+#   zip). When no file of the listed size is there, the same path on the
+#   other fixed and removable drives is tried: the drive (e.g. a USB drive)
+#   may have another letter now, on another machine or plugged in again.
 # A manifest comes from the examined machine, so it must not make the
 # builder read just any file or connect to a server: only the names the
 # collector writes are used (Memory\memory_dump.<ext>, and outside the
 # collection <collection folder name>_memory_dump.<ext>), and outside the
-# collection only a path on a drive letter. The dump is not hashed (it is
-# as large as RAM), but its size must match the manifest.
+# collection only a path on a drive letter, or a path the builder looks at
+# anyway next to the collection zip or folder it was given (e.g. on a
+# network share). The dump is not hashed (it is as large as RAM), but its
+# size must match the manifest. Only string methods are used on the
+# manifest's paths: Windows PowerShell 5.1's Path methods throw on
+# characters such as | in a path.
 # Returns Status: None (no such row), Found, Missing, SizeMismatch or
-# Refused (for these two, Reason says why); Path (the full path it names;
-# RelativePath for a refused one in the collection), InCollection,
-# RelativePath, Sha256 and SizeBytes (as listed).
+# Refused (for these two, Reason says why); Path (the full path it names,
+# or the file found on another drive; RelativePath for a refused one in
+# the collection); ListedPath (the DestPath it names when the file is on
+# another drive, else ""); OtherDrives ($true when other drives were
+# tried); Extension (.dmp or .raw when the name is one the collector
+# writes: Find-MemoryDump then checks the size of a dump of that type it
+# finds elsewhere); InCollection, RelativePath, Sha256 and SizeBytes (as
+# listed).
 function Get-ManifestMemoryDump {
-    $result = [PSCustomObject]@{ Status = "None"; Path = ""; InCollection = $false; RelativePath = ""; Sha256 = ""; SizeBytes = ""; Reason = "" }
+    $result = [PSCustomObject]@{ Status = "None"; Path = ""; ListedPath = ""; OtherDrives = $false; Extension = ""; InCollection = $false; RelativePath = ""; Sha256 = ""; SizeBytes = ""; Reason = "" }
     $manifest = Get-CollectionManifest
     $row = $null
     foreach ($candidate in $manifest.Rows) {
@@ -15354,20 +15471,16 @@ function Get-ManifestMemoryDump {
         $result.InCollection = $true
         $result.RelativePath = $relPath
         $result.Path = $relPath
-        if ($relPath -notmatch '^Memory\\memory_dump\.(?:dmp|raw)$') {
+        if (-not ($relPath -match '^Memory\\memory_dump(\.(?:dmp|raw))$')) {
             $result.Status = "Refused"
             $result.Reason = "not a name the collector gives a memory dump in the collection (Memory\memory_dump.dmp or .raw)"
             return $result
         }
+        $result.Extension = $Matches[1].ToLowerInvariant()
         $result.Path = Join-Path (Get-CollectionRootFolder) $relPath
     }
     else {
         $result.Path = $destPath
-        if ($destPath -notmatch '^[A-Za-z]:\\') {
-            $result.Status = "Refused"
-            $result.Reason = "not a path on a drive letter (a network or device path named in a collection is never opened)"
-            return $result
-        }
         # The collection folder's name now, and as the collector named it
         # (DestPath minus RelativePath of the other rows): a renamed folder
         $names = @([System.IO.Path]::GetFileName((Get-CollectionRootFolder)))
@@ -15376,42 +15489,95 @@ function Get-ManifestMemoryDump {
             $otherRel = "$($other.RelativePath)"
             $otherDest = "$($other.DestPath)"
             if ($otherRel -and $otherDest.Length -gt $otherRel.Length + 1 -and $otherDest.EndsWith('\' + $otherRel, [System.StringComparison]::OrdinalIgnoreCase)) {
-                $names += [System.IO.Path]::GetFileName($otherDest.Substring(0, $otherDest.Length - $otherRel.Length - 1))
+                $folderThen = $otherDest.Substring(0, $otherDest.Length - $otherRel.Length - 1)
+                $names += $folderThen.Substring($folderThen.LastIndexOf('\') + 1)
                 break
             }
         }
         $leaf = $destPath.Substring($destPath.LastIndexOf('\') + 1)
-        if (-not ($leaf -match '^(.+)_memory_dump\.(?:dmp|raw)$' -and $names -contains $Matches[1])) {
+        $leafName = ""
+        $leafExtension = ""
+        if ($leaf -match '^(.+)_memory_dump(\.(?:dmp|raw))$') {
+            $leafName = $Matches[1]
+            $leafExtension = $Matches[2].ToLowerInvariant()
+        }
+        if (-not $leafName -or $names -notcontains $leafName) {
             $result.Status = "Refused"
             $result.Reason = "not a name the collector gives this collection's memory dump ($($names[0])_memory_dump.dmp or .raw)"
             return $result
         }
+        $result.Extension = $leafExtension
+        if ($destPath -notmatch '^[A-Za-z]:\\' -and @(Get-MemoryDumpSiblingPaths -Zip -Folder) -notcontains $destPath) {
+            $result.Status = "Refused"
+            $result.Reason = "not a path on a drive letter (a network or device path named in a collection is opened only when it is next to the collection zip or folder)"
+            return $result
+        }
     }
 
-    $file = $null
-    try {
-        $file = New-Object System.IO.FileInfo($result.Path)
-        if (-not $file.Exists) { $file = $null }
+    # The file it names, then the same path on the other drives; the first
+    # file of the listed size is the dump
+    $wrongSize = $null
+    $savedTo = "there"
+    $file = Get-MemoryDumpFile $result.Path
+    if ($file) {
+        if (-not (Get-MemoryDumpSizeMismatch -Listed $result -Length $file.Length)) {
+            $result.Path = $file.FullName
+            $result.Status = "Found"
+            return $result
+        }
+        $wrongSize = $file
     }
-    catch {
-        Write-Verbose "Memory dump in collection_manifest.csv, $($result.Path): $($_.Exception.Message)"
-        $file = $null
+    if (-not $result.InCollection -and $destPath -match '^[A-Za-z]:\\') {
+        $result.OtherDrives = $true
+        foreach ($root in @(Get-MemoryDumpDriveRoots)) {
+            $moved = "$root".TrimEnd('\') + $destPath.Substring(2)
+            if ($moved -eq $destPath) { continue }
+            $movedFile = Get-MemoryDumpFile $moved
+            if (-not $movedFile) { continue }
+            if (-not (Get-MemoryDumpSizeMismatch -Listed $result -Length $movedFile.Length)) {
+                $result.ListedPath = $destPath
+                $result.Path = $movedFile.FullName
+                $result.Status = "Found"
+                return $result
+            }
+            if (-not $wrongSize) {
+                $wrongSize = $movedFile
+                $savedTo = "to $destPath"
+                $result.ListedPath = $destPath
+            }
+        }
     }
-    if (-not $file) {
+    if (-not $wrongSize) {
         $result.Status = "Missing"
         return $result
     }
-    $result.Path = $file.FullName
-    $listedSize = [long]-1
-    if (-not [long]::TryParse($result.SizeBytes, [System.Globalization.NumberStyles]::None, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$listedSize) -or $listedSize -ne $file.Length) {
-        $listedText = "no size"
-        if ($result.SizeBytes) { $listedText = "$($result.SizeBytes) bytes" }
-        $result.Status = "SizeMismatch"
-        $result.Reason = "$($file.Length) bytes, but collection_manifest.csv lists $listedText for the dump the collector saved there"
-        return $result
-    }
-    $result.Status = "Found"
+    $result.Status = "SizeMismatch"
+    $result.Path = $wrongSize.FullName
+    $result.Reason = "$(Get-MemoryDumpSizeMismatch -Listed $result -Length $wrongSize.Length) for the dump the collector saved $savedTo"
     return $result
+}
+
+# A dump that checks 3 to 5 of Find-MemoryDump found: not the file of
+# another size that check 2 found (NotThis), and, when
+# collection_manifest.csv lists this collection's dump of the same type
+# (.dmp or .raw) and the file has a name the collector writes, of the size
+# the manifest lists. A file of another size (e.g. a copy cut short) gets
+# one warning and is not used; with that size, the manifest's SHA-256 is
+# logged. Returns $true to use it.
+function Test-MemoryDumpCandidate {
+    param([string]$Path, [object]$Listed, [string]$NotThis = "")
+    if ($NotThis -and $Path -eq $NotThis) { return $false }
+    $leaf = $Path.Substring($Path.LastIndexOf('\') + 1)
+    if (-not $Listed.Extension -or $leaf -notmatch '(?:^|_)memory_dump\.(?:dmp|raw)$' -or -not $leaf.EndsWith($Listed.Extension, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    $file = Get-MemoryDumpFile $Path
+    if (-not $file) { return $true }
+    $mismatch = Get-MemoryDumpSizeMismatch -Listed $Listed -Length $file.Length
+    if ($mismatch) {
+        Write-MemoryDumpNotice -Warning "Memory dump not used: $Path is $mismatch for this collection's dump (a copy cut short?)."
+        return $false
+    }
+    Write-MemoryDumpNotice "Memory dump: $Path ($($Listed.SizeBytes) bytes, as collection_manifest.csv lists for this collection's dump). $(Get-MemoryDumpHashNote $Listed)"
+    return $true
 }
 
 # Memory dump for this collection: where the collector saved it
@@ -15422,10 +15588,10 @@ function Get-ManifestMemoryDump {
 # collection's Memory\ folder. DumpIt writes Microsoft crash dumps (.dmp);
 # WinPmem and Magnet RAM Capture write raw images (.raw). Returns the full
 # path or $null. A dump that is offered and then analyzed is looked for
-# twice, so each notice is logged once per run.
+# twice, so each notice is logged once per run (Write-MemoryDumpNotice).
 function Find-MemoryDump {
-    $extensions = @("dmp", "raw")
     $script:memoryDumpFromManifest = $false
+    $script:memoryDumpListedPath = ""
 
     # Check 1: -MemoryDumpPath. A path that is not a file is reported once,
     # and the other places are tried.
@@ -15440,81 +15606,109 @@ function Find-MemoryDump {
         }
     }
 
-    # Check 2: where the collector saved it, by collection_manifest.csv.
-    # Missing there (outside the collection): moved, deleted, or this is
+    # Check 2: where the collector saved it, by collection_manifest.csv,
+    # also on a drive with another letter now. Not there (outside the
+    # collection): moved, deleted, its drive not connected, or this is
     # another machine; the other places are tried. A file of another size
     # is not the dump the collector saved (e.g. a copy cut short): it is
-    # not used, here or by the checks below.
+    # not used, here or by the checks below, which check the size of the
+    # dumps they find as well (Test-MemoryDumpCandidate).
     $listed = Get-ManifestMemoryDump
     $notThis = ""
-    $firstNotice = -not $script:manifestDumpNoticeLogged
     switch ($listed.Status) {
         "Found" {
-            if ($firstNotice) {
-                Log "Memory dump where the collector saved it (collection_manifest.csv): $($listed.Path) ($($listed.SizeBytes) bytes, as listed). SHA-256 in the manifest: $($listed.Sha256) -- the dump is not hashed again here (it is as large as RAM); Get-FileHash -Algorithm SHA256 checks it."
-            }
-            $script:manifestDumpNoticeLogged = $true
+            $where = "Memory dump where the collector saved it (collection_manifest.csv)"
+            if ($listed.ListedPath) { $where = "Memory dump where the collector saved it, on a drive with another letter now (collection_manifest.csv lists $($listed.ListedPath))" }
+            Write-MemoryDumpNotice "${where}: $($listed.Path) ($($listed.SizeBytes) bytes, as listed). $(Get-MemoryDumpHashNote $listed)"
             $script:memoryDumpFromManifest = $true
+            $script:memoryDumpListedPath = $listed.ListedPath
             return $listed.Path
         }
         "Missing" {
-            if ($firstNotice -and -not $listed.InCollection) {
-                Log "The collector saved the memory dump to $($listed.Path) (collection_manifest.csv); it is not there now (moved, deleted, or this is another machine). Looking in and next to the collection instead."
+            if (-not $listed.InCollection) {
+                $otherDrives = ""
+                if ($listed.OtherDrives) { $otherDrives = ", nor at that path on another drive" }
+                Write-MemoryDumpNotice "The collector saved the memory dump to $($listed.Path) (collection_manifest.csv); it is not there now$otherDrives (moved, deleted, its drive not connected, or this is another machine). Looking in and next to the collection instead."
             }
         }
         "SizeMismatch" {
-            if ($firstNotice) {
-                Log-Warning "Memory dump not used: $($listed.Path) is $($listed.Reason) (a copy cut short?)."
-            }
+            Write-MemoryDumpNotice -Warning "Memory dump not used: $($listed.Path) is $($listed.Reason) (a copy cut short?)."
             $notThis = $listed.Path
         }
         "Refused" {
-            if ($firstNotice) {
-                Log-Warning "Memory dump in collection_manifest.csv not used: $($listed.Path) is $($listed.Reason)."
-            }
+            Write-MemoryDumpNotice -Warning "Memory dump in collection_manifest.csv not used: $($listed.Path) is $($listed.Reason)."
         }
     }
-    if ($listed.Status -ne "None") { $script:manifestDumpNoticeLogged = $true }
 
     # Check 3: Sibling of the selected zip (browse mode, or a zip as -InputPath)
-    if ($script:selectedZipPath -and (Test-Path -LiteralPath $script:selectedZipPath)) {
-        $zipDir = Split-Path $script:selectedZipPath -Parent
-        $zipBaseName = [System.IO.Path]::GetFileNameWithoutExtension($script:selectedZipPath)
-        foreach ($ext in $extensions) {
-            $siblingDump = Join-Path $zipDir "${zipBaseName}_memory_dump.$ext"
-            if ((Test-Path -LiteralPath $siblingDump) -and $siblingDump -ne $notThis) { return $siblingDump }
-        }
+    foreach ($siblingDump in @(Get-MemoryDumpSiblingPaths -Zip)) {
+        if ((Test-Path -LiteralPath $siblingDump) -and (Test-MemoryDumpCandidate -Path $siblingDump -Listed $listed -NotThis $notThis)) { return $siblingDump }
     }
 
     # Check 4: Inside the collection directory (uncompressed collections)
-    $memFiles = @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("memory_dump.dmp", "memory_dump.raw", "memdump.raw", "memory.raw", "physmem.raw") |
-        Where-Object { $_.FullName -ne $notThis })
-    if ($memFiles.Count -gt 0) { return $memFiles[0].FullName }
+    $memFiles = @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("memory_dump.dmp", "memory_dump.raw", "memdump.raw", "memory.raw", "physmem.raw"))
+    foreach ($memFile in $memFiles) {
+        if (Test-MemoryDumpCandidate -Path $memFile.FullName -Listed $listed -NotThis $notThis) { return $memFile.FullName }
+    }
 
-    # Check 5: Next to the collection folder (the folder of
-    # collection_manifest.csv, else -InputPath) and next to -InputPath (an
-    # outer folder that holds the collection), by the collection folder's
-    # name only: a folder such as the collector's reports\ holds the dumps
-    # of other collections too. Windows "Extract All" of <name>.zip makes
-    # <name>\<name>\, so the dump next to the zip is then next to the outer
-    # folder.
-    $root = Get-CollectionRootFolder
-    $collectionName = [System.IO.Path]::GetFileName($root)
-    $parentDir = [System.IO.Path]::GetDirectoryName($root)
-    if (-not $collectionName -or -not $parentDir) { return $null }
-    $dumpDirs = @($parentDir)
-    $outerParentDir = [System.IO.Path]::GetDirectoryName($parentDir)
-    if ($outerParentDir -and [System.IO.Path]::GetFileName($parentDir) -eq $collectionName) { $dumpDirs += $outerParentDir }
-    $inputDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($InputPath).TrimEnd('\')
-    $inputParentDir = [System.IO.Path]::GetDirectoryName($inputDir)
-    if ($inputParentDir -and $dumpDirs -notcontains $inputParentDir) { $dumpDirs += $inputParentDir }
-    foreach ($dumpDir in $dumpDirs) {
-        foreach ($ext in $extensions) {
-            $namedDump = Join-Path $dumpDir "${collectionName}_memory_dump.$ext"
-            if ((Test-Path -LiteralPath $namedDump -PathType Leaf) -and $namedDump -ne $notThis) { return $namedDump }
-        }
+    # Check 5: Next to the collection folder and next to -InputPath, by the
+    # collection folder's name only (Get-MemoryDumpSiblingPaths)
+    foreach ($namedDump in @(Get-MemoryDumpSiblingPaths -Folder)) {
+        if ((Test-Path -LiteralPath $namedDump -PathType Leaf) -and (Test-MemoryDumpCandidate -Path $namedDump -Listed $listed -NotThis $notThis)) { return $namedDump }
     }
     return $null
+}
+
+# What to say when Find-MemoryDump found no dump to use. Note: what
+# collection_manifest.csv lists. Remedy: how to have the dump analyzed,
+# which works from Run-TimelineBuilder.bat too (it cannot pass
+# -MemoryDumpPath): copy the dump where Find-MemoryDump looks, next to the
+# collection zip (else next to the collection folder) under its name, or
+# connect the drive the collector saved it to.
+function Get-MemoryDumpNotFoundText {
+    param([object]$Listed)
+    $extension = $Listed.Extension
+    if (-not $extension) { $extension = ".dmp" }
+    $targets = @(Get-MemoryDumpSiblingPaths -Zip)
+    if ($targets.Count -eq 0) { $targets = @(Get-MemoryDumpSiblingPaths -Folder) }
+    $target = @($targets | Where-Object { $_.EndsWith("_memory_dump$extension", [System.StringComparison]::OrdinalIgnoreCase) }) | Select-Object -First 1
+    $remedy = "copy the dump next to the collection zip or folder as <collection folder name>_memory_dump$extension"
+    if ($target) { $remedy = "copy the dump to $target" }
+    if (-not $Listed.Extension) { $remedy += " (_memory_dump.raw for a raw image)" }
+    elseif ($Listed.SizeBytes) { $remedy += " (collection_manifest.csv lists $($Listed.SizeBytes) bytes)" }
+    $note = switch ($Listed.Status) {
+        "None" {
+            if ((Get-CollectionManifest).Path) { "collection_manifest.csv lists none (the collector saved no complete dump)" }
+            else { "there is no collection_manifest.csv that says where the collector saved one" }
+        }
+        "Missing" {
+            if ($Listed.InCollection) {
+                "collection_manifest.csv lists one in the collection ($($Listed.RelativePath)), which the collector moves next to the zip as $([System.IO.Path]::GetFileName((Get-CollectionRootFolder)))_memory_dump$($Listed.Extension) when it zips the collection"
+            }
+            else {
+                $otherDrives = ""
+                if ($Listed.OtherDrives) { $otherDrives = ", nor at that path on another drive" }
+                "the collector saved it to $($Listed.Path) (collection_manifest.csv), and it is not there now$otherDrives"
+            }
+        }
+        default { "collection_manifest.csv lists one at $($Listed.Path), which was not used (see the warning above)" }
+    }
+    if ($Listed.Status -eq "Missing" -and $Listed.OtherDrives) { $remedy = "connect the drive the collector saved it to, or $remedy" }
+    return [PSCustomObject]@{ Note = $note; Remedy = $remedy }
+}
+
+# The offer step found no dump: when collection_manifest.csv lists one,
+# say what became of it and how to have it analyzed. This is all a user of
+# Run-TimelineBuilder.bat sees of it (Memory is not in its -Sources, so
+# the Memory parser does not run), and the .bat cannot pass -MemoryDumpPath
+function Write-NoMemoryDumpToOffer {
+    $listed = Get-ManifestMemoryDump
+    if ($listed.Status -eq "None") { return }
+    $notFound = Get-MemoryDumpNotFoundText -Listed $listed
+    Log ""
+    Log "No memory dump to offer: $($notFound.Note)."
+    Log "  To have it analyzed, $($notFound.Remedy), then run the builder again."
+    Log ""
 }
 
 # A memory dump as the user is shown it: "<path in the collection> in the
@@ -15771,23 +15965,9 @@ function Parse-Memory {
     $dumpPath = Find-MemoryDump
 
     if (-not $dumpPath) {
-        # What collection_manifest.csv said, and -MemoryDumpPath only for a
-        # dump moved after the collection
-        $listed = Get-ManifestMemoryDump
-        $manifestNote = switch ($listed.Status) {
-            "None" {
-                if ((Get-CollectionManifest).Path) { "collection_manifest.csv lists none (the collector saved no complete dump)" }
-                else { "there is no collection_manifest.csv that says where the collector saved one" }
-            }
-            "Missing" {
-                if ($listed.InCollection) {
-                    "collection_manifest.csv lists one in the collection ($($listed.RelativePath)), which the collector moves next to the zip as $([System.IO.Path]::GetFileName((Get-CollectionRootFolder)))_memory_dump$([System.IO.Path]::GetExtension($listed.RelativePath)) when it zips the collection"
-                }
-                else { "the collector saved it to $($listed.Path) (collection_manifest.csv), and it is not there now" }
-            }
-            default { "collection_manifest.csv lists one at $($listed.Path), which was not used (see the warning above)" }
-        }
-        Log-Warning "No memory dump found in or next to the collection; $manifestNote. If the dump was moved after the collection, pass -MemoryDumpPath with its new path."
+        # What collection_manifest.csv said, and how to have the dump found
+        $notFound = Get-MemoryDumpNotFoundText -Listed (Get-ManifestMemoryDump)
+        Log-Warning "No memory dump found in or next to the collection; $($notFound.Note). To have it analyzed, $($notFound.Remedy), or pass the file as -MemoryDumpPath."
         Log "  Memory parsing complete."
         Log ""
         return
@@ -17067,7 +17247,12 @@ function Parse-AntiVirus {
 if ($Sources -notcontains "Memory") {
     # Check if a memory dump exists alongside the collection
     $detectedDump = Find-MemoryDump
-    if ($detectedDump -and (Get-MemoryDumpInfo -Path $detectedDump).Architecture -eq "ARM64") {
+    if (-not $detectedDump) {
+        # Nothing to offer: what became of a dump collection_manifest.csv
+        # lists, and how to have it analyzed
+        Write-NoMemoryDumpToOffer
+    }
+    elseif ((Get-MemoryDumpInfo -Path $detectedDump).Architecture -eq "ARM64") {
         # Volatility 3 cannot analyze Windows ARM64 memory: don't offer it
         Log ""
         Log "Memory dump detected: $(Get-MemoryDumpDisplayName $detectedDump) (Windows ARM64)."
@@ -17097,7 +17282,10 @@ if ($Sources -notcontains "Memory") {
             Write-Host "========================================" -ForegroundColor Cyan
             Write-Host ""
             Write-Host "  Found: $(Get-MemoryDumpDisplayName $detectedDump) ($dumpSizeGB GB)" -ForegroundColor Green
-            if ($script:memoryDumpFromManifest) {
+            if ($script:memoryDumpListedPath) {
+                Write-Host "  (where the collector saved it, on a drive with another letter now:" -ForegroundColor Green
+                Write-Host "   collection_manifest.csv lists $($script:memoryDumpListedPath))" -ForegroundColor Green
+            } elseif ($script:memoryDumpFromManifest) {
                 Write-Host "  (where the collector saved it, as collection_manifest.csv says)" -ForegroundColor Green
             }
             Write-Host "  Volatility 3 is available in tools\" -ForegroundColor Green
