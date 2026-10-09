@@ -627,7 +627,8 @@ Parses .evtx files using Get-WinEvent. Targets high-value forensic events
     command, only the part after its last backslash
   - OAlerts (Execution): alerts shown by Office applications (300, "Office
     alert (<application>): <text>", with the document) and Office add-in
-    events ("Office add-in event (<what>): <add-in>")
+    events ("Office add-in event (<what>): <add-in>") (User: the account
+    the Office application ran as, the record's own SID)
   - Antivirus products' own event logs collected under AntiVirus\
     (Symantec_SEP_EventLog.evtx, CrowdStrike_EventLog.evtx): every event
     goes through the same filter and wording as the antivirus events of the

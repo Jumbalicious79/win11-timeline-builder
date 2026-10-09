@@ -3281,9 +3281,10 @@ function Add-ShellCoreEntries {
 #   "Id=..., DisplayName=..., ..."): %1 what happened ("Activated App",
 #   "Failed to parse element: ..."), P3 an error code, P4 the open document:
 #   "Office add-in event (<what>): <add-in name>"
-# Both Execution: the user had the application or document open. Events
-# with fewer than three values (Office diagnostics such as "Compositor Type:
-# 1") are neither and are only counted.
+# Both Execution: the user had the application or document open. User is
+# the account the Office application ran as (the record's own UserID, also
+# kept as UserSID). Events with fewer than three values (Office diagnostics
+# such as "Compositor Type: 1") are neither and are only counted.
 function Add-OfficeAlertEntries {
     param([object[]]$Records, [string]$FileName, [string]$FilePath)
     $skipped = 0
@@ -3304,6 +3305,7 @@ function Add-OfficeAlertEntries {
                 Version   = $values[3]
                 ErrorCode = $values[4]
                 Document  = $values[5]
+                UserSID   = "$($r.UserId)"
             }
             $desc = "Office add-in event ($($values[0])): $addIn"
         }
@@ -3316,11 +3318,13 @@ function Add-OfficeAlertEntries {
                 Version     = $values[3]
                 P3          = $values[4]
                 Document    = $values[5]
+                UserSID     = "$($r.UserId)"
             }
             $desc = "Office alert ($($values[0])): $(Get-EvtxShortText $message 200)"
         }
         Add-TimelineEntry -Timestamp $r.TimeCreated -Source $FileName -EventType "Execution" `
-            -Description $desc -Details (Format-ArtifactDetails $details) -Artifact "EventLogs" -RawPath $FilePath
+            -Description $desc -User (Resolve-BamUser -Sid "$($r.UserId)" -SidNames @{}) `
+            -Details (Format-ArtifactDetails $details) -Artifact "EventLogs" -RawPath $FilePath
     }
     if ($skipped -gt 0) { Log "    Skipped $skipped event(s): Office diagnostics that are not alerts (fewer than three values)" }
 }
