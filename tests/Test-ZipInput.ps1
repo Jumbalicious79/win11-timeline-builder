@@ -9,14 +9,17 @@
 #   names with "/" and "\", folder entries, original entry dates, an
 #   over-long name shortened with its original name kept for the manifest
 #   lookup, a ".." entry not written outside the folder, nothing extracted
-#   when the zip does not fit), the manifest lookups from an outer folder,
-#   the input-file list of a collection folder and the list of missing
-#   files, the setupapi logs found (also under names shortened on
-#   extraction) and those the manifest lists but that are gone, the
-#   free-space verdict, the temp-folder check (8.3 short paths too), the
-#   end-of-run hive list, the clean-up of work folders left by
-#   earlier runs, the refusal of a network work folder and the end-of-run
-#   banners (missing input files, unexpected errors).
+#   when the zip does not fit), the manifest lookups from an outer folder
+#   (also the email parser's), the input-file list of a collection folder
+#   and the list of missing files, the setupapi logs found (also under
+#   names shortened on extraction; email attachment copies and Secrets\
+#   skipped) and those the manifest lists but that are gone, the
+#   free-space verdict, the temp-folder check (8.3 short paths and
+#   relative paths too), the end-of-run hive list, the clean-up of work
+#   folders left by earlier runs, the SRUM database copy (made in the work
+#   folder's scratch folder, a missing transaction log reported), the
+#   refusal of a network work folder and the end-of-run banners (missing
+#   input files, unexpected errors).
 # Part 2 -- builder runs: a synthetic collection zip whose entries are dated
 #   2025, with two setupapi logs (USBSTOR devices) under "/" and "\" entry
 #   names and a manifest, passed as -InputPath (-Sources USB):
@@ -238,6 +241,20 @@ try {
     Assert-Equal -Name "original file times found below an outer folder" -Expected "2024-03-02 11:00:00" -Actual $modified
     Assert-Equal -Name "manifest lists a collected file" -Expected $true -Actual (Test-ManifestListsFile (Join-Path $coll "Registry\alice\NTUSER.DAT"))
     Assert-Equal -Name "manifest does not list a file it lacks" -Expected $false -Actual (Test-ManifestListsFile (Join-Path $coll "Registry\alice\NTUSER.DAT.LOG1"))
+    # The email parser reads the same manifest: the collection's own (the
+    # nearest), not the first one a recursive search finds (a deeper one
+    # in a folder that sorts first)
+    $emailOuter = Join-Path $testRoot "email-outer"
+    $emailColl = Join-Path $emailOuter "Coll"
+    $decoyDir = Join-Path $emailOuter "Aaa\deeper"
+    New-Item -ItemType Directory -Path $emailColl, $decoyDir -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $decoyDir "collection_manifest.csv"), (New-TestManifest -RelativePaths @("Email\decoy\NewOutlook\UserSettings.json")))
+    [System.IO.File]::WriteAllText((Join-Path $emailColl "collection_manifest.csv"), (New-TestManifest -RelativePaths @("Email\alice\NewOutlook\UserSettings.json", "USB\setupapi.dev.log")))
+    Set-Variable -Name InputPath -Value $emailOuter -Scope Script
+    $script:collectionManifest = $null
+    $script:collectionInfo = $null
+    $script:collectionRoot = Get-CollectionRootFolder
+    Assert-Equal -Name "email manifest rows from the collection's own manifest below an outer folder" -Expected "Email\alice\NewOutlook\UserSettings.json" -Actual (@((Get-EmailManifestRows).Keys | Sort-Object) -join ", ")
 
     # --- Input files of a collection folder ------------------------------
     $folderColl = Join-Path $testRoot "folder\Coll"
@@ -274,30 +291,44 @@ try {
     # Logs shortened on extraction, named the way Expand-CollectionZip does
     # (the name's start, 8 characters or more, and a hash), are found and
     # count by their full-length names; only a listed log that is gone is
-    # reported
+    # reported. Email attachment copies and the Secrets\ folder are skipped
+    # like Find-ArtifactFiles skips them, also under a shortened name, and
+    # are not counted as listed.
     $usbColl = Join-Path $testRoot "usb\Coll"
     $shortSetupApi = Join-Path $usbColl "USB\setupapi~0123ABCD.log"
     $shortRotated = Join-Path $usbColl "USB\setupapi.dev.2023~4567CDEF.log"
-    New-Item -ItemType Directory -Path (Join-Path $usbColl "USB") -Force | Out-Null
-    foreach ($file in @((Join-Path $usbColl "USB\setupapi.dev.log"), $shortSetupApi, $shortRotated)) { [System.IO.File]::WriteAllText($file, "x") }
+    $attachedLog = Join-Path $usbColl "Email\alice\NewOutlook\Attachments\setupapi.dev.log"
+    $shortAttached = Join-Path $usbColl "Email\alice\NewOutlook\Attachments\setupapi~89ABCDEF.log"
+    $shortSecrets = Join-Path $usbColl "Secrets\setupapi~CDEF0123.log"
+    foreach ($file in @((Join-Path $usbColl "USB\setupapi.dev.log"), $shortSetupApi, $shortRotated, $attachedLog, $shortAttached, $shortSecrets)) {
+        New-Item -ItemType Directory -Path (Split-Path $file -Parent) -Force | Out-Null
+        [System.IO.File]::WriteAllText($file, "x")
+    }
     [System.IO.File]::WriteAllText((Join-Path $usbColl "collection_manifest.csv"),
-        (New-TestManifest -RelativePaths @("USB\setupapi.dev.log", "USB\setupapi.dev.20241201_000000.log", "USB\setupapi.dev.20230601_000000.log", "USB\setupapi.dev.20240101_000000.log", "Registry\SYSTEM")))
+        (New-TestManifest -RelativePaths @("USB\setupapi.dev.log", "USB\setupapi.dev.20241201_000000.log", "USB\setupapi.dev.20230601_000000.log", "USB\setupapi.dev.20240101_000000.log", "Registry\SYSTEM",
+            "Email\alice\NewOutlook\Attachments\setupapi.dev.log", "Email\alice\NewOutlook\Attachments\setupapi.dev.20220101_000000.log", "Secrets\setupapi.dev.20220202_000000.log")))
     Set-Variable -Name InputPath -Value (Split-Path $usbColl -Parent) -Scope Script
     $script:collectionManifest = $null
+    $script:collectionRoot = Get-CollectionRootFolder
+    $script:secretsRoot = $null
     $script:shortenedNames = @{
         $shortSetupApi = (Join-Path $usbColl "USB\setupapi.dev.20241201_000000.log")
         $shortRotated  = (Join-Path $usbColl "USB\setupapi.dev.20230601_000000.log")
+        $shortAttached = (Join-Path $usbColl "Email\alice\NewOutlook\Attachments\setupapi.dev.20220101_000000.log")
+        $shortSecrets  = (Join-Path $usbColl "Secrets\setupapi.dev.20220202_000000.log")
     }
     $foundLogs = @(Find-SetupApiLogFiles)
     $foundNames = [string[]]@($foundLogs | ForEach-Object { $_.Name })
     [Array]::Sort($foundNames, [System.StringComparer]::Ordinal)
     Assert-Equal -Name "SetupAPI logs: found, also under a shortened name, each once" -Expected "setupapi.dev.2023~4567CDEF.log, setupapi.dev.log, setupapi~0123ABCD.log" -Actual ($foundNames -join ", ")
+    Assert-Equal -Name "SetupAPI logs: email attachment copies and Secrets\ skipped, also under a shortened name" -Expected "" -Actual (@($foundLogs | Where-Object { $_.FullName -notlike "$usbColl\USB\*" } | ForEach-Object { $_.FullName }) -join ", ")
     $setupApiCheck = Compare-ManifestSetupApiLogs -Found $foundLogs
-    Assert-Equal -Name "SetupAPI logs: listed in the manifest" -Expected "USB\setupapi.dev.20230601_000000.log, USB\setupapi.dev.20240101_000000.log, USB\setupapi.dev.20241201_000000.log, USB\setupapi.dev.log" -Actual ($setupApiCheck.Listed -join ", ")
+    Assert-Equal -Name "SetupAPI logs: listed in the manifest (not email attachment copies or Secrets\)" -Expected "USB\setupapi.dev.20230601_000000.log, USB\setupapi.dev.20240101_000000.log, USB\setupapi.dev.20241201_000000.log, USB\setupapi.dev.log" -Actual ($setupApiCheck.Listed -join ", ")
     Assert-Equal -Name "SetupAPI logs: only the one that is gone is missing (shortened ones found)" -Expected "USB\setupapi.dev.20240101_000000.log" -Actual ($setupApiCheck.Missing -join ", ")
     $setupApiCheck = Compare-ManifestSetupApiLogs -Found @()
     Assert-Equal -Name "SetupAPI logs: none found, all listed are missing" -Expected 4 -Actual $setupApiCheck.Missing.Count
     $script:shortenedNames = @{}
+    $script:secretsRoot = $null
 
     # --- Free space verdict ----------------------------------------------
     $need = 2GB
@@ -315,6 +346,12 @@ try {
     if ($shortTemp) {
         Write-TestResult -Name "an 8.3 short path of it is too ($shortTemp)" -Passed ([bool](Get-ContainingTempFolder $shortTemp)) -Message "no temp folder found for $shortTemp"
     }
+    # A relative -InputPath is resolved against the PowerShell location (as
+    # the parsers do), not the process working directory
+    Push-Location -LiteralPath $testRoot
+    try { $relativeTemp = Get-ContainingTempFolder "." }
+    finally { Pop-Location }
+    Write-TestResult -Name "a relative path is resolved against the PowerShell location" -Passed ([bool]$relativeTemp) -Message "no temp folder found for '.' in $testRoot (process directory: $([Environment]::CurrentDirectory))"
     $defaultBase = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) "TimelineBuilder"
     Assert-Equal -Name "the default work folder base is not inside a temp folder" -Expected "" -Actual (Get-ContainingTempFolder $defaultBase)
 
@@ -356,6 +393,49 @@ try {
         $held.Close()
         if ($script:runWorkLock) { $script:runWorkLock.Close() }
     }
+
+    # --- SRUM: scratch copy in the work folder, missing transaction log ----
+    # A SRUDB.dat that is not an ESE database is copied and then skipped:
+    # the copy must be made in the work folder's scratch folder (not
+    # %TEMP%) and removed. Its manifest lists a log that is gone.
+    $srumColl = Join-Path $testRoot "srum\Coll"
+    $srumDir = Join-Path $srumColl "Execution\SRUM"
+    New-Item -ItemType Directory -Path $srumDir -Force | Out-Null
+    foreach ($name in @("SRUDB.dat", "SRU.log", "SRUtmp.jrs")) { [System.IO.File]::WriteAllText((Join-Path $srumDir $name), "not an ESE file") }
+    [System.IO.File]::WriteAllText((Join-Path $srumColl "collection_manifest.csv"),
+        (New-TestManifest -RelativePaths @("Execution\SRUM\SRUDB.dat", "Execution\SRUM\SRU.log", "Execution\SRUM\SRU00001.log", "Execution\SRUM\SRUtmp.jrs", "Execution\SRUM\SRUres00001.jrs")))
+    Set-Variable -Name InputPath -Value $srumColl -Scope Script
+    $script:collectionManifest = $null
+    $script:manifestTimes = $null
+    $script:collectionRoot = Get-CollectionRootFolder
+    $script:runScratchDir = Join-Path $testRoot "srum-work\scratch"
+    New-Item -ItemType Directory -Path $script:runScratchDir -Force | Out-Null
+    if (Initialize-SrumReader) {
+        $script:srumCopyDir = ""
+        $script:srumCopyMade = $false
+        $logBefore = @(Get-Content -LiteralPath $logFile).Count
+        # The real Get-SrumWorkingCopy, wrapped to see where it copies to
+        & {
+            $realGetCopy = ${function:Get-SrumWorkingCopy}
+            function Get-SrumWorkingCopy {
+                param([System.IO.FileInfo]$File, [string]$TempDir)
+                $copy = & $realGetCopy -File $File -TempDir $TempDir
+                $script:srumCopyDir = $TempDir
+                $script:srumCopyMade = Test-Path -LiteralPath (Join-Path $TempDir "SRUDB.dat") -PathType Leaf
+                return $copy
+            }
+            Add-SrumTimelineEntries -File (Get-Item -LiteralPath (Join-Path $srumDir "SRUDB.dat"))
+        }
+        $srumLog = @(Get-Content -LiteralPath $logFile | Select-Object -Skip $logBefore)
+        Write-TestResult -Name "SRUM copy made in the work folder's scratch folder" -Passed ($script:srumCopyMade -and
+            $script:srumCopyDir.StartsWith($script:runScratchDir + "\", [System.StringComparison]::OrdinalIgnoreCase)) -Message "copy folder: $($script:srumCopyDir)"
+        Assert-Equal -Name "SRUM copy removed after reading" -Expected $false -Actual (Test-Path -LiteralPath $script:srumCopyDir)
+        $missingLogLines = @($srumLog | Where-Object { $_ -match 'Transaction log missing: ' } | ForEach-Object { $_ -replace '^\[[^\]]+\] ', '' })
+        Assert-Equal -Name "SRUM: only the transaction log listed in the manifest but gone is reported" -Expected (
+            "WARNING:   Transaction log missing: $(Join-Path $srumDir 'SRU00001.log') is in the collection manifest but not here -- the database is read without it (records not yet written to the database are lost)") -Actual ($missingLogLines -join " | ")
+    }
+    else { Write-TestResult -Name "SRUM reader compiles" -Passed $false -Message "Initialize-SrumReader failed" }
+    $script:runScratchDir = $null
 
     # --- A network work folder is refused (reg load needs local hives) -----
     # Only the path is looked at: no network access
