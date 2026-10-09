@@ -10,7 +10,8 @@
 # mounted_devices.csv with rows first, then the SYSTEM hive (also after an
 # empty CSV), then mounted_devices.txt, and no rows from the decoded .txt
 # of newer collectors. The hive is not loaded when the CSV has rows and is
-# unloaded also after a read error. Loading and reading a real hive needs
+# unloaded also after a read error. No CSV or SYSTEM hive is read from the
+# collection's Secrets\ folder or the email attachment copies. Loading and reading a real hive needs
 # reg load (admin), so stubs stand in for them here;
 # tests\Test-RegistryParsers.ps1 reads a real SYSTEM hive.
 # The builder's functions are loaded from its AST, so the script itself (and
@@ -255,10 +256,12 @@ try {
     # Runs Parse-USB on a new collection with the given USB\ files (name ->
     # @(text, encoding)) and, with -SystemHive, a Registry\SYSTEM whose
     # MountedDevices values are $HiveRows (or whose read throws $HiveError);
+    # each of -ExcludedFolders (folders no parser may read) gets a
+    # mounted_devices.csv with rows and a SYSTEM hive too;
     # returns its rows, their RawPaths, the log text and the hive stub calls
     function Invoke-ParseUsb {
         param([string]$Name, [System.Collections.IDictionary]$Files, [string]$Mode = "Live",
-            [switch]$SystemHive, [object[]]$HiveRows = @(), [string]$HiveError = "")
+            [switch]$SystemHive, [object[]]$HiveRows = @(), [string]$HiveError = "", [string[]]$ExcludedFolders = @())
         $collection = Join-Path $workDir $Name
         New-Item -ItemType Directory -Path (Join-Path $collection "USB") -Force | Out-Null
         $info = '{ "SchemaVersion": 1, "Mode": "' + $Mode + '", "CollectionStartUtc": "2025-06-30T12:00:00Z", "CollectorTimeZoneId": "UTC", "TargetTimeZoneId": "UTC" }'
@@ -269,11 +272,19 @@ try {
             New-Item -ItemType Directory -Path (Join-Path $collection "Registry") -Force | Out-Null
             [System.IO.File]::WriteAllBytes((Join-Path $collection "Registry\SYSTEM"), [byte[]](0x72, 0x65, 0x67, 0x66, 0, 0, 0, 0))
         }
+        foreach ($folder in $ExcludedFolders) {
+            $excludedPath = Join-Path $collection $folder
+            New-Item -ItemType Directory -Path $excludedPath -Force | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $excludedPath "mounted_devices.csv"), $csvText, $utf8Bom)
+            [System.IO.File]::WriteAllBytes((Join-Path $excludedPath "SYSTEM"), [byte[]](0x72, 0x65, 0x67, 0x66, 0, 0, 0, 0))
+        }
         $script:stubHiveCalls = @()
         $script:stubHiveRows = $HiveRows
         $script:stubHiveError = $HiveError
         $script:InputPath = $collection
         $script:collectionRoot = $collection
+        # The builder looks up the collection's Secrets\ folder once per run
+        $script:secretsRoot = $null
         $script:collectionInfo = $null
         $script:collectionManifest = $null
         $script:shortenedNames = @{}
@@ -335,6 +346,13 @@ try {
 
     $run = Invoke-ParseUsb -Name "hive-nokey" -SystemHive -Files ([ordered]@{ "mounted_devices.txt" = @($oldText, $utf8Bom) })
     Assert-Equal -Name "SYSTEM hive without MountedDevices: hive unloaded, rows from the old .txt" -Expected "True|$hiveCallsDone|6|$(Join-Path $run.Path 'USB\mounted_devices.txt')" -Actual "$($run.Log.Contains('No MountedDevices values in the SYSTEM hive.'))|$($run.HiveCalls)|$($run.Rows.Count)|$($run.RawPaths)"
+
+    # Folders no parser reads: the collection's top-level Secrets\ (collector
+    # -IncludeSecrets) and the email attachment copies. A CSV with rows or a
+    # SYSTEM hive there is not used, so the rows come from the old .txt
+    $excluded = @("Secrets", "Email\alice\NewOutlook\Attachments", "Email\alice\Outlook\SecureTemp")
+    $run = Invoke-ParseUsb -Name "excluded" -ExcludedFolders $excluded -HiveRows $hiveRows -Files ([ordered]@{ "mounted_devices.txt" = @($oldText, $utf8Bom) })
+    Assert-Equal -Name "Secrets\ and email attachment copies: no CSV or SYSTEM hive read there, rows from the old .txt" -Expected "6|$(Join-Path $run.Path 'USB\mounted_devices.txt')||False|False" -Actual "$($run.Rows.Count)|$($run.RawPaths)|$($run.HiveCalls)|$($run.Log.Contains((Join-Path $run.Path 'Secrets\')))|$($run.Log.Contains((Join-Path $run.Path 'Email\')))"
 }
 catch {
     Write-TestResult -Name "test run" -Passed $false -Message "$($_.Exception.Message) ($($_.InvocationInfo.PositionMessage))"
