@@ -1554,9 +1554,10 @@ parsing is skipped, and the timeline CSV can be opened manually.
   committing.
 
   The scripts below test the event log, browser, registry, $MFT, email,
-  SRUM and Defender parsers and how the builder handles its input
-  (secrets, zip input). CI runs them after Test-Parsers.ps1 in both
-  PowerShell versions (GitHub Actions runners are elevated):
+  SRUM and Defender parsers, the USB parser's mounted devices, and how the
+  builder handles its input (secrets, zip input). CI runs them after
+  Test-Parsers.ps1 in both PowerShell versions (GitHub Actions runners are
+  elevated):
 
   tests\Test-EventLogParsers.ps1 -- Part 1 feeds the Security, System,
   Defender and Application handlers synthetic event records and checks
