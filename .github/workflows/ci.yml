@@ -3,8 +3,9 @@ name: CI
 on:
   push:
     branches: [master]
+  # Every pull request, whatever its base branch: a PR stacked on another
+  # PR's branch gets the same checks as a PR into master
   pull_request:
-    branches: [master]
 
 permissions:
   contents: read
@@ -42,8 +43,8 @@ jobs:
           Write-Host "All scripts parse in PowerShell $($PSVersionTable.PSVersion)"
 
   parser-tests:
-    # Runs the builder on the fixture collection in tests\fixtures and
-    # compares the timeline with the expected rows (Windows runners are
+    # Runs the builder on each fixture collection in tests\fixtures and
+    # compares the timelines with the expected rows (Windows runners are
     # elevated, which the builder requires)
     name: Parser tests (${{ matrix.shell }})
     runs-on: windows-latest
@@ -132,6 +133,34 @@ jobs:
       - name: Run findings report builder test
         if: ${{ !cancelled() }}
         run: ./tests/Test-ReportBuilder.ps1
+
+      - name: Run zip input test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-ZipInput.ps1
+
+      - name: Run mounted devices test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-MountedDevices.ps1
+
+      - name: Run memory parser test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-MemoryParser.ps1
+
+      - name: Run ShimCache parser test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-ShimCacheParser.ps1
+
+      - name: Run summary counts test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-SummaryCounts.ps1
+
+      - name: Run scheduled tasks test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-ScheduledTasks.ps1
+
+      - name: Run console mode test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-ConsoleMode.ps1
 
   analyze:
     name: PSScriptAnalyzer

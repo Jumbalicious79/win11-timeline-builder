@@ -122,7 +122,8 @@ themselves are never committed.
     1. Finds triage collection .zip files from sibling triage-collector\reports\
     2. Lists them with size and date, newest first
     3. You pick a number
-    4. Extracts to a temp folder (cleaned up after)
+    4. Extracts it into a work folder in %LOCALAPPDATA%\TimelineBuilder,
+       not %TEMP% (deleted after; see "Work folder" below)
     5. Builds the timeline (~2 minutes for ~36,000 events)
     6. Generates a color-coded Excel file (rows colored by EventType)
     7. Writes the findings report: report.pdf, report.html and findings.csv
@@ -131,10 +132,12 @@ themselves are never committed.
     8. Asks how you want to view: Excel (colored), Timeline Explorer, Both,
        Open report, None
 
-  You can also pass a path directly, optionally followed by a comma-separated
+  You can also pass a collection folder or a collection .zip directly (or
+  drop either on the .bat), optionally followed by a comma-separated
   keyword list (both in quotes):
 
   Run-TimelineBuilder.bat "path\to\triage\collection"
+  Run-TimelineBuilder.bat "path\to\TriageCollection_2026-04-08_09-30.zip"
   Run-TimelineBuilder.bat "path\to\collection" "mimikatz,psexec"
 
   The launcher asks for Administrator rights (UAC) and restarts itself
@@ -142,10 +145,36 @@ themselves are never committed.
   are fine, and a relative path is turned into a full path first (the
   elevated window starts in C:\Windows\System32).
 
+  While the builder runs, QuickEdit is off in its console window, so a
+  click in the window cannot pause the run. (With QuickEdit on, a click
+  starts a text selection, and every write to the window -- and with it
+  the whole run, log file included -- waits until the selection ends.)
+  The console's mouse input is turned off with it, so the mouse wheel
+  still scrolls the window. The log says "Console QuickEdit is off for
+  this run ...". To copy text during the run, use the window menu (the
+  icon at the top left, or Alt+Space): Edit > Mark, select, then Enter to
+  copy; that selection pauses the run too until Enter or Esc ends it. Or
+  copy from the log file or the window after the run. The console's own
+  setting comes back when the run ends. In Windows Terminal a selection
+  does not pause the run, and text is selected and copied as usual.
+
+  The collection's memory dump is found as well, also when the collector
+  wrote it to another drive (e.g. D:\TriageMemory\ when the system drive
+  was low on space): collection_manifest.csv records where the collector
+  saved it, and a drive that has another letter now (e.g. a USB drive on
+  the analysis machine) is searched under its new letter. With
+  Volatility 3 in tools\, the builder offers to analyze it (see parser
+  #15). When the manifest lists a dump the builder cannot find or use, it
+  says what to do: connect the drive, or copy the dump next to the zip
+  under the name it gives (<zip name>_memory_dump.dmp or .raw), then run
+  the .bat again.
+
 ### PowerShell (Admin)
 
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -Browse
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection"
+  powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\TriageCollection_2025-01-20_14-05.zip" -WorkDir "D:\Work"
+  powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\TriageCollection_2025-01-20_14-05.zip" -MemoryDumpPath "E:\Moved\TriageCollection_2025-01-20_14-05_memory_dump.dmp"
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -StartDate "2025-01-15" -EndDate "2025-01-20"
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -Sources "EventLogs,Prefetch,Registry"
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -Keywords "mimikatz,psexec,powershell -enc"
@@ -162,12 +191,20 @@ themselves are never committed.
   itself, so both forms work. From a PowerShell prompt (.\timeline-builder.ps1)
   normal arrays (-Keywords "a","b") work as well.
 
+  -MemoryDumpPath (fourth line) is needed only for a dump the builder does
+  not find or does not use by itself (see -MemoryDumpPath below); a dump
+  where the collector saved it is found without it, and copying a dump
+  next to the zip as <zip name>_memory_dump.dmp (.raw) works too, also
+  from Run-TimelineBuilder.bat.
+
 
 ## Parameters
 
   -Browse         Auto-find triage zips in sibling triage-collector\reports\
                   and present a numbered menu to select one. No InputPath needed.
-  -InputPath      Path to a triage collection directory or any directory
+  -InputPath      Path to a triage collection directory, a collection .zip
+                  (extracted into the work folder, as in browse mode; a
+                  memory dump next to it is found too), or any directory
                   containing supported artifacts.
   -OutputFile     Output CSV path. Defaults to reports\timeline_<timestamp>\timeline.csv
   -StartDate      Only include events after this date (UTC).
@@ -179,7 +216,9 @@ themselves are never committed.
                   UsnJournal, Amcache, PowerShellHistory, SystemInfo,
                   AntiVirus, Email, SRUM, Memory
                   Note: Memory is opt-in. Requires Volatility 3 in tools\ and
-                  a memory dump in the collection. Adds 5-30 minutes.
+                  a memory dump where the collector saved it (also on
+                  another drive), in or next to the collection, or
+                  -MemoryDumpPath (see parser #15). Adds 5-30 minutes.
   -Keywords       Strings to flag in the timeline, as an array or a
                   comma-separated string ("mimikatz,psexec"). Spaces around
                   each keyword are trimmed and empty items ignored. Matching is
@@ -227,6 +266,36 @@ themselves are never committed.
                   update alone can add hundreds of thousands. Possible
                   timestomping and Mark-of-the-Web (downloaded or
                   extracted file) rows are always reported (see parser #8).
+  -WorkDir        Folder in which this run's work folder is made (the
+                  extracted zip and scratch copies; see "Work folder").
+                  Default %LOCALAPPDATA%\TimelineBuilder. Use a folder on
+                  another local drive when the system drive is low on
+                  space, and never a temp folder. A network share or mapped
+                  network drive is refused (reg load cannot load hives
+                  from there).
+  -MemoryDumpPath The collection's memory dump file (a DumpIt .dmp or a
+                  .raw image), for a dump the builder does not find or does
+                  not use by itself: one moved to another folder after the
+                  collection, one on a network share that is not next to
+                  the collection zip or folder, or one whose size is not
+                  the one collection_manifest.csv lists (to analyze it
+                  anyway). A dump the triage collector saved on another
+                  drive (with -MemoryOutputPath, or the drive picked at its
+                  memory prompt when the system drive was low on space,
+                  e.g. D:\TriageMemory\<collection>_memory_dump.dmp) is
+                  found without it, also when that drive has another
+                  letter now: collection_manifest.csv records where the
+                  collector saved it (see parser #15). Copying the dump
+                  next to the collection zip as <zip name>_memory_dump.dmp
+                  (.raw) does the same as this parameter for a complete
+                  dump, also from Run-TimelineBuilder.bat; the builder
+                  names that path when it finds no dump. It is used before
+                  the places listed under parser #15; if it is not an
+                  existing file, a warning is logged and those places are
+                  searched instead. It does not turn on the Memory parser:
+                  add Memory to -Sources, or choose [1] when the builder
+                  offers the dump. Run-TimelineBuilder.bat does not pass
+                  it; start the script from PowerShell.
 
 
 ## Auto-Downloaded Dependencies
@@ -264,7 +333,8 @@ installed as PowerShell modules -- no manual installation needed.
   Eric Zimmerman's tools: https://ericzimmerman.github.io/
 
 All downloads happen once. On subsequent runs, cached copies are reused.
-All temp files (download zips, extraction dirs) are cleaned up automatically.
+Download zips are deleted from %TEMP% after extraction; the work folder
+(extracted collection, scratch copies) is deleted at the end of every run.
 
 
 ## Output
@@ -298,6 +368,77 @@ The report files are written next to the timeline: with -OutputFile, in
 that file's folder (the builder log stays in reports\timeline_<timestamp>\).
 See "Findings Report".
 
+### Work folder
+
+  A collection zip is extracted, and hives, browser databases and SRUM
+  databases are copied for reading, into a work folder that exists only
+  while the builder runs:
+
+    %LOCALAPPDATA%\TimelineBuilder\w<PID>_<HHmmss>\
+      .lock                          -- held open for the whole run
+      in\                            -- the extracted collection zip
+      scratch\                       -- copies for reg load, sqlite3 and
+                                        the SRUM reader, Volatility 3
+                                        output
+
+  It is deleted at the end of every run, also after an error or Ctrl+C. A
+  folder left by a run that was killed (window closed, crash) is deleted by
+  the next run, once no builder holds its .lock. -WorkDir makes the work
+  folder in another folder; if %LOCALAPPDATA% cannot be written, work\ next
+  to the script is used. The log names the work folder. It must be on a
+  local drive: reg load only loads a hive from a local file, so a network
+  share (\\server\share) or a mapped network drive is not used, and with
+  such a -WorkDir the run stops at the start.
+
+  Copied email attachments (Email\<user>\Outlook\SecureTemp\ and
+  Email\<user>\NewOutlook\Attachments\) stay in the zip: no parser reads
+  them (their rows come from the manifest and the email listings), and
+  antivirus on this machine may quarantine them. The log gives their
+  number.
+
+  Why not %TEMP%: Windows Storage Sense deletes files older than 7 days from
+  temp folders when disk space runs low, and extracted files keep the dates
+  stored in the zip, which are often months old. This once deleted setupapi
+  logs and browser databases while a timeline was being built. The builder
+  warns when the work folder, or a folder passed as -InputPath, is inside a
+  temp folder.
+
+  Before extracting, the free space on the work folder's drive is checked:
+  the builder stops below the zip's uncompressed size plus 256 MB, and warns
+  below the size plus 1 GB, or when the system drive would be left with
+  less than 10% free.
+
+### Incomplete timeline (exit code 2)
+
+  Missing input files. Every input file is recorded when the run starts:
+  each file extracted from the zip, or, for a collection folder, each file
+  listed in collection_manifest.csv that is present (memory dumps and
+  copied email attachments excepted: the attachments are not read, so
+  antivirus removing one does not make the timeline incomplete). Files
+  that disappear right after the extraction (e.g. antivirus) stop the
+  run. After the parsers have run, all of them must still be there; files
+  that disappeared are listed by collection folder (USB\, Browser\, ...;
+  the console shows 20 names per folder, the log file all of them), and
+  the run ends with
+
+    === Timeline Builder Completed WITH N MISSING INPUT FILE(S) -- timeline incomplete ===
+
+  The timeline is still written, but rows from those files may be missing.
+  The check runs once, after all parsers, so a file deleted after its
+  parser read it is listed too, although its rows are in the timeline.
+
+  Unexpected errors. An error the builder does not handle itself (a bug,
+  or input it does not expect) is logged as "Unexpected error at line N
+  (rest of this step skipped)", and the rest of that step -- usually the
+  rest of one parser -- is skipped. The run goes on with the next step and
+  ends with
+
+    === Timeline Builder Completed WITH N UNEXPECTED ERROR(S) -- timeline may be incomplete ===
+
+  In both cases the exit code is 2 instead of 0. Exit code 1 means the run
+  stopped early (input not found, a bad zip, no work folder, files gone
+  right after the extraction).
+
 
 ## Output Format (CSV and Excel)
 
@@ -307,10 +448,10 @@ gets it):
 
   Timestamp     UTC-normalized datetime (yyyy-MM-dd HH:mm:ss.fff)
   Source        Which artifact produced the entry (e.g., Security.evtx, Prefetch)
-  EventType     Category: Execution, FileAccess, Logon, NetworkConnection,
-                PersistenceChange, AccountChange, ProcessCreation, ServiceChange,
-                ScheduledTaskChange, USBDevice, Installation, SecurityAlert,
-                Snapshot (see below)
+  EventType     Category: Execution, FileAccess, FileLastModified, Logon,
+                NetworkConnection, PersistenceChange, AccountChange,
+                ProcessCreation, ServiceChange, ScheduledTaskChange, USBDevice,
+                Installation, SecurityAlert, Snapshot (see below)
   Description   Human-readable summary of what happened
   User          Account the artifact belongs to, if known (see below)
   Details       Additional context (command line, file path, IP, etc.)
@@ -332,6 +473,13 @@ gets it):
     ...): the registry key's last-write time. Values that store a time of
     their own use it (TaskCache, Office TrustRecords and File/Place MRU)
   - BAM: bam_entries.csv, or the collected SYSTEM hive
+  - ShimCache (AppCompatCache): the file's last-modified time stored in
+    each cache entry, not when the program ran (EventType
+    FileLastModified)
+  - Scheduled tasks: the registered and last run times Windows records in
+    the TaskCache, and the last run times in scheduled_tasks.csv. The
+    registration date in the task XML is set by whoever wrote the task, so
+    its rows say "(author-supplied)" (parser #6)
   - Browser history, downloads, logins, cookies, form entries and
     permissions: times the browsers store in UTC
   - USN journal and setupapi logs: these are local-time text. They are
@@ -346,35 +494,83 @@ gets it):
   - SRUM: the last hourly SRUM record of each UTC day
   - Defender DetectionHistory and quarantine entries: the times stored in
     the files
+  - Memory dump (Volatility 3): process creation and connection times kept
+    in memory; rows without one get the capture time (the SystemTime in the
+    header of a 64-bit crash dump, else the dump file's last-write time; see
+    "Snapshot rows" and parser #15)
 
 ### Snapshot rows
 
   Some artifacts describe the state of the system when it was collected, not
   an event: the service and driver list, DNS and ARP cache, current TCP
   connections, shares, Wi-Fi profiles, loaded DLLs, browser settings, email
-  accounts, and scheduled tasks, services, run keys or browser extensions
-  that have no usable time of their own. These rows have EventType
-  "Snapshot" and the collection time as their Timestamp. A few context rows
-  are Snapshot rows at a time of their own: a security product reported ON
-  to Security Center (event time), the Outlook attachment folder and the
-  triage collector's own Defender exclusion (registry key last-write time).
-  Snapshot rows are colored light gray in Excel. Filter them out
-  (EventType <> Snapshot) to see only real events.
+  accounts, the drive letters and volumes in MountedDevices, and scheduled
+  tasks, services, run keys or browser extensions that have no usable time
+  of their own. These rows have EventType "Snapshot" and the collection
+  time as their Timestamp. The memory dump is read the same way: services
+  and process command lines found in memory, and processes or connections
+  without a valid time of their own, are Snapshot rows at the time the
+  memory was captured (parser #15). A few context rows are Snapshot rows at
+  a time of their own: a security product reported ON to Security Center
+  (event time), the Outlook attachment folder and the triage collector's
+  own Defender exclusion (registry key last-write time). Snapshot rows are
+  colored light gray in Excel. Filter them out (EventType <> Snapshot) to
+  see only real events.
 
 ### User column
 
-  The user is taken from the collection's own folder layout: Registry\<user>\,
-  UserActivity\<user>\, Browser\<user>\, Email\<user>\ or a Users\<user>\
-  folder inside the collection. It is never taken from the analysis
-  machine's path (for example the %TEMP% folder a browse-mode zip is
-  extracted to). Rows that do not belong to a specific profile have an
-  empty User.
+  For a per-profile artifact (a user's registry hive, user activity,
+  browser history, e-mail, a file in a profile) the user is taken from the
+  collection's own folder layout: Registry\<user>\, UserActivity\<user>\,
+  Browser\<user>\, Email\<user>\ or a Users\<user>\ folder inside the
+  collection. It is never taken from the analysis machine's path (for
+  example the work folder a zip is extracted to). Event logs, scheduled
+  tasks, BAM and other sources write the account their record names, each
+  in its own way (HOST\alice, a SID, LocalSystem, ...). A row with no
+  account has an empty User.
+
+  After all parsers have run, every User value is put in one form per
+  account, so that a filter on an account finds all of its rows:
+  - A local account of the examined machine is its name alone (alice, not
+    HOST\alice or .\alice, in any case). The machine's names are the
+    computer name in collection_info.json (live collections only) and the
+    computer and host names in the collected SYSTEM hive.
+  - A SID gets the account name from the collected SOFTWARE hive's
+    ProfileList (the profile folder name) or from bam_entries.csv, and the
+    SID stays in Details as UserSID=<SID>, unless a Details field already
+    holds it (for example BAM's SID=, the firewall's ModifyingUser= or a
+    scheduled task's UserId=). A SID with no name is left as it is; the
+    log lists such SIDs.
+  - The built-in accounts are NT AUTHORITY\SYSTEM (also for SYSTEM,
+    LocalSystem and S-1-5-18), NT AUTHORITY\LOCAL SERVICE and NT
+    AUTHORITY\NETWORK SERVICE, and Window Manager\DWM-n and Font Driver
+    Host\UMFD-n for their SIDs.
+  - Empty and "-" parts are dropped ("-\-" becomes an empty User).
+  - Everything else is left as it is: domain accounts (DOMAIN\alice),
+    MicrosoftAccount\..., AzureAD\..., the computer account
+    (WORKGROUP\HOST$), NT SERVICE\..., NT VIRTUAL MACHINE\... and group
+    names.
+  The log's "User column:" line says how many rows changed.
+
+  The machine and SID names are read, with no extra hive loads, only by
+  the sources that open those files: ProfileList by Registry (and by
+  PowerShellHistory when it reads BAM from the SYSTEM hive, and by SRUM
+  when one of its user SIDs has no name yet), bam_entries.csv by
+  PowerShellHistory and SRUM, and the SYSTEM hive's names by Registry and
+  PowerShellHistory (and by USB when it reads MountedDevices from the
+  hive). SRUM names its rows' SIDs the same way. All of them are in the
+  default -Sources. A run with only some sources (for example -Sources
+  EventLogs) can leave SIDs, and for a mounted image HOST\ prefixes, as
+  they are.
 
 ### Duplicates
 
   A row is removed as a duplicate only if Timestamp, Source, EventType,
-  Description, User and Details are all identical (case-sensitive); the
-  first copy is kept. The count is shown in the summary.
+  Description, User and Details are all identical (case-sensitive), with
+  User already in its one form per account (see "User column"); the
+  first copy is kept. The summary shows how many rows were removed. Its
+  "Events by artifact source" counts the rows left in the timeline, so
+  they add up to "Total events".
 
 ### CSV vs Excel differences
 
@@ -790,7 +986,8 @@ Parses .evtx files using Get-WinEvent. Targets high-value forensic events
     markers of a boot and of a clean shutdown)
   - Application: software installed or removed (MsiInstaller 1033/1034,
     EventType Installation, with Product, Version, Manufacturer, Status and
-    the installing account as User; 11707/11724 only when there is no
+    the installing account as User, named from its SID (see "User
+    column"); 11707/11724 only when there is no
     matching 1033/1034), application crashes and hangs (Application Error
     1000, Application Hang 1002, EventType Execution, with the faulting
     Module and ExceptionCode), ESE database created, attached, detached or
@@ -807,7 +1004,10 @@ Parses .evtx files using Get-WinEvent. Targets high-value forensic events
     Malwarebytes, Webroot, CrowdStrike) are SecurityAlert rows with the
     message text, trimmed: Critical, Error and Warning events, and
     Information events only when their text reports a detection
-  - PowerShell Operational: Script block logging (4104), module logging (4103)
+  - PowerShell Operational: Script block logging (4104, with ScriptBlockId
+    and the script's Path), module logging (4103). User is the event's
+    own user: a SID, named when the collection has its name (see "User
+    column")
   - Sysmon (if present): Process creation (1), network (3), image loads (7),
     file creation (11), registry changes (13)
   - Task Scheduler: Task registered (106), updated (140), deleted (141)
@@ -821,6 +1021,7 @@ Parses .evtx files using Get-WinEvent. Targets high-value forensic events
     rule name; audits are folded into one row per rule, path, process and
     day, with Count and LastSeen) (EventType SecurityAlert)
   - BITS Client: background transfer jobs and the URLs they download from
+    (User: the job owner, or the event's own user for transfers)
   - Defender detections (defender_detections.csv) with the threat name and
     severity from defender_threats.csv
   - Defender support logs (MPLog-*.log): detections and remediations,
@@ -881,7 +1082,8 @@ Parses .evtx files using Get-WinEvent. Targets high-value forensic events
     command, only the part after its last backslash
   - OAlerts (Execution): alerts shown by Office applications (300, "Office
     alert (<application>): <text>", with the document) and Office add-in
-    events ("Office add-in event (<what>): <add-in>")
+    events ("Office add-in event (<what>): <add-in>") (User: the account
+    the Office application ran as, the record's own SID)
   - Antivirus products' own event logs collected under AntiVirus\
     (Symantec_SEP_EventLog.evtx, CrowdStrike_EventLog.evtx): every event
     goes through the same filter and wording as the antivirus events of the
@@ -954,10 +1156,12 @@ From the SOFTWARE hive (EventType PersistenceChange unless noted):
   - Scheduled tasks from the TaskCache (Registry-TaskCache): hidden tasks
     and task folders -- a Tree entry without an SD value, which schtasks
     and Task Scheduler do not list (ScheduledTaskChange); and, from
-    DynamicInfo, "Scheduled task registered" (ScheduledTaskChange) and
-    "Scheduled task last run" (Execution, with LastErrorCode) with the
-    task's Actions, for tasks that scheduled_tasks.csv or the task XML
-    files do not already put on the timeline
+    DynamicInfo, with the task's Actions: "Scheduled task registered"
+    (ScheduledTaskChange) for every task -- the time Windows recorded,
+    also for a task that scheduled_tasks.csv or the task XML files list
+    (Details: Listed=yes) -- and "Scheduled task last run" (Execution,
+    with LastErrorCode) unless scheduled_tasks.csv already gives the
+    task's last run time
   - Defender exclusions (Registry-DefenderExclusions; Paths, Extensions,
     Processes, IpAddresses; local and Group Policy): one SecurityAlert row
     each; local ones are "ignored by policy" when Group Policy sets
@@ -975,7 +1179,13 @@ From the SYSTEM hive:
   - BAM/DAM: Background/Desktop Activity Moderator last execution times,
     from bam_entries.csv (current collector) or the collected SYSTEM hive
   - AppCompatCache (ShimCache): programs recorded by the compatibility
-    cache, from the collected SYSTEM hive / appcompat_cache.reg
+    cache, from the collected SYSTEM hive / appcompat_cache.reg (read with
+    -Sources PowerShellHistory, like BAM). The time in an entry is the
+    file's last-modified time, not an execution time, and on Windows 10/11
+    an entry alone does not prove that the program ran: such rows are
+    EventType FileLastModified, "ShimCache entry (file last modified):
+    <path>" (tan in Excel). Entries without a time (e.g. packaged apps)
+    are Snapshot rows at the collection time
 MRU-style entries (TypedPaths, RunMRU, RecentDocs, Open/Save dialogs,
 WordWheelQuery, Remote Desktop MRU) are timed with the registry key's
 last-write time, which is when the most recent entry was added -- older
@@ -1118,11 +1328,19 @@ timeline. The members blanked here cover every member the collector blanks.
 Parses scheduled_tasks.csv from the triage collection (live collections):
   - Task name, path, state, author, run-as user, actions (the command) and
     triggers
-  - Registration and last run times; tasks with no usable time are
-    Snapshot rows
+  - The registration date of the task XML (RegistrationInfo/Date) as
+    "Scheduled task registration date (author-supplied)" (Details:
+    Time=task XML RegistrationInfo/Date ...). Whoever writes a task sets
+    this date, and Windows' own tasks carry dates years before the install
+    (2005, 2010, ...), so it does not show when the task appeared. The
+    time Windows recorded is the TaskCache "Scheduled task registered" row
+    (-Sources Registry); a date less than 2 seconds from it is not added
+    again (the log counts them)
+  - Last run times. A task with neither row (no usable time, or only a
+    date that is the TaskCache time) is a Snapshot row
 Mounted-image collections have no scheduled_tasks.csv; the task XML files
 the collector copies from Windows\System32\Tasks are parsed instead
-(registration date, author, command).
+(registration date, author, command), with the same rules.
 
 ### 7. Services
 Parses services.csv from triage collection:
@@ -1198,9 +1416,40 @@ Parses USB device history:
     install, last arrival (connected) and last removal times per device
   - All SetupAPI device install logs (setupapi.dev.log and the rotated
     setupapi.dev.<date>.log files): first-install times, converted from the
-    examined system's local time to UTC
+    examined system's local time to UTC. The logs record every device and
+    driver install, so only USB devices -- instance IDs that start with
+    USB\ or contain USBSTOR or VID_xxxx, and volumes on removable drives
+    (SWD\WPDBUSENUM\{volume GUID}#<partition offset>) -- are EventType
+    USBDevice; all others (graphics card, audio, Bluetooth, software
+    devices, driver packages, ...) are EventType Installation. Source is
+    USB-SetupAPI for both. Device deletions are reported for USB devices
+    only. The log says how many setupapi logs were found and warns when
+    collection_manifest.csv lists one that is missing (lost after
+    collection)
   - USB devices and storage devices (usb_devices.txt, usb_storage_devices.txt)
-  - Mounted devices (mounted_devices.txt)
+  - Mounted devices (HKLM\SYSTEM\MountedDevices): one Snapshot row per
+    value (Source USB-MountedDevices) saying which disk, partition or
+    device a drive letter or volume GUID last belonged to, e.g.
+      Drive letter H: -> MBR disk 0A1B2C3D, partition at offset 1048576
+      Volume {...} -> USB storage Generic- SD/MMC (serial 0123456789)
+    Read from USB\mounted_devices.csv (decoded by the collector), else from
+    MountedDevices in the collected SYSTEM hive (also for mounted-image
+    collections), else from the mounted_devices.txt of older collectors,
+    which shows only the first 4 bytes of each value (see Known
+    Limitations). Details: Kind (GPT, MBR, DevicePath or Other) and the
+    decoded fields (partition GUID; disk signature and partition offset;
+    device path with its InstanceId and Serial); VolumeGuid (the
+    \??\Volume{} name with the same data, else the GPT partition GUID, or
+    {<disk signature>-0000-0000-<offset bytes>} for MBR -- the names
+    MountPoints2 keys in NTUSER.DAT use); SameDataAs (values with the same
+    data, e.g. a drive letter and its volume GUID); SameDisk (other
+    partitions of the same MBR disk); KeyLastWriteUtc (when the key was
+    last written); PnPRecord for USB storage, when usb_storage_devices.csv
+    is there ("in USBSTOR at collection time: <instance ID>", or "not in
+    USBSTOR at collection time" -- a device Windows no longer lists);
+    CollectorDrive=yes for the drive letter the triage collector wrote its
+    output to (live collections). The log says how many values of each kind
+    were read and from where
 
 ### 12. Persistence
 Parses persistence mechanisms from triage collection:
@@ -1238,18 +1487,95 @@ Parses command history:
 ### 15. Memory Dump (opt-in, requires Volatility 3)
 Analyzes memory dumps captured by the triage collector using Volatility 3:
 the crash dump from DumpIt (<collection>_memory_dump.dmp) or a raw image
-(_memory_dump.raw), found next to the collection zip.
+(<collection>_memory_dump.raw). The collector saves it next to the zip, as
+it is too large to zip, or on another drive (its -MemoryOutputPath, or the
+drive picked at its memory prompt: <drive>\TriageMemory\). The dump is
+looked for in this order:
+  1. -MemoryDumpPath, for a dump the builder does not find or use by itself
+     (if it is not an existing file, a warning is logged and the places
+     below are searched)
+  2. where the collector saved it: the "(memory dump via <tool>)" row of
+     collection_manifest.csv (read from the work folder for a zip). Its
+     DestPath for a dump outside the collection (e.g.
+     D:\TriageMemory\<collection>_memory_dump.dmp), its RelativePath in
+     the collection (Memory\memory_dump.dmp or .raw) otherwise. It is used
+     only when the file is there and its size is the one in the manifest;
+     the dump is not hashed again (it is as large as RAM), but the log
+     shows the manifest's SHA-256 for checking it with Get-FileHash. When
+     no file of that size is at a DestPath on a drive letter, the same
+     path on each other ready fixed or removable drive is tried (the
+     drives the collector's memory prompt offers): a USB drive often has
+     another letter on the analysis machine or when plugged in again, so
+     Q:\TriageMemory\<collection>_memory_dump.dmp is found as
+     E:\TriageMemory\<collection>_memory_dump.dmp, and the log names both.
+     A manifest comes from the examined machine, so only the names the
+     collector writes are used (<collection folder name>_memory_dump.dmp
+     or .raw, also under the folder's name at collection time, and
+     Memory\memory_dump.dmp or .raw), and outside the collection only a
+     path on a drive letter, or a network path that is exactly where
+     steps 3 and 5 look anyway (a collection and its dump on a share);
+     another network or device path gets a warning and is not opened. If
+     the file is not there now (moved, deleted, its drive not connected,
+     or another machine), the log says so once and the places below are
+     searched; a dump the collector saved in the collection is missing
+     from every zip (the collector moves it next to the zip), which is not
+     logged. A file of another size gets one warning and is not used, also
+     not by the checks below. A collection without that row (no memory
+     captured) skips this step
+  3. next to the collection zip: <zip name>_memory_dump.dmp or .raw
+  4. inside the collection folder (Memory\memory_dump.dmp or .raw, where
+     the collector leaves it with -NoCompress)
+  5. next to the collection folder (the folder of collection_manifest.csv)
+     or next to -InputPath (an outer folder that holds the collection):
+     only <folder name>_memory_dump.dmp or .raw, so the dump of another
+     collection in the same folder (e.g. the collector's reports\) is
+     never used. After Windows "Extract All" (<name>\<name>\), a dump next
+     to the outer folder is found too
+  When the manifest lists a dump, a collector-named dump of the same type
+  (.dmp or .raw) that steps 3 to 5 find must have the size the manifest
+  lists too: a copy cut short (e.g. while being copied to the analysis
+  machine) gets one warning and is not used. With that size, the log shows
+  the manifest's SHA-256 for it.
 Opt-in only -- not included in default Sources. Add "Memory" to -Sources to enable.
+Without it, the builder offers to analyze a dump it finds when vol.exe is
+in tools\; the offer shows the dump's full path when it is outside the
+collection, and says when collection_manifest.csv gave the place (and the
+path it lists, when the drive has another letter now). When no dump is
+found and the manifest lists one, the offer step says what became of it
+and how to have it analyzed, which works from Run-TimelineBuilder.bat:
+connect the drive the collector saved it to, or copy the dump to the path
+it names next to the zip (<zip name>_memory_dump.dmp or .raw; for a
+collection folder, next to the folder under its name), then run the
+builder again. With Memory in -Sources, the parser's warning says the
+same (also for a collection whose manifest lists no dump) and adds
+-MemoryDumpPath.
 Requires vol.exe in tools\volatility3\ (see tools\volatility3\README.txt).
 Windows ARM64 dumps are detected from the dump header and skipped:
 Volatility 3 analyzes Intel x86/x64 Windows memory only (use WinDbg).
-  - windows.pslist: Running processes with creation timestamps, PIDs, parent PIDs
-  - windows.netscan: Network connections with protocol, addresses, ports, state
-  - windows.cmdline: Full command line arguments for each process
+  - windows.pslist: Running processes with creation timestamps, PIDs, parent
+    PIDs (ProcessCreation at the creation time)
+  - windows.netscan: Network connections with protocol, addresses, ports,
+    state (NetworkConnection at the time the connection was created); the
+    process that owns the connection is in Details (Process=), not User
+  - windows.cmdline: Full command line arguments for each process (Snapshot)
   - windows.svcscan: Windows services with binary paths, state, start type
-Memory artifacts use the same EventTypes as disk artifacts (ProcessCreation,
-NetworkConnection, Execution, ServiceChange) and are color-coded automatically.
-The Source column distinguishes them (Memory-Processes, Memory-Network, etc.).
+    (Snapshot)
+A memory row is an event only when its entry has a valid time of its own: a
+process creation time or a connection's created time from 1980 up to one
+day after the end of the acquisition. Every other row is a Snapshot row at
+the capture time: every command line (it is read from the process's own
+memory, which the process can change, so it shows the state at capture, not
+what was run), every service (its state, not when it changed), and
+processes and connections without a valid time. A time outside that range
+is kept in Details (CreateTime=... or Created=..., in UTC). The capture time
+is the SystemTime in the header of a 64-bit crash dump (DumpIt: when the
+acquisition started); raw images, 32-bit dumps and a header time that is
+not plausible fall back to the dump file's last-write time (when the
+acquisition ended). The log shows it as "Dump time: <UTC> (crash dump
+header)" or "(dump file last-write time)", and per plugin "windows.pslist:
+N entries (T timed, S snapshot)". The Source column distinguishes memory
+rows (Memory-Processes, Memory-Network, Memory-CommandLine,
+Memory-Services).
 
 ### 16. System Info
 Parses systeminfo.txt and the firewall rule list:
@@ -1342,7 +1668,8 @@ Not parsed: OST/PST contents (deferred), the new Outlook's and Windows
 Mail's mail stores (listed only), and other listed files (WebView data,
 .msf summaries, logs). The attachment copies can have any name, so no other
 parser reads them: an attached .lnk, .evtx or $MFT is not this system's
-shortcut, event log or MFT.
+shortcut, event log or MFT. They are not extracted from a collection zip
+(see "Work folder").
 
 ### Collections made with the collector's -IncludeSecrets switch
 A collection made with -IncludeSecrets holds two things this builder treats
@@ -1351,9 +1678,10 @@ logs one line about it at the start):
   - A top-level Secrets\ folder with DPAPI credential material (per-user and
     system master keys, Credentials, Vault). No parser ever reads anything
     there: the Secrets\ exclusion is applied at the Find-ArtifactFiles choke
-    point (so all of its callers skip it) and on every other recursive search
+    point (so all of its callers skip it), on every other recursive search
     that walks the whole collection -- the $MFT search, the ScheduledTasks_XML
-    folders, the SRUDB.dat search and the AntiVirus vendor / Defender folders.
+    folders, the SRUDB.dat search and the AntiVirus vendor / Defender folders
+    -- and on the setupapi logs whose names were shortened on extraction.
     A $MFT, Preferences, Task XML, SRUDB.dat or antivirus file left in Secrets\
     is not parsed. Only the collection's own top-level Secrets\ folder (next to
     collection_info.json) is excluded, so a user profile folder named "Secrets"
@@ -1384,21 +1712,25 @@ tools. Artifact SRUM:
     stores it (a \device\harddiskvolumeN\... path, a packaged app or a
     service name). User is the account name when the collection gives one
     (well-known SIDs, bam_entries.csv, the SOFTWARE hive's ProfileList),
-    otherwise the SID
+    in the User column's one form per account (NT AUTHORITY\SYSTEM for
+    S-1-5-18; see "User column"), otherwise the SID
   - Details: Day, App, AppId, UserSid; BytesSent and BytesRecvd (network)
     or ForegroundCycleTime, BackgroundCycleTime, FaceTime, the foreground
     and background bytes read and written, BytesRead and BytesWritten
     (app); Records, FirstRecordUtc, LastRecordUtc, Interfaces (Wi-Fi,
     Ethernet, ...), L2ProfileIds (not resolved to network names), and
     Database=... and Partial=yes when they apply
-  - The database is read from a temp copy; the collection is never
-    changed. A copy of an open database is normally in "dirty shutdown"
-    state: the collected logs are replayed into the copy in the builder's
-    own process ("Database=soft recovery (in-process)"); if that fails,
-    with esentutl /r, then by repairing the copy with esentutl /p
-    ("Database=repair (esentutl /p)"), which can lose the newest records.
-    A damaged page stops the reading of a table; its rows then carry
-    "Partial=yes (read error; later records of this table are missing)"
+  - The database is read from a scratch copy in the work folder (see "Work
+    folder"); the collection is never changed. A transaction log listed in
+    collection_manifest.csv but no longer in the collection is reported
+    ("Transaction log missing: ..."). A copy of an open database is
+    normally in "dirty shutdown" state: the collected logs are replayed
+    into the copy in the builder's own process ("Database=soft recovery
+    (in-process)"); if that fails, with esentutl /r, then by repairing the
+    copy with esentutl /p ("Database=repair (esentutl /p)"), which can lose
+    the newest records. A damaged page stops the reading of a table; its
+    rows then carry "Partial=yes (read error; later records of this table
+    are missing)"
   - Not parsed: the Network Connectivity, energy and push-notification
     tables. SRUM keeps hourly totals per application, not connections: a
     row says how much an app sent and received that day, not where to
@@ -1448,15 +1780,19 @@ differences" above for details.
     AccountChange           Red         -- user accounts created/modified
     NetworkConnection       Blue        -- network activity, browser, DNS
     FileAccess              Gray        -- file system activity
+    FileLastModified        Tan         -- file last-modified time (ShimCache),
+                                           not execution
     ServiceChange           Yellow      -- service state changes
     ScheduledTaskChange     Yellow      -- task scheduler changes
     USBDevice               Purple      -- USB device connections
-    Installation            Light Blue  -- application installs
+    Installation            Light Blue  -- application installs, and device and
+                                           driver installs (setupapi)
     SecurityAlert           Bright red  -- AV detections, security tampering
                                            (Defender disabled, exclusion added);
                                            text in bold
-    Snapshot                Light gray  -- state at collection time, not an
-                                           event (see "Snapshot rows")
+    Snapshot                Light gray  -- state when collected or captured
+                                           (memory dump), not an event (see
+                                           "Snapshot rows")
 
   The Excel file includes AutoFilter on all columns and a frozen header row.
   Use column filters to narrow by EventType, Source, User, or date range.
@@ -1575,6 +1911,42 @@ Timeline Explorer at the same time.
     with them often hit this warning and Amcache parsing is skipped.
     Re-collect with the current collector to get the logs.
 
+  - "Transaction log missing: ..." -- A hive's .LOG1/.LOG2 file, or a SRUM
+    database's SRU*.log file, is listed in collection_manifest.csv but is
+    not in the collection any more. The hive or database is read without
+    it, so changes Windows had not yet written into the hive or database
+    file are missing.
+
+  - "Completed WITH N MISSING INPUT FILE(S) -- timeline incomplete" (exit
+    code 2) -- Input files were deleted while the timeline was being built,
+    usually by a cleanup tool or antivirus; the log lists them. Rows from
+    them may be missing (a browser store also logs "sqlite3 query skipped,
+    input file missing"); a file deleted after its parser read it is listed
+    too, although its rows are there. Copied email attachments are not
+    input files (no parser reads them), so antivirus quarantining one does
+    not cause this. Build the timeline again from the zip, or from a copy
+    of the collection outside any temp folder.
+
+  - "Completed WITH N UNEXPECTED ERROR(S) -- timeline may be incomplete"
+    (exit code 2) -- The log has an "Unexpected error at line N (rest of
+    this step skipped)" line for each. The rest of that step, often the
+    rest of one parser, produced no rows. Such an error used to skip only
+    its own statement; since the main body runs in try/finally (to clean up
+    the work folder on every exit), it skips the rest of the step, so the
+    run says so. Please report it with the log line.
+
+  - Console window -- QuickEdit is off while the builder runs (see Quick
+    Start), so a click no longer pauses it, but a selection made with the
+    window menu (Edit > Mark) still does, until Enter or Esc ends it. The
+    builder changes the mode only when its input is a console with
+    QuickEdit on: with input redirected (a script piping into it, CI) or
+    QuickEdit already off, nothing is changed and the log has no QuickEdit
+    line. The console's mode is put back at every end of the run (also an
+    error, exit or Ctrl+C), not when the process is killed: closing the
+    window kills the run (the next run removes its work folder), and a
+    console the builder was started from keeps QuickEdit off after its
+    process was ended from Task Manager, until that window is closed.
+
   - "No service data found" -- Appears for mounted-image collections, which
     have no services.csv (it needs live queries). Scheduled tasks of mounted
     images are parsed from the collected task XML files instead.
@@ -1590,11 +1962,20 @@ Timeline Explorer at the same time.
     other folders in the same hive have an SD value; otherwise the log says
     "N TaskCache\Tree folder(s) without an SD value not reported".
 
-  - TaskCache times -- "Scheduled task registered" / "last run" rows from
-    Registry-TaskCache are only added for tasks that scheduled_tasks.csv or
-    the task XML files do not already cover. With -Sources Registry but not
-    ScheduledTasks they are added for every task (a few hundred Microsoft
-    tasks on a normal system).
+  - TaskCache times -- Every task in the TaskCache gets a "Scheduled task
+    registered" row from Registry-TaskCache (a few hundred Microsoft tasks
+    on a normal system). Its "last run" row is only added when
+    scheduled_tasks.csv has no last run time for the task; with -Sources
+    Registry but not ScheduledTasks it is added for every task.
+
+  - Scheduled task registration date (author-supplied) -- The date in the
+    task XML (RegistrationDateUtc in scheduled_tasks.csv, or the
+    ScheduledTasks_XML files) is whatever the task's author wrote, so a
+    task can be backdated. Compare it with the TaskCache "Scheduled task
+    registered" row of the same task. A date less than 2 seconds from that
+    time is left out as the same time; any other date is kept as its own
+    row. Without the Registry source or the SOFTWARE hive, every date is
+    kept.
 
   - Mark of the Web -- Only Zone.Identifier text stored inside the MFT
     record (resident, almost always the case) can be read. A non-resident
@@ -1647,16 +2028,93 @@ Timeline Explorer at the same time.
     manifest, no bam_entries.csv / run_keys.csv / startup_folders.csv /
     usb_storage_devices.csv (BAM is read from the SYSTEM hive; run keys and
     startup items become Snapshot rows), and only setupapi.dev.log is
-    collected (it may be missing if Windows rotated it).
+    collected (it may be missing if Windows rotated it). They have no
+    mounted_devices.csv either: MountedDevices is read from the collected
+    SYSTEM hive, and only without one (or when it cannot be loaded) from
+    mounted_devices.txt, whose values those collectors cut off after 4
+    bytes. Such a row says "(value cut off)": the kind is taken from the
+    first bytes (an MBR disk signature is complete in them), but the
+    partition GUID, offset and device name are missing, and the log warns.
 
   - Snapshot rows -- Services, drivers, network state, DLLs and items with
     no recorded time are shown at the collection time with EventType
-    Snapshot. Their Timestamp is when the state was observed, not when it
-    was created.
+    Snapshot; memory rows without a time of their own (all command lines
+    and services) at the capture time of the memory dump. Their Timestamp
+    is when the state was observed, not when it was created.
+
+  - Memory capture time -- Only the header of 64-bit crash dumps (DumpIt on
+    x64) is read for when the memory was captured; raw images (WinPmem,
+    Magnet RAM Capture) have no header. For raw images and 32-bit dumps the
+    dump file's last-write time is used: the end of the acquisition, which
+    for a large dump is minutes after its start. A copy of the dump that
+    does not keep the file's dates (most copies do) gives the time of the
+    copy instead.
+
+  - Memory dump on another drive -- collection_manifest.csv records where
+    the collector saved the dump as a path on the machine that ran the
+    collector (e.g. D:\TriageMemory\<collection>_memory_dump.dmp). The
+    same path on another fixed or removable drive is found too (a USB
+    drive with another letter now). A dump moved to another folder, or a
+    drive that is not connected, is not found there: the log says once
+    that the dump is not there now, and the dump is found only next to the
+    zip or the collection folder. When no dump is found, the builder says
+    so and names the path to copy it to (<zip name>_memory_dump.dmp or
+    .raw next to the zip), which works from Run-TimelineBuilder.bat; from
+    PowerShell, -MemoryDumpPath works as well. A path on a network share
+    (collector -MemoryOutputPath \\server\share) is opened from the
+    manifest only when it is next to the collection zip or folder the
+    builder was given; otherwise a warning says it is not used, and the
+    dump has to be copied next to the zip. The dump is not hashed again:
+    only its size is compared with the manifest, and the log shows the
+    manifest's SHA-256 to check it with Get-FileHash.
+
+  - "Memory dump not used: ... bytes, but collection_manifest.csv lists
+    ..." -- The dump file found (where the collector saved it, next to the
+    zip or the collection folder, or in the collection) has another size
+    than the manifest lists for this collection's dump (e.g. a copy cut
+    short). It is not analyzed. Copy the complete dump next to the zip
+    under the name the builder gives; to analyze that file anyway, pass it
+    as -MemoryDumpPath from PowerShell.
 
   - Local-time sources -- USN and setupapi times are local-time text. Times
     inside the hour that repeats when daylight saving time ends cannot be
     told apart and may be off by one hour.
+
+  - SetupAPI USB devices -- A setupapi install counts as a USB device
+    (USBDevice) only by its instance ID (USB\, USBSTOR, VID_xxxx, or
+    SWD\WPDBUSENUM\{volume GUID}#...). The disk of a USB drive that uses
+    UAS (USB Attached SCSI) is installed as SCSI\Disk&Ven_...; that row is
+    Installation, while the drive's own USB\VID_... install just before it
+    is USBDevice. Bluetooth devices are Installation. The portable device
+    Windows makes for a volume on a removable drive (the
+    SWD\WPDBUSENUM\{volume GUID}#<partition offset> rows) is USBDevice,
+    as it nearly always is a USB drive, but an SD card in a built-in card
+    reader gives one too. Such a row names only the volume GUID and the
+    partition offset, not the drive.
+
+  - Mounted devices -- MountedDevices keeps the last disk, partition or
+    device each drive letter and volume GUID belonged to, not when it was
+    mounted: the rows are Snapshot rows, and KeyLastWriteUtc is the last
+    change to any value. Volume GUIDs of removable drives are version 1
+    UUIDs with a time inside, but that time is not a mount or install time
+    (in a real collection it was hours before the devices' first setupapi
+    installs, and different devices had times microseconds apart), so it
+    gives no row. The instance ID is rebuilt from the device path, where
+    every "\" of the ID and a "/" in a product name (SD/MMC) are both
+    written "#": the fields between the first and the last are joined with
+    "/". PnPRecord compares serial numbers with usb_storage_devices.csv
+    (live collections only).
+
+  - User column -- A SID is named only from the collection (SOFTWARE
+    ProfileList or bam_entries.csv, read only when a source that opens
+    them runs; see "User column"), so the SID of a deleted account stays
+    a SID. The name is the profile folder's, which can differ from the
+    account name (a renamed account, or a folder such as alice.DOMAIN). An
+    account written with an older computer name (before the machine was
+    renamed) keeps it, a Microsoft account (MicrosoftAccount\...) is not
+    merged with the local account it signs in to, and the computer account
+    (WORKGROUP\HOST$, the name Security events give SYSTEM as the subject)
+    is not turned into NT AUTHORITY\SYSTEM.
 
   - Excel row limit -- Timelines over 1,048,575 rows are written to CSV only.
 
@@ -1803,6 +2261,12 @@ parsing is skipped, and the timeline CSV can be opened manually.
 
   The Memory parser is opt-in. Add "Memory" to -Sources to enable it.
   If vol.exe is not found, the parser logs download instructions and skips.
+  The dump is found where the collector saved it (collection_manifest.csv
+  records the path, also on another drive, whose letter may have changed),
+  next to the collection zip or folder, or inside the collection (see
+  parser #15). For a dump it does not find, the builder names the path
+  next to the zip to copy it to; -MemoryDumpPath also works from
+  PowerShell.
 
   Plugins run (4 core plugins):
     windows.pslist   -- running processes with creation timestamps
@@ -1812,38 +2276,70 @@ parsing is skipped, and the timeline CSV can be opened manually.
 
   Processing time: 5-30 minutes depending on dump size (16-64 GB typical).
   Memory artifacts are interleaved with disk artifacts in the timeline and
-  color-coded by EventType like all other entries.
+  color-coded by EventType like all other entries. Command lines and
+  services are Snapshot rows at the dump's capture time, and so are
+  processes and connections without a valid time of their own (see parser
+  #15). Volatility's JSON output goes to the work folder's scratch\ and is
+  deleted after each plugin.
 
 
 ## Tests
 
-  tests\Test-Parsers.ps1 runs the builder on the fixture collection in
-  tests\fixtures\av\ (public Symantec, Sophos and McAfee sample logs from the
-  plaso project, Apache-2.0 -- see that folder's README.txt) and compares the
-  timeline with tests\fixtures\av\expected.csv. CI runs it on every pull
-  request in Windows PowerShell 5.1 and PowerShell 7.
+  tests\Test-Parsers.ps1 runs the builder on every fixture collection in
+  tests\fixtures\<name>\ and compares each timeline with that folder's
+  expected.csv. A fixture folder holds collection\ (the collection),
+  sources.txt (the -Sources to run) and expected.csv:
+    av\        AntiVirus -- public Symantec, Sophos and McAfee sample logs
+               from the plaso project (Apache-2.0, see that folder's
+               README.txt)
+    setupapi\  USB -- two synthetic setupapi logs (current and rotated)
+               with USB and other device installs and deletions
+    usb\       USB -- a synthetic mounted_devices.csv (GPT, MBR, USB and
+               other device paths) and usb_storage_devices.csv
+  CI runs it on every pull request in Windows PowerShell 5.1 and
+  PowerShell 7.
 
-  Run it locally from an elevated PowerShell (the builder needs admin):
+  Run it locally from an elevated PowerShell (the builder needs admin), or
+  pass -BuilderPath with a copy of the builder without the admin check;
+  -Fixture <name> runs only that fixture:
     powershell -ExecutionPolicy Bypass -File tests\Test-Parsers.ps1
 
   After an intended change to the parser output, regenerate the expected rows
-  with -UpdateExpected and review the diff before committing.
+  with -UpdateExpected (with -Fixture <name> for one fixture; it also
+  creates expected.csv for a new fixture folder) and review the diff before
+  committing.
 
-  Nine more scripts test the event log, browser, registry, $MFT, email,
-  SRUM and Defender parsers. CI runs them after Test-Parsers.ps1 in both
+  The scripts below test the event log, browser, registry, $MFT, email,
+  SRUM, Defender and scheduled task parsers, the USB parser's mounted
+  devices, the Memory parser (where it finds the dump, the dump's capture
+  time and the rows made from Volatility's output), the ShimCache rows of
+  the PowerShellHistory parser, the run summary's counts per artifact,
+  how the builder handles its input (secrets, zip input) and its console
+  window (QuickEdit). CI runs them after Test-Parsers.ps1 in both
   PowerShell versions (GitHub Actions runners are elevated):
 
   tests\Test-EventLogParsers.ps1 -- Part 1 feeds the Security, System,
   Defender and Application handlers synthetic event records and checks
-  their rows and which event IDs and providers each log reads; it needs no
+  their rows and which event IDs and providers each log reads, and the User
+  of the Security, PowerShell (4104/4103) and BITS rows. It also checks the
+  User column: the one form per account for each kind of value, SID names
+  from ProfileList and bam_entries.csv (also as the SRUM parser reads and
+  writes them), and the pass over all rows
+  (UserSID= in Details, the counts, and that it runs before
+  deduplication). The main flow's own User column statements are run on
+  synthetic rows: the computer name of collection_info.json must strip
+  HOST\ only for a live collection, not for a mounted image, and the log
+  lines are checked. The computer name and ProfileList are read from this
+  machine's own SYSTEM and SOFTWARE keys (read only). Part 1 needs no
   admin and always runs. Part 2 generates real events (audit policy, a
   temporary local user and group membership, scheduled task, service and
   classic event log), exports the logs with wevtutil, runs the builder on
-  them and checks the rows. It needs admin and runs only in GitHub Actions or with
-  -AllowSystemChanges; otherwise it is skipped. It undoes its changes, but
-  the event records stay in the Security and System logs. Only in CI does
-  it also clear the Security log (1102) and write synthetic Application
-  events.
+  them and checks the rows (the account that made the changes must be in
+  User without the computer name). It needs admin and runs only in GitHub
+  Actions or with -AllowSystemChanges; otherwise it is skipped. It undoes
+  its changes, but the event records stay in the Security and System logs.
+  Only in CI does it also clear the Security log (1102) and write
+  synthetic Application events.
 
   tests\Test-BrowserParsers.ps1 -- builds synthetic Chromium and Firefox
   databases with sqlite3.exe, runs the builder with -Sources Browser and
@@ -1854,13 +2350,21 @@ parsing is skipped, and the timeline CSV can be opened manually.
   sqlite3.exe is missing, the builder is run once to download it.
 
   tests\Test-RegistryParsers.ps1 -- writes known values (IFEO, Winlogon, a
-  hidden TaskCache task, Defender exclusions, Office, Remote Desktop, ...)
-  below a temporary key HKCU\Software\TriageTimelineTest_<guid>, saves them
-  as SOFTWARE, SYSTEM and NTUSER.DAT hives with reg save, deletes the key,
-  runs the builder with -Sources Registry,ScheduledTasks and checks the
-  rows and times. Needs admin; because it writes to the registry it runs
-  only in GitHub Actions or with -AllowSystemChanges (otherwise it prints
-  SKIP).
+  hidden TaskCache task, Defender exclusions, Office, Remote Desktop,
+  MountedDevices, ProfileList, the computer name, ...) below a temporary key
+  HKCU\Software\TriageTimelineTest_<guid>, saves them as SOFTWARE, SYSTEM
+  and NTUSER.DAT hives with reg save, deletes the key, runs the builder
+  with -Sources Registry,ScheduledTasks,USB,Persistence and checks the rows
+  and times (the MountedDevices rows must come from the SYSTEM hive, not
+  from the empty mounted_devices.csv or the cut-off mounted_devices.txt of
+  an older collector next to it; the tasks scheduled_tasks.csv lists keep
+  their TaskCache registered rows, and the list's own date is an
+  author-supplied row only where it is not the TaskCache time; the User of
+  startup_entries.csv rows, written as TESTHOST\testuser, with the hive's
+  new host name or as a SID, must come out in one form per account, named
+  from the hives). Needs admin;
+  because it writes to the registry it runs only in GitHub Actions or with
+  -AllowSystemChanges (otherwise it prints SKIP).
 
   tests\Test-MftParser.ps1 -- builds a small synthetic $MFT and checks the
   $MFT parser's rows (Mark of the Web: downloaded, extracted, deleted,
@@ -1947,6 +2451,134 @@ parsing is skipped, and the timeline CSV can be opened manually.
   one builder run. Apart from Test-SrumParsers part 2, they change nothing
   on the system.
 
+  tests\Test-ZipInput.ps1 -- Part 1 loads the builder's functions and checks
+  the zip extraction ("/" and "\" entry names, entry dates kept, over-long
+  names shortened, no ".." entry written outside the folder, copied email
+  attachments left in the zip, nothing extracted when the zip does not
+  fit), the manifest lookups, the list of input files, the free-space and
+  temp-folder checks, the refusal of a network work folder, the clean-up
+  of work folders left by killed runs, the SRUM database copy (made in the
+  work folder; a missing transaction log reported) and the end-of-run
+  banners; it needs no admin. Part 2 runs the builder on a synthetic
+  collection zip dated 2025 with two setupapi logs: both must be parsed,
+  the free space must be checked, the work folder must be outside %TEMP%
+  and removed afterwards, and an input file deleted during the run (by a
+  test hook) must give exit code 2 and the MISSING INPUT FILE(S) banner.
+  A zip with a copied email attachment must give exit code 0 and the
+  attachment's rows without extracting it. Part 2 needs admin like the
+  builder (or -BuilderPath with a copy without the admin check); it
+  changes nothing on the system.
+
+  tests\Test-MountedDevices.ps1 -- loads the builder's functions and checks
+  the MountedDevices decoder (GPT, MBR, device paths, unrecognized values),
+  the instance ID rebuilt from a device path (Prod_SD#MMC -> SD/MMC), the
+  salvage of the cut-off mounted_devices.txt of older collectors ("..."
+  and the ellipsis character), each row's Description and Details, and
+  which source Parse-USB uses (mounted_devices.csv with rows first, then
+  the SYSTEM hive, also after an empty CSV, then the .txt; the hive is
+  unloaded also after a read error; no rows from the decoded .txt of newer
+  collectors; no CSV or SYSTEM hive read from the Secrets\ folder or the
+  email attachment copies). No admin needed: stubs stand in for loading
+  and reading the hive; reading a real SYSTEM hive is covered by
+  Test-RegistryParsers.ps1.
+
+  tests\Test-MemoryParser.ps1 -- loads the builder's functions and checks
+  where the memory dump is found, on synthetic folders: -MemoryDumpPath
+  first (also a relative path and one with [ ] in it; a missing file or
+  a folder gives one warning, then the other places are searched), then
+  where the collector saved it by collection_manifest.csv (a dump on
+  another drive, also for a zip extracted into a work folder, where it
+  wins over the dump next to the zip; a renamed collection folder;
+  Memory\ with -NoCompress; the manifest's SHA-256 logged once; a dump on
+  a drive with another letter now, found at the same path under another
+  drive's root (folders stand in for the drives) past a copy of another
+  size; a dump that is gone, also on a drive that does not exist, logged
+  once and the other places searched; one of another size warned about
+  once and used by no check, also when it is next to the zip or the
+  folder; a name the collector does not write, a \\?\ or network path
+  and a RelativePath outside Memory\ refused with one warning over two
+  lookups, but the dump next to a zip on a network share (reached as
+  \\localhost\<drive>$ when that works) used; | in the manifest's paths
+  in Windows PowerShell 5.1; a zipped collection and the first
+  collector's manifest find the dump next to the zip with its size
+  checked and the manifest's SHA-256 logged once, and one without a dump
+  row as before, with nothing logged; a copy of another size next to the
+  zip, also of a zip moved to another folder with its dump, or in
+  Memory\, warned about once and not used), next to the collection zip
+  (.dmp or .raw), Memory\ inside the collection (nothing from the
+  Secrets\ folder or the email attachment copies), and next to the collection folder or -InputPath
+  only under the collection folder's name (another collection's dump in
+  the same folder is not used; also with collection_manifest.csv below
+  -InputPath, an outer -InputPath of another name and after Windows
+  "Extract All"). It checks how the offer shows the dump (its path in the
+  collection, else its full path), and what the offer step and the
+  Memory parser's warning say when there is no dump: what
+  collection_manifest.csv lists (nothing, no manifest, a dump that is
+  gone, a dump in the collection, one not used) and how to have it
+  analyzed (connect its drive, or copy it to the path named next to the
+  zip or folder); only the parser, run with -Sources ...,Memory from
+  PowerShell, names -MemoryDumpPath, and the offer step says nothing for a
+  collection whose manifest lists no dump. Then it
+  reads synthetic dump headers: the architecture and the capture time
+  (64-bit SystemTime used; zero, before 1980, more than a day after the
+  last write, cut off, 32-bit and raw fall back to the last-write time;
+  also with [ ] in the path and while another program has the file open),
+  and the "Dump time" line of the Memory parser, also for the dump the
+  manifest names. It turns canned Volatility
+  JSON for pslist, netscan, cmdline and svcscan into rows and checks each
+  row's time, EventType, User and Details (rejected times kept; a PID,
+  PPID, Threads, SessionId or port of 0 is kept, not left empty; netscan's
+  owning process in Details, not in User), the counts,
+  and that the rows are the same under the de-DE culture. A stub stands
+  in for vol.exe to check that its output is read back from a scratch
+  folder with [ ] in its path and deleted, and for a whole Memory parser
+  run on an x64 dump: the rows at the header's capture time (not the
+  file's last write), the counts per plugin in the log, and the warning
+  for a plugin without output. Volatility 3 is not run; no admin needed.
+
+  tests\Test-ShimCacheParser.ps1 -- loads the builder's functions and runs
+  the PowerShellHistory parser (which also reads BAM and the ShimCache) on
+  a synthetic collection whose appcompat_cache.reg holds a synthetic
+  Windows 10/11 AppCompatCache value, saved like the collector does (reg
+  query output) and as a regedit export. Entries with a file time must be
+  FileLastModified rows at that time, not Execution; entries without one
+  Snapshot rows at the collection time (a packaged app once, not once per
+  architecture). It also checks that the Excel color map has
+  FileLastModified in tan and that the console color legend lists every
+  EventType of the color map. No admin needed.
+
+  tests\Test-SummaryCounts.ps1 -- loads the builder's functions and checks
+  the counts per artifact of the run summary ("Events by artifact
+  source"): rows per Artifact, the largest count first and equal counts in
+  name order, only the rows it is given; and, in the builder's syntax
+  tree, that the summary counts the rows written to the CSV (after
+  deduplication), so the counts add up to "Total events". No admin needed.
+
+  tests\Test-ScheduledTasks.ps1 -- loads the builder's functions and runs
+  the ScheduledTasks parser on synthetic collections: scheduled_tasks.csv
+  of the current and of older collectors, and the task XML files of a
+  mounted image, with and without the TaskCache times the Registry source
+  leaves for it. A registration date from the task XML must be a
+  "registration date (author-supplied)" row; one less than 2 seconds from
+  the task's TaskCache time is not added again (the task gets a Snapshot
+  row if it has no last run row); last run and Snapshot rows are
+  unchanged. It also checks that the Registry source runs first. No admin
+  needed; the TaskCache rows are checked by Test-RegistryParsers.ps1.
+
+  tests\Test-ConsoleMode.ps1 -- checks how the builder turns console
+  QuickEdit off for a run: the mode without QuickEdit for known console
+  modes (QuickEdit and mouse input cleared, the extended-flags bit set,
+  other bits kept, a mode with QuickEdit already off unchanged); in a
+  child PowerShell with redirected input (as in CI), that turning it off
+  and back changes nothing and writes nothing; in a child with a new
+  hidden console of its own, that QuickEdit and mouse input are off
+  afterwards, stay off through a Read-Host, and that the mode from before
+  comes back (skipped when the child gets no console of its own). In the
+  builder's syntax tree it checks that QuickEdit is turned off first in
+  the main body, before its first long step and every exit, with the log
+  line, and put back last in its finally block. The console the test runs
+  in is never changed. No admin needed.
+
   Four scripts test the findings report (CI runs them after the parser
   tests, in both PowerShell versions). The first three need no admin and do
   not run the builder:
@@ -2012,6 +2644,13 @@ parsing is skipped, and the timeline CSV can be opened manually.
     powershell -ExecutionPolicy Bypass -File tests\Test-SrumParsers.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-DefenderParsers.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-MftParser.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-ZipInput.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-MountedDevices.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-MemoryParser.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-ShimCacheParser.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-SummaryCounts.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-ScheduledTasks.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-ConsoleMode.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers.ps1 -AllowSystemChanges
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers2.ps1 -AllowSystemChanges
     powershell -ExecutionPolicy Bypass -File tests\Test-RegistryParsers.ps1 -AllowSystemChanges
@@ -2026,8 +2665,9 @@ parsing is skipped, and the timeline CSV can be opened manually.
                        RunMRU, RecentDocs, ShellBags, Office and Remote
                        Desktop history, IFEO / Winlogon / AppInit_DLLs, the
                        TaskCache, Defender exclusions, LSA settings, BAM,
-                       ShimCache and Amcache entries, including key
-                       last-write times. Unloads after.
+                       ShimCache, MountedDevices (when there is no
+                       mounted_devices.csv) and Amcache entries, including
+                       key last-write times. Unloads after.
 
   Get-WinEvent         Parses .evtx event log files with XPath filtering.
                        Used for targeted extraction of high-value Security,
@@ -2038,12 +2678,12 @@ parsing is skipped, and the timeline CSV can be opened manually.
                        OAlerts and antivirus product logs.
 
   esent.dll            The Windows ESE database engine. Reads the SRUM
-                       database (SRUDB.dat) from a temp copy and replays its
-                       transaction logs into that copy, with event logging
-                       off.
+                       database (SRUDB.dat) from a scratch copy in the work
+                       folder and replays its transaction logs into that
+                       copy, with event logging off.
 
   esentutl.exe         Fallback only: recovery (/r) or repair (/p) of the
-                       temp copy of a SRUM database, when the recovery in
+                       scratch copy of a SRUM database, when the recovery in
                        the builder's process fails or the copy is damaged.
 
   WScript.Shell COM    Reads LNK shortcut files to extract target paths,
@@ -2112,26 +2752,37 @@ parsing is skipped, and the timeline CSV can be opened manually.
 ## What It Modifies
 
 This script is read-only with respect to the target system's artifacts. It only
-creates files in its own reports\ directory and temp folders (cleaned up after).
-No system files, registry keys, or artifacts are modified. The one lasting
-trace: when a SRUM database needs esentutl, it writes entries to this
-machine's Application event log (see below).
+creates files in its own reports\ directory, in its work folder
+(%LOCALAPPDATA%\TimelineBuilder\w<PID>_<HHmmss>, or inside -WorkDir; deleted
+at the end of the run) and in %TEMP% for downloads. No system files, registry
+keys, or artifacts are modified. The one lasting trace: when a SRUM database
+needs esentutl, it writes entries to this machine's Application event log
+(see below).
 
 One-time actions (first run only):
   - Installs ImportExcel PowerShell module (CurrentUser scope)
 
-Temporary actions (all cleaned up automatically):
-  - Extracts triage zip to %TEMP% (browse mode) -- deleted after processing
+Temporary actions (all cleaned up automatically, also after an error or Ctrl+C):
+  - Extracts a collection zip (browse mode, or a .zip as -InputPath) into the
+    work folder, with the dates stored in the zip, except copied email
+    attachments -- deleted after processing
   - Copies registry hives (NTUSER.DAT, UsrClass.dat, SOFTWARE, SYSTEM,
-    Amcache.hve) to %TEMP% for reg load -- unloaded and deleted after
+    Amcache.hve) into the work folder for reg load -- unloaded and deleted
+    after processing (a hive a parser left loaded is unloaded at the end)
+  - Copies browser DBs into the work folder for sqlite3 -- deleted after
     processing
-  - Copies browser DBs to %TEMP% for sqlite3 -- deleted after processing
-  - Copies SRUDB.dat and its logs to %TEMP%\TimelineSrum_<n> for recovery
-    and reading (the copies are made writable) -- deleted after processing
+  - Copies SRUDB.dat and its logs into the work folder
+    (scratch\TimelineSrum_<n>) for recovery and reading (the copies are
+    made writable) -- deleted after processing
+  - Writes Volatility 3's JSON output (Memory parser) into the work folder
+    -- deleted after each plugin
   - Downloads zip files to %TEMP% (first run) -- deleted after extraction
   - Gives Microsoft Edge a temporary profile folder,
     %TEMP%\timeline-report-edge-<id>, to print report.pdf -- deleted after
     printing
+  - Turns QuickEdit and mouse input off in its console window, so a click
+    cannot pause the run (see Quick Start) -- the console's own mode is
+    put back at the end
 
 The findings report writes only next to the timeline (report.*,
 findings.csv, report-model.json, copies of collection_info.json and
@@ -2141,7 +2792,7 @@ given and logs to report_log.txt there.
 
 Event log entries (not removed):
   - Only when the in-process recovery of a SRUM database fails, or a copy
-    has to be repaired, esentutl.exe runs on the temp copy. It writes
+    has to be repaired, esentutl.exe runs on the scratch copy. It writes
     ESENT events (information, and for a repair also warnings and an
     error) to the Application event log of the machine running the
     builder. If that machine is collected later, its timeline shows them

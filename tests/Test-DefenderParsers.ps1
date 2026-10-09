@@ -546,7 +546,8 @@ try {
         $log -match "Parsing: 10 Defender DetectionHistory file\(s\)\s*\n[^\n]*Added 6 timeline entries \(skipped: 2 not in the expected format, 1 without a time, 1 over 1 MB not read\)")
     Write-TestResult -Name "log: quarantine entries and skips" -Message $parseLines -Passed (
         $log -match "Parsing: 6 Defender quarantine entry file\(s\)\s*\n[^\n]*Added 6 timeline entries \(skipped: 2 not in the expected format\)")
-    $warnings = @($builderOutput | Where-Object { $_ -match 'WARNING:|ERROR:' })
+    # The test collection is in %TEMP%, which the builder warns about
+    $warnings = @($builderOutput | Where-Object { $_ -match 'WARNING:|ERROR:' -and $_ -notmatch 'The input folder is inside a temp folder' })
     Write-TestResult -Name "log: no warnings or errors" -Passed ($warnings.Count -eq 0) -Message ($warnings -join "`n")
     Assert-Equal -Name "log: ResourceData never named" -Expected $false -Actual ($log -match 'ResourceData')
 
@@ -566,7 +567,6 @@ try {
     $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and $tableNames -contains $node.Left.Extent.Text }, $false) |
         Sort-Object { $_.Extent.StartOffset } | ForEach-Object { . ([scriptblock]::Create($_.Extent.Text)) }
     $script:timelineEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
-    $script:artifactStats = @{}
     $script:manifestTimes = @{}
     $script:collectionRoot = $collection
     $script:logFile = Join-Path $workDir "unit.log"

@@ -556,7 +556,8 @@ PRAGMA writable_schema = OFF;
     $logText = ($logFiles | ForEach-Object { [System.IO.File]::ReadAllText($_.FullName) }) -join "`n"
     Write-TestResult -Succeeded ($logFiles.Count -gt 0 -and $logText.IndexOf($canary, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) -Message "no secret or message text (canary) in the builder log"
     Write-TestResult -Succeeded ((($builderOutput -join "`n").IndexOf($canary, [System.StringComparison]::OrdinalIgnoreCase)) -lt 0) -Message "no secret or message text (canary) in the builder output"
-    $emailWarnings = @($builderOutput | Where-Object { $_ -match 'WARNING: ' -and $_ -notmatch 'No \.lnk|Jump' })
+    # The test collection is in %TEMP%, which the builder warns about
+    $emailWarnings = @($builderOutput | Where-Object { $_ -match 'WARNING: ' -and $_ -notmatch 'No \.lnk|Jump|The input folder is inside a temp folder' })
     Write-TestResult -Succeeded ($emailWarnings.Count -eq 0) -Message "no warnings from the builder$(if ($emailWarnings) { ': ' + $emailWarnings[0] })"
 
     if ($script:failures -gt 0) {

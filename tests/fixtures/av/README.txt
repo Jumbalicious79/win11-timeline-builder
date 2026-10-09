@@ -3,7 +3,8 @@ ANTIVIRUS LOG FIXTURES
 
 A minimal triage collection used by tests\Test-Parsers.ps1 to check the
 AntiVirus parser (timeline-builder.ps1, parser #17). The test runs the builder
-on collection\ and compares its timeline with expected.csv.
+with the -Sources in sources.txt (AntiVirus) on collection\ and compares its
+timeline with expected.csv.
 
   collection\
     collection_info.json                       -- fixture metadata (time zone:
@@ -14,6 +15,7 @@ on collection\ and compares its timeline with expected.csv.
     AntiVirus\McAfee_Trellix\AccessProtectionLog.txt
                                                -- McAfee VirusScan Access
                                                   Protection log
+  sources.txt                                  -- -Sources for the test run
   expected.csv                                 -- rows the parser must produce
   LICENSE-Apache-2.0.txt                       -- license of the three sample logs
 
@@ -41,5 +43,5 @@ repository.
 UPDATING
 --------
 If the parser output changes on purpose, regenerate expected.csv with:
-  powershell -ExecutionPolicy Bypass -File tests\Test-Parsers.ps1 -UpdateExpected
+  powershell -ExecutionPolicy Bypass -File tests\Test-Parsers.ps1 -Fixture av -UpdateExpected
 and review the diff before committing it.

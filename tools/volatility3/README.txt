@@ -25,9 +25,11 @@ GET IT
 
 HOW THE BUILDER USES IT
 -----------------------
-  - When a memory dump is found next to the collection zip
-    (<collection>_memory_dump.dmp from DumpIt, or _memory_dump.raw), the
-    builder offers memory analysis, or runs it with -Sources ...,Memory.
+  - When a memory dump is found where the collector saved it (next to the
+    collection zip, or on another drive as collection_manifest.csv
+    records: <collection>_memory_dump.dmp from DumpIt, or
+    _memory_dump.raw), the builder offers memory analysis, or runs it with
+    -Sources ...,Memory.
   - Plugins: windows.pslist, windows.netscan, windows.cmdline,
     windows.svcscan. Results are added to the timeline (Source Memory-*).
   - Expect 5-30 minutes depending on the dump size. On first use Volatility

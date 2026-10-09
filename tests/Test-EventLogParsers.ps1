@@ -73,9 +73,14 @@ $functions = $ast.FindAll({ param($node) $node -is [System.Management.Automation
 }
 foreach ($function in $functions) { . ([ScriptBlock]::Create($function.Extent.Text)) }
 $tableNames = @("xmlInvalidPattern", "xmlInvalidRegex", "AuditCategoryNames", "AuditSubcategoryNames", "AuditChangeNames",
-    "ServiceTypeNames", "ServiceStartTypeNames", "AsrRuleNames", "ThirdPartyAvProviders")
-$tables = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and $node.Parent.Parent -is [System.Management.Automation.Language.ScriptBlockAst] -and $null -eq $node.Parent.Parent.Parent }, $true) |
-    Where-Object { $_.Left.Extent.Text -match '^\$script:(\w+)$' -and $tableNames -contains $Matches[1] } | Sort-Object { $_.Extent.StartOffset }
+    "ServiceTypeNames", "ServiceStartTypeNames", "AsrRuleNames", "ThirdPartyAvProviders", "TimelineUserAliases")
+# Any assignment that is not inside a function: most of the builder runs
+# inside its main try block, so the tables are not top-level statements
+$tables = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true) | Where-Object {
+    $parent = $_.Parent
+    while ($parent -and $parent -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { $parent = $parent.Parent }
+    $null -eq $parent -and $_.Left.Extent.Text -match '^\$script:(\w+)$' -and $tableNames -contains $Matches[1]
+} | Sort-Object { $_.Extent.StartOffset }
 foreach ($table in $tables) { . ([ScriptBlock]::Create($table.Extent.Text)) }
 foreach ($name in $tableNames) {
     if ($null -eq (Get-Variable -Name $name -Scope Script -ErrorAction SilentlyContinue)) {
@@ -84,7 +89,6 @@ foreach ($name in $tableNames) {
 }
 
 $script:timelineEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
-$script:artifactStats = @{}
 $logFile = Join-Path ([System.IO.Path]::GetTempPath()) ("evtx-unit-" + [guid]::NewGuid().ToString("N") + ".log")
 $script:nextRecordId = 0
 $eventNs = "http://schemas.microsoft.com/win/2004/08/events/event"
@@ -457,6 +461,340 @@ Test-Case -Name "Helpers: unknown codes kept as text" -Action {
     }
 } -Expected @()
 
+# --- User column (ConvertTo-TimelineUserName, Update-TimelineUserColumn) ---
+# SID names as Get-TimelineSidNames gives them, and the examined machine's
+# names (the computer name and a host name after a rename)
+$userSidNames = @{ "S-1-5-21-1111-2222-3333-1001" = "alice"; "S-1-5-80-1111-2222-3333-4444-5555" = "NT SERVICE\TestSvc" }
+$userMachines = @("TESTHOST", "TestHost-New")
+Test-Case -Name "User column: one form per account (ConvertTo-TimelineUserName)" -Action {
+    # @(value, expected)
+    $cases = @(
+        @("", ""),
+        @("-", ""),
+        @("-\-", ""),
+        @("\admin", "admin"),
+        @("-\admin", "admin"),
+        @("TESTHOST\-", "TESTHOST"),
+        @("  alice  ", "alice"),
+        @("TESTHOST\alice", "alice"),
+        @("testhost\alice", "alice"),
+        @("TestHost-New\alice", "alice"),
+        @(" TESTHOST \ alice ", "alice"),
+        @(".\alice", "alice"),
+        @("OTHERHOST\alice", "OTHERHOST\alice"),
+        @("WORKGROUP\TESTHOST$", "WORKGROUP\TESTHOST$"),
+        @("MicrosoftAccount\alice@example.com", "MicrosoftAccount\alice@example.com"),
+        @("AzureAD\AliceExample", "AzureAD\AliceExample"),
+        @("NT VIRTUAL MACHINE\00000000-0000-0000-0000-000000000001", "NT VIRTUAL MACHINE\00000000-0000-0000-0000-000000000001"),
+        @("NT SERVICE\TrustedInstaller", "NT SERVICE\TrustedInstaller"),
+        @("NT AUTHORITY\ANONYMOUS LOGON", "NT AUTHORITY\ANONYMOUS LOGON"),
+        @("BUILTIN\Users", "BUILTIN\Users"),
+        @("Users", "Users"),
+        @("S-1-5-18", "NT AUTHORITY\SYSTEM"),
+        @("S-1-5-19", "NT AUTHORITY\LOCAL SERVICE"),
+        @("S-1-5-20", "NT AUTHORITY\NETWORK SERVICE"),
+        @("S-1-5-90-0-3", "Window Manager\DWM-3"),
+        @("S-1-5-96-0-1", "Font Driver Host\UMFD-1"),
+        @("S-1-5-21-1111-2222-3333-1001", "alice"),
+        @(" S-1-5-21-1111-2222-3333-1001 ", "alice"),
+        @("S-1-5-80-1111-2222-3333-4444-5555", "NT SERVICE\TestSvc"),
+        @("S-1-5-21-1111-2222-3333-1009", "S-1-5-21-1111-2222-3333-1009"),
+        @("S-1-5-21-1111-2222-3333-100", "S-1-5-21-1111-2222-3333-100"),
+        @("S-1-5-32-544", "S-1-5-32-544"),
+        @("SYSTEM", "NT AUTHORITY\SYSTEM"),
+        @("system", "NT AUTHORITY\SYSTEM"),
+        @("LocalSystem", "NT AUTHORITY\SYSTEM"),
+        @("NT AUTHORITY\SYSTEM", "NT AUTHORITY\SYSTEM"),
+        @("nt authority\system", "NT AUTHORITY\SYSTEM"),
+        @("NT AUTHORITY\LocalSystem", "NT AUTHORITY\SYSTEM"),
+        @(".\LocalSystem", "NT AUTHORITY\SYSTEM"),
+        @("TESTHOST\SYSTEM", "NT AUTHORITY\SYSTEM"),
+        @("LOCAL SERVICE", "NT AUTHORITY\LOCAL SERVICE"),
+        @("LocalService", "NT AUTHORITY\LOCAL SERVICE"),
+        @("NT AUTHORITY\LocalService", "NT AUTHORITY\LOCAL SERVICE"),
+        @("NT AUTHORITY\LOCAL SERVICE", "NT AUTHORITY\LOCAL SERVICE"),
+        @("NETWORK SERVICE", "NT AUTHORITY\NETWORK SERVICE"),
+        @("NetworkService", "NT AUTHORITY\NETWORK SERVICE"),
+        @("NT AUTHORITY\NetworkService", "NT AUTHORITY\NETWORK SERVICE"),
+        @("DWM-1", "Window Manager\DWM-1"),
+        @("Window Manager\DWM-1", "Window Manager\DWM-1"),
+        @("UMFD-0", "Font Driver Host\UMFD-0")
+    )
+    $wrong = @()
+    foreach ($case in $cases) {
+        $got = ConvertTo-TimelineUserName -Value $case[0] -SidNames $userSidNames -MachineNames $userMachines
+        if ($got -cne $case[1]) { $wrong += "'$($case[0])' -> '$got' (expected '$($case[1])')" }
+    }
+    # Without machine names or SID names nothing is stripped or named
+    foreach ($case in @(@("TESTHOST\alice", "TESTHOST\alice"), @("S-1-5-21-1111-2222-3333-1001", "S-1-5-21-1111-2222-3333-1001"), @(".\alice", "alice"))) {
+        $got = ConvertTo-TimelineUserName -Value $case[0] -SidNames @{} -MachineNames @()
+        if ($got -cne $case[1]) { $wrong += "no names: '$($case[0])' -> '$got' (expected '$($case[1])')" }
+    }
+    if ($wrong.Count -gt 0) { throw ($wrong -join "; ") }
+} -Expected @()
+
+Test-Case -Name "User column: SID names from ProfileList (wins) and bam_entries.csv, machine names" -Action {
+    $script:timelineUserContext = $null
+    try {
+        Add-TimelineSidName -Sid "S-1-5-21-1111-2222-3333-1001" -Name "alice-bam"
+        Add-TimelineSidName -Sid "S-1-5-21-1111-2222-3333-1001" -Name "alice" -ProfileList
+        Add-TimelineSidName -Sid "S-1-5-21-1111-2222-3333-1002" -Name "bob" -ProfileList
+        Add-TimelineSidName -Sid "S-1-5-21-1111-2222-3333-1002" -Name "bob-bam"
+        Add-TimelineSidName -Sid "S-1-5-21-1111-2222-3333-1003" -Name " carol "
+        Add-TimelineSidName -Sid "S-1-5-21-1111-2222-3333-1003" -Name "carol-later"
+        Add-TimelineSidName -Sid "S-1-5-21-1111-2222-3333-1004" -Name ""
+        Add-TimelineSidName -Sid "S-1-12-1-1111-2222-3333-4444" -Name "dave" -ProfileList
+        Add-TimelineSidName -Sid "S-1-5-80-1111-2222-3333-4444-5555" -Name "TestSvc" -ProfileList
+        # Profile folders of the built-in accounts and a group are not account names
+        Add-TimelineSidName -Sid "S-1-5-18" -Name "systemprofile" -ProfileList
+        Add-TimelineSidName -Sid "S-1-5-19" -Name "LocalService" -ProfileList
+        Add-TimelineSidName -Sid "S-1-5-20" -Name "NetworkService" -ProfileList
+        Add-TimelineSidName -Sid "S-1-5-32-544" -Name "Administrators"
+        $names = Get-TimelineSidNames
+        $keys = [string[]]@($names.Keys)
+        [Array]::Sort($keys, [System.StringComparer]::Ordinal)
+        $text = (@($keys | ForEach-Object { "$_=$($names[$_])" })) -join ", "
+        $expected = "S-1-12-1-1111-2222-3333-4444=dave, S-1-5-21-1111-2222-3333-1001=alice, S-1-5-21-1111-2222-3333-1002=bob, " +
+            "S-1-5-21-1111-2222-3333-1003=carol, S-1-5-80-1111-2222-3333-4444-5555=NT SERVICE\TestSvc"
+        if ($text -cne $expected) { throw "Get-TimelineSidNames gave: $text" }
+        Add-TimelineMachineName @("TESTHOST", " testhost ", "", "TestHost-New")
+        Add-TimelineMachineName $null
+        $machines = [string[]]@((Get-TimelineUserContext).MachineNames)
+        [Array]::Sort($machines, [System.StringComparer]::Ordinal)
+        if (($machines -join ",") -cne "TESTHOST,TestHost-New") { throw "machine names: $($machines -join ',')" }
+        if (@(Get-OfflineComputerNames "not a registry key").Count -ne 0) { throw "Get-OfflineComputerNames read names from a string" }
+    }
+    finally { $script:timelineUserContext = $null }
+} -Expected @()
+
+# Parse-PowerShellHistory keeps the Sid/User pairs of bam_entries.csv for the
+# User column (a synthetic collection with only that file)
+$bamDir = Join-Path ([System.IO.Path]::GetTempPath()) ("evtx-bam-" + [guid]::NewGuid().ToString("N"))
+try {
+    New-Item -ItemType Directory -Path (Join-Path $bamDir "Execution") -Force | Out-Null
+    $bamCsv = '"Sid","User","Path","LastExecutionUtc"' + "`r`n" +
+        '"S-1-5-21-1111-2222-3333-1003","carol","\Device\HarddiskVolume3\Tools\a.exe","2026-01-05T10:00:00Z"' + "`r`n" +
+        '"S-1-5-18","SYSTEM","\Device\HarddiskVolume3\Windows\b.exe","2026-01-05T10:01:00Z"' + "`r`n"
+    [System.IO.File]::WriteAllText((Join-Path $bamDir "Execution\bam_entries.csv"), $bamCsv)
+    Test-Case -Name "User column: Parse-PowerShellHistory keeps the Sid/User pairs of bam_entries.csv" -Action {
+        $script:timelineUserContext = $null
+        try {
+            & {
+                # Local to this block, as in a builder run
+                Set-Variable -Name InputPath -Value $bamDir
+                $script:collectionRoot = $bamDir
+                $script:collectionInfo = $null
+                $script:collectionManifest = $null
+                $script:manifestTimes = $null
+                $script:shortenedNames = @{}
+                # The builder looks up the collection's Secrets\ folder once per run
+                $script:secretsRoot = $null
+                Parse-PowerShellHistory 6>$null | Out-Null
+            }
+            $names = Get-TimelineSidNames
+            $text = (@($names.Keys | ForEach-Object { "$_=$($names[$_])" })) -join ", "
+            if ($text -cne "S-1-5-21-1111-2222-3333-1003=carol") { throw "Get-TimelineSidNames gave: $text" }
+        }
+        finally {
+            $script:timelineUserContext = $null
+            $script:collectionInfo = $null
+            $script:secretsRoot = $null
+        }
+    } -Expected @(
+        @{ Source = "BAM"; EventType = "Execution"; Description = "BAM execution: \Device\HarddiskVolume3\Tools\a.exe"; User = "carol" },
+        @{ Source = "BAM"; EventType = "Execution"; Description = "BAM execution: \Device\HarddiskVolume3\Windows\b.exe"; User = "SYSTEM" }
+    )
+
+    # The SRUM parser names its user SIDs the same way (Get-SrumSidNames):
+    # in the User column's form, from the names the parsers before it
+    # gathered (here a ProfileList name for alice, which wins over
+    # bam_entries.csv) and from bam_entries.csv, which it adds to them. The
+    # collection has no SOFTWARE hive, so the unknown SID stays unnamed.
+    Test-Case -Name "User column: Get-SrumSidNames names SRUM's SIDs in the User column's form and keeps the bam_entries.csv names" -Action {
+        $script:timelineUserContext = $null
+        try {
+            Add-TimelineSidName -Sid "S-1-5-21-1111-2222-3333-1001" -Name "alice" -ProfileList
+            [System.IO.File]::AppendAllText((Join-Path $bamDir "Execution\bam_entries.csv"),
+                '"S-1-5-21-1111-2222-3333-1001","alice-bam","\Device\HarddiskVolume3\Tools\c.exe","2026-01-05T10:02:00Z"' + "`r`n")
+            $srumSids = @("S-1-5-21-1111-2222-3333-1001", "S-1-5-21-1111-2222-3333-1003", "S-1-5-21-1111-2222-3333-1009", "S-1-5-18", "S-1-5-19", "S-1-5-90-0-2")
+            $srumNames = & {
+                Set-Variable -Name InputPath -Value $bamDir
+                $script:collectionRoot = $bamDir
+                $script:collectionInfo = $null
+                $script:secretsRoot = $null
+                Get-SrumSidNames -Sids $srumSids
+            }
+            $keys = [string[]]@($srumNames.Keys)
+            [Array]::Sort($keys, [System.StringComparer]::Ordinal)
+            $text = (@($keys | ForEach-Object { "$_=$($srumNames[$_])" })) -join ", "
+            $expected = "S-1-5-18=NT AUTHORITY\SYSTEM, S-1-5-19=NT AUTHORITY\LOCAL SERVICE, S-1-5-21-1111-2222-3333-1001=alice, " +
+                "S-1-5-21-1111-2222-3333-1003=carol, S-1-5-90-0-2=Window Manager\DWM-2"
+            if ($text -cne $expected) { throw "Get-SrumSidNames gave: $text" }
+            $names = Get-TimelineSidNames
+            $keys = [string[]]@($names.Keys)
+            [Array]::Sort($keys, [System.StringComparer]::Ordinal)
+            $text = (@($keys | ForEach-Object { "$_=$($names[$_])" })) -join ", "
+            if ($text -cne "S-1-5-21-1111-2222-3333-1001=alice, S-1-5-21-1111-2222-3333-1003=carol") { throw "Get-TimelineSidNames gave: $text" }
+        }
+        finally {
+            $script:timelineUserContext = $null
+            $script:collectionInfo = $null
+            $script:secretsRoot = $null
+        }
+    } -Expected @()
+}
+finally {
+    Remove-Item -LiteralPath $bamDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# Get-OfflineComputerNames and Add-OfflineProfileNames on this machine's own
+# SYSTEM and SOFTWARE keys (read only; a loaded hive has the same layout):
+# the computer name, and the current account's profile folder by its SID
+Test-Case -Name "User column: computer name and ProfileList read from SYSTEM and SOFTWARE keys (this machine's, read only)" -Action {
+    $script:timelineUserContext = $null
+    $systemKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SYSTEM")
+    $softwareKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SOFTWARE")
+    try {
+        $computerNames = @(Get-OfflineComputerNames $systemKey)
+        $nameValue = [Microsoft.Win32.Registry]::GetValue("HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName", "ComputerName", "")
+        if ($computerNames -notcontains $env:COMPUTERNAME -or -not $nameValue -or $computerNames -cnotcontains $nameValue) {
+            throw "Get-OfflineComputerNames did not give this computer's name ($($computerNames.Count) name(s))"
+        }
+        Add-OfflineProfileNames $softwareKey
+        $names = Get-TimelineSidNames
+        $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        if ($me -match '^S-1-(5-21|12-1)-' -and $names[$me] -ne (Split-Path $env:USERPROFILE -Leaf)) { throw "the current account's SID is not named after its profile folder" }
+        foreach ($builtIn in @("S-1-5-18", "S-1-5-19", "S-1-5-20")) {
+            if ($names.ContainsKey($builtIn)) { throw "$builtIn named from its profile folder: $($names[$builtIn])" }
+        }
+    }
+    finally {
+        $systemKey.Close()
+        $softwareKey.Close()
+        $script:timelineUserContext = $null
+    }
+} -Expected @()
+
+Test-Case -Name "User column pass: rows rewritten once per value, a named SID kept in Details, counts (Update-TimelineUserColumn)" -Action {
+    $entries = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $userRows = @(
+        @("TESTHOST\alice", "EventID=4624"),
+        @("testhost\alice", ""),
+        @("TESTHOST\alice", "EventID=4672"),
+        @("S-1-5-21-1111-2222-3333-1001", ""),
+        @("S-1-5-21-1111-2222-3333-1001", "EventID=1033 | UserSID=S-1-5-21-1111-2222-3333-1001"),
+        @("S-1-5-21-1111-2222-3333-1001", "SID=S-1-5-21-1111-2222-3333-1001; Time=last execution (BAM)"),
+        @("S-1-5-21-1111-2222-3333-1001", "MemberSID=S-1-5-21-1111-2222-3333-10011"),
+        # The SID as the value of a field that is not named ...SID (firewall
+        # ModifyingUser, scheduled task UserId) is in Details already; inside
+        # a path it is not
+        @("S-1-5-21-1111-2222-3333-1001", "EventID=2052 | RuleName=Open RDP | ModifyingUser=S-1-5-21-1111-2222-3333-1001"),
+        @("S-1-5-21-1111-2222-3333-1001", "Actions=x.exe | UserId=S-1-5-21-1111-2222-3333-1001 | State=Ready"),
+        @("S-1-5-21-1111-2222-3333-1001", "Location=HKU\S-1-5-21-1111-2222-3333-1001\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
+        @("S-1-5-18", "ScriptBlock=Get-Date ScriptBlockId={00000000-0000-0000-0000-000000000001}"),
+        @("S-1-5-21-1111-2222-3333-1009", "x"),
+        @("S-1-5-21-1111-2222-3333-1009", ""),
+        @("S-1-5-32-544", ""),
+        @("LocalSystem", "a=1"),
+        @("WORKGROUP\TESTHOST$", ""),
+        # Values that differ only in case are kept apart
+        @("OTHERHOST\Alice", ""),
+        @("OTHERHOST\alice", ""),
+        @("", "no user")
+    )
+    foreach ($row in $userRows) { $entries.Add([PSCustomObject]@{ Timestamp = "2026-01-05 00:00:00.000"; Source = "Test"; User = $row[0]; Details = $row[1] }) }
+    $result = Update-TimelineUserColumn -Entries $entries -SidNames $userSidNames -MachineNames $userMachines
+    $rowsText = (@($entries | ForEach-Object { "$($_.User)|$($_.Details)" })) -join "`n"
+    $expectedRows = @(
+        "alice|EventID=4624",
+        "alice|",
+        "alice|EventID=4672",
+        "alice|UserSID=S-1-5-21-1111-2222-3333-1001",
+        "alice|EventID=1033 | UserSID=S-1-5-21-1111-2222-3333-1001",
+        "alice|SID=S-1-5-21-1111-2222-3333-1001; Time=last execution (BAM)",
+        "alice|MemberSID=S-1-5-21-1111-2222-3333-10011 | UserSID=S-1-5-21-1111-2222-3333-1001",
+        "alice|EventID=2052 | RuleName=Open RDP | ModifyingUser=S-1-5-21-1111-2222-3333-1001",
+        "alice|Actions=x.exe | UserId=S-1-5-21-1111-2222-3333-1001 | State=Ready",
+        "alice|Location=HKU\S-1-5-21-1111-2222-3333-1001\SOFTWARE\Microsoft\Windows\CurrentVersion\Run | UserSID=S-1-5-21-1111-2222-3333-1001",
+        "NT AUTHORITY\SYSTEM|ScriptBlock=Get-Date ScriptBlockId={00000000-0000-0000-0000-000000000001} | UserSID=S-1-5-18",
+        "S-1-5-21-1111-2222-3333-1009|x",
+        "S-1-5-21-1111-2222-3333-1009|",
+        "S-1-5-32-544|",
+        "NT AUTHORITY\SYSTEM|a=1",
+        "WORKGROUP\TESTHOST$|",
+        "OTHERHOST\Alice|",
+        "OTHERHOST\alice|",
+        "|no user"
+    ) -join "`n"
+    if ($rowsText -cne $expectedRows) { throw "rows:`n$rowsText" }
+    $transitions = (@($result.Transitions | ForEach-Object { "$($_.From) -> $($_.To) x$($_.Rows)" })) -join "; "
+    $expectedTransitions = "S-1-5-21-1111-2222-3333-1001 -> alice x7; TESTHOST\alice -> alice x2; LocalSystem -> NT AUTHORITY\SYSTEM x1; " +
+        "S-1-5-18 -> NT AUTHORITY\SYSTEM x1; testhost\alice -> alice x1"
+    if ($transitions -cne $expectedTransitions) { throw "transitions: $transitions" }
+    $unresolved = (@($result.Unresolved | ForEach-Object { "$($_.Sid) x$($_.Rows)" })) -join "; "
+    if ($unresolved -cne "S-1-5-21-1111-2222-3333-1009 x2; S-1-5-32-544 x1") { throw "unresolved: $unresolved" }
+    if ("$($result.Rows)|$($result.SidRows)" -ne "12|4") { throw "rows changed|given UserSID: $($result.Rows)|$($result.SidRows)" }
+    if (@($entries | Where-Object { $_.Timestamp -ne "2026-01-05 00:00:00.000" -or $_.Source -ne "Test" }).Count -gt 0) { throw "other columns changed" }
+} -Expected @()
+
+# In the builder's main flow, the pass runs once, on the collected rows,
+# after the exit for a run without rows and before deduplication (which
+# compares User)
+$outside = { param($node) $p = $node.Parent; while ($p -and $p -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { $p = $p.Parent }; $null -eq $p }
+$passCalls = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq "Update-TimelineUserColumn" }, $true) | Where-Object { & $outside $_ })
+$noRowsExit = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.Extent.Text -eq "Write-RunEndBanner -NoOutput" }, $true) | Where-Object { & $outside $_ })
+$dedupLoop = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.ForEachStatementAst] -and $node.Condition.Extent.Text -eq '$script:timelineEntries' }, $true) | Where-Object { & $outside $_ })
+Test-Case -Name "User column pass in the main flow: after the no-rows exit, before deduplication" -Action {
+    if ($passCalls.Count -ne 1 -or $noRowsExit.Count -ne 1 -or $dedupLoop.Count -ne 1) { throw "found $($passCalls.Count) pass call(s), $($noRowsExit.Count) no-rows exit(s), $($dedupLoop.Count) loop(s) over the rows" }
+    if ($passCalls[0].Extent.Text -notmatch '-Entries \$script:timelineEntries\b') { throw "the pass is not given the collected rows: $($passCalls[0].Extent.Text)" }
+    $order = "$($noRowsExit[0].Extent.StartOffset -lt $passCalls[0].Extent.StartOffset)|$($passCalls[0].Extent.StartOffset -lt $dedupLoop[0].Extent.StartOffset)"
+    if ($order -ne "True|True") { throw "order (no-rows exit < pass | pass < deduplication): $order" }
+} -Expected @()
+
+# The main flow's own User column statements (after the no-rows exit, up to
+# the last that uses $userPass) on synthetic rows, with Log captured: the
+# computer name of collection_info.json is a name of the examined machine
+# only in a live collection (a mounted image is collected on another
+# machine), and the two log lines
+Test-Case -Name "User column pass in the main flow: collection_info.json's computer name only for a live collection, the log lines" -Action {
+    $statement = $passCalls[0]
+    while ($statement.Parent -and $statement.Parent -isnot [System.Management.Automation.Language.NamedBlockAst] -and $statement.Parent -isnot [System.Management.Automation.Language.StatementBlockAst]) { $statement = $statement.Parent }
+    $siblings = @($statement.Parent.Statements)
+    $first = -1
+    $last = -1
+    for ($i = 0; $i -lt $siblings.Count; $i++) {
+        if ($siblings[$i].Extent.StartOffset -le $noRowsExit[0].Extent.StartOffset -and $siblings[$i].Extent.EndOffset -ge $noRowsExit[0].Extent.EndOffset) { $first = $i + 1 }
+        if ($siblings[$i].Extent.Text -match '\$userPass\b') { $last = $i }
+    }
+    if ($first -lt 1 -or $last -lt $first) { throw "the User column statements were not found after the no-rows exit ($first..$last)" }
+    $userStatements = [ScriptBlock]::Create((@($siblings[$first..$last] | ForEach-Object { $_.Extent.Text }) -join "`n"))
+    $collectedRows = $script:timelineEntries
+    try {
+        # @(Mode, User of the "COLLECTORPC\alice" row afterwards, rows changed)
+        foreach ($case in @(@("MountedImage", "COLLECTORPC\alice", 0), @("Live", "alice", 1))) {
+            $script:timelineUserContext = $null
+            $script:collectionInfo = [PSCustomObject]@{ Mode = $case[0]; ComputerName = "COLLECTORPC" }
+            $script:timelineEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
+            foreach ($user in @("COLLECTORPC\alice", "S-1-5-21-1111-2222-3333-1009")) { $script:timelineEntries.Add([PSCustomObject]@{ User = $user; Details = "" }) }
+            $logged = [System.Collections.Generic.List[string]]::new()
+            & {
+                function Log { param([string]$Message) $logged.Add($Message) }
+                . $userStatements
+            }
+            $users = (@($script:timelineEntries | ForEach-Object { $_.User })) -join ", "
+            if ($users -cne "$($case[1]), S-1-5-21-1111-2222-3333-1009") { throw "Mode $($case[0]): rows $users" }
+            $summary = "^  User column: $($case[2]) row\(s\) changed to one form per account \($($case[2]) distinct value\(s\)\); 0 row\(s\) whose SID got a name keep it in Details \(UserSID=\)$"
+            $unnamed = '^  User column: 1 SID\(s\) not named by the sources read in this run \(.*-Sources Registry.*\), left as they are: S-1-5-21-1111-2222-3333-1009 \(1 row\(s\)\)$'
+            if ($logged.Count -ne 2 -or $logged[0] -cnotmatch $summary -or $logged[1] -cnotmatch $unnamed) { throw "Mode $($case[0]): logged $($logged -join ' / ')" }
+        }
+    }
+    finally {
+        $script:timelineEntries = $collectedRows
+        $script:timelineUserContext = $null
+        $script:collectionInfo = $null
+    }
+} -Expected @()
+
 # --- Parse-EventLogs dispatch ---
 # Parse-EventLogs itself on synthetic records, with Get-WinEvent replaced by
 # Get-TestWinEvent, which applies the EventID and provider terms of the XPath
@@ -484,8 +822,10 @@ function Get-TestWinEvent {
 $dispatchDir = Join-Path ([System.IO.Path]::GetTempPath()) ("evtx-dispatch-" + [guid]::NewGuid().ToString("N"))
 try {
     $defName = "Microsoft-Windows-Windows Defender%4Operational.evtx"
+    $psName = "Microsoft-Windows-PowerShell%4Operational.evtx"
+    $bitsName = "Microsoft-Windows-Bits-Client%4Operational.evtx"
     New-Item -ItemType Directory -Path (Join-Path $dispatchDir "EventLogs") -Force | Out-Null
-    foreach ($name in @("Security.evtx", "System.evtx", $defName, "Application.evtx")) {
+    foreach ($name in @("Security.evtx", "System.evtx", $defName, "Application.evtx", $psName, $bitsName)) {
         Set-Content -LiteralPath (Join-Path $dispatchDir "EventLogs\$name") -Value "placeholder" -Encoding ASCII
     }
     $bobSid = "S-1-5-21-1111-2222-3333-1002"
@@ -511,7 +851,11 @@ try {
         @(4700, (New-EventDataXml -Data (Join-Subject ([ordered]@{ TaskName = "\TestTask"; TaskContent = $taskXml })))),
         @(4699, (New-EventDataXml -Data (Join-Subject ([ordered]@{ TaskName = "\TestTask"; TaskContent = $taskXml })))),
         @(4726, (New-EventDataXml -Data (Join-Subject $bob))),
-        @(4634, (New-EventDataXml -Data ([ordered]@{ TargetUserName = "alice" })))
+        @(4634, (New-EventDataXml -Data ([ordered]@{ TargetUserName = "alice" }))),
+        # Accounts with "-" parts: a failed logon without a domain, and a
+        # process created without a subject account
+        @(4625, (New-EventDataXml -Data ([ordered]@{ TargetUserName = "bob"; TargetDomainName = "-"; Status = "0xc000006d"; SubStatus = "0xc000006a"; IpAddress = "203.0.113.7" }))),
+        @(4688, (New-EventDataXml -Data ([ordered]@{ SubjectUserSid = "S-1-0-0"; SubjectUserName = "-"; SubjectDomainName = "-"; NewProcessId = "0x1a0"; NewProcessName = "C:\Windows\System32\smss.exe"; CommandLine = ""; ParentProcessName = "" })))
     )
     $script:mockEvtx.Records["Security.evtx"] = @(foreach ($e in $security) {
             $provider = if ($e[0] -eq 1102) { "Microsoft-Windows-Eventlog" } else { $auditing }
@@ -556,6 +900,25 @@ try {
         $appRecords += New-TestRecord -Provider $provider -Id 1 -Time ("2026-01-04 12:00:{0:D2}" -f $second) -Level 2 -Message "Threat detected by $provider"
     }
     $script:mockEvtx.Records["Application.evtx"] = $appRecords
+    # PowerShell 4104 / 4103 and BITS 59: the account is only the record's
+    # UserID (4105 is not read)
+    $psProvider = "Microsoft-Windows-PowerShell"
+    $script:mockEvtx.Records[$psName] = @(
+        (New-TestRecord -Provider $psProvider -Id 4104 -Time "2026-01-04 13:00:00" -Level 5 -UserSid "S-1-5-21-1111-2222-3333-1001" -Body (New-EventDataXml -Data ([ordered]@{
+                MessageNumber = "1"; MessageTotal = "1"; ScriptBlockText = "Get-Process"; ScriptBlockId = "{00000000-0000-0000-0000-000000004104}"; Path = "C:\Scripts\test.ps1" }))),
+        (New-TestRecord -Provider $psProvider -Id 4104 -Time "2026-01-04 13:01:00" -Level 5 -UserSid "S-1-5-18" -Body (New-EventDataXml -Data ([ordered]@{
+                MessageNumber = "1"; MessageTotal = "1"; ScriptBlockText = "Get-Date"; ScriptBlockId = "{00000000-0000-0000-0000-000000004105}"; Path = "" }))),
+        (New-TestRecord -Provider $psProvider -Id 4103 -Time "2026-01-04 13:02:00" -UserSid "S-1-5-21-1111-2222-3333-1001" -Body (New-EventDataXml -Data ([ordered]@{
+                ContextInfo = "Host Name = ConsoleHost"; UserData = ""; Payload = "CommandInvocation(Get-Process): Get-Process" }))),
+        (New-TestRecord -Provider $psProvider -Id 4105 -Time "2026-01-04 13:03:00" -UserSid "S-1-5-21-1111-2222-3333-1001" -Body (New-EventDataXml -Data ([ordered]@{ ScriptBlockId = "{00000000-0000-0000-0000-000000004104}"; RunspaceId = "{00000000-0000-0000-0000-000000000001}" })))
+    )
+    $bitsProvider = "Microsoft-Windows-Bits-Client"
+    $script:mockEvtx.Records[$bitsName] = @(
+        (New-TestRecord -Provider $bitsProvider -Id 3 -Time "2026-01-04 14:00:00" -UserSid "S-1-5-21-1111-2222-3333-1001" -Body (New-EventDataXml -Data ([ordered]@{
+                jobTitle = "TestJob"; jobId = "{00000000-0000-0000-0000-0000000b1753}"; jobOwner = "TESTHOST\alice"; processPath = "C:\Tools\dl.exe"; processId = "4242" }))),
+        (New-TestRecord -Provider $bitsProvider -Id 59 -Time "2026-01-04 14:00:01" -UserSid "S-1-5-21-1111-2222-3333-1001" -Body (New-EventDataXml -Data ([ordered]@{
+                transferId = "{00000000-0000-0000-0000-000000000059}"; name = "TestJob"; Id = "{00000000-0000-0000-0000-0000000b1753}"; url = "https://dl.example.com/x.bin"; bytesTotal = "1024"; bytesTransferred = "0" })))
+    )
 
     $expectedRows = @(
         @("Security.evtx", "Logon", "Successful logon (Interactive)", "*"),
@@ -576,6 +939,13 @@ try {
         @("Security.evtx", "ScheduledTaskChange", "Scheduled task enabled: \TestTask", "*"),
         @("Security.evtx", "ScheduledTaskChange", "Scheduled task deleted: \TestTask", "*"),
         @("Security.evtx", "AccountChange", "User account deleted: bob", "DeletedAccount=TESTHOST\bob | AccountSID=$bobSid"),
+        @("Security.evtx", "Logon", "Failed logon attempt (Status=0xc000006d)", "FailureReason=0xc000006a Source=203.0.113.7"),
+        @("Security.evtx", "ProcessCreation", "New process created: C:\Windows\System32\smss.exe", "*PID=0x1a0"),
+        @($psName, "Execution", "PowerShell script block executed", "ScriptBlock=Get-Process ScriptBlockId={00000000-0000-0000-0000-000000004104} Path=C:\Scripts\test.ps1"),
+        @($psName, "Execution", "PowerShell script block executed", "ScriptBlock=Get-Date ScriptBlockId={00000000-0000-0000-0000-000000004105}"),
+        @($psName, "Execution", "PowerShell module logging event", "Payload=CommandInvocation(Get-Process): Get-Process"),
+        @($bitsName, "NetworkConnection", "BITS job created: TestJob", "EventID=3 | JobId={00000000-0000-0000-0000-0000000b1753} | Process=C:\Tools\dl.exe | PID=4242"),
+        @($bitsName, "NetworkConnection", "BITS transfer started: TestJob -> https://dl.example.com/x.bin", "EventID=59 | JobId={00000000-0000-0000-0000-0000000b1753} | Url=https://dl.example.com/x.bin | BytesTransferred=0 | BytesTotal=1024 | UserSID=S-1-5-21-1111-2222-3333-1001"),
         @("System.evtx", "SecurityAlert", "Event log cleared: TestLog", "EventID=104 | Channel=TestLog | ClearedBy=TESTHOST\alice"),
         @("System.evtx", "ServiceChange", "Event log service started (system startup)", "EventID=6005"),
         @("System.evtx", "ServiceChange", "Event log service stopped (clean shutdown)", "EventID=6006"),
@@ -623,6 +993,29 @@ try {
     $warnings = @(Get-Content -LiteralPath $logFile -ErrorAction SilentlyContinue | Select-Object -Skip $logBefore | Where-Object { $_ -match "WARNING:" })
     if ($warnings.Count -gt 0) { $problems += "warnings: $($warnings -join '; ')" }
     Write-TestResult -Name "Parse-EventLogs reads the handled IDs and providers of each channel ($($script:mockEvtx.Queries) queries)" -Passed ($problems.Count -eq 0) -Message ($problems -join "; ")
+
+    # User as the parsers write it (the User column pass names SIDs and
+    # strips the computer name later): joined without "-" parts, and the
+    # record's UserID for PowerShell 4104 / 4103 and BITS 59
+    $userChecks = @(
+        @("Security.evtx", "Successful logon (Interactive)", "*", "TESTHOST\alice"),
+        @("Security.evtx", "Failed logon attempt (Status=0xc000006d)", "*", "bob"),
+        @("Security.evtx", "New process created: C:\Windows\System32\smss.exe", "*", ""),
+        @("Security.evtx", "User account created: bob", "*", "TESTHOST\alice"),
+        @($psName, "PowerShell script block executed", "ScriptBlock=Get-Process *", "S-1-5-21-1111-2222-3333-1001"),
+        @($psName, "PowerShell script block executed", "ScriptBlock=Get-Date *", "S-1-5-18"),
+        @($psName, "PowerShell module logging event", "*", "S-1-5-21-1111-2222-3333-1001"),
+        @($bitsName, "BITS job created: TestJob", "*", "TESTHOST\alice"),
+        @($bitsName, "BITS transfer started: TestJob -> https://dl.example.com/x.bin", "*", "S-1-5-21-1111-2222-3333-1001")
+    )
+    $problems = @()
+    foreach ($check in $userChecks) {
+        $match = @($rows | Where-Object { $_.Source -eq $check[0] -and $_.Description -ceq $check[1] -and $_.Details -clike $check[2] })
+        if ($match.Count -ne 1 -or $match[0].User -cne $check[3]) {
+            $problems += "[$($check[0])] $($check[1]): User '$(@($match | ForEach-Object { $_.User }) -join "', '")', expected '$($check[3])'"
+        }
+    }
+    Write-TestResult -Name "Parse-EventLogs: User of Security logon / process rows, PowerShell 4104 / 4103 and BITS rows" -Passed ($problems.Count -eq 0) -Message ($problems -join "; ")
 }
 finally {
     Remove-Item -LiteralPath $dispatchDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -866,6 +1259,13 @@ else {
                     $near = @($rows | Where-Object { $_.Description -like "*$tag*" -or $_.Description -like "*$userName*" -or $_.Description -like "*$classicLog*" } | ForEach-Object { "$($_.Description) | $($_.Details)" })
                     Write-TestResult -Name "Part 2: $($check[0])" -Passed ($match.Count -gt 0) -Message "no row like '$($check[3])' / '$($check[4])'. Rows of this test: $($near -join ' || ')"
                 }
+                # User column: the account that created the user is a local
+                # account of this machine, so its computer name is dropped.
+                # The collection has no SYSTEM hive: the name comes from
+                # collection_info.json (a live collection).
+                $createdRows = @($rows | Where-Object { $_.Source -eq "Security.evtx" -and $_.Description -eq "User account created: $userName" })
+                Write-TestResult -Name "Part 2: User column (local account without the computer name of collection_info.json)" `
+                    -Passed ($createdRows.Count -gt 0 -and $createdRows[0].User -eq $env:USERNAME) -Message "User '$(@($createdRows | ForEach-Object { $_.User }) -join "', '")', expected '$env:USERNAME'"
             }
         }
         finally {

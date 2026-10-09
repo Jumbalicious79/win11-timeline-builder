@@ -405,7 +405,6 @@ try {
     $script:InputPath = $collection
     $script:collectionRoot = $collection
     $script:collectionInfo = $null
-    $script:artifactStats = @{}
 
     Write-Host "Running Parse-FileSystem ($($PSVersionTable.PSEdition) $($PSVersionTable.PSVersion)) on a synthetic `$MFT, -MftDays 7 ..."
     $script:MftDays = 7

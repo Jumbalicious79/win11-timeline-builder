@@ -5,6 +5,7 @@
 :: Usage:
 ::   Run-TimelineBuilder.bat                     (auto-find triage zips, pick one)
 ::   Run-TimelineBuilder.bat "path\to\collection"
+::   Run-TimelineBuilder.bat "path\to\collection.zip"
 ::   Run-TimelineBuilder.bat "path\to\collection" "keyword1,keyword2"
 ::
 :: The arguments are copied into variables once and the script is started

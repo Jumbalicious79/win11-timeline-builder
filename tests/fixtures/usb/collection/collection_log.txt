@@ -1,0 +1,2 @@
+[2025-06-30 12:00:00] === Windows Forensic Triage Collection Started ===
+[2025-06-30 12:00:00] Output directory: E:\TriageOut\TriageCollection_2025-06-30_12-00

@@ -1,6 +1,9 @@
 # Reports (generated at runtime)
 reports/
 
+# Work folder fallback (used only when %LOCALAPPDATA% cannot be written)
+/work/
+
 # Tools: auto-downloaded (sqlite3, Timeline Explorer) or user-provided
 # (Volatility 3) -- never committed. Only each tool folder's README.txt is
 # tracked, so a clone has the expected tools\<tool>\ layout.

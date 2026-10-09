@@ -1,0 +1,77 @@
+[Device Install Log]
+     OS Version = 10.0.26100
+     Service Pack = 0.0
+     Suite = 0x0100
+     ProductType = 1
+     Architecture = amd64
+
+[BeginLog]
+
+[Boot Session: 2025/01/10 07:58:30.500]
+
+>>>  [Device Install (Hardware initiated) - PCI\VEN_FFF0&DEV_0A01&SUBSYS_0001FFF0&REV_01\3&11223344&0&10]
+>>>  Section start 2025/01/10 08:01:02.345
+     dvi: {Build Driver List} 08:01:02.345
+     dvi: {Build Driver List - exit(0x00000000)} 08:01:02.345
+<<<  Section end 2025/01/10 08:01:05.010
+<<<  [Exit status: SUCCESS]
+
+>>>  [Device Install (Hardware initiated) - HDAUDIO\FUNC_01&VEN_FFF0&DEV_0A02&SUBSYS_FFF00001&REV_1000\4&1A2B3C4D&0&0001]
+>>>  Section start 2025/01/10 08:01:06.120
+     dvi: {Build Driver List} 08:01:06.120
+     dvi: {Build Driver List - exit(0x00000000)} 08:01:06.120
+<<<  Section end 2025/01/10 08:01:07.300
+<<<  [Exit status: SUCCESS]
+
+>>>  [Driver Install (DrvSetupInstallDriver) - fixturedrv.inf]
+>>>  Section start 2025/01/10 08:02:00.000
+     inf: Driver package installed
+<<<  Section end 2025/01/10 08:02:01.000
+<<<  [Exit status: SUCCESS]
+
+>>>  [Device Install (Hardware initiated) - USB\VID_FFF1&PID_0001\FIXTURESERIAL0001]
+>>>  Section start 2025/02/14 09:30:00.100
+     dvi: {Build Driver List} 09:30:00.100
+     dvi: {Build Driver List - exit(0x00000000)} 09:30:00.100
+<<<  Section end 2025/02/14 09:30:01.000
+<<<  [Exit status: SUCCESS]
+
+>>>  [Device Install (Hardware initiated) - USBSTOR\Disk&Ven_Fixture&Prod_Test_Disk&Rev_1.00\FIXTURESERIAL0001&0]
+>>>  Section start 2025/02/14 09:30:02.200
+     dvi: {Build Driver List} 09:30:02.200
+     dvi: {Build Driver List - exit(0x00000000)} 09:30:02.200
+<<<  Section end 2025/02/14 09:30:03.000
+<<<  [Exit status: SUCCESS]
+
+>>>  [Device Install (Hardware initiated) - SWD\WPDBUSENUM\_??_USBSTOR#Disk&Ven_Fixture&Prod_Test_Disk&Rev_1.00#FIXTURESERIAL0001&0#{53f56307-b6bf-11d0-94f2-00a0c91efb8b}]
+>>>  Section start 2025/02/14 09:30:04.400
+     dvi: {Build Driver List} 09:30:04.400
+     dvi: {Build Driver List - exit(0x00000000)} 09:30:04.400
+<<<  Section end 2025/02/14 09:30:05.000
+<<<  [Exit status: SUCCESS]
+
+>>>  [Delete Device - SWD\MMDEVAPI\{0.0.0.00000000}.{00000000-0000-0000-0000-000000000001}]
+>>>  Section start 2025/02/20 18:00:00.000
+     dvi: Device removed
+<<<  Section end 2025/02/20 18:00:00.500
+<<<  [Exit status: SUCCESS]
+
+>>>  [Delete Device - USB\VID_FFF1&PID_0001\FIXTURESERIAL0001]
+>>>  Section start 2025/02/20 18:05:10.250
+     dvi: Device removed
+<<<  Section end 2025/02/20 18:05:11.000
+<<<  [Exit status: SUCCESS]
+
+>>>  [Device Install (DiInstallDriver) - C:\Windows\System32\DriverStore\FileRepository\fixturedrv.inf_amd64_0123456789abcdef\fixturedrv.inf]
+>>>  Section start 2025/02/28 23:59:59
+      cmd: C:\Windows\System32\pnputil.exe /add-driver fixturedrv.inf /install
+<<<  Section end 2025/03/01 00:00:01
+<<<  [Exit status: SUCCESS]
+
+>>>  [Device Install (Hardware initiated) - BTHENUM\{0000110b-0000-1000-8000-00805f9b34fb}_VID&0001fff2_PID&0001\7&2B3C4D5E&0&000000000000_C00000000]
+>>>  Section start 2025/03/01 10:14:00.000
+     dvi: {Build Driver List} 10:14:00.000
+     dvi: {Build Driver List - exit(0x00000000)} 10:14:00.000
+<<<  Section end 2025/03/01 10:14:02.000
+<<<  [Exit status: SUCCESS]
+

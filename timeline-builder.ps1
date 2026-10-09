@@ -10,6 +10,7 @@
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSReviewUnusedParameter", "MftDays", Justification = "Read by Parse-FileSystem through script scope")]
 [CmdletBinding(DefaultParameterSetName = "Direct")]
 param(
+    # A collection folder, or a collection .zip (extracted into the work folder)
     [Parameter(ParameterSetName = "Direct", Mandatory = $true)]
     [string]$InputPath,
 
@@ -62,6 +63,7 @@ param(
     [Parameter(Mandatory = $false)]
     [switch]$NoExcel,
 
+
     # Don't write the findings report (report.html, report.pdf, findings.csv)
     [Parameter(Mandatory = $false, ParameterSetName = "Direct")]
     [Parameter(Mandatory = $false, ParameterSetName = "Browse")]
@@ -75,7 +77,28 @@ param(
 
     # Rules file for the findings report (default: report\report-rules.json)
     [Parameter(Mandatory = $false)]
-    [string]$ReportRules
+    [string]$ReportRules,
+
+    # Folder in which this run's work folder (extracted zip, scratch copies)
+    # is created. Default: %LOCALAPPDATA%\TimelineBuilder. Not a temp folder:
+    # Windows cleans those up during the run.
+    [Parameter(Mandatory = $false)]
+    [string]$WorkDir,
+
+    # Memory dump file (.dmp or .raw) of this collection, used before every
+    # other place. Needed only for a dump Find-MemoryDump does not find or
+    # does not use: one moved to another folder after the collection, one
+    # on a network share that is not next to the collection zip or folder,
+    # or one whose size is not the one collection_manifest.csv lists.
+    # Without it, Find-MemoryDump finds the dump where the collector saved
+    # it (the path in collection_manifest.csv, also on another drive:
+    # -MemoryOutputPath or the drive picked at the collector's memory
+    # prompt, also when that drive has another letter now), next to the
+    # collection zip or folder, and in the collection. A dump copied next
+    # to the zip as <zip name>_memory_dump.dmp (.raw) is found from
+    # Run-TimelineBuilder.bat too, which cannot pass this parameter.
+    [Parameter(Mandatory = $false)]
+    [string]$MemoryDumpPath
 )
 
 # --- Require Administrator (not for -ReportOnly: it only reads a timeline) ---
@@ -89,6 +112,628 @@ if (-not $ReportOnly -and -not $principal.IsInRole([Security.Principal.WindowsBu
     Write-Host ""
     pause
     exit 1
+}
+
+$ErrorActionPreference = "Continue"
+
+# =============================================================
+# Logging
+# Set up before a collection is opened, so a zip extraction is logged
+# too. $logFile is set once a collection is picked and the report folder
+# exists; until then messages only go to the console.
+# =============================================================
+$logFile = $null
+
+function Log {
+    param([string]$Message)
+    $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message"
+    Write-Host $entry
+    if ($logFile) { Add-Content -LiteralPath $logFile -Value $entry }
+}
+
+function Log-Warning {
+    param([string]$Message)
+    $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] WARNING: $Message"
+    Write-Host $entry -ForegroundColor Yellow
+    if ($logFile) { Add-Content -LiteralPath $logFile -Value $entry }
+}
+
+function Log-Error {
+    param([string]$Message)
+    $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ERROR: $Message"
+    Write-Host $entry -ForegroundColor Red
+    if ($logFile) { Add-Content -LiteralPath $logFile -Value $entry }
+}
+
+function Log-Success {
+    param([string]$Message)
+    $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message"
+    Write-Host $entry -ForegroundColor Green
+    if ($logFile) { Add-Content -LiteralPath $logFile -Value $entry }
+}
+
+# =============================================================
+# Console QuickEdit
+# With QuickEdit on (the console's default), a click in the window starts
+# a text selection, and while it is shown every write to the console
+# waits. The Log functions write to the console before the log file, so a
+# stray click stopped the whole run (no CPU, no new log lines) until the
+# selection was ended or the window was closed. QuickEdit is turned off
+# for the run (at the start of the main body), mouse input with it, and
+# the console's own mode is put back at the end (its finally block). Text
+# can still be copied with the window menu (Edit > Mark) or after the
+# run. Without console input (input redirected, a CI runner) nothing is
+# changed.
+# =============================================================
+$script:consoleModeToRestore = $null   # console input mode before Disable-ConsoleQuickEdit changed it
+
+# The console input mode for the run: ENABLE_QUICK_EDIT_MODE (0x0040) and
+# ENABLE_MOUSE_INPUT (0x0010) cleared and ENABLE_EXTENDED_FLAGS (0x0080)
+# set, without which SetConsoleMode leaves QuickEdit as it is. Mouse input
+# goes with QuickEdit: with mouse input on and QuickEdit off, the console
+# passes the mouse wheel and clicks to the script, which never reads them,
+# so the wheel stops scrolling the window, and Windows Terminal switches
+# to mouse reporting (a drag selects text only with Shift). Every other
+# bit is kept. A mode with QuickEdit already off (and that flag set) comes
+# back as it is.
+function Get-ConsoleModeWithoutQuickEdit {
+    param([uint32]$Mode)
+    if (([long]$Mode -band [long]0x00C0) -eq [long]0x0080) { return $Mode }
+    return [uint32](([long]$Mode -band (-bnot [long]0x0050)) -bor [long]0x0080)
+}
+
+# Turn QuickEdit (and mouse input) off in this process's console. Returns
+# the console input mode from before the change, for Restore-ConsoleMode,
+# or $null when nothing was changed: no console input (redirected, a CI
+# runner), QuickEdit already off, or a call that failed. Never throws.
+function Disable-ConsoleQuickEdit {
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]'TimelineNative.ConsoleMode').Type) {
+            Add-Type -Namespace TimelineNative -Name ConsoleMode -ErrorAction Stop -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern IntPtr GetStdHandle(int nStdHandle);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+'@
+        }
+        $handle = [TimelineNative.ConsoleMode]::GetStdHandle(-10)   # STD_INPUT_HANDLE
+        $mode = [uint32]0
+        # Fails for anything but console input: nothing to change
+        if (-not [TimelineNative.ConsoleMode]::GetConsoleMode($handle, [ref]$mode)) { return $null }
+        $newMode = Get-ConsoleModeWithoutQuickEdit $mode
+        if ($newMode -eq $mode) { return $null }
+        if (-not [TimelineNative.ConsoleMode]::SetConsoleMode($handle, $newMode)) { return $null }
+        return $mode
+    }
+    catch {
+        Write-Verbose "Console QuickEdit left as it is: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+# Put back the console input mode Disable-ConsoleQuickEdit returned
+# ($null: it changed nothing, so nothing to do). Never throws.
+function Restore-ConsoleMode {
+    param($Mode)
+    if ($null -eq $Mode) { return }
+    try {
+        $handle = [TimelineNative.ConsoleMode]::GetStdHandle(-10)   # STD_INPUT_HANDLE
+        if (-not [TimelineNative.ConsoleMode]::SetConsoleMode($handle, [uint32]$Mode)) {
+            Write-Verbose "Could not restore the console mode (SetConsoleMode failed)"
+        }
+    }
+    catch { Write-Verbose "Could not restore the console mode: $($_.Exception.Message)" }
+}
+
+# =============================================================
+# Work folder and input files
+# A collection zip is extracted into a per-run work folder,
+# <base>\w<PID>_<HHmmss>, outside every temp folder: Windows Storage
+# Sense deletes files older than 7 days from %TEMP% when disk space is
+# low, and extracted files keep the date stored in the zip (often months
+# old), so it deleted collection files while a timeline was being built.
+# Scratch copies (hives for reg load, browser databases for sqlite3) go
+# to <work folder>\scratch. The main body runs in try/finally, so the
+# folder is removed on every exit (errors, exit, Ctrl+C). Every input
+# file is recorded; one that disappears before the end makes the run end
+# with exit code 2 ("timeline incomplete").
+# =============================================================
+$script:selectedZipPath = $null
+$script:runWorkDir = $null       # this run's work folder
+$script:runWorkLock = $null      # its .lock file, held open for the whole run
+$script:runScratchDir = $null    # <work folder>\scratch
+$script:runHives = New-Object System.Collections.Generic.List[string]    # HKLM hives loaded and not yet unloaded
+$script:inputFiles = New-Object System.Collections.Generic.List[string]  # input files that must exist until the end
+$script:shortenedNames = @{}     # extracted file shortened to fit -> its full-length path
+$script:collectionManifest = $null
+$script:missingInputCount = 0
+$script:unexpectedErrorCount = 0  # errors caught by the main body's trap (rest of a step skipped)
+
+# Long form of a path: full, with 8.3 short names expanded (GitHub runners
+# have a %TEMP% like C:\Users\RUNNER~1\...) and no trailing backslash. A
+# path that does not exist is only made full. A relative path (e.g. a
+# relative -InputPath) is resolved against the PowerShell location, as the
+# parsers' Get-ChildItem calls do, not the process working directory.
+if (-not ([System.Management.Automation.PSTypeName]'TimelineNative.LongPath').Type) {
+    Add-Type -Namespace TimelineNative -Name LongPath -MemberDefinition @'
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern uint GetLongPathName(string lpszShortPath, System.Text.StringBuilder lpszLongPath, uint cchBuffer);
+'@
+}
+
+function Get-LongPath {
+    param([string]$Path)
+    if (-not $Path) { return "" }
+    $full = $Path
+    try { $full = [System.IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)) }
+    catch {
+        try { $full = [System.IO.Path]::GetFullPath($Path) }
+        catch { Write-Verbose "Could not make $Path a full path: $($_.Exception.Message)" }
+    }
+    $buffer = New-Object System.Text.StringBuilder 1024
+    $length = [TimelineNative.LongPath]::GetLongPathName($full, $buffer, [uint32]$buffer.Capacity)
+    if ($length -gt 0 -and $length -lt $buffer.Capacity) { $full = $buffer.ToString() }
+    if ($full.Length -gt 3) { $full = $full.TrimEnd('\') }
+    return $full
+}
+
+# The temp folder (long form) that contains $Path, or "". Windows cleans
+# these up on its own (Storage Sense, Disk Cleanup).
+function Get-ContainingTempFolder {
+    param([string]$Path)
+    $long = Get-LongPath $Path
+    if (-not $long) { return "" }
+    $candidates = @($env:TEMP, $env:TMP, [System.IO.Path]::GetTempPath())
+    $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
+    if ($localAppData) { $candidates += (Join-Path $localAppData "Temp") }
+    if ($env:SystemRoot) { $candidates += (Join-Path $env:SystemRoot "Temp") }
+    foreach ($candidate in $candidates) {
+        if (-not $candidate) { continue }
+        $temp = Get-LongPath $candidate
+        if ($long -eq $temp -or $long.StartsWith($temp.TrimEnd('\') + '\', [System.StringComparison]::OrdinalIgnoreCase)) { return $temp }
+    }
+    return ""
+}
+
+# Remove the work folders of earlier runs in $BaseFolder that ended
+# without cleaning up (crash, closed window): only w<PID>_<HHmmss> folders
+# whose .lock exists and is not held open by a running builder. Files in
+# use (e.g. a hive copy that is still loaded) are skipped; the .lock goes
+# last, so such a folder is tried again by the next run.
+function Remove-StaleWorkFolders {
+    param([string]$BaseFolder)
+    foreach ($dir in @(Get-ChildItem -LiteralPath $BaseFolder -Directory -ErrorAction SilentlyContinue)) {
+        if ($dir.Name -notmatch '^w\d+_\d{6}(_\d+)?$') { continue }
+        $lockPath = Join-Path $dir.FullName ".lock"
+        if (-not (Test-Path -LiteralPath $lockPath -PathType Leaf)) { continue }
+        try { [System.IO.File]::Open($lockPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None).Close() }
+        catch { continue }   # held open: that run is still going
+        Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne ".lock" } |
+            ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+        if (@(Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne ".lock" }).Count -gt 0) {
+            Log-Warning "Could not fully remove the work folder of an earlier run (files in use): $($dir.FullName)"
+            continue
+        }
+        Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        Log "Removed the work folder of an earlier run: $($dir.FullName)"
+    }
+}
+
+# $true when $Path is a network path: a UNC path (\\server\share\...) or a
+# folder on a mapped network drive. reg load (RegLoadKey) only loads a hive
+# from a local file, and the hive copies are made in the work folder, so
+# the work folder must be on a local drive. A path that is not valid is
+# not reported here; creating the folder reports it.
+function Test-NetworkPath {
+    param([string]$Path)
+    $root = ""
+    try { $root = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($Path)) }
+    catch { return $false }
+    if (-not $root) { return $false }
+    if ($root.StartsWith('\\')) { return $true }
+    try { return ((New-Object System.IO.DriveInfo($root)).DriveType -eq [System.IO.DriveType]::Network) }
+    catch { return $false }
+}
+
+# Create this run's work folder, <base>\w<PID>_<HHmmss> (kept short: deep
+# collection paths come close to the 260-character limit), with a
+# <work folder>\scratch subfolder, and hold its .lock open until the end
+# of the run. Base: -WorkDir if given, else %LOCALAPPDATA%\TimelineBuilder
+# (no Windows cleanup covers it), else the script's work\ folder. A base
+# on a network drive is not used (see Test-NetworkPath). Returns the
+# folder, or "" after logging why not.
+function New-RunWorkFolder {
+    param([string]$BaseFolder)
+    $bases = @()
+    if ($BaseFolder) { $bases += $BaseFolder }
+    else {
+        $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
+        if ($localAppData) { $bases += (Join-Path $localAppData "TimelineBuilder") }
+        $bases += (Join-Path $PSScriptRoot "work")
+    }
+    foreach ($base in $bases) {
+        if (Test-NetworkPath $base) {
+            Log-Warning "Not using $base for the work folder: it is on a network drive or share, and reg load cannot load hives from there."
+            continue
+        }
+        $folder = ""
+        try {
+            [void][System.IO.Directory]::CreateDirectory($base)
+            Remove-StaleWorkFolders -BaseFolder $base
+            $name = "w$($PID)_$(Get-Date -Format 'HHmmss')"
+            $folder = Join-Path $base $name
+            for ($n = 2; Test-Path -LiteralPath $folder; $n++) { $folder = Join-Path $base "$($name)_$n" }
+            [void][System.IO.Directory]::CreateDirectory($folder)
+            $script:runWorkLock = [System.IO.File]::Open((Join-Path $folder ".lock"), [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            $note = [System.Text.Encoding]::ASCII.GetBytes("timeline-builder.ps1 work folder, PID $PID, started $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`r`n")
+            $script:runWorkLock.Write($note, 0, $note.Length)
+            $script:runWorkLock.Flush()
+            $script:runScratchDir = Join-Path $folder "scratch"
+            [void][System.IO.Directory]::CreateDirectory($script:runScratchDir)
+            return $folder
+        }
+        catch {
+            Log-Warning "Could not create a work folder in ${base}: $($_.Exception.Message)"
+            if ($script:runWorkLock) { $script:runWorkLock.Close(); $script:runWorkLock = $null }
+            $script:runScratchDir = $null
+            if ($folder -and (Test-Path -LiteralPath $folder)) { Remove-Item -LiteralPath $folder -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+    }
+    return ""
+}
+
+# Delete this run's work folder (extracted collection and scratch copies);
+# call Dismount-RunHives first. Hive copies stay locked briefly after reg
+# unload, so this retries. The .lock goes last: a folder that cannot be
+# emptied is removed by the next run.
+function Remove-RunWorkFolder {
+    if (-not $script:runWorkDir) { return }
+    Log "Removing the work folder: $($script:runWorkDir)"
+    [gc]::Collect()
+    [gc]::WaitForPendingFinalizers()
+    $left = @()
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        Get-ChildItem -LiteralPath $script:runWorkDir -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne ".lock" } |
+            ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+        $left = @(Get-ChildItem -LiteralPath $script:runWorkDir -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne ".lock" })
+        if ($left.Count -eq 0) { break }
+        if ($attempt -lt 3) { Start-Sleep -Seconds 2 }
+    }
+    if ($script:runWorkLock) { $script:runWorkLock.Close(); $script:runWorkLock = $null }
+    if ($left.Count -eq 0) { Remove-Item -LiteralPath $script:runWorkDir -Recurse -Force -ErrorAction SilentlyContinue }
+    if (Test-Path -LiteralPath $script:runWorkDir) {
+        Log-Warning "  Could not remove the work folder (file in use). The next run removes it, or delete it manually: $($script:runWorkDir)"
+    }
+    else { Log "  Work folder removed." }
+}
+
+# Folder for scratch copies (hives for reg load, browser databases for
+# sqlite3): <work folder>\scratch. Outside a builder run (functions loaded
+# by a test) the system temp folder.
+function Get-ScratchFolder {
+    if ($script:runScratchDir) { return $script:runScratchDir }
+    return [System.IO.Path]::GetTempPath()
+}
+
+# Hives this run loaded under HKLM (Mount-TimelineHive, Parse-Amcache) and
+# has not unloaded yet. Registered before reg load, so an interrupted load
+# is covered too.
+function Register-RunHive {
+    param([string]$Name)
+    if ($null -eq $script:runHives) { $script:runHives = New-Object System.Collections.Generic.List[string] }
+    if (-not $script:runHives.Contains($Name)) { $script:runHives.Add($Name) }
+}
+
+function Unregister-RunHive {
+    param([string]$Name)
+    if ($script:runHives) { [void]$script:runHives.Remove($Name) }
+}
+
+# Unload the hives this run left loaded (a parser stopped by an error or
+# Ctrl+C, or an unload that failed), so their copies in the work folder
+# can be deleted. Only this run's own TEMP_TL* / TEMP_AMCACHE_* hives.
+function Dismount-RunHives {
+    if (-not $script:runHives -or $script:runHives.Count -eq 0) { return }
+    $loadedNow = @()
+    try { $loadedNow = @([Microsoft.Win32.Registry]::LocalMachine.GetSubKeyNames()) }
+    catch { Write-Verbose "Could not list the loaded hives: $($_.Exception.Message)" }
+    foreach ($name in @($script:runHives)) {
+        # Not loaded (any more): nothing to unload
+        if ($loadedNow.Count -gt 0 -and $loadedNow -notcontains $name) { Unregister-RunHive $name; continue }
+        [gc]::Collect()
+        [gc]::WaitForPendingFinalizers()
+        $unloaded = $false
+        for ($attempt = 1; $attempt -le 3 -and -not $unloaded; $attempt++) {
+            $null = & reg unload "HKLM\$name" 2>&1
+            $unloaded = ($LASTEXITCODE -eq 0)
+            if (-not $unloaded) { Start-Sleep -Milliseconds 1000 }
+        }
+        if ($unloaded) {
+            Log "Unloaded hive HKLM\$name (left loaded by a parser)"
+            Unregister-RunHive $name
+        }
+        else { Log-Warning "Failed to unload hive HKLM\$name -- run: reg unload HKLM\$name" }
+    }
+}
+
+# Free space verdict for extracting $NeededBytes onto a volume: "Error"
+# below the size plus 256 MB, "Warning" below the size plus 1 GB or when
+# the system drive would be left with under 10% free, else "Ok"
+function Get-ExtractionSpaceVerdict {
+    param([long]$FreeBytes, [long]$TotalBytes, [long]$NeededBytes, [bool]$IsSystemDrive)
+    if ($FreeBytes -lt $NeededBytes + 256MB) { return "Error" }
+    if ($FreeBytes -lt $NeededBytes + 1GB) { return "Warning" }
+    if ($IsSystemDrive -and $TotalBytes -gt 0 -and ($FreeBytes - $NeededBytes) -lt ($TotalBytes / 10)) { return "Warning" }
+    return "Ok"
+}
+
+# Check the free space on the drive of $Folder before extracting
+# $NeededBytes into it. Logs the result; $false when the zip cannot fit.
+# Skipped (with a log line) for UNC paths and drives that report no size.
+function Test-ExtractionSpace {
+    param([string]$Folder, [long]$NeededBytes)
+    $root = ""
+    try { $root = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($Folder)) }
+    catch { Write-Verbose "Could not get the drive of ${Folder}: $($_.Exception.Message)" }
+    if (-not $root -or $root.StartsWith('\\')) {
+        Log "  Free space check skipped: $Folder is not on a drive letter."
+        return $true
+    }
+    try {
+        $drive = New-Object System.IO.DriveInfo($root)
+        $free = $drive.AvailableFreeSpace
+        $total = $drive.TotalSize
+    }
+    catch {
+        Log "  Free space check skipped for ${root}: $($_.Exception.Message)"
+        return $true
+    }
+    $isSystemDrive = $root.TrimEnd('\') -eq "$env:SystemDrive".TrimEnd('\')
+    $verdict = Get-ExtractionSpaceVerdict -FreeBytes $free -TotalBytes $total -NeededBytes $NeededBytes -IsSystemDrive $isSystemDrive
+    $numbers = "$([math]::Round($free / 1GB, 2)) GB free of $([math]::Round($total / 1GB, 1)) GB, $([math]::Round($NeededBytes / 1MB, 1)) MB to extract"
+    if ($verdict -eq "Error") {
+        Log-Error "Not enough free space on $root for the extraction ($numbers, plus 256 MB to spare). Free up space or pass -WorkDir with a folder on another drive."
+        return $false
+    }
+    if ($verdict -eq "Warning") {
+        Log-Warning "Low free space on $root ($numbers). Windows may start cleaning up when a drive runs low; consider -WorkDir with a folder on another drive."
+    }
+    else { Log "  Free space on ${root}: $numbers" }
+    return $true
+}
+
+# $true for a path (relative to the collection, or a zip entry name with
+# "\") inside the email attachment copies the collector makes
+# (Email\<user>\Outlook\SecureTemp\, Email\<user>\NewOutlook\Attachments\).
+# No parser reads them: Parse-Email takes their rows from the manifest and
+# the email listings. They can have any name -- an attached .lnk or .evtx
+# is not this system's shortcut or event log -- so Find-ArtifactFiles never
+# returns them to a parser. They can be malware, which antivirus on this
+# machine may quarantine, so they are not extracted from a collection zip
+# and are not input files (their removal does not make a timeline
+# incomplete).
+function Test-EmailAttachmentCopy {
+    param([string]$RelativePath)
+    return $RelativePath -match '(?:^|\\)Email\\[^\\]+\\(?:Outlook\\SecureTemp|NewOutlook\\Attachments)\\'
+}
+
+# Extract a collection zip into $Destination entry by entry (not
+# Expand-Archive), so that:
+#  - entry names with "/" (the zip standard) and "\" (older collectors)
+#    both extract into folders;
+#  - a path over 240 characters is shortened (start of the name plus a
+#    hash) instead of failing the extraction; the full-length path is kept
+#    in $script:shortenedNames, so manifest lookups still find the file;
+#  - no entry is written outside $Destination ("..", rooted names);
+#  - files keep the date stored in the zip. Several parsers fall back to a
+#    file's date, so it is never changed to "now";
+#  - copied email attachments stay in the zip (see Test-EmailAttachmentCopy).
+# Every extracted file is recorded as an input file. Throws when the zip
+# cannot be read, does not fit on the drive, or an entry fails to extract.
+function Expand-CollectionZip {
+    param([string]$ZipPath, [string]$Destination)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $Destination = [System.IO.Path]::GetFullPath($Destination).TrimEnd('\')
+    [void][System.IO.Directory]::CreateDirectory($Destination)
+    $zipArchive = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+    $sha1 = $null
+    try {
+        # Folder entries end with a separator
+        $fileEntries = New-Object System.Collections.Generic.List[object]
+        $attachmentCount = 0
+        $attachmentBytes = 0L
+        $totalBytes = 0L
+        foreach ($entry in $zipArchive.Entries) {
+            if (-not $entry.FullName -or $entry.FullName -match '[/\\]$') { continue }
+            if (Test-EmailAttachmentCopy $entry.FullName.Replace('/', '\')) {
+                $attachmentCount++
+                $attachmentBytes += $entry.Length
+                continue
+            }
+            $fileEntries.Add($entry)
+            $totalBytes += $entry.Length
+        }
+        Log "  Zip: $ZipPath -- $($zipArchive.Entries.Count) entries, $($fileEntries.Count + $attachmentCount) file(s), $([math]::Round(($totalBytes + $attachmentBytes) / 1MB, 1)) MB uncompressed"
+        if ($attachmentCount -gt 0) {
+            Log "  Not extracted: $attachmentCount copied email attachment(s), $([math]::Round($attachmentBytes / 1MB, 1)) MB. No parser reads them (their rows come from the manifest and the email listings), and antivirus may quarantine them."
+        }
+        if (-not (Test-ExtractionSpace -Folder $Destination -NeededBytes $totalBytes)) {
+            throw "not enough free space to extract the zip"
+        }
+
+        $shortenedCount = 0
+        $skippedCount = 0
+        foreach ($entry in $fileEntries) {
+            $relName = $entry.FullName.Replace('/', '\')
+            $leaf = $relName.Substring($relName.LastIndexOf('\') + 1)
+            $entryDest = Join-Path $Destination $relName
+            $fullLengthDest = $entryDest
+            $shortened = $false
+            if ($entryDest.Length -gt 240) {
+                # Keep the name's start and add a hash so it stays unique
+                $entryDir = Split-Path $entryDest -Parent
+                $ext = [System.IO.Path]::GetExtension($leaf)
+                if (-not $sha1) { $sha1 = [System.Security.Cryptography.SHA1]::Create() }
+                $nameHash =[System.BitConverter]::ToString($sha1.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($leaf))).Replace("-", "").Substring(0, 8)
+                $keep = [Math]::Max(8, 240 - $entryDir.Length - 1 - $ext.Length - 9)
+                $baseName = [System.IO.Path]::GetFileNameWithoutExtension($leaf)
+                if ($baseName.Length -gt $keep) { $baseName = $baseName.Substring(0, $keep) }
+                $entryDest = Join-Path $entryDir "$baseName~$nameHash$ext"
+                $shortened = $true
+            }
+            # Never write outside the extraction folder (".." or rooted entry names)
+            $fullDest = ""
+            try { $fullDest = [System.IO.Path]::GetFullPath($entryDest) }
+            catch { Write-Verbose "Zip entry $($entry.FullName) has no valid path: $($_.Exception.Message)" }
+            if (-not $fullDest.StartsWith($Destination + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+                Log-Warning "  Zip entry skipped (it would be written outside the extraction folder): $($entry.FullName)"
+                $skippedCount++
+                continue
+            }
+            [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($fullDest))
+            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $fullDest, $true)
+            $script:inputFiles.Add($fullDest)
+            if ($shortened) {
+                $script:shortenedNames[$fullDest] = $fullLengthDest
+                Log "  Shortened to fit the 260-character path limit: $relName -> $(Split-Path $fullDest -Leaf)"
+                $shortenedCount++
+            }
+        }
+        $summary = "  Extracted $($fileEntries.Count - $skippedCount) file(s) to $Destination"
+        if ($shortenedCount -gt 0) { $summary += " ($shortenedCount over-long file name(s) shortened)" }
+        Log $summary
+    }
+    finally {
+        if ($sha1) { $sha1.Dispose() }
+        $zipArchive.Dispose()
+    }
+}
+
+# collection_manifest.csv of the collection (written by the triage
+# collector): the one nearest to -InputPath, so an outer folder (e.g. the
+# zip extracted with Windows "Extract All") works too. Its RelativePath
+# column is relative to the manifest's own folder. Read once. Path and
+# Folder are "" and Rows is empty when there is no manifest.
+function Get-CollectionManifest {
+    if ($script:collectionManifest) { return $script:collectionManifest }
+    $manifest = [PSCustomObject]@{
+        Path          = ""
+        Folder        = ""
+        Rows          = @()
+        RelativePaths = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    }
+    $mf = Get-ChildItem -Path $InputPath -Filter "collection_manifest.csv" -Recurse -File -ErrorAction SilentlyContinue |
+        Sort-Object { $_.FullName.Length } | Select-Object -First 1
+    if ($mf) {
+        $manifest.Path = $mf.FullName
+        $manifest.Folder = $mf.DirectoryName
+        try {
+            $manifest.Rows = @(Import-Csv -LiteralPath $mf.FullName -ErrorAction Stop)
+            foreach ($row in $manifest.Rows) {
+                if ($row.PSObject.Properties["RelativePath"] -and $row.RelativePath) { [void]$manifest.RelativePaths.Add($row.RelativePath) }
+            }
+        }
+        catch { Log-Warning "Could not read collection manifest: $($_.Exception.Message)" }
+    }
+    $script:collectionManifest = $manifest
+    return $manifest
+}
+
+# Folder the collection's relative paths start from: the folder of
+# collection_manifest.csv, else -InputPath. A relative -InputPath is
+# resolved against the PowerShell location (as the parsers' Get-ChildItem
+# calls do), not the process working directory.
+function Get-CollectionRootFolder {
+    $folder = (Get-CollectionManifest).Folder
+    if (-not $folder) { $folder = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($InputPath) }
+    return [System.IO.Path]::GetFullPath($folder).TrimEnd('\')
+}
+
+# Input files of a collection folder: the files collection_manifest.csv
+# lists that exist now (files gone before the run are not tracked).
+# Memory dumps are left out: they are large and found separately. So are
+# copied email attachments: no parser reads them, and antivirus may
+# quarantine them (see Test-EmailAttachmentCopy). Without a manifest
+# nothing is tracked.
+function Add-ManifestInputFiles {
+    $manifest = Get-CollectionManifest
+    if (-not $manifest.Path) {
+        Log "No collection_manifest.csv found: input files are not checked for deletion during the run."
+        return
+    }
+    $root = [System.IO.Path]::GetFullPath($manifest.Folder).TrimEnd('\')
+    $listed = 0
+    foreach ($rel in $manifest.RelativePaths) {
+        if ($rel -match '^Memory\\.+\.dmp$' -or (Test-EmailAttachmentCopy $rel)) { continue }
+        $listed++
+        $full = Join-Path $root $rel
+        if ([System.IO.File]::Exists($full)) { $script:inputFiles.Add($full) }
+    }
+    Log "Input files: $($script:inputFiles.Count) of the $listed file(s) listed in $($manifest.Path) are present."
+}
+
+# Input files of this run that no longer exist
+function Get-MissingInputFiles {
+    return @($script:inputFiles | Where-Object { -not [System.IO.File]::Exists($_) })
+}
+
+# Log missing input files grouped by their top folder in the collection
+# (USB\, Browser\, Registry\, ...), which shows the parsers affected. The
+# log file gets every name; the console shows at most 20 per folder.
+function Write-MissingInputFiles {
+    param([string[]]$Files, [string]$BaseFolder)
+    $base = $BaseFolder.TrimEnd('\') + '\'
+    $groups = [ordered]@{}
+    foreach ($file in $Files) {
+        $name = $file
+        if ($file.StartsWith($base, [System.StringComparison]::OrdinalIgnoreCase)) { $name = $file.Substring($base.Length) }
+        $folder = "(collection folder)"
+        if ($name.Contains('\')) { $folder = $name.Substring(0, $name.IndexOf('\') + 1) }
+        if (-not $groups.Contains($folder)) { $groups[$folder] = New-Object System.Collections.Generic.List[string] }
+        $groups[$folder].Add($name)
+    }
+    foreach ($folder in $groups.Keys) {
+        $names = $groups[$folder]
+        Log-Warning "  Missing in ${folder}: $($names.Count) file(s)"
+        $time = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        $lines = @($names | ForEach-Object { "[$time]     $_" })
+        $lines | Select-Object -First 20 | ForEach-Object { Write-Host $_ }
+        if ($names.Count -gt 20) { Write-Host "[$time]     ... and $($names.Count - 20) more (all listed in the log file)" }
+        if ($logFile) { Add-Content -LiteralPath $logFile -Value $lines }
+    }
+}
+
+# The end-of-run banner. The timeline is incomplete when input files
+# disappeared during the run, and may be incomplete when the main body's
+# trap caught an unexpected error (the rest of that step, e.g. a whole
+# parser, was skipped). Returns $true in both cases; the run then ends
+# with exit code 2. -NoOutput: no timeline was written (no entries).
+function Write-RunEndBanner {
+    param([switch]$NoOutput)
+    $verb = "Completed"
+    $incompleteText = "-- timeline incomplete"
+    $maybeText = "-- timeline may be incomplete"
+    if ($NoOutput) {
+        $verb = "Finished"
+        $incompleteText = "(no output generated)"
+        $maybeText = "(no output generated)"
+    }
+    $incomplete = $false
+    if ($script:missingInputCount -gt 0) {
+        Log-Error "=== Timeline Builder $verb WITH $($script:missingInputCount) MISSING INPUT FILE(S) $incompleteText ==="
+        $incomplete = $true
+    }
+    if ($script:unexpectedErrorCount -gt 0) {
+        Log-Error "=== Timeline Builder $verb WITH $($script:unexpectedErrorCount) UNEXPECTED ERROR(S) $maybeText ==="
+        $incomplete = $true
+    }
+    if (-not $incomplete) {
+        if ($NoOutput) { Log "=== Timeline Builder Finished (no output generated) ===" }
+        else { Log "=== Timeline Builder Completed Successfully ===" }
+    }
+    return $incomplete
 }
 
 # =============================================================
@@ -160,79 +805,17 @@ if ($Browse) {
     Write-Host ""
     Write-Host "Selected: $($selectedZip.Name)" -ForegroundColor Green
 
-    # Extract to a short temp path to avoid Windows 260-char path limit
-    # (the iCloud path is already very deep). A marker file next to the
-    # folder is written only when extraction finishes, so a half-extracted
-    # folder left by an earlier failed run is never reused.
-    $script:browseExtractDir = Join-Path $env:TEMP ("TriageExtract_" + $selectedZip.BaseName)
-    $extractDir = $script:browseExtractDir
-    $extractMarker = "$extractDir.complete"
-
-    if ((Test-Path -LiteralPath $extractMarker) -and (Test-Path -LiteralPath $extractDir)) {
-        Write-Host "Using existing extracted folder: $extractDir" -ForegroundColor Cyan
-    } else {
-        if (Test-Path -LiteralPath $extractDir) {
-            Write-Host "Removing incomplete extraction from an earlier run: $extractDir" -ForegroundColor Yellow
-            Remove-Item -LiteralPath $extractDir -Recurse -Force -ErrorAction SilentlyContinue
-        }
-        Write-Host "Extracting $($selectedZip.Name) to temp..." -ForegroundColor Cyan
-        try {
-            # Entry by entry (not Expand-Archive) so over-long paths can be
-            # shortened instead of failing the whole extraction
-            Add-Type -AssemblyName System.IO.Compression.FileSystem
-            $zipArchive = [System.IO.Compression.ZipFile]::OpenRead($selectedZip.FullName)
-            $renamedCount = 0
-            try {
-                foreach ($entry in $zipArchive.Entries) {
-                    if (-not $entry.Name) { continue }   # folder entry
-                    $entryDest = Join-Path $extractDir $entry.FullName.Replace('/', '\')
-                    if ($entryDest.Length -gt 240) {
-                        # Keep the name's start and add a hash so it stays unique
-                        $entryDir = Split-Path $entryDest -Parent
-                        $ext = [System.IO.Path]::GetExtension($entry.Name)
-                        $sha1 = New-Object System.Security.Cryptography.SHA1Managed
-                        $nameHash = [System.BitConverter]::ToString($sha1.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($entry.Name))).Replace("-", "").Substring(0, 8)
-                        $keep = [Math]::Max(8, 240 - $entryDir.Length - 1 - $ext.Length - 9)
-                        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($entry.Name)
-                        if ($baseName.Length -gt $keep) { $baseName = $baseName.Substring(0, $keep) }
-                        $entryDest = Join-Path $entryDir "$baseName~$nameHash$ext"
-                        $renamedCount++
-                    }
-                    # Never write outside the extraction folder (".." entries)
-                    if (-not [System.IO.Path]::GetFullPath($entryDest).StartsWith($extractDir + '\', [System.StringComparison]::OrdinalIgnoreCase)) { continue }
-                    New-Item -ItemType Directory -Path (Split-Path $entryDest -Parent) -Force | Out-Null
-                    [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $entryDest, $true)
-                }
-            }
-            finally {
-                $zipArchive.Dispose()
-            }
-            Set-Content -LiteralPath $extractMarker -Value $selectedZip.FullName
-            Write-Host "Extracted to: $extractDir" -ForegroundColor Green
-            if ($renamedCount -gt 0) {
-                Write-Host "  ($renamedCount over-long file name(s) shortened to fit the 260-character path limit)" -ForegroundColor DarkGray
-            }
-        } catch {
-            Write-Host "ERROR: Failed to extract zip: $($_.Exception.Message)" -ForegroundColor Red
-            Remove-Item -LiteralPath $extractDir -Recurse -Force -ErrorAction SilentlyContinue
-            pause
-            exit 1
-        }
-    }
-
-    # The extracted folder may contain a single subfolder -- find the actual collection root
-    $children = Get-ChildItem -Path $extractDir -Directory
-    if ($children.Count -eq 1 -and -not (Get-ChildItem -Path $extractDir -File)) {
-        $InputPath = $children[0].FullName
-    } else {
-        $InputPath = $extractDir
-    }
-
-    Write-Host "Input path: $InputPath" -ForegroundColor Cyan
+    # Extracted into this run's work folder once the log is set up (below)
+    $InputPath = $selectedZip.FullName
     Write-Host ""
+} elseif ((Test-Path -LiteralPath $InputPath -PathType Leaf) -and [System.IO.Path]::GetExtension($InputPath) -eq ".zip") {
+    # A collection zip passed as -InputPath is extracted like a browse-mode
+    # pick; Find-MemoryDump also looks for the memory dump next to it
+    $script:selectedZipPath = (Resolve-Path -LiteralPath $InputPath).ProviderPath
 }
 
-$ErrorActionPreference = "Continue"
+# Report folder: created only once a collection is picked, so "[0] Cancel"
+# leaves none behind
 $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
 if ($ReportOnly) {
     # -ReportOnly works in the existing timeline folder and logs to its
@@ -261,36 +844,8 @@ else {
 }
 
 # =============================================================
-# Logging
+# XML 1.0 character filter
 # =============================================================
-function Log {
-    param([string]$Message)
-    $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message"
-    Write-Host $entry
-    Add-Content -LiteralPath $logFile -Value $entry
-}
-
-function Log-Warning {
-    param([string]$Message)
-    $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] WARNING: $Message"
-    Write-Host $entry -ForegroundColor Yellow
-    Add-Content -LiteralPath $logFile -Value $entry
-}
-
-function Log-Error {
-    param([string]$Message)
-    $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ERROR: $Message"
-    Write-Host $entry -ForegroundColor Red
-    Add-Content -LiteralPath $logFile -Value $entry
-}
-
-function Log-Success {
-    param([string]$Message)
-    $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message"
-    Write-Host $entry -ForegroundColor Green
-    Add-Content -LiteralPath $logFile -Value $entry
-}
-
 # Characters that are not allowed in XML 1.0 (and so break the .xlsx):
 # control characters other than tab/LF/CR, U+FFFE/U+FFFF, and unpaired
 # surrogate halves. Everything else is kept, including non-Latin text and
@@ -996,18 +1551,117 @@ Log "Sources    : $($Sources -join ', ')"
 if ($StartDate) { Log "Start Date : $StartDate" }
 if ($EndDate)   { Log "End Date   : $EndDate" }
 if ($Keywords)  { Log "Keywords   : $($Keywords -join ', ')" }
+if ($MemoryDumpPath) { Log "Memory Dump: $MemoryDumpPath" }
 Log ""
 
-if (-not (Test-Path $InputPath)) {
+# =============================================================
+# Main body. Everything from here to the end of the script runs inside
+# this try block, which starts right before console QuickEdit is turned
+# off and the work folder is made. Its finally block (at the end) unloads
+# any hive this run left loaded, deletes the work folder and puts the
+# console's mode back on every exit path: normal end, exit, Ctrl+C and
+# terminating errors. The body is intentionally NOT re-indented so the
+# diff stays small. (Closing the console window kills the process
+# outright; that cannot be caught.)
+# =============================================================
+if ($WorkDir) { $WorkDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($WorkDir) }
+try {
+
+# Inside a try block, a statement-terminating error (a .NET exception or a
+# method call on $null outside an inner try/catch) would skip the whole
+# rest of the run. Log it and go on with the next step instead. Without
+# the try block such an error skipped only its own statement; here it
+# skips the rest of the step (e.g. the rest of a parser), so it is counted
+# and the run ends with "UNEXPECTED ERROR(S)" and exit code 2 instead of
+# "Completed Successfully" (Write-RunEndBanner). Ctrl+C
+# (PipelineStoppedException) is passed on, so the run stops and the
+# finally block cleans up.
+trap {
+    if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { break }
+    $script:unexpectedErrorCount++
+    Log-Error "Unexpected error at line $($_.InvocationInfo.ScriptLineNumber) (rest of this step skipped): $($_.Exception.Message)"
+    continue
+}
+
+# QuickEdit off before the first step that can take long (making the work
+# folder removes the work folders of killed runs); the prompts before this
+# point wait for input anyway. Read-Host works the same with it off.
+$script:consoleModeToRestore = Disable-ConsoleQuickEdit
+if ($null -ne $script:consoleModeToRestore) {
+    Log "Console QuickEdit is off for this run, so a click in the window cannot pause it (copy text with the window menu: Edit > Mark)."
+}
+
+$script:runWorkDir = New-RunWorkFolder -BaseFolder $WorkDir
+if (-not $script:runWorkDir) {
+    Log-Error "Could not create a work folder. Pass -WorkDir with a writable folder on a local drive that is not a temp folder."
+    exit 1
+}
+Log "Work folder: $($script:runWorkDir)"
+$tempFolder = Get-ContainingTempFolder $script:runWorkDir
+if ($tempFolder) {
+    Log-Warning "The work folder is inside a temp folder ($tempFolder). Windows Storage Sense deletes files older than 7 days there when disk space is low, also during a run; pass -WorkDir with another folder."
+}
+
+if (-not (Test-Path -LiteralPath $InputPath)) {
     Log-Error "Input path does not exist: $InputPath"
     exit 1
 }
+
+if ($script:selectedZipPath) {
+    Log "Extracting the collection zip into the work folder..."
+    $extractDir = Join-Path $script:runWorkDir "in"
+    try { Expand-CollectionZip -ZipPath $script:selectedZipPath -Destination $extractDir }
+    catch {
+        Log-Error "Failed to extract the zip: $($_.Exception.Message)"
+        exit 1
+    }
+    # The zip normally holds one folder, the collection: use it as the input path
+    $children = @(Get-ChildItem -LiteralPath $extractDir -Directory)
+    if ($children.Count -eq 1 -and -not (Get-ChildItem -LiteralPath $extractDir -File)) {
+        $InputPath = $children[0].FullName
+    } else {
+        $InputPath = $extractDir
+    }
+    Log "Collection folder: $InputPath"
+
+    # Every extracted file must still be there (antivirus or a cleanup tool
+    # can remove files as soon as they are written)
+    $missingInputs = @(Get-MissingInputFiles)
+    if ($missingInputs.Count -gt 0) {
+        Log-Error "$($missingInputs.Count) extracted file(s) disappeared right after the extraction -- stopping:"
+        Write-MissingInputFiles -Files $missingInputs -BaseFolder $InputPath
+        exit 1
+    }
+
+    # Test hook for tests\Test-ZipInput.ps1: delete one extracted file now,
+    # as a cleanup tool would during the run. Only a file inside this run's
+    # work folder is ever deleted.
+    if ($env:TIMELINE_BUILDER_TEST_DELETE_INPUT) {
+        $hookFile = [System.IO.Path]::GetFullPath((Join-Path $InputPath $env:TIMELINE_BUILDER_TEST_DELETE_INPUT))
+        if ($hookFile.StartsWith($script:runWorkDir + '\', [System.StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $hookFile -PathType Leaf)) {
+            Remove-Item -LiteralPath $hookFile -Force
+            Log-Warning "Test hook: deleted $hookFile"
+        }
+        else { Log-Warning "Test hook ignored (not a file in the work folder): $hookFile" }
+    }
+}
+elseif (Test-Path -LiteralPath $InputPath -PathType Leaf) {
+    Log-Error "Input path is a file, not a collection folder or .zip: $InputPath"
+    exit 1
+}
+else {
+    $tempFolder = Get-ContainingTempFolder $InputPath
+    if ($tempFolder) {
+        Log-Warning "The input folder is inside a temp folder ($tempFolder). Windows Storage Sense deletes files older than 7 days there when disk space is low, also during a run. Copy the collection elsewhere, or pass the collection .zip as -InputPath."
+    }
+    Add-ManifestInputFiles
+}
+Log ""
 
 # =============================================================
 # Timeline Entry Collection
 # =============================================================
 $script:timelineEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
-$script:artifactStats = @{}
 
 function Add-TimelineEntry {
     param(
@@ -1051,27 +1705,11 @@ function Add-TimelineEntry {
     }
 
     $script:timelineEntries.Add($entry)
-
-    # Track stats
-    if (-not $script:artifactStats.ContainsKey($Artifact)) {
-        $script:artifactStats[$Artifact] = 0
-    }
-    $script:artifactStats[$Artifact]++
 }
 
 # =============================================================
 # Helper: Find files recursively with extensions
 # =============================================================
-# $true for a path (relative to the collection) inside the email attachment
-# copies the collector makes (Email\<user>\Outlook\SecureTemp\,
-# Email\<user>\NewOutlook\Attachments\). They can have any name: an attached
-# .lnk or .evtx is not this system's shortcut or event log, so
-# Find-ArtifactFiles never returns them to a parser (Parse-Email reports them)
-function Test-EmailAttachmentCopy {
-    param([string]$RelativePath)
-    return $RelativePath -match '(?:^|\\)Email\\[^\\]+\\(?:Outlook\\SecureTemp|NewOutlook\\Attachments)\\'
-}
-
 function Find-ArtifactFiles {
     param(
         [string]$BasePath,
@@ -1108,9 +1746,10 @@ function Find-ArtifactFiles {
 # collector (see its README); older collections fall back to
 # collection_log.txt and file times.
 # =============================================================
-# A relative -InputPath is resolved against the PowerShell location (as the
-# parsers' Get-ChildItem calls do), not the process working directory
-$script:collectionRoot = [System.IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($InputPath)).TrimEnd('\')
+# The folder of collection_manifest.csv (its paths are relative to it),
+# so an outer folder passed as -InputPath works too; without a manifest,
+# -InputPath (a relative one resolved against the PowerShell location)
+$script:collectionRoot = Get-CollectionRootFolder
 $script:collectionInfo = $null
 $script:manifestTimes = $null
 $script:secretsRoot = $null
@@ -1170,6 +1809,193 @@ function Get-CollectionUser {
     if ($rel -match '^(?:Registry|UserActivity|Browser|Email)\\([^\\]+)\\') { return $Matches[1] }
     if ($rel -match '(?:^|\\)Users\\([^\\]+)\\') { return $Matches[1] }
     return ""
+}
+
+# What the User column pass (Update-TimelineUserColumn) needs to know about
+# the examined system, gathered while the parsers read the collection (no
+# hive is loaded for it): the machine's names (MachineNames: the SYSTEM
+# hive's computer and host names; the main body adds the computer name of
+# a live collection) and account names by SID (ProfileSids from SOFTWARE
+# ProfileList, BamSids from bam_entries.csv)
+$script:timelineUserContext = $null
+function Get-TimelineUserContext {
+    if ($null -eq $script:timelineUserContext) {
+        $script:timelineUserContext = [PSCustomObject]@{
+            MachineNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+            ProfileSids  = @{}
+            BamSids      = @{}
+        }
+    }
+    return $script:timelineUserContext
+}
+
+# Keep names of the examined machine: "<name>\account" is a local account
+# of this machine (see ConvertTo-TimelineUserName)
+function Add-TimelineMachineName {
+    param([string[]]$Name)
+    $context = Get-TimelineUserContext
+    foreach ($n in $Name) {
+        $text = "$n".Trim()
+        if ($text) { [void]$context.MachineNames.Add($text) }
+    }
+}
+
+# Keep the account name of a SID for the User column. Only SIDs that say
+# what they are: local and domain accounts (S-1-5-21-...), Entra ID accounts
+# (S-1-12-1-...) and service SIDs (S-1-5-80-..., as NT SERVICE\<name>).
+# Never SYSTEM, LOCAL SERVICE or NETWORK SERVICE: their ProfileList folders
+# (systemprofile, LocalService, NetworkService) are not account names, and
+# ConvertTo-TimelineUserName names them itself. A ProfileList name wins over
+# one from bam_entries.csv (see Get-TimelineSidNames).
+function Add-TimelineSidName {
+    param([string]$Sid, [string]$Name, [switch]$ProfileList)
+    $sidText = "$Sid".Trim()
+    $account = "$Name".Trim()
+    if (-not $account) { return }
+    if ($sidText -match '^S-1-5-80(-\d+)+$') {
+        if ($account -notmatch '\\') { $account = "NT SERVICE\$account" }
+    }
+    elseif ($sidText -notmatch '^S-1-(5-21|12-1)(-\d+)+$') { return }
+    $context = Get-TimelineUserContext
+    if ($ProfileList) { $context.ProfileSids[$sidText] = $account }
+    elseif (-not $context.BamSids.ContainsKey($sidText)) { $context.BamSids[$sidText] = $account }
+}
+
+# SID -> account name for the User column: ProfileList, else bam_entries.csv
+function Get-TimelineSidNames {
+    $context = Get-TimelineUserContext
+    $names = @{}
+    foreach ($sid in $context.BamSids.Keys) { $names[$sid] = $context.BamSids[$sid] }
+    foreach ($sid in $context.ProfileSids.Keys) { $names[$sid] = $context.ProfileSids[$sid] }
+    return $names
+}
+
+# The names Windows writes for its built-in service accounts, in any case
+# (hashtable keys are case-insensitive) -> one form each
+$script:TimelineUserAliases = @{
+    "SYSTEM"                       = "NT AUTHORITY\SYSTEM"
+    "LocalSystem"                  = "NT AUTHORITY\SYSTEM"
+    "NT AUTHORITY\SYSTEM"          = "NT AUTHORITY\SYSTEM"
+    "NT AUTHORITY\LocalSystem"     = "NT AUTHORITY\SYSTEM"
+    "LOCAL SERVICE"                = "NT AUTHORITY\LOCAL SERVICE"
+    "LocalService"                 = "NT AUTHORITY\LOCAL SERVICE"
+    "NT AUTHORITY\LOCAL SERVICE"   = "NT AUTHORITY\LOCAL SERVICE"
+    "NT AUTHORITY\LocalService"    = "NT AUTHORITY\LOCAL SERVICE"
+    "NETWORK SERVICE"              = "NT AUTHORITY\NETWORK SERVICE"
+    "NetworkService"               = "NT AUTHORITY\NETWORK SERVICE"
+    "NT AUTHORITY\NETWORK SERVICE" = "NT AUTHORITY\NETWORK SERVICE"
+    "NT AUTHORITY\NetworkService"  = "NT AUTHORITY\NETWORK SERVICE"
+}
+
+# One form per account for the User column (parsers write what their
+# source gives: "HOST\name", a SID, "LocalSystem", ...). In this order:
+#   1. trim the value and split it at the first "\"; empty and "-" parts
+#      are dropped ("-\-" gives "", "\x" and "-\x" give "x", "X\-" "X")
+#   2. S-1-5-18/19/20 -> NT AUTHORITY\SYSTEM, LOCAL SERVICE, NETWORK SERVICE;
+#      S-1-5-90-0-n -> Window Manager\DWM-n; S-1-5-96-0-n -> Font Driver
+#      Host\UMFD-n
+#   3. any other SID -> its name in $SidNames, else the SID as it is
+#   4. "X\name" -> "name" when X is "." or a name of the examined machine
+#      ($MachineNames, any case): a local account, named the way the
+#      profile folders and the collector name it
+#   5. the built-in service account names ($script:TimelineUserAliases:
+#      SYSTEM, LocalSystem, LocalService, ...) and DWM-n / UMFD-n without a
+#      domain -> the forms of step 2
+#   6. anything else as it is: other domains, MicrosoftAccount\...,
+#      AzureAD\..., the computer account (WORKGROUP\HOST$), NT VIRTUAL
+#      MACHINE\..., NT SERVICE\..., group names
+function ConvertTo-TimelineUserName {
+    param([string]$Value, [hashtable]$SidNames, [string[]]$MachineNames)
+    $text = "$Value".Trim()
+    $domain = ""
+    $name = $text
+    $slash = $text.IndexOf('\')
+    if ($slash -ge 0) {
+        $domain = $text.Substring(0, $slash).Trim()
+        $name = $text.Substring($slash + 1).Trim()
+    }
+    if ($domain -eq "-") { $domain = "" }
+    if ($name -eq "-") { $name = "" }
+    if (-not $name) {
+        $name = $domain
+        $domain = ""
+    }
+    if (-not $name) { return "" }
+
+    if (-not $domain -and $name -match '^S-1-\d+(-\d+)+$') {
+        switch -Regex ($name) {
+            '^S-1-5-18$'         { return "NT AUTHORITY\SYSTEM" }
+            '^S-1-5-19$'         { return "NT AUTHORITY\LOCAL SERVICE" }
+            '^S-1-5-20$'         { return "NT AUTHORITY\NETWORK SERVICE" }
+            '^S-1-5-90-0-(\d+)$' { return "Window Manager\DWM-$($Matches[1])" }
+            '^S-1-5-96-0-(\d+)$' { return "Font Driver Host\UMFD-$($Matches[1])" }
+        }
+        if ($SidNames -and $SidNames.ContainsKey($name) -and $SidNames[$name]) { return [string]$SidNames[$name] }
+        return $name
+    }
+
+    if ($domain -and ($domain -eq "." -or ($MachineNames -and $MachineNames -contains $domain))) { $domain = "" }
+    $text = if ($domain) { "$domain\$name" } else { $name }
+    if ($script:TimelineUserAliases -and $script:TimelineUserAliases.ContainsKey($text)) { return $script:TimelineUserAliases[$text] }
+    if (-not $domain -and $name -match '^DWM-\d+$') { return "Window Manager\$name" }
+    if (-not $domain -and $name -match '^UMFD-\d+$') { return "Font Driver Host\$name" }
+    return $text
+}
+
+# The User column pass, after all parsers and before deduplication: each
+# row's User through ConvertTo-TimelineUserName (once per distinct value,
+# compared exactly). A row whose User was a SID that now has a name keeps
+# the SID in Details as UserSID=<sid>, unless Details already has a field
+# whose value is that SID (UserSID=, SID=, ModifyingUser=, UserId=, ...;
+# not a path such as Location=HKU\<sid>\...). Returns Rows (rows changed),
+# SidRows (rows given UserSID=), Transitions (From, To and Rows per changed
+# value, most rows first) and Unresolved (Sid and Rows per SID left as it
+# is).
+function Update-TimelineUserColumn {
+    param($Entries, [hashtable]$SidNames, [string[]]$MachineNames)
+    # Value -> its new form and the SID it is (if it is one)
+    $cache = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::Ordinal)
+    $changedRows = New-Object 'System.Collections.Generic.Dictionary[string,int]' ([System.StringComparer]::Ordinal)
+    $unresolvedRows = New-Object 'System.Collections.Generic.Dictionary[string,int]' ([System.StringComparer]::Ordinal)
+    $rows = 0
+    $sidRows = 0
+    foreach ($entry in $Entries) {
+        $value = [string]$entry.User
+        if (-not $value) { continue }
+        $known = $null
+        if (-not $cache.TryGetValue($value, [ref]$known)) {
+            $sid = ""
+            if ($value.Trim() -match '^S-1-\d+(-\d+)+$') { $sid = $value.Trim() }
+            $known = [PSCustomObject]@{ New = (ConvertTo-TimelineUserName -Value $value -SidNames $SidNames -MachineNames $MachineNames); Sid = $sid }
+            $cache[$value] = $known
+        }
+        $new = $known.New
+        $sid = $known.Sid
+        $count = 0
+        if ($sid -and $new -ceq $sid) {
+            [void]$unresolvedRows.TryGetValue($sid, [ref]$count)
+            $unresolvedRows[$sid] = $count + 1
+        }
+        if ($new -ceq $value) { continue }
+
+        $entry.User = $new
+        $rows++
+        $count = 0
+        [void]$changedRows.TryGetValue($value, [ref]$count)
+        $changedRows[$value] = $count + 1
+        if ($sid -and $new -cne $sid) {
+            $details = [string]$entry.Details
+            if ($details -notmatch ('=' + [regex]::Escape($sid) + '(?=$|[\s|;,])')) {
+                $entry.Details = if ($details) { "$details | UserSID=$sid" } else { "UserSID=$sid" }
+                $sidRows++
+            }
+        }
+    }
+    $transitions = @($changedRows.Keys | ForEach-Object { [PSCustomObject]@{ From = $_; To = $cache[$_].New; Rows = $changedRows[$_] } } |
+        Sort-Object -CaseSensitive -Property @{ Expression = "Rows"; Descending = $true }, @{ Expression = "From"; Descending = $false })
+    $unresolved = @($unresolvedRows.Keys | ForEach-Object { [PSCustomObject]@{ Sid = $_; Rows = $unresolvedRows[$_] } } |
+        Sort-Object -CaseSensitive -Property @{ Expression = "Rows"; Descending = $true }, @{ Expression = "Sid"; Descending = $false })
+    return [PSCustomObject]@{ Rows = $rows; SidRows = $sidRows; Transitions = $transitions; Unresolved = $unresolved }
 }
 
 function Get-TimeZoneById {
@@ -1242,6 +2068,8 @@ function Get-CollectionInfo {
         TargetTimeZoneAssumed = $false
         CollectorCulture   = $null
         TargetRoot         = ""
+        # The collector host's name: the examined system only in a live collection
+        ComputerName       = ""
         # Additive collection_info.json fields (older collections lack them):
         # whether the collection holds unredacted browser files + DPAPI
         # credential material (the Secrets\ folder) and Thunderbird's index
@@ -1263,6 +2091,7 @@ function Get-CollectionInfo {
             $info.Source = "collection_info.json"
             if ($j.Mode) { $info.Mode = [string]$j.Mode }
             if ($j.TargetRoot) { $info.TargetRoot = [string]$j.TargetRoot }
+            if ($j.ComputerName) { $info.ComputerName = [string]$j.ComputerName }
             $info.CollectionStartUtc = ConvertFrom-UtcText $j.CollectionStartUtc
             $tz = Get-TimeZoneById ([string]$j.CollectorTimeZoneId)
             if ($tz) { $info.CollectorTimeZone = $tz }
@@ -1350,33 +2179,38 @@ function Get-SnapshotTimeUtc {
 
 # Original filesystem times of a collected file (Created/Modified/Accessed,
 # Kind=Utc), from collection_manifest.csv. $null when the collector did not
-# record them (older collectors, command output, reg save exports).
+# record them (older collectors, command output, reg save exports). A file
+# whose name was shortened on extraction is looked up by its original name.
 function Get-SourceFileTimes {
     param([string]$FullPath)
     if ($null -eq $script:manifestTimes) {
         $script:manifestTimes = @{}
-        $mf = Get-ChildItem -Path $InputPath -Filter "collection_manifest.csv" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($mf) {
-            try {
-                foreach ($row in (Import-Csv -Path $mf.FullName -ErrorAction Stop)) {
-                    if ($row.PSObject.Properties["RelativePath"] -and $row.RelativePath -and $row.PSObject.Properties["SourceModifiedUtc"]) {
-                        $script:manifestTimes[$row.RelativePath] = [PSCustomObject]@{
-                            Created  = ConvertFrom-UtcText $row.SourceCreatedUtc
-                            Modified = ConvertFrom-UtcText $row.SourceModifiedUtc
-                            Accessed = ConvertFrom-UtcText $row.SourceAccessedUtc
-                        }
-                    }
+        foreach ($row in (Get-CollectionManifest).Rows) {
+            if ($row.PSObject.Properties["RelativePath"] -and $row.RelativePath -and $row.PSObject.Properties["SourceModifiedUtc"]) {
+                $script:manifestTimes[$row.RelativePath] = [PSCustomObject]@{
+                    Created  = ConvertFrom-UtcText $row.SourceCreatedUtc
+                    Modified = ConvertFrom-UtcText $row.SourceModifiedUtc
+                    Accessed = ConvertFrom-UtcText $row.SourceAccessedUtc
                 }
             }
-            catch { Log-Warning "Could not read collection manifest: $($_.Exception.Message)" }
         }
         if ($script:manifestTimes.Count -eq 0) {
             Log-Warning "Collection manifest has no original file times (older collector) -- file-time events will be limited."
         }
     }
+    if ($FullPath -and $script:shortenedNames -and $script:shortenedNames.ContainsKey($FullPath)) { $FullPath = $script:shortenedNames[$FullPath] }
     $rel = Get-RelativeCollectionPath $FullPath
     if (-not $rel) { return $null }
     return $script:manifestTimes[$rel]
+}
+
+# $true when collection_manifest.csv lists the file (the collector saved
+# it), so its absence means it was lost after collection
+function Test-ManifestListsFile {
+    param([string]$FullPath)
+    $rel = Get-RelativeCollectionPath $FullPath
+    if (-not $rel) { return $false }
+    return (Get-CollectionManifest).RelativePaths.Contains($rel)
 }
 
 # Last-write time (UTC) of an open registry key, or $null
@@ -3265,9 +4099,10 @@ function Add-ShellCoreEntries {
 #   "Id=..., DisplayName=..., ..."): %1 what happened ("Activated App",
 #   "Failed to parse element: ..."), P3 an error code, P4 the open document:
 #   "Office add-in event (<what>): <add-in name>"
-# Both Execution: the user had the application or document open. Events
-# with fewer than three values (Office diagnostics such as "Compositor Type:
-# 1") are neither and are only counted.
+# Both Execution: the user had the application or document open. User is
+# the account the Office application ran as (the record's own UserID, also
+# kept as UserSID). Events with fewer than three values (Office diagnostics
+# such as "Compositor Type: 1") are neither and are only counted.
 function Add-OfficeAlertEntries {
     param([object[]]$Records, [string]$FileName, [string]$FilePath)
     $skipped = 0
@@ -3288,6 +4123,7 @@ function Add-OfficeAlertEntries {
                 Version   = $values[3]
                 ErrorCode = $values[4]
                 Document  = $values[5]
+                UserSID   = "$($r.UserId)"
             }
             $desc = "Office add-in event ($($values[0])): $addIn"
         }
@@ -3300,11 +4136,13 @@ function Add-OfficeAlertEntries {
                 Version     = $values[3]
                 P3          = $values[4]
                 Document    = $values[5]
+                UserSID     = "$($r.UserId)"
             }
             $desc = "Office alert ($($values[0])): $(Get-EvtxShortText $message 200)"
         }
         Add-TimelineEntry -Timestamp $r.TimeCreated -Source $FileName -EventType "Execution" `
-            -Description $desc -Details (Format-ArtifactDetails $details) -Artifact "EventLogs" -RawPath $FilePath
+            -Description $desc -User (Resolve-BamUser -Sid "$($r.UserId)" -SidNames @{}) `
+            -Details (Format-ArtifactDetails $details) -Artifact "EventLogs" -RawPath $FilePath
     }
     if ($skipped -gt 0) { Log "    Skipped $skipped event(s): Office diagnostics that are not alerts (fewer than three values)" }
 }
@@ -3385,49 +4223,49 @@ function Parse-EventLogs {
                             }
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "Logon" `
                                 -Description "Successful logon ($logonTypeDesc)" `
-                                -User "$($eventData['TargetDomainName'])\$($eventData['TargetUserName'])" `
+                                -User (Join-EvtxAccountName $eventData['TargetDomainName'] $eventData['TargetUserName']) `
                                 -Details (Format-ArtifactDetails $logonDetails) `
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
                         4625 {
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "Logon" `
                                 -Description "Failed logon attempt (Status=$($eventData['Status']))" `
-                                -User "$($eventData['TargetDomainName'])\$($eventData['TargetUserName'])" `
+                                -User (Join-EvtxAccountName $eventData['TargetDomainName'] $eventData['TargetUserName']) `
                                 -Details "FailureReason=$($eventData['SubStatus']) Source=$($eventData['IpAddress'])" `
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
                         4648 {
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "Logon" `
                                 -Description "Logon using explicit credentials" `
-                                -User "$($eventData['SubjectDomainName'])\$($eventData['SubjectUserName'])" `
+                                -User (Join-EvtxAccountName $eventData['SubjectDomainName'] $eventData['SubjectUserName']) `
                                 -Details "TargetUser=$($eventData['TargetDomainName'])\$($eventData['TargetUserName']) TargetServer=$($eventData['TargetServerName'])" `
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
                         4672 {
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "Logon" `
                                 -Description "Special privileges assigned to new logon" `
-                                -User "$($eventData['SubjectDomainName'])\$($eventData['SubjectUserName'])" `
+                                -User (Join-EvtxAccountName $eventData['SubjectDomainName'] $eventData['SubjectUserName']) `
                                 -Details "Privileges=$($eventData['PrivilegeList'])" `
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
                         4688 {
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "ProcessCreation" `
                                 -Description "New process created: $($eventData['NewProcessName'])" `
-                                -User "$($eventData['SubjectDomainName'])\$($eventData['SubjectUserName'])" `
+                                -User (Join-EvtxAccountName $eventData['SubjectDomainName'] $eventData['SubjectUserName']) `
                                 -Details "CommandLine=$($eventData['CommandLine']) ParentProcess=$($eventData['ParentProcessName']) PID=$($eventData['NewProcessId'])" `
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
                         4720 {
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "AccountChange" `
                                 -Description "User account created: $($eventData['TargetUserName'])" `
-                                -User "$($eventData['SubjectDomainName'])\$($eventData['SubjectUserName'])" `
+                                -User (Join-EvtxAccountName $eventData['SubjectDomainName'] $eventData['SubjectUserName']) `
                                 -Details (Format-ArtifactDetails ([ordered]@{ NewAccount = "$($eventData['TargetDomainName'])\$($eventData['TargetUserName'])"; AccountSID = $eventData['TargetSid'] })) `
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
                         4726 {
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "AccountChange" `
                                 -Description "User account deleted: $($eventData['TargetUserName'])" `
-                                -User "$($eventData['SubjectDomainName'])\$($eventData['SubjectUserName'])" `
+                                -User (Join-EvtxAccountName $eventData['SubjectDomainName'] $eventData['SubjectUserName']) `
                                 -Details (Format-ArtifactDetails ([ordered]@{ DeletedAccount = "$($eventData['TargetDomainName'])\$($eventData['TargetUserName'])"; AccountSID = $eventData['TargetSid'] })) `
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
@@ -3522,14 +4360,20 @@ function Parse-EventLogs {
                         }
                     }
 
+                    # The account is the event's own UserID (a SID; the User
+                    # column pass names it): 4104 has no user field, and 4103
+                    # has the user only inside its ContextInfo text
                     switch ($evt.Id) {
                         4104 {
                             $scriptBlock = $eventData['ScriptBlockText']
                             if ($scriptBlock.Length -gt 500) { $scriptBlock = $scriptBlock.Substring(0, 500) + "..." }
+                            # Path: the script file; empty for a command typed or passed with -Command
+                            $details = "ScriptBlock=$scriptBlock ScriptBlockId=$($eventData['ScriptBlockId'])"
+                            if ($eventData['Path']) { $details += " Path=$($eventData['Path'])" }
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "Execution" `
                                 -Description "PowerShell script block executed" `
-                                -User $eventData['UserName'] `
-                                -Details "ScriptBlock=$scriptBlock Path=$($eventData['ScriptBlockId'])" `
+                                -User "$($evt.UserId)" `
+                                -Details $details `
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
                         4103 {
@@ -3537,6 +4381,7 @@ function Parse-EventLogs {
                             if ($payload -and $payload.Length -gt 500) { $payload = $payload.Substring(0, 500) + "..." }
                             Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "Execution" `
                                 -Description "PowerShell module logging event" `
+                                -User "$($evt.UserId)" `
                                 -Details "Payload=$payload" `
                                 -Artifact "EventLogs" -RawPath $filePath
                         }
@@ -3806,6 +4651,7 @@ function Parse-EventLogs {
                         $what = if ($evt.Id -eq 59) { "started" } else { "stopped" }
                         Add-TimelineEntry -Timestamp $evt.TimeCreated -Source $fileName -EventType "NetworkConnection" `
                             -Description "BITS transfer ${what}: $($f['name']) -> $($f['url'])" `
+                            -User "$($evt.UserId)" `
                             -Details (Format-ArtifactDetails ([ordered]@{ EventID = $evt.Id; JobId = $f["Id"]; Url = $f["url"]; Result = $hr; BytesTransferred = $f["bytesTransferred"]; BytesTotal = $f["bytesTotal"]; UserSID = $evt.UserId })) `
                             -Artifact "EventLogs" -RawPath $filePath
                     }
@@ -5036,14 +5882,14 @@ function Find-OfflineHiveFile {
     return ($candidates | Select-Object -First 1)
 }
 
-# Load an offline hive under HKLM\<name> from a temp copy (plus any .LOG1/.LOG2
-# transaction logs, so reg load can replay a dirty hive). The collected file
-# is never modified. Returns Name/TempDir/Root (open .NET RegistryKey) or $null.
-# Always pair with Dismount-TimelineHive.
+# Load an offline hive under HKLM\<name> from a scratch copy in the work
+# folder (plus any .LOG1/.LOG2 transaction logs, so reg load can replay a
+# dirty hive). The collected file is never modified. Returns Name/TempDir/
+# Root (open .NET RegistryKey) or $null. Always pair with Dismount-TimelineHive.
 function Mount-TimelineHive {
     param([System.IO.FileInfo]$HiveFile, [string]$Prefix = "TEMP_TL")
     $hiveName = "$($Prefix)_$(Get-Random)"
-    $tempDir = Join-Path $env:TEMP "TimelineHive_$(Get-Random)"
+    $tempDir = Join-Path (Get-ScratchFolder) "TimelineHive_$(Get-Random)"
     $loaded = $false
     try {
         New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
@@ -5054,10 +5900,15 @@ function Mount-TimelineHive {
             if (Test-Path -LiteralPath $logSrc) {
                 Copy-Item -LiteralPath $logSrc -Destination ($tempHive + $logExt) -Force -ErrorAction SilentlyContinue
             }
+            elseif (Test-ManifestListsFile $logSrc) {
+                Log-Warning "  Transaction log missing: $logSrc is in the collection manifest but not here -- the hive is loaded without it (changes not yet written to the hive are lost)"
+            }
         }
         Log "  Loading hive: $($HiveFile.FullName)"
+        Register-RunHive $hiveName
         $regLoadResult = & reg load "HKLM\$hiveName" $tempHive 2>&1
         if ($LASTEXITCODE -ne 0) {
+            Unregister-RunHive $hiveName
             Log-Warning "  Could not load hive $($HiveFile.FullName) : $regLoadResult"
             Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
             return $null
@@ -5097,9 +5948,11 @@ function Dismount-TimelineHive {
     }
     if ($unloaded) {
         Log "  Unloaded hive: $($Mount.Name)"
+        Unregister-RunHive $Mount.Name
         Remove-Item -LiteralPath $Mount.TempDir -Recurse -Force -ErrorAction SilentlyContinue
     }
     else {
+        # Tried again at the end of the run, before the work folder is deleted
         Log-Warning "  Failed to unload hive $($Mount.Name) -- may need manual cleanup via: reg unload HKLM\$($Mount.Name) (temp copy: $($Mount.TempDir))"
     }
 }
@@ -6382,12 +7235,13 @@ function Read-TaskCacheTreeNode {
     }
 }
 
-# Scheduled tasks that the collection's task list already puts on the
+# Scheduled tasks that the collection's task list also puts on the
 # timeline (Parse-ScheduledTasks): scheduled_tasks.csv (live collections;
 # HasLastRun = the CSV gives a last run time, read like Get-ScheduledTaskInfo
-# from the same scheduler state as TaskCache DynamicInfo) and
-# ScheduledTasks_XML (mounted images; no run times). Task path in lower case
-# -> HasLastRun. Empty when the ScheduledTasks source is not selected.
+# from the same scheduler state as TaskCache DynamicInfo, so Read-TaskCache
+# leaves that task's last run to the list) and ScheduledTasks_XML (mounted
+# images; no run times). Task path in lower case -> HasLastRun. Empty when
+# the ScheduledTasks source is not selected.
 function Get-CollectedTaskNames {
     $listed = @{}
     if ($Sources -notcontains "ScheduledTasks") { return $listed }
@@ -6430,6 +7284,11 @@ function Get-TaskCacheParentFolder {
     return ""
 }
 
+# TaskCache registered times (UTC) by task path in lower case, filled by
+# Read-TaskCache (Registry source, which runs first) and read by
+# Test-TaskCacheRegistered (ScheduledTasks source)
+$script:taskCacheRegistered = @{}
+
 # Scheduled tasks in the TaskCache of one loaded SOFTWARE hive
 # (Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache):
 #   Tree\<folder>\<task>  Id (task GUID), Index and SD (security
@@ -6445,11 +7304,16 @@ function Get-TaskCacheParentFolder {
 #   4  FILETIME  created/registered  24 uint32    last error code
 #   12 FILETIME  last run (launch)   28 FILETIME  last successful run (36 bytes)
 # Times later than the hive file time + 1 day are treated as invalid.
-# "Scheduled task registered" / "last run" rows are only added where they
-# are new to the timeline: a task that scheduled_tasks.csv or
-# ScheduledTasks_XML lists (Get-CollectedTaskNames) gets its rows from the
-# ScheduledTasks source, so only its last run is added, and only when the
-# list has no run time for it. Hidden tasks are never in scheduled_tasks.csv.
+# "Scheduled task registered" is added for every task, also one that
+# scheduled_tasks.csv or ScheduledTasks_XML lists: Windows records the
+# created time, while the date those lists give is the task XML's
+# RegistrationInfo/Date, which whoever wrote the task sets (Microsoft's own
+# tasks: often years before the install). The registered times are kept in
+# $script:taskCacheRegistered, so Parse-ScheduledTasks leaves out an XML
+# date that is the same time. "Last run" is only added where it is new to
+# the timeline: not for a task that scheduled_tasks.csv lists with a run
+# time (Get-CollectedTaskNames). Hidden tasks are never in
+# scheduled_tasks.csv.
 # Actions (format version 3; older versions are not parsed): uint16 version,
 # uint32 size + UTF-16 context, then per action uint16 type, uint32 size +
 # UTF-16 id and for type 0x6666 (exec) command, arguments and working
@@ -6532,11 +7396,17 @@ function Read-TaskCache {
                     }
                     foreach ($what in $times.Keys) {
                         if (-not $times[$what]) { continue }
-                        if (($what -eq "registered" -and $isListed) -or ($what -eq "last run" -and $listedRun)) {
+                        $isRun = ($what -eq "last run")
+                        if ($isRun -and $listedRun) {
                             $leftToList++
                             continue
                         }
-                        $isRun = ($what -eq "last run")
+                        if (-not $isRun) {
+                            foreach ($name in $names) {
+                                if (-not $script:taskCacheRegistered.ContainsKey($name)) { $script:taskCacheRegistered[$name] = @() }
+                                $script:taskCacheRegistered[$name] += $times[$what]
+                            }
+                        }
                         $details = Format-ArtifactDetails ([ordered]@{
                             Id                   = $guidName
                             Actions              = $actions
@@ -6544,7 +7414,7 @@ function Read-TaskCache {
                             Hidden               = $hidden
                             LastErrorCode        = $(if ($isRun) { "0x{0:X8}" -f [BitConverter]::ToUInt32($dynamicInfo, 24) } else { "" })
                             LastSuccessfulRunUtc = $(if ($isRun -and $lastSuccess) { $lastSuccess.ToString("yyyy-MM-dd HH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture) } else { "" })
-                            Listed               = $(if ($isListed) { "yes (scheduled task list of the collection, without a run time)" } else { "" })
+                            Listed               = $(if (-not $isListed) { "" } elseif ($isRun) { "yes (scheduled task list of the collection, without a run time)" } else { "yes (scheduled task list of the collection)" })
                             Key                  = "HKLM\SOFTWARE\$cachePath\Tasks\$guidName"
                             Time                 = $(if ($isRun) { "TaskCache DynamicInfo last run time" } else { "TaskCache DynamicInfo created (registered) time" })
                         })
@@ -6593,7 +7463,7 @@ function Read-TaskCache {
         $added++
         $hiddenCount++
     }
-    Log "    TaskCache: $taskCount task(s), $hiddenCount hidden task(s)/folder(s) (no SD value), $leftToList time(s) already on the timeline from the ScheduledTasks source"
+    Log "    TaskCache: $taskCount task(s), $hiddenCount hidden task(s)/folder(s) (no SD value), $leftToList last run time(s) already on the timeline from the ScheduledTasks source"
     if ($badDynamicInfo -gt 0) { Log-Warning "    $badDynamicInfo TaskCache DynamicInfo value(s) skipped: size is not 28 or 36 bytes" }
     return $added
 }
@@ -6923,12 +7793,15 @@ function Parse-Registry {
 
             $mount = Mount-TimelineHive -HiveFile $hiveFile -Prefix $(if ($hiveName -eq "SOFTWARE") { "TEMP_TLSW" } else { "TEMP_TLSYS" })
             if ($mount -and $mount.Root) {
+                # Account and machine names for the User column too
                 if ($hiveName -eq "SOFTWARE") {
                     $rowCount = Read-SoftwareHive -HiveRoot $mount.Root -RawPath $hiveFile.FullName -FallbackTime $hiveTime `
                         -CollectorFolder (Get-CollectorOutputFolder) -ListedTasks (Get-CollectedTaskNames)
+                    Add-OfflineProfileNames $mount.Root
                 }
                 else {
                     $rowCount = Read-SystemHive -HiveRoot $mount.Root -RawPath $hiveFile.FullName -FallbackTime $hiveTime
+                    Add-TimelineMachineName (Get-OfflineComputerNames $mount.Root)
                 }
                 Log "  Added $rowCount row(s) from the $hiveName hive."
                 $registryParsed = $true
@@ -7010,16 +7883,25 @@ function Find-Sqlite3Exe {
     return $null
 }
 
-# Run a query with sqlite3 against a temp copy of the database (plus its -wal
-# file, so recent history not yet checkpointed is included, and its rollback
-# -journal, so a copy taken mid-transaction is rolled back to its last
-# committed state instead of being read half-written). Returns the CSV output
-# lines, decoded as UTF-8. -Attach: other databases the query reads, as
-# alias -> path; each is attached from its own temporary copy (with its
-# -wal and -journal) under that alias.
+# Run a query with sqlite3 against a scratch copy of the database in the work
+# folder (plus its -wal file, so recent history not yet checkpointed is
+# included, and its rollback -journal, so a copy taken mid-transaction is
+# rolled back to its last committed state instead of being read
+# half-written). Returns the CSV output lines, decoded as UTF-8. -Attach:
+# other databases the query reads, as alias -> path; each is attached from
+# its own scratch copy (with its -wal and -journal) under that alias.
 function Invoke-Sqlite3Query {
     param([string]$Sqlite3Exe, [string]$DbPath, [string]$Query, [System.Collections.IDictionary]$Attach)
-    $tempDb = Join-Path $env:TEMP "timeline_browser_$(Get-Random).db"
+    # Found by the parser, so gone since then (not a sqlite3 problem)
+    $dbFiles = @($DbPath)
+    if ($Attach) { $dbFiles += @($Attach.Values) }
+    foreach ($dbFile in $dbFiles) {
+        if (-not (Test-Path -LiteralPath $dbFile -PathType Leaf)) {
+            Log-Warning "    sqlite3 query skipped, input file missing: $dbFile"
+            return @()
+        }
+    }
+    $tempDb = Join-Path (Get-ScratchFolder) "timeline_browser_$(Get-Random).db"
     $tempFiles = New-Object System.Collections.Generic.List[string]
     $tempFiles.Add($tempDb)
     $prevEncoding = $null
@@ -7028,7 +7910,7 @@ function Invoke-Sqlite3Query {
         $attachSql = ""
         if ($Attach) {
             foreach ($alias in $Attach.Keys) {
-                $tempAttach = Join-Path $env:TEMP "timeline_browser_$(Get-Random).db"
+                $tempAttach = Join-Path (Get-ScratchFolder) "timeline_browser_$(Get-Random).db"
                 $tempFiles.Add($tempAttach)
                 $copies += , @($Attach[$alias], $tempAttach)
                 $attachSql += "ATTACH '" + $tempAttach.Replace("'", "''") + "' AS $alias; "
@@ -9857,14 +10739,36 @@ function Get-TaskXmlText {
     return ""
 }
 
+# $true when Read-TaskCache recorded a TaskCache registered time for the
+# task (path such as "\Folder\Task") less than 2 seconds from $Time, a date
+# from the task XML: that date is then the time Windows recorded (it often
+# has whole seconds only) and its row would repeat the TaskCache row
+function Test-TaskCacheRegistered {
+    param([string]$TaskName, [datetime]$Time)
+    if (-not $script:taskCacheRegistered -or -not $TaskName) { return $false }
+    $key = $TaskName.ToLowerInvariant()
+    if (-not $script:taskCacheRegistered.ContainsKey($key)) { return $false }
+    foreach ($cacheTime in $script:taskCacheRegistered[$key]) {
+        if ([Math]::Abs(($cacheTime - $Time).TotalSeconds) -lt 2) { return $true }
+    }
+    return $false
+}
+
 function Parse-ScheduledTasks {
     Log "--- Parsing Scheduled Tasks ---"
 
     $tasksParsed = $false
 
+    # The registration date of the task XML (RegistrationInfo/Date) is set by
+    # whoever wrote the task, not recorded by Windows: its rows say so. The
+    # time Windows recorded is the TaskCache "Scheduled task registered" row
+    # (Registry source); a date that is that time is not added again.
+    $authorDateNote = "task XML RegistrationInfo/Date (author-supplied, not recorded by Windows)"
+
     # scheduled_tasks.csv from the triage collector (live systems). Newer
-    # collectors add RegistrationDateUtc and LastRunTimeUtc; a task with
-    # neither (and every task from older collectors) becomes one Snapshot row.
+    # collectors add RegistrationDateUtc (the XML date, as Get-ScheduledTask
+    # reports it) and LastRunTimeUtc; a task with no row from either (and
+    # every task from older collectors) becomes one Snapshot row.
     $tasksCsv = Find-ArtifactFiles -BasePath $InputPath -FileNames @("scheduled_tasks.csv")
 
     foreach ($csv in $tasksCsv) {
@@ -9874,11 +10778,14 @@ function Parse-ScheduledTasks {
             $snapshotTs = Get-SnapshotTimeUtc -File $csv
             $eventRows = 0
             $snapshotRows = 0
+            $sameAsCache = 0
             foreach ($task in $tasks) {
                 $taskName = Get-ArtifactRowValue $task @("TaskName", "Name")
                 if (-not $taskName) { $taskName = "Unknown" }
                 $taskPath = Get-ArtifactRowValue $task @("TaskPath")
                 $fullName = if ($taskPath) { $taskPath.TrimEnd('\') + "\" + $taskName } else { $taskName }
+                # Task path as Get-CollectedTaskNames and the TaskCache name it
+                $cacheName = if ($taskPath) { $fullName } else { "\" + $taskName }
                 $userId = Get-ArtifactRowValue $task @("UserId")
                 $author = Get-ArtifactRowValue $task @("Author")
                 $taskUser = if ($userId) { $userId } else { $author }
@@ -9892,15 +10799,21 @@ function Parse-ScheduledTasks {
 
                 $registered = ConvertFrom-UtcText (Get-ArtifactRowValue $task @("RegistrationDateUtc"))
                 if (-not $registered) { $registered = ConvertFrom-TaskDateText (Get-ArtifactRowValue $task @("Date")) }
+                if ($registered -and (Test-TaskCacheRegistered -TaskName $cacheName -Time $registered)) {
+                    $registered = $null
+                    $sameAsCache++
+                }
                 $lastRun = ConvertFrom-UtcText (Get-ArtifactRowValue $task @("LastRunTimeUtc"))
                 # Task Scheduler reports 11/30/1999 for tasks that never ran
                 if ($lastRun -and $lastRun.Year -lt 2000) { $lastRun = $null }
 
                 if ($registered) {
+                    $pairs["Time"] = $authorDateNote
                     Add-TimelineEntry -Timestamp $registered -Source "ScheduledTasks" -EventType "ScheduledTaskChange" `
-                        -Description "Scheduled task registered: $fullName" `
+                        -Description "Scheduled task registration date (author-supplied): $fullName" `
                         -User $taskUser -Details (Format-ArtifactDetails $pairs) `
                         -Artifact "ScheduledTasks" -RawPath $csv.FullName
+                    $pairs.Remove("Time")
                     $eventRows++
                 }
                 if ($lastRun) {
@@ -9921,6 +10834,7 @@ function Parse-ScheduledTasks {
                 $tasksParsed = $true
             }
             Log "    $eventRows dated row(s), $snapshotRows snapshot row(s)"
+            if ($sameAsCache -gt 0) { Log "    $sameAsCache registration date(s) not added: the same time as the task's TaskCache registered row" }
         }
         catch {
             Log-Warning "  Failed to parse scheduled tasks CSV: $($_.Exception.Message)"
@@ -9928,7 +10842,8 @@ function Parse-ScheduledTasks {
     }
 
     # Task XML definitions copied from a mounted image (Windows\System32\Tasks).
-    # RegistrationInfo/Date gives the registration time; tasks without it
+    # RegistrationInfo/Date gives the (author-supplied) registration date;
+    # tasks without it, or whose date is the TaskCache registered time,
     # become Snapshot rows.
     $xmlDirs = @(Get-ChildItem -Path $InputPath -Directory -Recurse -Filter "ScheduledTasks_XML" -ErrorAction SilentlyContinue | Where-Object { -not (Test-SecretsPath $_.FullName) })
     foreach ($dir in $xmlDirs) {
@@ -9936,6 +10851,7 @@ function Parse-ScheduledTasks {
         Log "  Parsing: $($dir.FullName) ($($taskFiles.Count) file(s))"
         $eventRows = 0
         $snapshotRows = 0
+        $sameAsCache = 0
         $skipped = 0
         foreach ($tf in $taskFiles) {
             try {
@@ -9960,19 +10876,24 @@ function Parse-ScheduledTasks {
                 }
                 $triggers = @()
                 foreach ($trig in $taskNode.SelectNodes("*[local-name()='Triggers']/*")) { $triggers += $trig.LocalName }
-                $details = Format-ArtifactDetails ([ordered]@{
+                $pairs = [ordered]@{
                     Actions  = ($actions -join "; ")
                     UserId   = $userId
                     Author   = $author
                     Enabled  = Get-TaskXmlText $taskNode "Settings/Enabled"
                     Triggers = ($triggers -join ", ")
-                })
+                }
 
                 $registered = ConvertFrom-TaskDateText (Get-TaskXmlText $taskNode "RegistrationInfo/Date")
+                if ($registered -and (Test-TaskCacheRegistered -TaskName $fullName -Time $registered)) {
+                    $registered = $null
+                    $sameAsCache++
+                }
                 if ($registered) {
+                    $pairs["Time"] = $authorDateNote
                     Add-TimelineEntry -Timestamp $registered -Source "ScheduledTasks-XML" -EventType "ScheduledTaskChange" `
-                        -Description "Scheduled task registered: $fullName" `
-                        -User $taskUser -Details $details `
+                        -Description "Scheduled task registration date (author-supplied): $fullName" `
+                        -User $taskUser -Details (Format-ArtifactDetails $pairs) `
                         -Artifact "ScheduledTasks" -RawPath $tf.FullName
                     $eventRows++
                 }
@@ -9981,7 +10902,7 @@ function Parse-ScheduledTasks {
                     if ($snapshotTs) {
                         Add-TimelineEntry -Timestamp $snapshotTs -Source "ScheduledTasks-XML" -EventType "Snapshot" `
                             -Description "Scheduled task: $fullName" `
-                            -User $taskUser -Details $details `
+                            -User $taskUser -Details (Format-ArtifactDetails $pairs) `
                             -Artifact "ScheduledTasks" -RawPath $tf.FullName
                         $snapshotRows++
                     }
@@ -9993,6 +10914,7 @@ function Parse-ScheduledTasks {
             }
         }
         Log "    $eventRows dated row(s), $snapshotRows snapshot row(s)"
+        if ($sameAsCache -gt 0) { Log "    $sameAsCache registration date(s) not added: the same time as the task's TaskCache registered row" }
         if ($skipped -gt 0) { Log-Warning "    Skipped $skipped file(s) that are not readable task XML." }
     }
 
@@ -11449,14 +12371,17 @@ $script:ThunderbirdAuthMethods = @{
 # Email\ rows of collection_manifest.csv by RelativePath: SHA256, SourcePath,
 # Size and the original file's Created/Modified/Accessed times (UTC). A copy
 # taken from the shadow copy is recorded as "(shadow)<path below the target
-# root>"; its SourcePath is given the target root again ("C:\Users\...")
+# root>"; its SourcePath is given the target root again ("C:\Users\...").
+# Read through the shared reader (Get-CollectionManifest): the manifest
+# nearest to -InputPath, whose folder is the collection root that
+# Get-RelativeCollectionPath looks the RelativePath keys up against.
 function Get-EmailManifestRows {
     $rows = @{}
-    $mf = Get-ChildItem -Path $InputPath -Filter "collection_manifest.csv" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $mf) { return $rows }
+    $manifestRows = @((Get-CollectionManifest).Rows)
+    if ($manifestRows.Count -eq 0) { return $rows }
     $targetRoot = (Get-CollectionInfo).TargetRoot
     try {
-        foreach ($row in (Import-Csv -Path $mf.FullName -ErrorAction Stop)) {
+        foreach ($row in $manifestRows) {
             if (-not $row.PSObject.Properties["RelativePath"] -or $row.RelativePath -notlike "Email\*") { continue }
             $sourcePath = $row.SourcePath
             if ($sourcePath -like "(shadow)*") {
@@ -11473,7 +12398,7 @@ function Get-EmailManifestRows {
             }
         }
     }
-    catch { Log-Warning "  Could not read the collection manifest: $($_.Exception.Message)" }
+    catch { Log-Warning "  Could not read the Email\ rows of the collection manifest: $($_.Exception.Message)" }
     return $rows
 }
 
@@ -12218,6 +13143,408 @@ function Get-DeviceInstanceLabel {
     return "$InstancePath"
 }
 
+# $true for the device instance path of a USB device: USB\VID_..., a USB
+# storage device (USBSTOR\..., also inside a portable-device or volume path
+# like SWD\WPDBUSENUM\_??_USBSTOR#...), an ID with a USB vendor ID
+# (HID\VID_..., SWC\VID_...), or the portable device Windows makes for a
+# volume on a removable drive (SWD\WPDBUSENUM\{volume GUID}#<partition
+# offset>), nearly always a USB drive (an SD card in a built-in reader
+# gives one too). Bluetooth IDs write "_VID&" and do not match.
+function Test-UsbDeviceInstance {
+    param([string]$InstancePath)
+    return ($InstancePath -match '(?i)USBSTOR|^USB\\|VID_[0-9A-F]{4}|^SWD\\WPDBUSENUM\\\{')
+}
+
+# The setupapi.dev*.log files under -InputPath. A log shortened on
+# extraction to fit the path limit (setupapi.dev.log becomes e.g.
+# setupapi~1A2B3C4D.log) is found by its full-length name. Like
+# Find-ArtifactFiles, it skips email attachment copies and the Secrets\
+# folder (only the file name is shortened, so the folder still shows).
+function Find-SetupApiLogFiles {
+    $files = @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("setupapi.dev*.log") |
+        Where-Object { $_.Name -like "setupapi.dev*.log" })
+    if ($script:shortenedNames) {
+        foreach ($shortPath in @($script:shortenedNames.Keys)) {
+            if ([System.IO.Path]::GetFileName($script:shortenedNames[$shortPath]) -like "setupapi.dev*.log" -and [System.IO.File]::Exists($shortPath) -and
+                -not (Test-EmailAttachmentCopy (Get-RelativeCollectionPath $shortPath)) -and -not (Test-SecretsPath $shortPath)) {
+                $files += Get-Item -LiteralPath $shortPath
+            }
+        }
+    }
+    return @($files | Sort-Object FullName -Unique)
+}
+
+# The setupapi.dev*.log files collection_manifest.csv lists (relative
+# paths): Listed, and Missing = those not among $Found (the files the USB
+# parser found). A missing log was saved by the collector but lost
+# afterwards, and its device installs are not in the timeline. A found log
+# that was shortened on extraction counts by its full-length name. Email
+# attachment copies and files in the Secrets\ folder are not listed: the
+# parser never reads them. Both are empty without a manifest.
+function Compare-ManifestSetupApiLogs {
+    param([object[]]$Found)
+    $result = [PSCustomObject]@{ Listed = @(); Missing = @() }
+    $manifest = Get-CollectionManifest
+    if (-not $manifest.Path) { return $result }
+    $foundPaths = @($Found | Where-Object { $_ } | ForEach-Object {
+            if ($script:shortenedNames -and $script:shortenedNames.ContainsKey($_.FullName)) { $script:shortenedNames[$_.FullName] } else { $_.FullName }
+        })
+    $result.Listed = @($manifest.RelativePaths | Where-Object {
+            [System.IO.Path]::GetFileName($_) -like "setupapi.dev*.log" -and -not (Test-EmailAttachmentCopy $_) -and
+            -not (Test-SecretsPath (Join-Path $manifest.Folder $_))
+        } | Sort-Object)
+    $result.Missing = @($result.Listed | Where-Object { $foundPaths -notcontains (Join-Path $manifest.Folder $_) })
+    return $result
+}
+
+# One MountedDevices value, decoded into the columns of the collector's
+# USB\mounted_devices.csv (the same decoder as the collector's). Kind:
+#   GPT         "DMIO:ID:" + partition GUID (24 bytes; also dynamic volumes)
+#   MBR         disk signature (4 bytes) + partition offset in bytes (8)
+#   DevicePath  UTF-16 device path starting "_??_" or "\??\", such as
+#               _??_USBSTOR#Disk&Ven_...&Prod_...#<serial>&0#{...}
+#   Other       anything else, including a value that is not binary
+# HexData is the raw data (as text for a value that is not binary)
+function ConvertFrom-MountedDeviceValue {
+    param([string]$Name, $Data)
+    $row = [ordered]@{
+        Name            = $Name
+        Kind            = "Other"
+        DiskSignature   = ""
+        PartitionOffset = ""
+        PartitionGuid   = ""
+        DevicePath      = ""
+        DataLength      = 0
+        HexData         = ""
+    }
+    if ($Data -isnot [byte[]]) {
+        if ($null -ne $Data) { $row.HexData = (@($Data) | ForEach-Object { "$_" }) -join "; " }
+        return [PSCustomObject]$row
+    }
+    $row.DataLength = $Data.Length
+    $row.HexData = [BitConverter]::ToString($Data).Replace("-", "")
+    if ($Data.Length -eq 24 -and [System.Text.Encoding]::ASCII.GetString($Data, 0, 8) -eq "DMIO:ID:") {
+        $row.Kind = "GPT"
+        $row.PartitionGuid = (New-Object Guid (, [byte[]]$Data[8..23])).ToString("B")
+    }
+    elseif ($Data.Length -eq 12) {
+        $row.Kind = "MBR"
+        $row.DiskSignature = "{0:X8}" -f [BitConverter]::ToUInt32($Data, 0)
+        $row.PartitionOffset = [string][BitConverter]::ToUInt64($Data, 4)
+    }
+    elseif ($Data.Length -ge 8 -and $Data.Length % 2 -eq 0 -and $Data[1] -eq 0) {
+        $text = [System.Text.Encoding]::Unicode.GetString($Data).TrimEnd([char]0)
+        if ($text -match '^(_\?\?_|\\\?\?\\)') {
+            $row.Kind = "DevicePath"
+            $row.DevicePath = $text
+        }
+    }
+    return [PSCustomObject]$row
+}
+
+# Values of the mounted_devices.txt older collectors wrote: Format-List
+# output of the MountedDevices key that shows only the first 4 bytes of
+# each value, followed by "..." (or the ellipsis character), e.g.
+#   \DosDevices\G:                                   : {182, 240, 19, 166...}
+#   \??\Volume{00000000-0000-11f0-8000-000000000001} : {95, 0, 63, 0...}
+# The first bytes still tell the kind: "DMIO" is GPT, "_?" or "\?" in
+# UTF-16 a device path, anything else is taken for MBR, whose first 4
+# bytes are the whole disk signature. A value shown in full (up to 4
+# bytes) is decoded. Rows have the mounted_devices.csv columns; a cut-off
+# value has DataLength "", the known bytes plus "..." as HexData and
+# Truncated = $true. Other lines (PSPath, ..., or the decoded
+# "Name : ..." lists of newer collectors) are ignored.
+function ConvertFrom-MountedDevicesText {
+    param([string[]]$Lines)
+    $ellipsis = [regex]::Escape([string][char]0x2026)
+    $pattern = '^(\\DosDevices\\[A-Za-z]:|\\\?\?\\Volume\{[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\})\s+:\s\{((?:\d{1,3}, )*\d{1,3})?(\.\.\.|' + $ellipsis + ')?\}\s*$'
+    $rows = @()
+    foreach ($line in $Lines) {
+        if ($line -notmatch $pattern) { continue }
+        $name = $Matches[1]
+        $cut = [bool]$Matches[3]
+        $numbers = @()
+        if ($Matches[2]) { $numbers = @($Matches[2] -split ', ' | ForEach-Object { [int]$_ }) }
+        if (@($numbers | Where-Object { $_ -gt 255 }).Count -gt 0) { continue }
+        $bytes = [byte[]]$numbers
+        if (-not $cut) {
+            $row = ConvertFrom-MountedDeviceValue -Name $name -Data $bytes
+            $row | Add-Member -NotePropertyName KeyLastWriteUtc -NotePropertyValue ""
+            $row | Add-Member -NotePropertyName Truncated -NotePropertyValue $false
+            $rows += $row
+            continue
+        }
+        $row = [PSCustomObject]@{
+            Name = $name; Kind = "Other"; DiskSignature = ""; PartitionOffset = ""; PartitionGuid = ""; DevicePath = ""
+            DataLength = ""; HexData = [BitConverter]::ToString($bytes).Replace("-", "") + "..."; KeyLastWriteUtc = ""; Truncated = $true
+        }
+        if ($bytes.Length -ge 4) {
+            if ([System.Text.Encoding]::ASCII.GetString($bytes, 0, 4) -eq "DMIO") { $row.Kind = "GPT" }
+            elseif (($bytes[0] -eq 95 -or $bytes[0] -eq 92) -and $bytes[1] -eq 0 -and $bytes[2] -eq 63 -and $bytes[3] -eq 0) { $row.Kind = "DevicePath" }
+            else {
+                $row.Kind = "MBR"
+                $row.DiskSignature = "{0:X8}" -f [BitConverter]::ToUInt32($bytes, 0)
+            }
+        }
+        $rows += $row
+    }
+    return $rows
+}
+
+# MountedDevices values of a loaded SYSTEM hive (the key is at the hive
+# root, not in a control set), decoded, with the key's last-write time as
+# KeyLastWriteUtc (ISO 8601, as in mounted_devices.csv). Empty when the
+# hive has no MountedDevices key.
+function Get-OfflineMountedDeviceRows {
+    param([Microsoft.Win32.RegistryKey]$SystemRoot)
+    $rows = @()
+    $key = $SystemRoot.OpenSubKey("MountedDevices")
+    if (-not $key) { return $rows }
+    try {
+        $lastWrite = Get-RegistryKeyLastWriteUtc $key
+        $lastWriteText = if ($lastWrite) { $lastWrite.ToString("o", [System.Globalization.CultureInfo]::InvariantCulture) } else { "" }
+        foreach ($valueName in $key.GetValueNames()) {
+            if (-not $valueName) { continue }
+            $row = ConvertFrom-MountedDeviceValue -Name $valueName -Data $key.GetValue($valueName, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $row | Add-Member -NotePropertyName KeyLastWriteUtc -NotePropertyValue $lastWriteText
+            $rows += $row
+        }
+    }
+    finally { $key.Close() }
+    return $rows
+}
+
+# MountedDevices of the examined system, from the best source in the
+# collection:
+#   1. mounted_devices.csv with at least one row (decoded by the collector;
+#      live collections)
+#   2. MountedDevices at the root of the collected SYSTEM hive (also
+#      mounted-image collections)
+#   3. mounted_devices.txt of older collectors (first 4 bytes of each
+#      value only, see ConvertFrom-MountedDevicesText)
+# Returns Rows (mounted_devices.csv columns), Source (for the log) and
+# File (where the rows came from); Rows is empty when no source has a value.
+function Read-CollectionMountedDevices {
+    $result = [PSCustomObject]@{ Rows = @(); Source = ""; File = $null }
+    foreach ($csvFile in @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("mounted_devices.csv") | Where-Object { -not $_.PSIsContainer })) {
+        Log "  Parsing: $($csvFile.FullName)"
+        try { $rows = @(Import-Csv -LiteralPath $csvFile.FullName -ErrorAction Stop | Where-Object { $_.Name }) }
+        catch {
+            Log-Warning "  Failed to parse mounted devices CSV: $($_.Exception.Message)"
+            continue
+        }
+        if ($rows.Count -gt 0) {
+            $result.Rows = $rows
+            $result.Source = $csvFile.FullName
+            $result.File = $csvFile
+            return $result
+        }
+        Log "    No values in $($csvFile.Name)."
+    }
+
+    $systemHive = Find-OfflineHiveFile "SYSTEM"
+    if ($systemHive) {
+        $mount = $null
+        try {
+            $mount = Mount-TimelineHive -HiveFile $systemHive -Prefix "TEMP_TLUSB"
+            if ($mount -and $mount.Root) {
+                # The machine's names for the User column too
+                Add-TimelineMachineName (Get-OfflineComputerNames $mount.Root)
+                $rows = @(Get-OfflineMountedDeviceRows -SystemRoot $mount.Root)
+                if ($rows.Count -gt 0) {
+                    $result.Rows = $rows
+                    $result.Source = "the SYSTEM hive $($systemHive.FullName)"
+                    $result.File = $systemHive
+                }
+                else { Log "    No MountedDevices values in the SYSTEM hive." }
+            }
+        }
+        catch { Log-Warning "  Failed to read MountedDevices from the SYSTEM hive: $($_.Exception.Message)" }
+        finally { Dismount-TimelineHive $mount }
+        if ($result.Rows.Count -gt 0) { return $result }
+    }
+
+    foreach ($txtFile in @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("mounted_devices.txt") | Where-Object { -not $_.PSIsContainer })) {
+        Log "  Parsing: $($txtFile.FullName)"
+        # Read-AntiVirusTextLines reads any of the encodings collectors wrote
+        # (UTF-8 with a BOM from Windows PowerShell 5.1, without one from 7)
+        try { $rows = @(ConvertFrom-MountedDevicesText -Lines (Read-AntiVirusTextLines $txtFile.FullName)) }
+        catch {
+            Log-Warning "  Failed to parse mounted devices: $($_.Exception.Message)"
+            continue
+        }
+        if (@($rows | Where-Object { $_.Truncated }).Count -gt 0) {
+            Log-Warning "  $($txtFile.Name) is from an older collector: it shows only the first 4 bytes of each value, so partition GUIDs, offsets and device names are missing (they are read from the SYSTEM hive when the collection has one that loads)."
+        }
+        if ($rows.Count -gt 0) {
+            $result.Rows = $rows
+            $result.Source = $txtFile.FullName
+            $result.File = $txtFile
+            return $result
+        }
+        Log "    No MountedDevices values in $($txtFile.Name)."
+    }
+    return $result
+}
+
+# Device instance ID of a device path from MountedDevices, e.g.
+#   _??_USBSTOR#Disk&Ven_Generic-&Prod_SD#MMC&Rev_1.00#0123456789&0#{53f56307-b6bf-11d0-94f2-00a0c91efb8b}
+#   -> USBSTOR\Disk&Ven_Generic-&Prod_SD/MMC&Rev_1.00\0123456789&0
+# The path writes each "\" of the ID as "#" and ends with the interface
+# class GUID. A "/" in the ID (Prod_SD/MMC) is a "#" in the path too, so
+# the fields between the first and the last are joined with "/". "" when
+# the path has fewer than three fields.
+function ConvertTo-DeviceInstanceId {
+    param([string]$DevicePath)
+    $fields = @(($DevicePath -replace '^(_\?\?_|\\\?\?\\)', '').TrimEnd([char]0) -split '#')
+    if ($fields.Count -gt 1 -and $fields[-1] -match '^\{[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\}$') {
+        $fields = @($fields[0..($fields.Count - 2)])
+    }
+    if ($fields.Count -lt 3) { return "" }
+    return (@($fields[0], (@($fields[1..($fields.Count - 2)]) -join "/"), $fields[-1]) -join "\")
+}
+
+# Volume GUID Windows uses for an MBR partition (e.g. the MountPoints2 key
+# name): the disk signature, two zero groups, then the 8 bytes of the
+# partition offset, {<signature>-0000-0000-<offset bytes>}. "" when the
+# signature (hex) or the offset (decimal) cannot be read.
+function Get-MbrVolumeGuid {
+    param([string]$DiskSignature, [string]$PartitionOffset)
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    $signature = [uint32]0
+    $offset = [uint64]0
+    if (-not [uint32]::TryParse($DiskSignature, [System.Globalization.NumberStyles]::AllowHexSpecifier, $invariant, [ref]$signature)) { return "" }
+    if (-not [uint64]::TryParse($PartitionOffset, [System.Globalization.NumberStyles]::None, $invariant, [ref]$offset)) { return "" }
+    $bytes = [byte[]]([BitConverter]::GetBytes($signature) + (New-Object byte[] 4) + [BitConverter]::GetBytes($offset))
+    return (New-Object Guid (, $bytes)).ToString("B")
+}
+
+# Timeline text for decoded MountedDevices values (rows with the
+# mounted_devices.csv columns). One object per value with Name, Kind,
+# Description and Details, e.g. "Drive letter H: -> MBR disk 0A1B2C3D,
+# partition at offset 1048576" or "Volume {...} -> USB storage <device>".
+# Details: Kind and the decoded fields; VolumeGuid (the \??\Volume{} name
+# of a value with the same data, else for GPT the partition GUID and for
+# MBR {<signature>-0000-0000-<offset bytes>}, the names MountPoints2
+# uses); InstanceId, Serial and DevicePath of a device path; SameDataAs
+# (values with the same bytes); SameDisk (other values with the same MBR
+# disk signature); KeyLastWriteUtc; PnPRecord for a USBSTOR device path
+# when $StorageSerials is given (usb_storage_devices.csv as serial ->
+# instance ID; $null when that file was not read); CollectorDrive=yes for
+# the drive letter of the collector's output folder. The times inside
+# volume GUIDs (version 1 UUIDs) are not used: they are not mount times.
+function ConvertTo-MountedDeviceEntries {
+    param([object[]]$Rows, [hashtable]$StorageSerials = $null, [string]$CollectorDrive = "")
+    $values = @(foreach ($row in $Rows) {
+            $name = Get-ArtifactRowValue $row @("Name")
+            if (-not $name) { continue }
+            $volume = ""
+            if ($name -match '^\\\?\?\\Volume(\{[0-9A-Fa-f-]{36}\})$') { $volume = $Matches[1] }
+            [PSCustomObject]@{
+                Row       = $row
+                Name      = $name
+                Kind      = Get-ArtifactRowValue $row @("Kind")
+                Volume    = $volume
+                Hex       = (Get-ArtifactRowValue $row @("HexData")).ToUpperInvariant()
+                Signature = (Get-ArtifactRowValue $row @("DiskSignature")).ToUpperInvariant()
+                Truncated = "$($row.Truncated)" -eq "True"
+            }
+        })
+    $entries = @()
+    for ($i = 0; $i -lt $values.Count; $i++) {
+        $v = $values[$i]
+        $row = $v.Row
+        $sameData = @(for ($j = 0; $j -lt $values.Count; $j++) {
+                if ($j -ne $i -and -not $v.Truncated -and -not $values[$j].Truncated -and $v.Hex -and $values[$j].Hex -eq $v.Hex) { $values[$j].Name }
+            })
+        $sameDisk = @(for ($j = 0; $j -lt $values.Count; $j++) {
+                if ($j -ne $i -and $v.Kind -eq "MBR" -and $v.Signature -and $values[$j].Kind -eq "MBR" -and $values[$j].Signature -eq $v.Signature -and $sameData -notcontains $values[$j].Name) { $values[$j].Name }
+            })
+        $volumes = @(for ($j = 0; $j -lt $values.Count; $j++) {
+                if ($values[$j].Volume -and ($j -eq $i -or $sameData -contains $values[$j].Name)) { $values[$j].Volume }
+            })
+
+        if ($v.Name -match '^\\DosDevices\\([A-Za-z]:)$') { $what = "Drive letter $($Matches[1].ToUpperInvariant())" }
+        elseif ($v.Volume) { $what = "Volume $($v.Volume)" }
+        else { $what = "Value $($v.Name)" }
+
+        # Empty fields are left out of Details
+        $details = [ordered]@{
+            Kind            = $v.Kind
+            PartitionGuid   = ""
+            DiskSignature   = ""
+            PartitionOffset = ""
+            VolumeGuid      = $volumes -join ", "
+            InstanceId      = ""
+            Serial          = ""
+            DevicePath      = ""
+            HexData         = ""
+            SameDataAs      = $sameData -join ", "
+            SameDisk        = $sameDisk -join ", "
+            KeyLastWriteUtc = Format-UtcDetailTime (ConvertFrom-UtcText (Get-ArtifactRowValue $row @("KeyLastWriteUtc")))
+            PnPRecord       = ""
+            CollectorDrive  = ""
+            Truncated       = ""
+        }
+        if ($v.Kind -eq "GPT") {
+            $details.PartitionGuid = Get-ArtifactRowValue $row @("PartitionGuid")
+            if (-not $details.VolumeGuid) { $details.VolumeGuid = $details.PartitionGuid }
+            $target = "GPT partition $($details.PartitionGuid)"
+        }
+        elseif ($v.Kind -eq "MBR") {
+            $details.DiskSignature = $v.Signature
+            $details.PartitionOffset = Get-ArtifactRowValue $row @("PartitionOffset")
+            if (-not $details.VolumeGuid) { $details.VolumeGuid = Get-MbrVolumeGuid -DiskSignature $v.Signature -PartitionOffset $details.PartitionOffset }
+            $target = "MBR disk $($v.Signature)"
+            if ($details.PartitionOffset) { $target += ", partition at offset $($details.PartitionOffset)" }
+        }
+        elseif ($v.Kind -eq "DevicePath") {
+            $details.DevicePath = Get-ArtifactRowValue $row @("DevicePath")
+            $details.InstanceId = ConvertTo-DeviceInstanceId $details.DevicePath
+            if ($details.InstanceId) {
+                # The last field is the serial number plus "&<LUN>", or an ID
+                # made up by Windows ("&" as its second character)
+                $instance = ($details.InstanceId -split '\\')[-1] -replace '&\d+$', ''
+                if ($instance.Length -gt 1 -and $instance[1] -ne '&') { $details.Serial = $instance }
+                if ($details.InstanceId -like "USBSTOR\*") {
+                    $target = "USB storage $(Get-DeviceInstanceLabel $details.InstanceId)"
+                    if ($null -ne $StorageSerials) {
+                        if ($StorageSerials.ContainsKey($instance)) { $details.PnPRecord = "in USBSTOR at collection time: $($StorageSerials[$instance])" }
+                        else { $details.PnPRecord = "not in USBSTOR at collection time" }
+                    }
+                }
+                else { $target = "device $(Get-DeviceInstanceLabel $details.InstanceId)" }
+            }
+            elseif ($details.DevicePath) { $target = "device path $($details.DevicePath)" }
+            else { $target = "device path" }
+        }
+        else {
+            $details.HexData = Get-ArtifactRowValue $row @("HexData")
+            $length = Get-ArtifactRowValue $row @("DataLength")
+            if ($v.Truncated -or -not $length) { $target = "unrecognized data" }
+            elseif ($length -eq "0" -and $v.Hex) { $target = "unrecognized value (not binary)" }
+            else { $target = "unrecognized data ($length bytes)" }
+        }
+        if ($v.Truncated) {
+            # mounted_devices.txt of an older collector: only the kind (and an
+            # MBR disk signature) can be read from the first 4 bytes
+            $details.HexData = Get-ArtifactRowValue $row @("HexData")
+            $details.Truncated = "yes (only the first 4 bytes are in mounted_devices.txt; the kind is taken from them)"
+            if ($v.Kind -eq "GPT") { $target = "GPT partition" }
+            elseif ($v.Kind -eq "DevicePath") { $target = "device path" }
+            $target += " (value cut off)"
+        }
+        if ($CollectorDrive -and $v.Name -match '^\\DosDevices\\([A-Za-z]:)$' -and $Matches[1] -eq $CollectorDrive) { $details.CollectorDrive = "yes" }
+        $entries += [PSCustomObject]@{
+            Name        = $v.Name
+            Kind        = $v.Kind
+            Description = "$what -> $target"
+            Details     = Format-ArtifactDetails $details
+        }
+    }
+    return $entries
+}
+
 # Parse Format-List text ("Name : value" blocks separated by blank lines,
 # long values wrapped onto indented lines) into ordered hashtables
 function ConvertFrom-FormatListBlocks {
@@ -12252,11 +13579,21 @@ function Parse-USB {
 
     # USB storage devices with PnP install/arrival/removal times (newer collectors, live only)
     $haveStorageCsv = $false
+    # Serial -> instance ID of these devices, for the mounted devices below
+    # ($null when there is no usb_storage_devices.csv)
+    $storageSerials = $null
     $usbCsvFiles = Find-ArtifactFiles -BasePath $InputPath -FileNames @("usb_storage_devices.csv")
     foreach ($csvFile in $usbCsvFiles) {
         Log "  Parsing: $($csvFile.FullName)"
         try {
             $rows = @(Import-Csv -Path $csvFile.FullName -ErrorAction Stop)
+            if ($null -eq $storageSerials) { $storageSerials = @{} }
+            foreach ($row in $rows) {
+                $serial = Get-ArtifactRowValue $row @("Serial")
+                if (-not $serial) { $serial = ("$($row.InstanceId)" -split '\\')[-1] }
+                $serial = $serial -replace '&\d+$', ''
+                if ($serial) { $storageSerials[$serial] = Get-ArtifactRowValue $row @("InstanceId") }
+            }
             $count = 0
             foreach ($row in $rows) {
                 $name = $row.FriendlyName
@@ -12354,30 +13691,51 @@ function Parse-USB {
         catch { Log-Warning "  Failed to parse USB devices: $($_.Exception.Message)" }
     }
 
-    # Mounted devices (state at collection time)
-    $mountedFiles = Find-ArtifactFiles -BasePath $InputPath -FileNames @("mounted_devices.txt")
-    foreach ($mountFile in $mountedFiles) {
-        Log "  Parsing: $($mountFile.FullName)"
-        try {
-            $ts = Get-SnapshotTimeUtc -File $mountFile
-            $content = Get-Content -Path $mountFile.FullName -ErrorAction Stop
-            foreach ($line in $content) {
-                if ($ts -and $line -match '(\\DosDevices\\[A-Z]:|\\\?\?\\Volume\{)') {
+    # Mounted devices (state at collection time): the disk, partition or
+    # device each drive letter and volume GUID last belonged to, one
+    # Snapshot row per MountedDevices value (sources: see
+    # Read-CollectionMountedDevices; Details: see ConvertTo-MountedDeviceEntries)
+    try {
+        $mounted = Read-CollectionMountedDevices
+        if ($mounted.Rows.Count -gt 0) {
+            # The collector's output drive: a drive letter of the examined
+            # system only in a live collection
+            $collectorDrive = ""
+            if ((Get-CollectionInfo).Mode -eq "Live") {
+                $outputFolder = Get-CollectorOutputFolder
+                if ($outputFolder.Path -match '^([A-Za-z]:)') { $collectorDrive = $Matches[1].ToUpperInvariant() }
+            }
+            $entries = @(ConvertTo-MountedDeviceEntries -Rows $mounted.Rows -StorageSerials $storageSerials -CollectorDrive $collectorDrive)
+            $ts = Get-SnapshotTimeUtc -File $mounted.File
+            if ($ts) {
+                foreach ($entry in $entries) {
                     Add-TimelineEntry -Timestamp $ts -Source "USB-MountedDevices" -EventType "Snapshot" `
-                        -Description "Mounted device: $($line.Trim() -replace '\s{2,}', ' ')" `
-                        -Artifact "USB" -RawPath $mountFile.FullName
+                        -Description $entry.Description `
+                        -Details $entry.Details `
+                        -Artifact "USB" -RawPath $mounted.File.FullName
                     $usbParsed = $true
                 }
             }
+            $kindCounts = "$(@($entries | Where-Object { $_.Kind -eq 'GPT' }).Count) GPT, $(@($entries | Where-Object { $_.Kind -eq 'MBR' }).Count) MBR, $(@($entries | Where-Object { $_.Kind -eq 'DevicePath' }).Count) device path"
+            $otherCount = @($entries | Where-Object { @("GPT", "MBR", "DevicePath") -notcontains $_.Kind }).Count
+            if ($otherCount -gt 0) { $kindCounts += ", $otherCount other" }
+            Log "  Parsed $($entries.Count) mounted device value(s) ($kindCounts) from $($mounted.Source)"
         }
-        catch { Log-Warning "  Failed to parse mounted devices: $($_.Exception.Message)" }
     }
+    catch { Log-Warning "  Failed to parse mounted devices: $($_.Exception.Message)" }
 
     # SetupAPI device logs (device first-install times). Windows rotates setupapi.dev.log
     # to setupapi.dev.<yyyymmdd_hhmmss>.log, so every setupapi.dev*.log is parsed.
-    # Times are the examined system's local time.
-    $setupApiFiles = @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("setupapi.dev*.log") |
-        Where-Object { $_.Name -like "setupapi.dev*.log" } | Sort-Object FullName -Unique)
+    # Times are the examined system's local time. The logs record every device
+    # and driver install (graphics card, audio, Bluetooth, software devices, ...):
+    # USB devices are USBDevice rows, all others Installation rows.
+    $setupApiFiles = @(Find-SetupApiLogFiles)
+    Log "  Found $($setupApiFiles.Count) SetupAPI log(s)."
+    # Logs the collector saved but that are not here were lost after collection
+    $setupApiManifest = Compare-ManifestSetupApiLogs -Found $setupApiFiles
+    if ($setupApiManifest.Missing.Count -gt 0) {
+        Log-Warning "  SetupAPI log(s) missing: the collection manifest lists $($setupApiManifest.Listed.Count), $($setupApiManifest.Missing.Count) of them are not here -- their device installs are not in the timeline: $($setupApiManifest.Missing -join ', ')"
+    }
     $seenSetupApi = @{}
     $sectionFormats = [string[]]@("yyyy/MM/dd HH:mm:ss.fff", "yyyy/MM/dd HH:mm:ss")
     foreach ($logFile2 in $setupApiFiles) {
@@ -12385,6 +13743,7 @@ function Parse-USB {
         try {
             $content = [System.IO.File]::ReadAllLines($logFile2.FullName)
             $count = 0
+            $usbCount = 0
             $dupes = 0
             for ($i = 0; $i -lt $content.Length; $i++) {
                 $line = $content[$i]
@@ -12394,8 +13753,9 @@ function Parse-USB {
                 $isDelete = $Matches[1] -eq "Delete Device"
                 $trigger = $Matches[2]
                 $instance = $Matches[3].Trim()
+                $isUsb = Test-UsbDeviceInstance $instance
                 # Deletions are only interesting for USB devices
-                if ($isDelete -and $instance -notmatch '(?i)USBSTOR|^USB\\|VID_[0-9A-F]{4}') { continue }
+                if ($isDelete -and -not $isUsb) { continue }
 
                 # ">>>  Section start 2026/10/06 20:19:08.123" follows the header
                 $localText = $null
@@ -12424,14 +13784,19 @@ function Parse-USB {
                     $desc = "Device install: $label"
                     $details = "Instance=$instance Action=Device Install ($trigger) LogTime=$localText (target local time)"
                 }
-                Add-TimelineEntry -Timestamp $ts -Source "USB-SetupAPI" -EventType "USBDevice" `
+                $eventType = "Installation"
+                if ($isUsb) {
+                    $eventType = "USBDevice"
+                    $usbCount++
+                }
+                Add-TimelineEntry -Timestamp $ts -Source "USB-SetupAPI" -EventType $eventType `
                     -Description $desc `
                     -Details $details `
                     -Artifact "USB" -RawPath $logFile2.FullName
                 $usbParsed = $true
                 $count++
             }
-            Log "  Parsed $count SetupAPI device event(s) ($dupes duplicate(s) from other log files skipped)."
+            Log "  Parsed $count SetupAPI device event(s): $usbCount USB, $($count - $usbCount) other device or driver install(s) ($dupes duplicate(s) from other log files skipped)."
         }
         catch { Log-Warning "  Failed to parse SetupAPI log: $($_.Exception.Message)" }
     }
@@ -13744,43 +15109,41 @@ function Invoke-SrumEsentutl {
     finally { $process.Dispose() }
 }
 
-# SID -> account name for the SRUM user SIDs: well-known SIDs, the
-# collector's bam_entries.csv (Sid,User), then ProfileList in the collected
-# SOFTWARE hive (loaded only if a user SID is still unknown); else the SID
+# SID -> account name for the SRUM user SIDs, in the User column's form
+# (ConvertTo-TimelineUserName: NT AUTHORITY\SYSTEM for S-1-5-18, ...): the
+# collector's bam_entries.csv (Sid,User) and ProfileList in the collected
+# SOFTWARE hive (loaded only if a user SID is still unknown) are added to
+# the User column's SID names (Add-TimelineSidName), and the SIDs are named
+# from those, with what the parsers before SRUM gathered (ProfileList wins
+# over bam_entries.csv); else the SID
 function Get-SrumSidNames {
     param([string[]]$Sids)
-    $names = @{}
     foreach ($csv in (Find-ArtifactFiles -BasePath $InputPath -FileNames @("bam_entries.csv"))) {
         try {
             foreach ($row in (Import-Csv -LiteralPath $csv.FullName -ErrorAction Stop)) {
-                $sid = Get-ArtifactRowValue $row @("Sid")
-                $user = Get-ArtifactRowValue $row @("User")
-                if ($sid -and $user -and -not $names.ContainsKey($sid)) { $names[$sid] = $user }
+                Add-TimelineSidName -Sid (Get-ArtifactRowValue $row @("Sid")) -Name (Get-ArtifactRowValue $row @("User"))
             }
         }
         catch { Log-Warning "  Could not read $($csv.FullName) for SID names: $($_.Exception.Message)" }
     }
-    $unknown = @($Sids | Where-Object { $_ -match '^S-1-(5-21|12-1)-' -and -not $names.ContainsKey($_) })
+    $known = Get-TimelineSidNames
+    $unknown = @($Sids | Where-Object { $_ -match '^S-1-(5-21|12-1)-' -and -not $known.ContainsKey($_) })
     if ($unknown.Count -gt 0) {
         $softwareHive = Find-OfflineHiveFile "SOFTWARE"
         if ($softwareHive) {
             $mount = $null
             try {
                 $mount = Mount-TimelineHive -HiveFile $softwareHive -Prefix "TEMP_TLSRUM"
-                if ($mount -and $mount.Root) {
-                    $profiles = Get-ProfileListMap $mount.Root
-                    foreach ($sid in $unknown) {
-                        if ($profiles.ContainsKey($sid)) { $names[$sid] = $profiles[$sid] }
-                    }
-                }
+                if ($mount -and $mount.Root) { Add-OfflineProfileNames $mount.Root }
             }
             catch { Log-Warning "  Failed to read ProfileList from SOFTWARE hive: $($_.Exception.Message)" }
             finally { Dismount-TimelineHive $mount }
         }
     }
+    $names = Get-TimelineSidNames
     $result = @{}
     foreach ($sid in $Sids) {
-        $name = Resolve-BamUser -Sid $sid -SidNames $names
+        $name = ConvertTo-TimelineUserName -Value $sid -SidNames $names
         if ($name -and $name -ne $sid) { $result[$sid] = $name }
     }
     return $result
@@ -13805,10 +15168,11 @@ function Repair-SrumWorkingCopy {
 }
 
 # Copies SRUDB.dat and its ESE companion files (SRU*.log, SRU.chk,
-# SRUres*.jrs, SRUDB.jfm) from the collection to the (empty) temp folder and
-# brings the copy to a clean state if needed: soft recovery with the
-# collected logs (in this process, else esentutl /r), else repair (esentutl
-# /p, which can lose data). The collection itself is never changed. Returns
+# SRUres*.jrs, SRUDB.jfm) from the collection to the (empty) folder
+# -TempDir in the work folder's scratch folder and brings the copy to a
+# clean state if needed: soft recovery with the collected logs (in this
+# process, else esentutl /r), else repair (esentutl /p, which can lose
+# data). The collection itself is never changed. Returns
 # Database (the copy), Header (Header.IsEse is false for a file that is not
 # an ESE database, Header.IsClean false if neither recovery nor repair
 # worked) and Method (what was needed: "" for a clean copy).
@@ -13820,6 +15184,20 @@ function Get-SrumWorkingCopy {
         Where-Object { $_.Name -match '^SRU.*\.(log|jtx|chk|jrs)$' -or $_.Name -eq "SRUDB.jfm" })
     foreach ($companion in $companions) {
         Copy-Item -LiteralPath $companion.FullName -Destination (Join-Path $TempDir $companion.Name) -Force -ErrorAction SilentlyContinue
+    }
+    # A transaction log the collector saved (listed in collection_manifest.csv)
+    # that is not here any more was deleted after the collection
+    $relDb = Get-RelativeCollectionPath $File.FullName
+    if ($relDb) {
+        $relDir = [System.IO.Path]::GetDirectoryName($relDb)
+        foreach ($rel in @((Get-CollectionManifest).RelativePaths | Sort-Object)) {
+            $leaf = [System.IO.Path]::GetFileName($rel)
+            if ($leaf -notmatch '^SRU.*\.(log|jtx)$' -or [System.IO.Path]::GetDirectoryName($rel) -ne $relDir) { continue }
+            $logSrc = Join-Path $File.DirectoryName $leaf
+            if (-not (Test-Path -LiteralPath $logSrc)) {
+                Log-Warning "  Transaction log missing: $logSrc is in the collection manifest but not here -- the database is read without it (records not yet written to the database are lost)"
+            }
+        }
     }
     # Copies keep the attributes of the collection's files; a read-only copy
     # (evidence marked read-only, read-only media) cannot be recovered or
@@ -13888,7 +15266,9 @@ function Get-SrumWorkingCopy {
 function Add-SrumTimelineEntries {
     param([System.IO.FileInfo]$File)
     Log "  Parsing: $($File.FullName) ($([Math]::Round($File.Length / 1MB, 1)) MB)"
-    $tempDir = Join-Path $env:TEMP "TimelineSrum_$(Get-Random)"
+    # Scratch copy in the work folder, not %TEMP% (Windows cleans that up
+    # during the run)
+    $tempDir = Join-Path (Get-ScratchFolder) "TimelineSrum_$(Get-Random)"
     $database = $null
     try {
         New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
@@ -14093,9 +15473,10 @@ function Parse-Amcache {
         $tempHiveDir = $null
 
         try {
-            # Copy hive + transaction logs to a temp dir so reg load can replay
-            # dirty hive logs automatically (fixes "registry database is corrupt")
-            $tempHiveDir = Join-Path $env:TEMP "AmcacheRepair_$(Get-Random)"
+            # Copy hive + transaction logs to a scratch folder so reg load can
+            # replay dirty hive logs automatically (fixes "registry database is
+            # corrupt")
+            $tempHiveDir = Join-Path (Get-ScratchFolder) "AmcacheRepair_$(Get-Random)"
             New-Item -ItemType Directory -Path $tempHiveDir -Force | Out-Null
 
             $srcDir = Split-Path $amcache.FullName -Parent
@@ -14106,17 +15487,21 @@ function Parse-Amcache {
             $logsCopied = 0
             foreach ($logExt in @(".LOG1", ".LOG2")) {
                 $logSrc = Join-Path $srcDir "Amcache.hve${logExt}"
-                if (Test-Path $logSrc) {
+                if (Test-Path -LiteralPath $logSrc) {
                     Copy-Item -Path $logSrc -Destination (Join-Path $tempHiveDir "Amcache.hve${logExt}") -Force
                     $logsCopied++
+                }
+                elseif (Test-ManifestListsFile $logSrc) {
+                    Log-Warning "  Transaction log missing: $logSrc is in the collection manifest but not here -- the hive is loaded without it (changes not yet written to the hive are lost)"
                 }
             }
 
             if ($logsCopied -gt 0) {
-                Log "  Copied hive + $logsCopied transaction log(s) to temp for recovery"
+                Log "  Copied hive + $logsCopied transaction log(s) for recovery"
             }
 
             Log "  Loading Amcache hive: $tempHive"
+            Register-RunHive $hiveName
             $regLoadResult = & reg load "HKLM\$hiveName" $tempHive 2>&1
             if ($LASTEXITCODE -eq 0) {
                 $loaded = $true
@@ -14212,6 +15597,7 @@ function Parse-Amcache {
                 Log "  Parsed $count Amcache entries."
             }
             else {
+                Unregister-RunHive $hiveName
                 $regLoadText = (@($regLoadResult) | ForEach-Object { "$_".Trim() } | Where-Object { $_ }) -join " "
                 Log-Warning "  Could not load Amcache hive: $regLoadText -- No Amcache data available."
             }
@@ -14229,7 +15615,11 @@ function Parse-Amcache {
                     & reg unload "HKLM\$hiveName" 2>&1 | Out-Null
                     $unloaded = ($LASTEXITCODE -eq 0)
                 }
-                if ($unloaded) { Log "  Unloaded Amcache hive." }
+                if ($unloaded) {
+                    Log "  Unloaded Amcache hive."
+                    Unregister-RunHive $hiveName
+                }
+                # Tried again at the end of the run, before the work folder is deleted
                 else { Log-Warning "  Failed to unload Amcache hive -- run: reg unload HKLM\$hiveName" }
             }
             # The temp copy holds a copy of the hive; loading it also creates
@@ -14308,6 +15698,43 @@ function Get-OfflineControlSetName {
         if ($k) { $k.Close(); return $candidate }
     }
     return $null
+}
+
+# Names of the examined machine from a loaded SYSTEM hive, for the User
+# column: the computer name (NetBIOS) and the TCP/IP host names (Hostname,
+# and NV Hostname, the name after a pending rename) of the current control
+# set. Anything but a registry key (no hive) gives none; a key that cannot
+# be read gives fewer names and a warning, never an error.
+function Get-OfflineComputerNames {
+    param($SystemRoot)
+    $names = @()
+    if ($SystemRoot -isnot [Microsoft.Win32.RegistryKey]) { return $names }
+    try {
+        $controlSet = Get-OfflineControlSetName $SystemRoot
+        if ($controlSet) {
+            foreach ($item in @(@("Control\ComputerName\ComputerName", "ComputerName"), @("Services\Tcpip\Parameters", "Hostname"), @("Services\Tcpip\Parameters", "NV Hostname"))) {
+                $key = $SystemRoot.OpenSubKey("$controlSet\$($item[0])")
+                if (-not $key) { continue }
+                try { $names += "$($key.GetValue($item[1]))".Trim() }
+                finally { $key.Close() }
+            }
+        }
+    }
+    catch { Log-Warning "  Could not read the computer name from the SYSTEM hive (User column): $($_.Exception.Message)" }
+    return @($names | Where-Object { $_ })
+}
+
+# Account names by SID from a loaded SOFTWARE hive's ProfileList, kept for
+# the User column (Add-TimelineSidName). Anything but a registry key gives
+# none; a ProfileList that cannot be read gives a warning, never an error.
+function Add-OfflineProfileNames {
+    param($SoftwareRoot)
+    if ($SoftwareRoot -isnot [Microsoft.Win32.RegistryKey]) { return }
+    try {
+        $profiles = Get-ProfileListMap $SoftwareRoot
+        foreach ($sid in $profiles.Keys) { Add-TimelineSidName -Sid $sid -Name $profiles[$sid] -ProfileList }
+    }
+    catch { Log-Warning "  Could not read ProfileList from the SOFTWARE hive (User column): $($_.Exception.Message)" }
 }
 
 # BAM/DAM values from a loaded SYSTEM hive: one object per value whose data
@@ -14519,6 +15946,8 @@ function Parse-PowerShellHistory {
         try {
             $mount = Mount-TimelineHive -HiveFile $systemHive -Prefix "TEMP_TLSYS"
             if ($mount -and $mount.Root) {
+                # The machine's names for the User column too
+                Add-TimelineMachineName (Get-OfflineComputerNames $mount.Root)
                 $controlSet = Get-OfflineControlSetName $mount.Root
                 if ($controlSet) {
                     Log "  SYSTEM hive current control set: $controlSet"
@@ -14545,6 +15974,8 @@ function Parse-PowerShellHistory {
             foreach ($row in (Import-Csv -LiteralPath $csv.FullName -ErrorAction Stop)) {
                 if (-not $row.Path) { continue }
                 $bamUser = [string]$row.User
+                # The collector's name for the SID, for the User column
+                Add-TimelineSidName -Sid $row.Sid -Name $bamUser
                 if (-not $bamUser) { $bamUser = Resolve-BamUser -Sid $row.Sid -SidNames @{} }
                 $ts = ConvertFrom-UtcText $row.LastExecutionUtc
                 if ($ts) {
@@ -14577,7 +16008,11 @@ function Parse-PowerShellHistory {
             $swMount = $null
             try {
                 $swMount = Mount-TimelineHive -HiveFile $softwareHive -Prefix "TEMP_TLSW"
-                if ($swMount -and $swMount.Root) { $sidNames = Get-ProfileListMap $swMount.Root }
+                if ($swMount -and $swMount.Root) {
+                    $sidNames = Get-ProfileListMap $swMount.Root
+                    # For the User column too
+                    foreach ($sid in $sidNames.Keys) { Add-TimelineSidName -Sid $sid -Name $sidNames[$sid] -ProfileList }
+                }
             }
             catch { Log-Warning "  Failed to read ProfileList from SOFTWARE hive: $($_.Exception.Message)" }
             finally { Dismount-TimelineHive $swMount }
@@ -14654,9 +16089,11 @@ function Parse-PowerShellHistory {
                     else { $entryName = $e.Path -replace "`t", " " }
                 }
                 if ($e.LastModifiedUtc) {
-                    # The time is the file's last-modified time, not when it ran
-                    Add-TimelineEntry -Timestamp $e.LastModifiedUtc -Source "AppCompatCache" -EventType "Execution" `
-                        -Description "ShimCache entry: $entryName" `
+                    # The time is the file's last-modified time, not when it
+                    # ran (on Windows 10/11 an entry alone does not prove
+                    # that it ran): FileLastModified, not Execution
+                    Add-TimelineEntry -Timestamp $e.LastModifiedUtc -Source "AppCompatCache" -EventType "FileLastModified" `
+                        -Description "ShimCache entry (file last modified): $entryName" `
                         -Details "$($entryNote)Time=file last-modified time (NOT an execution time); CachePosition=$($e.Position) of $total (1 = most recent)" `
                         -Artifact "Registry" -RawPath $shimSource
                     $timed++
@@ -14687,59 +16124,644 @@ function Parse-PowerShellHistory {
 # ----------------------------------------------------------
 # 15. Memory Dump Parser (Volatility 3)
 # ----------------------------------------------------------
-# Memory dump for this collection: the collector saves it next to the zip
-# (<zip name>_memory_dump.dmp / .raw) because it is too large to zip.
-# DumpIt writes Microsoft crash dumps (.dmp); WinPmem and Magnet RAM
-# Capture write raw images (.raw). Returns the full path or $null.
-function Find-MemoryDump {
-    $extensions = @("dmp", "raw")
+$script:memoryDumpPathWarned = $false   # Find-MemoryDump has reported a bad -MemoryDumpPath
+$script:memoryDumpNotices = New-Object 'System.Collections.Generic.HashSet[string]'   # the lines Find-MemoryDump has logged in this run
+$script:memoryDumpFromManifest = $false   # the last dump Find-MemoryDump returned is the manifest's
+$script:memoryDumpListedPath = ""   # ... found on a drive with another letter: the path the manifest lists
 
-    # Check 1: Sibling of the selected zip (browse mode)
-    if ($script:selectedZipPath -and (Test-Path -LiteralPath $script:selectedZipPath)) {
+# Logs a line of Find-MemoryDump once per run: a dump that is offered and
+# then analyzed is looked for twice
+function Write-MemoryDumpNotice {
+    param([string]$Text, [switch]$Warning)
+    if ($null -eq $script:memoryDumpNotices) { $script:memoryDumpNotices = New-Object 'System.Collections.Generic.HashSet[string]' }
+    if (-not $script:memoryDumpNotices.Add($Text)) { return }
+    if ($Warning) { Log-Warning $Text }
+    else { Log $Text }
+}
+
+# Ready fixed and removable drives, as roots ("E:\"): the drives the
+# collector's memory prompt offers for the dump. A function of its own so
+# the tests can stand in for the machine's drives
+function Get-MemoryDumpDriveRoots {
+    $roots = @()
+    try {
+        foreach ($drive in [System.IO.DriveInfo]::GetDrives()) {
+            try {
+                if ($drive.IsReady -and ($drive.DriveType -eq [System.IO.DriveType]::Fixed -or $drive.DriveType -eq [System.IO.DriveType]::Removable)) {
+                    $roots += $drive.RootDirectory.FullName
+                }
+            }
+            catch { Write-Verbose "Checking drive $($drive.Name): $($_.Exception.Message)" }
+        }
+    }
+    catch { Write-Verbose "Listing drives: $($_.Exception.Message)" }
+    return $roots
+}
+
+# The file at a path that may come from collection_manifest.csv, or $null
+# when there is none (also for a path Windows PowerShell 5.1 refuses, e.g.
+# one with | in it)
+function Get-MemoryDumpFile {
+    param([string]$Path)
+    try {
+        $file = New-Object System.IO.FileInfo($Path)
+        if ($file.Exists) { return $file }
+    }
+    catch { Write-Verbose "Memory dump ${Path}: $($_.Exception.Message)" }
+    return $null
+}
+
+# Where Find-MemoryDump looks for the dump next to the collection, by name.
+# -Zip: next to the selected zip (browse mode, or a zip as -InputPath),
+# <zip name>_memory_dump.dmp and .raw. -Folder: next to the collection
+# folder (the folder of collection_manifest.csv, else -InputPath) and next
+# to -InputPath (an outer folder that holds the collection), only under
+# the collection folder's name: a folder such as the collector's reports\
+# holds the dumps of other collections too. Windows "Extract All" of
+# <name>.zip makes <name>\<name>\, so the dump next to the zip is then
+# next to the outer folder.
+function Get-MemoryDumpSiblingPaths {
+    param([switch]$Zip, [switch]$Folder)
+    $extensions = @("dmp", "raw")
+    $paths = @()
+    if ($Zip -and $script:selectedZipPath -and (Test-Path -LiteralPath $script:selectedZipPath)) {
         $zipDir = Split-Path $script:selectedZipPath -Parent
         $zipBaseName = [System.IO.Path]::GetFileNameWithoutExtension($script:selectedZipPath)
-        foreach ($ext in $extensions) {
-            $siblingDump = Join-Path $zipDir "${zipBaseName}_memory_dump.$ext"
-            if (Test-Path -LiteralPath $siblingDump) { return $siblingDump }
+        foreach ($ext in $extensions) { $paths += Join-Path $zipDir "${zipBaseName}_memory_dump.$ext" }
+    }
+    if ($Folder) {
+        $root = Get-CollectionRootFolder
+        $collectionName = [System.IO.Path]::GetFileName($root)
+        $parentDir = [System.IO.Path]::GetDirectoryName($root)
+        if ($collectionName -and $parentDir) {
+            $dumpDirs = @($parentDir)
+            $outerParentDir = [System.IO.Path]::GetDirectoryName($parentDir)
+            if ($outerParentDir -and [System.IO.Path]::GetFileName($parentDir) -eq $collectionName) { $dumpDirs += $outerParentDir }
+            $inputDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($InputPath).TrimEnd('\')
+            $inputParentDir = [System.IO.Path]::GetDirectoryName($inputDir)
+            if ($inputParentDir -and $dumpDirs -notcontains $inputParentDir) { $dumpDirs += $inputParentDir }
+            foreach ($dumpDir in $dumpDirs) {
+                foreach ($ext in $extensions) { $paths += Join-Path $dumpDir "${collectionName}_memory_dump.$ext" }
+            }
+        }
+    }
+    return $paths
+}
+
+# The size collection_manifest.csv lists for the dump (SizeBytes) against
+# a file's length: "" when they are the same, else "<length> bytes, but
+# collection_manifest.csv lists <size> bytes" (or "no size")
+function Get-MemoryDumpSizeMismatch {
+    param([object]$Listed, [long]$Length)
+    $listedSize = [long]-1
+    if ([long]::TryParse($Listed.SizeBytes, [System.Globalization.NumberStyles]::None, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$listedSize) -and $listedSize -eq $Length) { return "" }
+    $listedText = "no size"
+    if ($Listed.SizeBytes) { $listedText = "$($Listed.SizeBytes) bytes" }
+    return "$Length bytes, but collection_manifest.csv lists $listedText"
+}
+
+# The end of the log line for a dump of the size the manifest lists
+function Get-MemoryDumpHashNote {
+    param([object]$Listed)
+    return "SHA-256 in the manifest: $($Listed.Sha256) -- the dump is not hashed again here (it is as large as RAM); Get-FileHash -Algorithm SHA256 checks it."
+}
+
+# The memory dump collection_manifest.csv lists: the collector records a
+# complete dump as "(memory dump via DumpIt)" (WinPmem, MagnetRAM), with
+# its size and SHA-256. Where it is:
+# - in the collection (RelativePath Memory\memory_dump.dmp or .raw; before
+#   the RelativePath column only DestPath, <collection>\Memory\...): the
+#   collector's default. When zipping, the collector moves it next to the
+#   zip, so in a zipped collection it is missing, which is normal (the
+#   other checks find it next to the zip).
+# - outside it (RelativePath empty): DestPath, the folder of the
+#   collector's -MemoryOutputPath or of the drive picked at its memory
+#   prompt, e.g. D:\TriageMemory\<collection>_memory_dump.dmp (a collector
+#   that changes the row when it moves the dump names the path next to the
+#   zip). When no file of the listed size is there, the same path on the
+#   other fixed and removable drives is tried: the drive (e.g. a USB drive)
+#   may have another letter now, on another machine or plugged in again.
+# A manifest comes from the examined machine, so it must not make the
+# builder read just any file or connect to a server: only the names the
+# collector writes are used (Memory\memory_dump.<ext>, and outside the
+# collection <collection folder name>_memory_dump.<ext>), and outside the
+# collection only a path on a drive letter, or a path the builder looks at
+# anyway next to the collection zip or folder it was given (e.g. on a
+# network share). The dump is not hashed (it is as large as RAM), but its
+# size must match the manifest. Only string methods are used on the
+# manifest's paths: Windows PowerShell 5.1's Path methods throw on
+# characters such as | in a path.
+# Returns Status: None (no such row), Found, Missing, SizeMismatch or
+# Refused (for these two, Reason says why); Path (the full path it names,
+# or the file found on another drive; RelativePath for a refused one in
+# the collection); ListedPath (the DestPath it names when the file is on
+# another drive, else ""); OtherDrives ($true when other drives were
+# tried); Extension (.dmp or .raw when the name is one the collector
+# writes: Find-MemoryDump then checks the size of a dump of that type it
+# finds elsewhere); InCollection, RelativePath, Sha256 and SizeBytes (as
+# listed).
+function Get-ManifestMemoryDump {
+    $result = [PSCustomObject]@{ Status = "None"; Path = ""; ListedPath = ""; OtherDrives = $false; Extension = ""; InCollection = $false; RelativePath = ""; Sha256 = ""; SizeBytes = ""; Reason = "" }
+    $manifest = Get-CollectionManifest
+    $row = $null
+    foreach ($candidate in $manifest.Rows) {
+        if ("$($candidate.SourcePath)" -match '^\(memory dump via .+\)$') { $row = $candidate; break }
+    }
+    if (-not $row) { return $result }
+    $result.Sha256 = "$($row.SHA256)".Trim()
+    $result.SizeBytes = "$($row.SizeBytes)".Trim()
+    $destPath = "$($row.DestPath)".Trim()
+    $relPath = ""
+    if ($row.PSObject.Properties["RelativePath"]) { $relPath = "$($row.RelativePath)".Trim() }
+    if (-not $relPath -and $destPath -match '\\(Memory\\memory_dump\.(?:dmp|raw))$') { $relPath = $Matches[1] }
+
+    if ($relPath) {
+        $result.InCollection = $true
+        $result.RelativePath = $relPath
+        $result.Path = $relPath
+        if (-not ($relPath -match '^Memory\\memory_dump(\.(?:dmp|raw))$')) {
+            $result.Status = "Refused"
+            $result.Reason = "not a name the collector gives a memory dump in the collection (Memory\memory_dump.dmp or .raw)"
+            return $result
+        }
+        $result.Extension = $Matches[1].ToLowerInvariant()
+        $result.Path = Join-Path (Get-CollectionRootFolder) $relPath
+    }
+    else {
+        $result.Path = $destPath
+        # The collection folder's name now, and as the collector named it
+        # (DestPath minus RelativePath of the other rows): a renamed folder
+        $names = @([System.IO.Path]::GetFileName((Get-CollectionRootFolder)))
+        foreach ($other in $manifest.Rows) {
+            if (-not $other.PSObject.Properties["RelativePath"]) { break }
+            $otherRel = "$($other.RelativePath)"
+            $otherDest = "$($other.DestPath)"
+            if ($otherRel -and $otherDest.Length -gt $otherRel.Length + 1 -and $otherDest.EndsWith('\' + $otherRel, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $folderThen = $otherDest.Substring(0, $otherDest.Length - $otherRel.Length - 1)
+                $names += $folderThen.Substring($folderThen.LastIndexOf('\') + 1)
+                break
+            }
+        }
+        $leaf = $destPath.Substring($destPath.LastIndexOf('\') + 1)
+        $leafName = ""
+        $leafExtension = ""
+        if ($leaf -match '^(.+)_memory_dump(\.(?:dmp|raw))$') {
+            $leafName = $Matches[1]
+            $leafExtension = $Matches[2].ToLowerInvariant()
+        }
+        if (-not $leafName -or $names -notcontains $leafName) {
+            $result.Status = "Refused"
+            $result.Reason = "not a name the collector gives this collection's memory dump ($($names[0])_memory_dump.dmp or .raw)"
+            return $result
+        }
+        $result.Extension = $leafExtension
+        if ($destPath -notmatch '^[A-Za-z]:\\' -and @(Get-MemoryDumpSiblingPaths -Zip -Folder) -notcontains $destPath) {
+            $result.Status = "Refused"
+            $result.Reason = "not a path on a drive letter (a network or device path named in a collection is opened only when it is next to the collection zip or folder)"
+            return $result
         }
     }
 
-    # Check 2: Inside the collection directory (uncompressed collections)
-    $memFiles = @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("memory_dump.dmp", "memory_dump.raw", "memdump.raw", "memory.raw", "physmem.raw"))
-    if ($memFiles.Count -gt 0) { return $memFiles[0].FullName }
+    # The file it names, then the same path on the other drives; the first
+    # file of the listed size is the dump
+    $wrongSize = $null
+    $savedTo = "there"
+    $file = Get-MemoryDumpFile $result.Path
+    if ($file) {
+        if (-not (Get-MemoryDumpSizeMismatch -Listed $result -Length $file.Length)) {
+            $result.Path = $file.FullName
+            $result.Status = "Found"
+            return $result
+        }
+        $wrongSize = $file
+    }
+    if (-not $result.InCollection -and $destPath -match '^[A-Za-z]:\\') {
+        $result.OtherDrives = $true
+        foreach ($root in @(Get-MemoryDumpDriveRoots)) {
+            $moved = "$root".TrimEnd('\') + $destPath.Substring(2)
+            if ($moved -eq $destPath) { continue }
+            $movedFile = Get-MemoryDumpFile $moved
+            if (-not $movedFile) { continue }
+            if (-not (Get-MemoryDumpSizeMismatch -Listed $result -Length $movedFile.Length)) {
+                $result.ListedPath = $destPath
+                $result.Path = $movedFile.FullName
+                $result.Status = "Found"
+                return $result
+            }
+            if (-not $wrongSize) {
+                $wrongSize = $movedFile
+                $savedTo = "to $destPath"
+                $result.ListedPath = $destPath
+            }
+        }
+    }
+    if (-not $wrongSize) {
+        $result.Status = "Missing"
+        return $result
+    }
+    $result.Status = "SizeMismatch"
+    $result.Path = $wrongSize.FullName
+    $result.Reason = "$(Get-MemoryDumpSizeMismatch -Listed $result -Length $wrongSize.Length) for the dump the collector saved $savedTo"
+    return $result
+}
 
-    # Check 3: Alongside the InputPath directory
-    $parentDir = Split-Path $InputPath -Parent
-    foreach ($ext in $extensions) {
-        $dumpFiles = @(Get-ChildItem -LiteralPath $parentDir -Filter "*_memory_dump.$ext" -File -ErrorAction SilentlyContinue)
-        if ($dumpFiles.Count -gt 0) { return $dumpFiles[0].FullName }
+# A dump that checks 3 to 5 of Find-MemoryDump found: not the file of
+# another size that check 2 found (NotThis), and, when
+# collection_manifest.csv lists this collection's dump of the same type
+# (.dmp or .raw) and the file has a name the collector writes, of the size
+# the manifest lists. A file of another size (e.g. a copy cut short) gets
+# one warning and is not used; with that size, the manifest's SHA-256 is
+# logged. Returns $true to use it.
+function Test-MemoryDumpCandidate {
+    param([string]$Path, [object]$Listed, [string]$NotThis = "")
+    if ($NotThis -and $Path -eq $NotThis) { return $false }
+    $leaf = $Path.Substring($Path.LastIndexOf('\') + 1)
+    if (-not $Listed.Extension -or $leaf -notmatch '(?:^|_)memory_dump\.(?:dmp|raw)$' -or -not $leaf.EndsWith($Listed.Extension, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    $file = Get-MemoryDumpFile $Path
+    if (-not $file) { return $true }
+    $mismatch = Get-MemoryDumpSizeMismatch -Listed $Listed -Length $file.Length
+    if ($mismatch) {
+        Write-MemoryDumpNotice -Warning "Memory dump not used: $Path is $mismatch for this collection's dump (a copy cut short?)."
+        return $false
+    }
+    Write-MemoryDumpNotice "Memory dump: $Path ($($Listed.SizeBytes) bytes, as collection_manifest.csv lists for this collection's dump). $(Get-MemoryDumpHashNote $Listed)"
+    return $true
+}
+
+# Memory dump for this collection: where the collector saved it
+# (collection_manifest.csv, Get-ManifestMemoryDump); by default the
+# collector saves it next to the zip and the collection folder
+# (<collection>_memory_dump.dmp / .raw, named after the folder, like the
+# zip) because it is too large to zip; with -NoCompress it stays in the
+# collection's Memory\ folder. DumpIt writes Microsoft crash dumps (.dmp);
+# WinPmem and Magnet RAM Capture write raw images (.raw). Returns the full
+# path or $null. A dump that is offered and then analyzed is looked for
+# twice, so each notice is logged once per run (Write-MemoryDumpNotice).
+function Find-MemoryDump {
+    $script:memoryDumpFromManifest = $false
+    $script:memoryDumpListedPath = ""
+
+    # Check 1: -MemoryDumpPath. A path that is not a file is reported once,
+    # and the other places are tried.
+    if ($MemoryDumpPath) {
+        $dumpItem = $null
+        try { $dumpItem = Get-Item -LiteralPath $MemoryDumpPath -Force -ErrorAction Stop }
+        catch { Write-Verbose "-MemoryDumpPath ${MemoryDumpPath}: $($_.Exception.Message)" }
+        if ($dumpItem -is [System.IO.FileInfo]) { return $dumpItem.FullName }
+        if (-not $script:memoryDumpPathWarned) {
+            Log-Warning "-MemoryDumpPath is not an existing file: $MemoryDumpPath -- looking for the memory dump where the collector saved it and in and next to the collection instead."
+            $script:memoryDumpPathWarned = $true
+        }
+    }
+
+    # Check 2: where the collector saved it, by collection_manifest.csv,
+    # also on a drive with another letter now. Not there (outside the
+    # collection): moved, deleted, its drive not connected, or this is
+    # another machine; the other places are tried. A file of another size
+    # is not the dump the collector saved (e.g. a copy cut short): it is
+    # not used, here or by the checks below, which check the size of the
+    # dumps they find as well (Test-MemoryDumpCandidate).
+    $listed = Get-ManifestMemoryDump
+    $notThis = ""
+    switch ($listed.Status) {
+        "Found" {
+            $where = "Memory dump where the collector saved it (collection_manifest.csv)"
+            if ($listed.ListedPath) { $where = "Memory dump where the collector saved it, on a drive with another letter now (collection_manifest.csv lists $($listed.ListedPath))" }
+            Write-MemoryDumpNotice "${where}: $($listed.Path) ($($listed.SizeBytes) bytes, as listed). $(Get-MemoryDumpHashNote $listed)"
+            $script:memoryDumpFromManifest = $true
+            $script:memoryDumpListedPath = $listed.ListedPath
+            return $listed.Path
+        }
+        "Missing" {
+            if (-not $listed.InCollection) {
+                $otherDrives = ""
+                if ($listed.OtherDrives) { $otherDrives = ", nor at that path on another drive" }
+                Write-MemoryDumpNotice "The collector saved the memory dump to $($listed.Path) (collection_manifest.csv); it is not there now$otherDrives (moved, deleted, its drive not connected, or this is another machine). Looking in and next to the collection instead."
+            }
+        }
+        "SizeMismatch" {
+            Write-MemoryDumpNotice -Warning "Memory dump not used: $($listed.Path) is $($listed.Reason) (a copy cut short?)."
+            $notThis = $listed.Path
+        }
+        "Refused" {
+            Write-MemoryDumpNotice -Warning "Memory dump in collection_manifest.csv not used: $($listed.Path) is $($listed.Reason)."
+        }
+    }
+
+    # Check 3: Sibling of the selected zip (browse mode, or a zip as -InputPath)
+    foreach ($siblingDump in @(Get-MemoryDumpSiblingPaths -Zip)) {
+        if ((Test-Path -LiteralPath $siblingDump) -and (Test-MemoryDumpCandidate -Path $siblingDump -Listed $listed -NotThis $notThis)) { return $siblingDump }
+    }
+
+    # Check 4: Inside the collection directory (uncompressed collections)
+    $memFiles = @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("memory_dump.dmp", "memory_dump.raw", "memdump.raw", "memory.raw", "physmem.raw"))
+    foreach ($memFile in $memFiles) {
+        if (Test-MemoryDumpCandidate -Path $memFile.FullName -Listed $listed -NotThis $notThis) { return $memFile.FullName }
+    }
+
+    # Check 5: Next to the collection folder and next to -InputPath, by the
+    # collection folder's name only (Get-MemoryDumpSiblingPaths)
+    foreach ($namedDump in @(Get-MemoryDumpSiblingPaths -Folder)) {
+        if ((Test-Path -LiteralPath $namedDump -PathType Leaf) -and (Test-MemoryDumpCandidate -Path $namedDump -Listed $listed -NotThis $notThis)) { return $namedDump }
     }
     return $null
 }
 
-# CPU architecture of a Microsoft crash dump from its header ("PAGEDU64":
-# machine type at 0x30; "PAGEDUMP": 32-bit x86). "Raw" for raw images,
-# "Unknown" if the header can't be read.
-function Get-MemoryDumpArchitecture {
+# What to say when Find-MemoryDump found no dump to use. Note: what
+# collection_manifest.csv lists. Remedy: how to have the dump analyzed,
+# which works from Run-TimelineBuilder.bat too (it cannot pass
+# -MemoryDumpPath): copy the dump where Find-MemoryDump looks, next to the
+# collection zip (else next to the collection folder) under its name, or
+# connect the drive the collector saved it to.
+function Get-MemoryDumpNotFoundText {
+    param([object]$Listed)
+    $extension = $Listed.Extension
+    if (-not $extension) { $extension = ".dmp" }
+    $targets = @(Get-MemoryDumpSiblingPaths -Zip)
+    if ($targets.Count -eq 0) { $targets = @(Get-MemoryDumpSiblingPaths -Folder) }
+    $target = @($targets | Where-Object { $_.EndsWith("_memory_dump$extension", [System.StringComparison]::OrdinalIgnoreCase) }) | Select-Object -First 1
+    $remedy = "copy the dump next to the collection zip or folder as <collection folder name>_memory_dump$extension"
+    if ($target) { $remedy = "copy the dump to $target" }
+    if (-not $Listed.Extension) { $remedy += " (_memory_dump.raw for a raw image)" }
+    elseif ($Listed.SizeBytes) { $remedy += " (collection_manifest.csv lists $($Listed.SizeBytes) bytes)" }
+    $note = switch ($Listed.Status) {
+        "None" {
+            if ((Get-CollectionManifest).Path) { "collection_manifest.csv lists none (the collector saved no complete dump)" }
+            else { "there is no collection_manifest.csv that says where the collector saved one" }
+        }
+        "Missing" {
+            if ($Listed.InCollection) {
+                "collection_manifest.csv lists one in the collection ($($Listed.RelativePath)), which the collector moves next to the zip as $([System.IO.Path]::GetFileName((Get-CollectionRootFolder)))_memory_dump$($Listed.Extension) when it zips the collection"
+            }
+            else {
+                $otherDrives = ""
+                if ($Listed.OtherDrives) { $otherDrives = ", nor at that path on another drive" }
+                "the collector saved it to $($Listed.Path) (collection_manifest.csv), and it is not there now$otherDrives"
+            }
+        }
+        default { "collection_manifest.csv lists one at $($Listed.Path), which was not used (see the warning above)" }
+    }
+    if ($Listed.Status -eq "Missing" -and $Listed.OtherDrives) { $remedy = "connect the drive the collector saved it to, or $remedy" }
+    return [PSCustomObject]@{ Note = $note; Remedy = $remedy }
+}
+
+# The offer step found no dump: when collection_manifest.csv lists one,
+# say what became of it and how to have it analyzed. This is all a user of
+# Run-TimelineBuilder.bat sees of it (Memory is not in its -Sources, so
+# the Memory parser does not run), and the .bat cannot pass -MemoryDumpPath
+function Write-NoMemoryDumpToOffer {
+    $listed = Get-ManifestMemoryDump
+    if ($listed.Status -eq "None") { return }
+    $notFound = Get-MemoryDumpNotFoundText -Listed $listed
+    Log ""
+    Log "No memory dump to offer: $($notFound.Note)."
+    Log "  To have it analyzed, $($notFound.Remedy), then run the builder again."
+    Log ""
+}
+
+# A memory dump as the user is shown it: "<path in the collection> in the
+# collection" when it is inside the collection folder (for a zip, in the
+# work folder), else its full path (next to the zip, on another drive, ...)
+function Get-MemoryDumpDisplayName {
     param([string]$Path)
-    $header = New-Object byte[] 0x40
+    $root = Get-CollectionRootFolder
+    if ($Path.StartsWith($root + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        return "$($Path.Substring($root.Length + 1)) in the collection"
+    }
+    return $Path
+}
+
+# What the header of a memory dump says, read once:
+# - Architecture: of a Microsoft crash dump ("PAGEDU64": machine type at
+#   0x30; "PAGEDUMP": 32-bit x86); "Raw" for raw images, "Unknown" if the
+#   header can't be read.
+# - CaptureTimeUtc: when the memory was captured. 64-bit crash dumps store
+#   it as DUMP_HEADER64.SystemTime at 0xFA8 (DumpIt: the start of the
+#   acquisition). Raw images, 32-bit dumps and a header time that is zero,
+#   before 1980 or more than a day after the file's last write fall back to
+#   the file's last-write time. TimeSource says which one it is.
+# - LastWriteUtc: the file's last-write time, the end of the acquisition.
+# The file is opened read-only, also while another program has it open.
+function Get-MemoryDumpInfo {
+    param([string]$Path)
+    $info = [PSCustomObject]@{ Architecture = "Unknown"; CaptureTimeUtc = $null; TimeSource = ""; LastWriteUtc = $null }
+    $header = New-Object byte[] 0xFB0
+    $read = 0
     try {
-        $stream = [System.IO.File]::OpenRead($Path)
-        try { $read = $stream.Read($header, 0, $header.Length) } finally { $stream.Dispose() }
+        $file = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        $info.LastWriteUtc = $file.LastWriteTimeUtc
+        $info.CaptureTimeUtc = $file.LastWriteTimeUtc
+        $info.TimeSource = "dump file last-write time"
+        $stream = New-Object System.IO.FileStream($file.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try {
+            while ($read -lt $header.Length) {
+                $count = $stream.Read($header, $read, $header.Length - $read)
+                if ($count -le 0) { break }
+                $read += $count
+            }
+        }
+        finally { $stream.Dispose() }
     }
     catch {
         Write-Verbose "Could not read memory dump header of ${Path}: $($_.Exception.Message)"
-        return "Unknown"
+        return $info
     }
-    if ($read -lt $header.Length) { return "Unknown" }
+    if ($read -lt 0x40) { return $info }
     $signature = [System.Text.Encoding]::ASCII.GetString($header, 0, 8)
-    if ($signature -eq "PAGEDUMP") { return "x86" }
-    if ($signature -ne "PAGEDU64") { return "Raw" }
+    if ($signature -eq "PAGEDUMP") { $info.Architecture = "x86"; return $info }
+    if ($signature -ne "PAGEDU64") { $info.Architecture = "Raw"; return $info }
     switch ([BitConverter]::ToUInt32($header, 0x30)) {
-        0x8664 { return "x64" }
-        0xAA64 { return "ARM64" }
-        default { return "Unknown" }
+        0x8664 { $info.Architecture = "x64" }
+        0xAA64 { $info.Architecture = "ARM64" }
     }
+    if ($read -lt 0xFB0) { return $info }
+    $fileTime = [BitConverter]::ToInt64($header, 0xFA8)
+    if ($fileTime -le 0 -or $fileTime -gt [datetime]::MaxValue.ToFileTimeUtc()) { return $info }
+    $systemTime = [datetime]::FromFileTimeUtc($fileTime)
+    if ($systemTime.Year -ge 1980 -and $systemTime -le $info.LastWriteUtc.AddDays(1)) {
+        $info.CaptureTimeUtc = $systemTime
+        $info.TimeSource = "crash dump header"
+    }
+    return $info
+}
+
+# Runs one Volatility 3 plugin on the dump with JSON output. The JSON goes
+# to a file in the work folder's scratch folder and is read back; the file
+# is deleted again. stderr is kept in memory: a 2> redirection cannot write
+# to a path with [ ] in it (-WorkDir may have them), and its lines must not
+# stop the run (Windows PowerShell makes them errors). Returns Json (the
+# output, "" for none) and Errors (the stderr lines).
+function Invoke-VolatilityPlugin {
+    param([string]$VolExe, [string]$DumpPath, [string]$Plugin)
+    $ErrorActionPreference = "Continue"
+    $jsonFile = Join-Path (Get-ScratchFolder) "vol3_$($Plugin -replace '\.','_')_$(Get-Random).json"
+    $errorLines = New-Object System.Collections.Generic.List[string]
+    try {
+        & $VolExe -f $DumpPath -r json $Plugin 2>&1 | ForEach-Object {
+            if ($_ -is [System.Management.Automation.ErrorRecord]) { $errorLines.Add("$_") } else { $_ }
+        } | Out-File -LiteralPath $jsonFile -Encoding utf8
+        $json = ""
+        if (Test-Path -LiteralPath $jsonFile) { $json = [System.IO.File]::ReadAllText($jsonFile) }
+        return [PSCustomObject]@{ Json = $json; Errors = ($errorLines -join "`n") }
+    }
+    finally { Remove-Item -LiteralPath $jsonFile -Force -ErrorAction SilentlyContinue }
+}
+
+# Own time of a Volatility entry (pslist CreateTime, netscan Created): text,
+# or a [datetime] where PowerShell 7's ConvertFrom-Json made one. TimeUtc is
+# set when the time is valid, from 1980 up to -LatestUtc. Text is a time
+# that is there but not used: in UTC as yyyy-MM-dd HH:mm:ss.fff when it
+# parses (the same in both PowerShell versions), else as found.
+function Get-MemoryEntryTime {
+    param($Value, [datetime]$LatestUtc)
+    $result = [PSCustomObject]@{ TimeUtc = $null; Text = "" }
+    $raw = "$Value".Trim()
+    if ($raw -eq "" -or $raw -eq "N/A") { return $result }
+    $time = ConvertFrom-UtcText $Value
+    if ($null -eq $time) { $result.Text = $raw }
+    elseif ($time.Year -lt 1980 -or $time -gt $LatestUtc) {
+        $result.Text = $time.ToString("yyyy-MM-dd HH:mm:ss.fff", [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    else { $result.TimeUtc = $time }
+    return $result
+}
+
+# A number of a Volatility 3 entry (PID, PPID, Threads, SessionId, a port)
+# as text for a row: "" when it is absent (null, empty or N/A). 0 is a
+# value and is kept: PID 0, PPID 0 (System), SessionId 0 (services),
+# Threads 0 (a process that has exited), port 0.
+function Get-MemoryFieldText {
+    param($Value)
+    $text = "$Value".Trim()
+    if ($text -eq "N/A") { return "" }
+    return $text
+}
+
+# Timeline rows for the entries of one Volatility 3 plugin (its JSON output
+# through ConvertFrom-Json). Every row starts as a Snapshot row at the
+# dump's capture time and is an event only when its entry has a valid time
+# of its own (Get-MemoryEntryTime, up to a day after the end of the
+# acquisition):
+# - pslist: CreateTime -> ProcessCreation at that time
+# - netscan: Created -> NetworkConnection at that time
+# - cmdline, svcscan: always Snapshot. A command line is read from the
+#   process's own memory, which the process can change, and a service
+#   record is the service's state; neither says when something happened.
+# A time that is there but not valid is kept in Details (CreateTime=,
+# Created=). Returns the row counts: Entries, Timed and Snapshot.
+function Add-MemoryPluginRows {
+    param(
+        [string]$Plugin,
+        [string]$Source,
+        [object[]]$Entries,
+        [datetime]$CaptureTimeUtc,
+        [datetime]$AcquisitionEndUtc,
+        [string]$DumpPath
+    )
+    $latestUtc = $AcquisitionEndUtc.AddDays(1)
+    $timed = 0
+    $snapshot = 0
+
+    foreach ($entry in $Entries) {
+        $ts = $CaptureTimeUtc
+        $eventType = "Snapshot"
+
+        # The counters are inside each branch: "continue" in a switch only
+        # leaves the switch, so a counter after it would count skipped entries
+        switch ($Plugin) {
+            "windows.pslist" {
+                $created = Get-MemoryEntryTime -Value $entry.CreateTime -LatestUtc $latestUtc
+                $procId = Get-MemoryFieldText $entry.PID
+                $ppid = Get-MemoryFieldText $entry.PPID
+                $name = if ($entry.ImageFileName) { $entry.ImageFileName } else { "Unknown" }
+                $threads = Get-MemoryFieldText $entry.Threads
+                $session = Get-MemoryFieldText $entry.SessionId
+                $details = "Threads=$threads SessionId=$session"
+                if ($null -ne $created.TimeUtc) {
+                    $ts = $created.TimeUtc
+                    $eventType = "ProcessCreation"
+                    $timed++
+                }
+                else {
+                    if ($created.Text) { $details += " CreateTime=$($created.Text)" }
+                    $snapshot++
+                }
+
+                Add-TimelineEntry -Timestamp $ts -Source $Source -EventType $eventType `
+                    -Description "Process in memory: $name (PID: $procId, PPID: $ppid)" `
+                    -Details $details `
+                    -Artifact "MemoryDump" -RawPath $DumpPath
+            }
+            "windows.netscan" {
+                $created = Get-MemoryEntryTime -Value $entry.Created -LatestUtc $latestUtc
+                $proto = if ($entry.Proto) { $entry.Proto } else { "" }
+                $localAddr = if ($entry.LocalAddr) { "$($entry.LocalAddr):$(Get-MemoryFieldText $entry.LocalPort)" } else { "" }
+                $foreignAddr = if ($entry.ForeignAddr) { "$($entry.ForeignAddr):$(Get-MemoryFieldText $entry.ForeignPort)" } else { "" }
+                $state = if ($entry.State) { $entry.State } else { "" }
+                $procId = Get-MemoryFieldText $entry.PID
+                # Owner is the process that owns the socket, not an account
+                $details = "PID=$procId"
+                if ($entry.Owner) { $details += " Process=$($entry.Owner)" }
+                if ($null -ne $created.TimeUtc) {
+                    $ts = $created.TimeUtc
+                    $eventType = "NetworkConnection"
+                    $timed++
+                }
+                else {
+                    if ($created.Text) { $details += " Created=$($created.Text)" }
+                    $snapshot++
+                }
+
+                Add-TimelineEntry -Timestamp $ts -Source $Source -EventType $eventType `
+                    -Description "Memory network: $proto $localAddr -> $foreignAddr ($state)" `
+                    -Details $details `
+                    -Artifact "MemoryDump" -RawPath $DumpPath
+            }
+            "windows.cmdline" {
+                $procId = Get-MemoryFieldText $entry.PID
+                $procName = if ($entry.Process) { $entry.Process } else { "" }
+                $cmdArgs = if ($entry.Args) { $entry.Args } else { "" }
+                if (-not $cmdArgs -or $cmdArgs -eq "N/A") { continue }
+
+                Add-TimelineEntry -Timestamp $ts -Source $Source -EventType $eventType `
+                    -Description "Process command line: $procName (PID: $procId)" `
+                    -Details "Args=$cmdArgs" `
+                    -Artifact "MemoryDump" -RawPath $DumpPath
+                $snapshot++
+            }
+            "windows.svcscan" {
+                $svcName = if ($entry.Name) { $entry.Name } else { "" }
+                $display = if ($entry.Display) { $entry.Display } else { $svcName }
+                $binary = if ($entry.Binary) { $entry.Binary } else { "" }
+                $state = if ($entry.State) { $entry.State } else { "" }
+                $start = if ($entry.Start) { $entry.Start } else { "" }
+                $procId = Get-MemoryFieldText $entry.PID
+
+                Add-TimelineEntry -Timestamp $ts -Source $Source -EventType $eventType `
+                    -Description "Service in memory: $display ($svcName)" `
+                    -Details "State=$state StartType=$start Binary=$binary PID=$procId" `
+                    -Artifact "MemoryDump" -RawPath $DumpPath
+                $snapshot++
+            }
+        }
+    }
+    return [PSCustomObject]@{ Entries = $timed + $snapshot; Timed = $timed; Snapshot = $snapshot }
+}
+
+# Volatility 3 next to the builder (tools\volatility3\, tools\ or the
+# builder's folder). Returns the full path or $null. A function of its own
+# so a test can put a stub in its place.
+function Find-VolatilityExe {
+    $volLocations = @(
+        (Join-Path $PSScriptRoot "tools\volatility3\vol.exe"),
+        (Join-Path $PSScriptRoot "tools\volatility3\volatility3.exe"),
+        (Join-Path $PSScriptRoot "tools\vol.exe"),
+        (Join-Path $PSScriptRoot "vol.exe")
+    )
+    foreach ($loc in $volLocations) {
+        if (Test-Path $loc) { return $loc }
+    }
+    return $null
 }
 
 function Parse-Memory {
@@ -14751,15 +16773,20 @@ function Parse-Memory {
     $dumpPath = Find-MemoryDump
 
     if (-not $dumpPath) {
-        Log-Warning "No memory dump found in collection or alongside zip."
+        # What collection_manifest.csv said, and how to have the dump found
+        $notFound = Get-MemoryDumpNotFoundText -Listed (Get-ManifestMemoryDump)
+        Log-Warning "No memory dump found in or next to the collection; $($notFound.Note). To have it analyzed, $($notFound.Remedy), or pass the file as -MemoryDumpPath."
         Log "  Memory parsing complete."
         Log ""
         return
     }
 
     $dumpSizeGB = [math]::Round((Get-Item -LiteralPath $dumpPath).Length / 1GB, 2)
-    $dumpArch = Get-MemoryDumpArchitecture -Path $dumpPath
+    $dumpInfo = Get-MemoryDumpInfo -Path $dumpPath
+    $dumpArch = $dumpInfo.Architecture
     Log "  Found memory dump: $dumpPath ($dumpSizeGB GB, $dumpArch)"
+    # The time of the Snapshot rows (entries without a valid time of their own)
+    Log "  Dump time: $($dumpInfo.CaptureTimeUtc.ToString('yyyy-MM-dd HH:mm:ss.fff', [System.Globalization.CultureInfo]::InvariantCulture)) UTC ($($dumpInfo.TimeSource))"
 
     # Volatility 3's Windows support is for Intel x86/x64 memory only
     if ($dumpArch -eq "ARM64") {
@@ -14772,16 +16799,7 @@ function Parse-Memory {
     Log "  Analyzing in-place (not copied to temp)"
 
     # --- Find Volatility 3 ---
-    $volExe = $null
-    $volLocations = @(
-        (Join-Path $PSScriptRoot "tools\volatility3\vol.exe"),
-        (Join-Path $PSScriptRoot "tools\volatility3\volatility3.exe"),
-        (Join-Path $PSScriptRoot "tools\vol.exe"),
-        (Join-Path $PSScriptRoot "vol.exe")
-    )
-    foreach ($loc in $volLocations) {
-        if (Test-Path $loc) { $volExe = $loc; break }
-    }
+    $volExe = Find-VolatilityExe
 
     if (-not $volExe) {
         Log-Warning "  Volatility 3 not found in tools\ directory."
@@ -14800,118 +16818,42 @@ function Parse-Memory {
     Log "  Using Volatility 3: $volExe"
 
     # --- Define plugins to run ---
+    # The EventType of each row depends on the entry (Add-MemoryPluginRows)
     $plugins = @(
-        @{ Name = "windows.pslist";  EventType = "ProcessCreation";   Source = "Memory-Processes";   Desc = "Running processes" },
-        @{ Name = "windows.netscan"; EventType = "NetworkConnection"; Source = "Memory-Network";     Desc = "Network connections" },
-        @{ Name = "windows.cmdline"; EventType = "Execution";         Source = "Memory-CommandLine"; Desc = "Process command lines" },
-        @{ Name = "windows.svcscan"; EventType = "ServiceChange";     Source = "Memory-Services";    Desc = "Windows services" }
+        @{ Name = "windows.pslist";  Source = "Memory-Processes";   Desc = "Running processes" },
+        @{ Name = "windows.netscan"; Source = "Memory-Network";     Desc = "Network connections" },
+        @{ Name = "windows.cmdline"; Source = "Memory-CommandLine"; Desc = "Process command lines" },
+        @{ Name = "windows.svcscan"; Source = "Memory-Services";    Desc = "Windows services" }
     )
 
-    $dumpTimestamp = (Get-Item $dumpPath).LastWriteTimeUtc
     $totalMemEntries = 0
 
     foreach ($plugin in $plugins) {
         $pluginTimer = [System.Diagnostics.Stopwatch]::StartNew()
         Log "  Running $($plugin.Name) ($($plugin.Desc))..."
 
-        $jsonFile = Join-Path $env:TEMP "vol3_$($plugin.Name -replace '\.','_')_$(Get-Random).json"
-        $errFile = Join-Path $env:TEMP "vol3_$($plugin.Name -replace '\.','_')_err.txt"
-
         try {
             # Run Volatility 3 with JSON output
-            & $volExe -f $dumpPath -r json $plugin.Name 2>$errFile | Out-File $jsonFile -Encoding utf8
+            $volResult = Invoke-VolatilityPlugin -VolExe $volExe -DumpPath $dumpPath -Plugin $plugin.Name
 
-            if (-not (Test-Path $jsonFile) -or (Get-Item $jsonFile).Length -eq 0) {
-                $errContent = if (Test-Path $errFile) { Get-Content $errFile -Raw } else { "No output" }
+            if (-not $volResult.Json.Trim()) {
+                $errContent = if ($volResult.Errors) { $volResult.Errors } else { "No output" }
                 Log-Warning "    $($plugin.Name) produced no output. Error: $($errContent.Substring(0, [Math]::Min(200, $errContent.Length)))"
                 continue
             }
 
-            $jsonContent = Get-Content $jsonFile -Raw -ErrorAction Stop
-            $entries = $jsonContent | ConvertFrom-Json -ErrorAction Stop
-            $pluginCount = 0
-
-            foreach ($entry in $entries) {
-                $ts = $dumpTimestamp  # default timestamp
-
-                switch ($plugin.Name) {
-                    "windows.pslist" {
-                        # Parse CreateTime if available
-                        if ($entry.CreateTime -and $entry.CreateTime -ne "N/A" -and $entry.CreateTime -notmatch "^0") {
-                            try { $ts = [datetime]::Parse($entry.CreateTime) }
-                            catch { Write-Verbose "Could not parse CreateTime '$($entry.CreateTime)', using dump time: $($_.Exception.Message)" }
-                        }
-                        $procId = if ($entry.PID) { $entry.PID } else { "" }
-                        $ppid = if ($entry.PPID) { $entry.PPID } else { "" }
-                        $name = if ($entry.ImageFileName) { $entry.ImageFileName } else { "Unknown" }
-                        $threads = if ($entry.Threads) { $entry.Threads } else { "" }
-                        $session = if ($entry.SessionId) { $entry.SessionId } else { "" }
-
-                        Add-TimelineEntry -Timestamp $ts -Source $plugin.Source -EventType $plugin.EventType `
-                            -Description "Process in memory: $name (PID: $procId, PPID: $ppid)" `
-                            -Details "Threads=$threads SessionId=$session" `
-                            -Artifact "MemoryDump" -RawPath $dumpPath
-                        $pluginCount++
-                    }
-                    "windows.netscan" {
-                        if ($entry.Created -and $entry.Created -ne "N/A" -and $entry.Created -notmatch "^0") {
-                            try { $ts = [datetime]::Parse($entry.Created) }
-                            catch { Write-Verbose "Could not parse Created '$($entry.Created)', using dump time: $($_.Exception.Message)" }
-                        }
-                        $proto = if ($entry.Proto) { $entry.Proto } else { "" }
-                        $localAddr = if ($entry.LocalAddr) { "$($entry.LocalAddr):$($entry.LocalPort)" } else { "" }
-                        $foreignAddr = if ($entry.ForeignAddr) { "$($entry.ForeignAddr):$($entry.ForeignPort)" } else { "" }
-                        $state = if ($entry.State) { $entry.State } else { "" }
-                        $procId = if ($entry.PID) { $entry.PID } else { "" }
-                        $owner = if ($entry.Owner) { $entry.Owner } else { "" }
-
-                        Add-TimelineEntry -Timestamp $ts -Source $plugin.Source -EventType $plugin.EventType `
-                            -Description "Memory network: $proto $localAddr -> $foreignAddr ($state)" `
-                            -User $owner -Details "PID=$procId" `
-                            -Artifact "MemoryDump" -RawPath $dumpPath
-                        $pluginCount++
-                    }
-                    "windows.cmdline" {
-                        $procId = if ($entry.PID) { $entry.PID } else { "" }
-                        $procName = if ($entry.Process) { $entry.Process } else { "" }
-                        $cmdArgs = if ($entry.Args) { $entry.Args } else { "" }
-                        if (-not $cmdArgs -or $cmdArgs -eq "N/A") { continue }
-
-                        Add-TimelineEntry -Timestamp $ts -Source $plugin.Source -EventType $plugin.EventType `
-                            -Description "Process command line: $procName (PID: $procId)" `
-                            -Details "Args=$cmdArgs" `
-                            -Artifact "MemoryDump" -RawPath $dumpPath
-                        $pluginCount++
-                    }
-                    "windows.svcscan" {
-                        $svcName = if ($entry.Name) { $entry.Name } else { "" }
-                        $display = if ($entry.Display) { $entry.Display } else { $svcName }
-                        $binary = if ($entry.Binary) { $entry.Binary } else { "" }
-                        $state = if ($entry.State) { $entry.State } else { "" }
-                        $start = if ($entry.Start) { $entry.Start } else { "" }
-                        $procId = if ($entry.PID) { $entry.PID } else { "" }
-
-                        Add-TimelineEntry -Timestamp $ts -Source $plugin.Source -EventType $plugin.EventType `
-                            -Description "Service in memory: $display ($svcName)" `
-                            -Details "State=$state StartType=$start Binary=$binary PID=$procId" `
-                            -Artifact "MemoryDump" -RawPath $dumpPath
-                        $pluginCount++
-                    }
-                }
-            }
+            $entries = $volResult.Json | ConvertFrom-Json -ErrorAction Stop
+            $rowCounts = Add-MemoryPluginRows -Plugin $plugin.Name -Source $plugin.Source -Entries $entries `
+                -CaptureTimeUtc $dumpInfo.CaptureTimeUtc -AcquisitionEndUtc $dumpInfo.LastWriteUtc -DumpPath $dumpPath
 
             $pluginTimer.Stop()
             $elapsed = [math]::Round($pluginTimer.Elapsed.TotalSeconds, 1)
-            Log "    $($plugin.Name): $pluginCount entries ($elapsed seconds)"
-            $totalMemEntries += $pluginCount
+            Log "    $($plugin.Name): $($rowCounts.Entries) entries ($($rowCounts.Timed) timed, $($rowCounts.Snapshot) snapshot) in $elapsed seconds"
+            $totalMemEntries += $rowCounts.Entries
             $memParsed = $true
         }
         catch {
             Log-Warning "    $($plugin.Name) failed: $($_.Exception.Message)"
-        }
-        finally {
-            Remove-Item $jsonFile -Force -ErrorAction SilentlyContinue
-            Remove-Item $errFile -Force -ErrorAction SilentlyContinue
         }
     }
 
@@ -16113,10 +18055,15 @@ function Parse-AntiVirus {
 if ($Sources -notcontains "Memory") {
     # Check if a memory dump exists alongside the collection
     $detectedDump = Find-MemoryDump
-    if ($detectedDump -and (Get-MemoryDumpArchitecture -Path $detectedDump) -eq "ARM64") {
+    if (-not $detectedDump) {
+        # Nothing to offer: what became of a dump collection_manifest.csv
+        # lists, and how to have it analyzed
+        Write-NoMemoryDumpToOffer
+    }
+    elseif ((Get-MemoryDumpInfo -Path $detectedDump).Architecture -eq "ARM64") {
         # Volatility 3 cannot analyze Windows ARM64 memory: don't offer it
         Log ""
-        Log "Memory dump detected: $(Split-Path $detectedDump -Leaf) (Windows ARM64)."
+        Log "Memory dump detected: $(Get-MemoryDumpDisplayName $detectedDump) (Windows ARM64)."
         Log "  Volatility 3 cannot analyze Windows ARM64 memory, so it is not offered."
         Log "  Open the .dmp file in WinDbg to examine it manually."
         Log ""
@@ -16136,13 +18083,19 @@ if ($Sources -notcontains "Memory") {
         }
 
         if ($volAvailable) {
-            $dumpSizeGB = [math]::Round((Get-Item $detectedDump).Length / 1GB, 2)
+            $dumpSizeGB = [math]::Round((Get-Item -LiteralPath $detectedDump).Length / 1GB, 2)
             Write-Host ""
             Write-Host "========================================" -ForegroundColor Cyan
             Write-Host "  Memory Dump Detected" -ForegroundColor Cyan
             Write-Host "========================================" -ForegroundColor Cyan
             Write-Host ""
-            Write-Host "  Found: $(Split-Path $detectedDump -Leaf) ($dumpSizeGB GB)" -ForegroundColor Green
+            Write-Host "  Found: $(Get-MemoryDumpDisplayName $detectedDump) ($dumpSizeGB GB)" -ForegroundColor Green
+            if ($script:memoryDumpListedPath) {
+                Write-Host "  (where the collector saved it, on a drive with another letter now:" -ForegroundColor Green
+                Write-Host "   collection_manifest.csv lists $($script:memoryDumpListedPath))" -ForegroundColor Green
+            } elseif ($script:memoryDumpFromManifest) {
+                Write-Host "  (where the collector saved it, as collection_manifest.csv says)" -ForegroundColor Green
+            }
             Write-Host "  Volatility 3 is available in tools\" -ForegroundColor Green
             Write-Host ""
             Write-Host "  Memory analysis extracts processes, network connections," -ForegroundColor White
@@ -16169,7 +18122,7 @@ if ($Sources -notcontains "Memory") {
             }
         } else {
             Log ""
-            Log "Memory dump detected but Volatility 3 not found in tools\ directory."
+            Log "Memory dump detected ($(Get-MemoryDumpDisplayName $detectedDump)) but Volatility 3 not found in tools\ directory."
             Log "  To enable memory analysis, place vol.exe in: $(Join-Path $PSScriptRoot 'tools\volatility3\')"
             Log "  Download from: https://github.com/volatilityfoundation/volatility3/releases"
             Log ""
@@ -16207,6 +18160,24 @@ if ($Sources -contains "SRUM")             { Parse-Srum }
 if ($Sources -contains "Memory")           { Parse-Memory }
 
 # =============================================================
+# Input files: a file deleted while the timeline was built (by a cleanup
+# tool or antivirus) left no error, only rows missing from the timeline.
+# List them; the run then ends with exit code 2. Checked once, after all
+# parsers: a file deleted after its parser read it has all its rows.
+# =============================================================
+$missingInputs = @(Get-MissingInputFiles)
+$script:missingInputCount = $missingInputs.Count
+if ($missingInputs.Count -gt 0) {
+    Log-Error "$($missingInputs.Count) of $($script:inputFiles.Count) input file(s) disappeared during the run -- rows from them may be missing from the timeline (not if a file was deleted after its parser read it):"
+    Write-MissingInputFiles -Files $missingInputs -BaseFolder $script:collectionRoot
+    Log ""
+}
+elseif ($script:inputFiles.Count -gt 0) {
+    Log "All $($script:inputFiles.Count) input file(s) were still present at the end of parsing."
+    Log ""
+}
+
+# =============================================================
 # Post-Processing: Deduplicate, Sort, Keyword Flag
 # =============================================================
 Log "--- Post-Processing Timeline ---"
@@ -16216,8 +18187,22 @@ Log "  Raw entries collected: $entryCount"
 
 if ($entryCount -eq 0) {
     Log-Warning "No timeline entries were collected. Check input path and selected sources."
-    Log "=== Timeline Builder Finished (no output generated) ==="
+    if (Write-RunEndBanner -NoOutput) { exit 2 }
     exit 0
+}
+
+# User column: one form per account (ConvertTo-TimelineUserName), with the
+# names gathered while parsing. Before deduplication, so rows are compared
+# in that form. The computer name the collector recorded is the examined
+# system's only in a live collection (a mounted image is collected on
+# another machine).
+if ((Get-CollectionInfo).Mode -eq "Live") { Add-TimelineMachineName (Get-CollectionInfo).ComputerName }
+$userPass = Update-TimelineUserColumn -Entries $script:timelineEntries -SidNames (Get-TimelineSidNames) -MachineNames @((Get-TimelineUserContext).MachineNames)
+Log "  User column: $($userPass.Rows) row(s) changed to one form per account ($($userPass.Transitions.Count) distinct value(s)); $($userPass.SidRows) row(s) whose SID got a name keep it in Details (UserSID=)"
+if ($userPass.Unresolved.Count -gt 0) {
+    $sidList = @($userPass.Unresolved | Select-Object -First 20 | ForEach-Object { "$($_.Sid) ($($_.Rows) row(s))" }) -join ", "
+    if ($userPass.Unresolved.Count -gt 20) { $sidList += ", and $($userPass.Unresolved.Count - 20) more" }
+    Log "  User column: $($userPass.Unresolved.Count) SID(s) not named by the sources read in this run (SOFTWARE ProfileList is read with -Sources Registry, bam_entries.csv with PowerShellHistory), left as they are: $sidList"
 }
 
 # Deduplicate: an entry is a duplicate only if Timestamp, Source, EventType,
@@ -16386,6 +18371,7 @@ if (-not $skipExcel -and (Get-Module -ListAvailable -Name ImportExcel)) {
             "SecurityAlert"       = "FF4D4D"   # Bright red (bold text)
             "NetworkConnection"   = "6BB5FF"   # Blue
             "FileAccess"          = "D9D9D9"   # Light gray
+            "FileLastModified"    = "E2C9A0"   # Tan (ShimCache file time, not an execution)
             "Snapshot"            = "F2F2F2"   # Very light gray (state, not an event)
             "ServiceChange"       = "FFFF00"   # Yellow
             "ScheduledTaskChange" = "FFFF00"   # Yellow
@@ -16515,11 +18501,12 @@ if (-not $skipExcel -and (Get-Module -ListAvailable -Name ImportExcel)) {
         Log "    Bright red   SecurityAlert        -- AV detections, security tampering (bold)"
         Log "    Blue         NetworkConnection    -- network activity, browser, DNS"
         Log "    Gray         FileAccess           -- file system activity"
+        Log "    Tan          FileLastModified     -- file last-modified time (ShimCache), not execution"
         Log "    Yellow       ServiceChange        -- service state changes"
         Log "    Yellow       ScheduledTaskChange  -- task scheduler changes"
         Log "    Purple       USBDevice            -- USB device connections"
-        Log "    Light Blue   Installation         -- application installs"
-        Log "    Light gray   Snapshot             -- state at collection time, not an event"
+        Log "    Light Blue   Installation         -- application, device and driver installs"
+        Log "    Light gray   Snapshot             -- state when collected or captured, not an event"
     }
     catch {
         Log-Warning "  Failed to generate Excel file: $($_.Exception.Message)"
@@ -16548,6 +18535,23 @@ if ($reportState) {
 # =============================================================
 # Summary Statistics
 # =============================================================
+
+# Rows per Artifact for "Events by artifact source". Pass the rows of the
+# finished timeline (after deduplication, as written to the CSV), so the
+# counts add up to the total. Returns Name/Count objects, the largest count
+# first and equal counts in name order.
+function Get-ArtifactRowCounts {
+    param([object[]]$Rows)
+    $counts = @{}
+    foreach ($row in $Rows) {
+        $artifact = [string]$row.Artifact
+        if ($counts.ContainsKey($artifact)) { $counts[$artifact]++ } else { $counts[$artifact] = 1 }
+    }
+    $counts.GetEnumerator() |
+        Sort-Object @{ Expression = "Value"; Descending = $true }, @{ Expression = "Key"; Descending = $false } |
+        ForEach-Object { [PSCustomObject]@{ Name = $_.Key; Count = $_.Value } }
+}
+
 $totalTimer.Stop()
 Log ""
 Log "============================================================="
@@ -16571,10 +18575,11 @@ Log "                   : $($latest.ToString('yyyy-MM-dd HH:mm:ss')) UTC"
 Log "  Span             : $(($latest - $earliest).Days) days"
 Log ""
 
-# Per-source breakdown
+# Per-source breakdown of the rows in the timeline: counted after
+# deduplication, so the counts add up to "Total events"
 Log "  Events by artifact source:"
-foreach ($artifact in ($script:artifactStats.GetEnumerator() | Sort-Object Value -Descending)) {
-    Log "    $($artifact.Key.PadRight(25)) : $($artifact.Value)"
+foreach ($artifact in (Get-ArtifactRowCounts -Rows $sorted)) {
+    Log "    $($artifact.Name.PadRight(25)) : $($artifact.Count)"
 }
 
 if ($Keywords -and $Keywords.Count -gt 0) {
@@ -16584,7 +18589,9 @@ if ($Keywords -and $Keywords.Count -gt 0) {
 
 Log ""
 Log "============================================================="
-Log "=== Timeline Builder Completed Successfully ==="
+# The exit code is decided here: an error while opening a viewer (below)
+# does not change it
+$timelineIncomplete = Write-RunEndBanner
 Log ""
 Log "============================================================="
 
@@ -16606,29 +18613,22 @@ Invoke-TimelineViewer -Choice $Viewer -CsvPath $OutputFile -XlsxPath $xlsxFile -
 
 Log "============================================================="
 
-# Cleanup: remove temp extraction directory from browse mode
-if ($script:browseExtractDir -and (Test-Path $script:browseExtractDir)) {
-    Log ""
-    Log "Cleaning up temp extraction: $($script:browseExtractDir)"
-    # Marker first: if the folder can't be fully removed, the next run re-extracts
-    Remove-Item -LiteralPath "$($script:browseExtractDir).complete" -Force -ErrorAction SilentlyContinue
-    # Give any lingering file handles time to release (e.g., reg unload)
-    [gc]::Collect()
-    [gc]::WaitForPendingFinalizers()
-    $cleaned = $false
-    for ($attempt = 1; $attempt -le 3; $attempt++) {
-        try {
-            Remove-Item -Path $script:browseExtractDir -Recurse -Force -ErrorAction Stop
-            Log "  Temp folder removed."
-            $cleaned = $true
-            break
-        }
-        catch {
-            if ($attempt -lt 3) { Start-Sleep -Seconds 2 }
-        }
+# Exit code 2: the timeline was written, but input files went missing or
+# an unexpected error skipped part of a step
+if ($timelineIncomplete) { exit 2 }
+
+# End of the main try block that starts after the "Started" log lines (the
+# body in between is intentionally not re-indented). The finally block runs
+# on normal completion, on exit, on Ctrl+C and on terminating errors.
+}
+finally {
+    try {
+        # Hives first: their scratch copies are in the work folder
+        Dismount-RunHives
+        Remove-RunWorkFolder
     }
-    if (-not $cleaned) {
-        Log-Warning "  Could not remove temp folder (file in use)."
-        Log-Warning "  You can manually delete: $($script:browseExtractDir)"
+    finally {
+        # Last, so a click cannot pause the clean-up either
+        Restore-ConsoleMode $script:consoleModeToRestore
     }
 }
