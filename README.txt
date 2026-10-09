@@ -1700,8 +1700,9 @@ parsing is skipped, and the timeline CSV can be opened manually.
   which source Parse-USB uses (mounted_devices.csv with rows first, then
   the SYSTEM hive, also after an empty CSV, then the .txt; the hive is
   unloaded also after a read error; no rows from the decoded .txt of newer
-  collectors). No admin needed: stubs stand in for loading and reading
-  the hive; reading a real SYSTEM hive is covered by
+  collectors; no CSV or SYSTEM hive read from the Secrets\ folder or the
+  email attachment copies). No admin needed: stubs stand in for loading
+  and reading the hive; reading a real SYSTEM hive is covered by
   Test-RegistryParsers.ps1.
 
   Run them from an elevated PowerShell; -AllowSystemChanges lets the event
