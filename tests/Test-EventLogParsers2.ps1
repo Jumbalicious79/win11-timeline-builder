@@ -583,26 +583,28 @@ Test-Case -Name "Shell-Core 9705-9708, 62170 / 62171: Run / RunOnce and Active S
 
 # --- OAlerts ---
 $longAlert = "Microsoft Word has blocked macros. " + ("y" * 1100)
-Test-Case -Name "OAlerts 300: Office alerts and add-in events (diagnostic events counted)" -Action {
+$bob = "S-1-5-21-1111-2222-3333-1002"
+Test-Case -Name "OAlerts 300: Office alerts and add-in events with the record's account (diagnostic events counted)" -Action {
     $records = @(
-        (New-TestRecord -Provider "Microsoft Office 16 Alerts" -Id 300 -Time "2026-02-08 09:00:00" -Body (New-EventDataXml -Data @("Microsoft Word`n", "SECURITY WARNING  Macros have been disabled.`n", "200054`n", "16.0.19231.20156`n", "0x0`n", "invoice.docm`n"))),
+        (New-TestRecord -Provider "Microsoft Office 16 Alerts" -Id 300 -Time "2026-02-08 09:00:00" -UserSid $alice -Body (New-EventDataXml -Data @("Microsoft Word`n", "SECURITY WARNING  Macros have been disabled.`n", "200054`n", "16.0.19231.20156`n", "0x0`n", "invoice.docm`n"))),
         (New-TestRecord -Provider "Microsoft Office 16 Alerts" -Id 300 -Time "2026-02-08 09:01:00" -Body (New-EventDataXml -Data @("Compositor Type: 1", "EXCEL"))),
-        (New-TestRecord -Provider "Microsoft Office 16 Alerts" -Id 300 -Time "2026-02-08 09:02:00" -Level 2 -Body (New-EventDataXml -Data @("Microsoft Word", $longAlert, "100", "16.0.1", "", ""))),
-        # Office add-in events, laid out like real ones
-        (New-TestRecord -Provider "Microsoft Office 16 Alerts" -Id 300 -Time "2026-02-08 09:03:00" -Body (New-EventDataXml -Data @("Activated App`n", "Id=fa000000124, DisplayName=Copilot (Preview), Provider=Microsoft Corporation, Version=1.0.0.0, StoreType=Exchange`n", "Apps for Office`n", "16.0.19231.20156`n", "`n", "C:\Users\bob\Documents\report.docx`n"))),
+        (New-TestRecord -Provider "Microsoft Office 16 Alerts" -Id 300 -Time "2026-02-08 09:02:00" -Level 2 -UserSid $alice -Body (New-EventDataXml -Data @("Microsoft Word", $longAlert, "100", "16.0.1", "", ""))),
+        # Office add-in events, laid out like real ones; the last has no
+        # UserID (a few real records have none)
+        (New-TestRecord -Provider "Microsoft Office 16 Alerts" -Id 300 -Time "2026-02-08 09:03:00" -UserSid $bob -Body (New-EventDataXml -Data @("Activated App`n", "Id=fa000000124, DisplayName=Copilot (Preview), Provider=Microsoft Corporation, Version=1.0.0.0, StoreType=Exchange`n", "Apps for Office`n", "16.0.19231.20156`n", "`n", "C:\Users\bob\Documents\report.docx`n"))),
         (New-TestRecord -Provider "Microsoft Office 16 Alerts" -Id 300 -Time "2026-02-08 09:04:00" -Body (New-EventDataXml -Data @("Failed to parse element: VersionOverrides", "Id=65ff8bd9-e8d3-4581-a27a-75840c41de94, DisplayName=Forms, Provider=Contoso", "Apps for Office", "16.0.19231.20156", "0x8004323E", "")))
     )
     $logBefore = Get-LogLineCount
     Add-OfficeAlertEntries -Records $records -FileName "OAlerts.evtx" -FilePath "X:\OAlerts.evtx"
     if (@(Get-NewLogLines $logBefore | Where-Object { $_ -match 'Skipped 1 event\(s\): Office diagnostics that are not alerts' }).Count -ne 1) { throw "no log line counting the diagnostic event" }
 } -Expected @(
-    @{ Timestamp = "2026-02-08 09:00:00.000"; Source = "OAlerts.evtx"; EventType = "Execution"; Description = "Office alert (Microsoft Word): SECURITY WARNING Macros have been disabled."; User = ""
-        Details = "EventID=300 | Application=Microsoft Word | Message=SECURITY WARNING Macros have been disabled. | P1=200054 | Version=16.0.19231.20156 | P3=0x0 | Document=invoice.docm"; Artifact = "EventLogs" },
-    @{ Description = "Office alert (Microsoft Word): " + $longAlert.Substring(0, 200) + "..."
-        Details = "EventID=300 | Application=Microsoft Word | Message=" + $longAlert.Substring(0, 1000) + "... | P1=100 | Version=16.0.1" },
-    @{ Timestamp = "2026-02-08 09:03:00.000"; EventType = "Execution"; Description = "Office add-in event (Activated App): Copilot (Preview)"
-        Details = "EventID=300 | Event=Activated App | AddIn=Id=fa000000124, DisplayName=Copilot (Preview), Provider=Microsoft Corporation, Version=1.0.0.0, StoreType=Exchange | Component=Apps for Office | Version=16.0.19231.20156 | Document=C:\Users\bob\Documents\report.docx" },
-    @{ Description = "Office add-in event (Failed to parse element: VersionOverrides): Forms"
+    @{ Timestamp = "2026-02-08 09:00:00.000"; Source = "OAlerts.evtx"; EventType = "Execution"; Description = "Office alert (Microsoft Word): SECURITY WARNING Macros have been disabled."; User = $alice
+        Details = "EventID=300 | Application=Microsoft Word | Message=SECURITY WARNING Macros have been disabled. | P1=200054 | Version=16.0.19231.20156 | P3=0x0 | Document=invoice.docm | UserSID=$alice"; Artifact = "EventLogs" },
+    @{ Description = "Office alert (Microsoft Word): " + $longAlert.Substring(0, 200) + "..."; User = $alice
+        Details = "EventID=300 | Application=Microsoft Word | Message=" + $longAlert.Substring(0, 1000) + "... | P1=100 | Version=16.0.1 | UserSID=$alice" },
+    @{ Timestamp = "2026-02-08 09:03:00.000"; EventType = "Execution"; Description = "Office add-in event (Activated App): Copilot (Preview)"; User = $bob
+        Details = "EventID=300 | Event=Activated App | AddIn=Id=fa000000124, DisplayName=Copilot (Preview), Provider=Microsoft Corporation, Version=1.0.0.0, StoreType=Exchange | Component=Apps for Office | Version=16.0.19231.20156 | Document=C:\Users\bob\Documents\report.docx | UserSID=$bob" },
+    @{ Description = "Office add-in event (Failed to parse element: VersionOverrides): Forms"; User = ""
         Details = "EventID=300 | Event=Failed to parse element: VersionOverrides | AddIn=Id=65ff8bd9-e8d3-4581-a27a-75840c41de94, DisplayName=Forms, Provider=Contoso | Component=Apps for Office | Version=16.0.19231.20156 | ErrorCode=0x8004323E" }
 )
 
