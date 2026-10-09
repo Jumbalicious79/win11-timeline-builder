@@ -145,8 +145,8 @@ themselves are never committed.
   are fine, and a relative path is turned into a full path first (the
   elevated window starts in C:\Windows\System32).
 
-  While the builder runs, QuickEdit is off in its console window, so a
-  click in the window cannot pause the run. (With QuickEdit on, a click
+  While the builder runs (also with -ReportOnly), QuickEdit is off in its
+  console window, so a click in the window cannot pause the run. (With QuickEdit on, a click
   starts a text selection, and every write to the window -- and with it
   the whole run, log file included -- waits until the selection ends.)
   The console's mouse input is turned off with it, so the mouse wheel
@@ -205,7 +205,10 @@ themselves are never committed.
   -InputPath      Path to a triage collection directory, a collection .zip
                   (extracted into the work folder, as in browse mode; a
                   memory dump next to it is found too), or any directory
-                  containing supported artifacts.
+                  containing supported artifacts. A collection directory
+                  whose path has [ ], * or ? in it is refused (exit code
+                  1): PowerShell reads them as wildcards, so its files
+                  would not be found. Rename it, or pass the .zip.
   -OutputFile     Output CSV path. Defaults to reports\timeline_<timestamp>\timeline.csv
   -StartDate      Only include events after this date (UTC).
   -EndDate        Only include events before this date (UTC).
@@ -252,7 +255,8 @@ themselves are never committed.
                   first). Logs to report_log.txt in that folder. -Viewer,
                   -NoExcel and -ReportRules apply; the parsing parameters
                   (-Sources, -StartDate, -EndDate, -Keywords, -MftDays,
-                  -MaxUsnEntries, -OutputFile) are ignored with a warning.
+                  -MaxUsnEntries, -OutputFile, -WorkDir, -MemoryDumpPath)
+                  are ignored with a warning.
                   Cannot be combined with -InputPath, -Browse or -NoReport.
                   Exit code 1 when no report could be made.
   -ReportRules    Rules file for the findings report (default:
@@ -272,7 +276,9 @@ themselves are never committed.
                   another local drive when the system drive is low on
                   space, and never a temp folder. A network share or mapped
                   network drive is refused (reg load cannot load hives
-                  from there).
+                  from there). For a .zip input, a work folder whose path
+                  has [ ], * or ? in it is refused at the start (exit code
+                  1): the parsers would not find the extracted files.
   -MemoryDumpPath The collection's memory dump file (a DumpIt .dmp or a
                   .raw image), for a dump the builder does not find or does
                   not use by itself: one moved to another folder after the
@@ -388,7 +394,13 @@ See "Findings Report".
   to the script is used. The log names the work folder. It must be on a
   local drive: reg load only loads a hive from a local file, so a network
   share (\\server\share) or a mapped network drive is not used, and with
-  such a -WorkDir the run stops at the start.
+  such a -WorkDir the run stops at the start. The run also stops at the
+  start (exit code 1, with an error naming the folder) when a zip is to be
+  extracted into a work folder whose path has [ ], * or ? in it, for
+  example -WorkDir "D:\Work [1]": the parsers find the collection's files
+  with PowerShell paths that read those characters as wildcards, so they
+  would find nothing there and the run would end without a timeline. The
+  same holds for a collection folder passed as -InputPath.
 
   Copied email attachments (Email\<user>\Outlook\SecureTemp\ and
   Email\<user>\NewOutlook\Attachments\) stay in the zip: no parser reads
@@ -438,6 +450,13 @@ See "Findings Report".
   In both cases the exit code is 2 instead of 0. Exit code 1 means the run
   stopped early (input not found, a bad zip, no work folder, files gone
   right after the extraction).
+
+  The findings report of such a run says so: "Timeline incomplete" comes
+  first in its Evidence coverage section, and the summary page's "What
+  this report can't tell you" box says how many input files disappeared
+  or how many unexpected errors were hit (report-model.json:
+  Coverage.TimelineCompleteness). -ReportOnly on that timeline later
+  reads the same from the run's timeline_builder_log.txt.
 
 
 ## Output Format (CSV and Excel)
@@ -550,7 +569,11 @@ gets it):
     MicrosoftAccount\..., AzureAD\..., the computer account
     (WORKGROUP\HOST$), NT SERVICE\..., NT VIRTUAL MACHINE\... and group
     names.
-  The log's "User column:" line says how many rows changed.
+  The log's "User column:" line says how many rows changed. The findings
+  report counts rows per account in these forms (Rows per user, User
+  accounts), so CORP\alice and a local alice stay two accounts; when SIDs
+  were left without a name, its Evidence coverage notes say that an
+  account can be listed under its SID.
 
   The machine and SID names are read, with no extra hive loads, only by
   the sources that open those files: ProfileList by Registry (and by
@@ -632,7 +655,10 @@ is logged as a warning; the timeline is never affected.
 
 On a 286,000-row timeline the rules take about 4 seconds; with the
 workbook's Findings sheet, the HTML and the PDF the report adds roughly
-half a minute to a run.
+half a minute to a run. When the input was a collection .zip, the report
+also records the zip's SHA-256 (Appendix D): reading a multi-gigabyte zip
+from a USB drive or a network share adds the time it takes to read it
+once more.
 
 ### Two audiences, in this order
 
@@ -645,14 +671,22 @@ half a minute to a run.
        - key facts: computer, operating system, user accounts, when the
          evidence was collected and how, the machine's time zone (marked
          "assumed" when the collection does not record it), the time span
-         the timeline covers, the Excel workbook;
+         the timeline covers, the Excel workbook. The computer is always
+         the examined one: for a mounted-image collection its name comes
+         from the image's SYSTEM hive (collection_info.json names only the
+         computer the collector ran on); when that is not known, the
+         report says "Not known" and why, and names the collector's
+         computer only as such. User accounts are named as in the
+         timeline's User column (alice and CORP\alice are two accounts);
        - the top five leads in one plain sentence each: the first lead of
          each rule (High first), so one rule cannot fill the list, with
          "and N similar leads" where a rule has more;
        - a box "What this report can't tell you".
      Then "All leads at a glance": every High and Medium lead in one table
      with its first row numbers (the rest of the report is for the analyst).
-  2  Evidence coverage and integrity: how far back each source reaches
+  2  Evidence coverage and integrity: first, when the builder run ended
+     with exit code 2, that the timeline is incomplete (see "Incomplete
+     timeline (exit code 2)"); how far back each source reaches
      (first and last time, days before the collection), cleared logs,
      boots and shutdowns, logging that was off (no 4688 process creation,
      no 4104 script blocks, no Sysmon, the USN journal's span, ...),
@@ -662,11 +696,14 @@ half a minute to a run.
   6  Execution                7  Initial access       8  File system
      (and "Other leads" when a rule uses another category)
   9  Activity overview: events per day (and per month when the data
-     reaches back further), the busiest hours, rows per source and per user,
-     with markers on the days and hours that have leads
+     reaches back further), the busiest hours, rows per source and per user
+     (one entry per account as the User column names it; in a timeline
+     from an older builder, HOST\alice of the examined computer counts with
+     alice), with markers on the days and hours that have leads
   A  Informational items      B  Rules used      C  Method
-  D  Files: timeline.csv, findings.csv, the workbook (and the collection zip
-     in browse mode) with their SHA-256
+  D  Files: timeline.csv, findings.csv, the workbook (and the collection
+     zip, when the input was a .zip: -InputPath, browse mode or a zip
+     dropped on Run-TimelineBuilder.bat) with their SHA-256
 
 ### Conservative flagging: leads, not a verdict
 
@@ -780,16 +817,24 @@ half a minute to a run.
   Nothing is parsed, the collection is not needed, and no Administrator
   rights are needed. It logs to report_log.txt in the folder. On a
   286,000-row timeline it takes about 35 seconds, 20 of them for the
-  workbook.
+  workbook; QuickEdit is off in its console window meanwhile, as in a full
+  run. -WorkDir and -MemoryDumpPath (and the other parsing parameters) are
+  ignored with a warning.
 
   The collection facts (computer name, collector user, collection time,
   mode and time zone) come from the collection_info.json and
-  collection_log.txt that every run copies next to the timeline. For a
+  collection_log.txt that every run copies next to the timeline. Their
+  computer name is the examined computer only for a live collection; for a
+  mounted image the report takes it from the original run's
+  timeline_builder_log.txt ("Examined computer name (SYSTEM hive): ...",
+  logged when a parser read the image's SYSTEM hive), else from the
+  timeline's SystemInfo row, else it says the name is not known. For a
   timeline folder made before the report existed, the collection time, mode
   and time zone are read from its timeline_builder_log.txt and the computer
   name from the timeline's SystemInfo row. When the original run had to
   assume the time zone (an older collection or a mounted image without it),
-  the report marks the zone as assumed.
+  the report marks the zone as assumed. When the original run ended with
+  exit code 2, its log says so, and so does the rebuilt report.
 
 ### Report rules file
 
@@ -798,7 +843,15 @@ half a minute to a run.
   download cradles, ...) live only in this file: Defender's AMSI blocks
   PowerShell code that contains such names, so never move them into a .ps1
   file, and edit the JSON in a text editor, not through PowerShell commands
-  that contain the words. Keep the file ASCII.
+  that contain the words. Keep the file ASCII. The engine expands
+  {{list:<name>}} and compiles every pattern in its C# helper, so the list
+  values are never the argument of a PowerShell method call (PowerShell 7
+  passes those to AMSI, which can block one). It fails closed: a pattern
+  that cannot be expanded or compiled -- an unknown or empty list, an
+  invalid regular expression, a call that antivirus blocked -- is an
+  "Invalid report rules file" error naming the rule and field (no report
+  is made; the timeline is not affected), never a condition that matches
+  every row.
 
     {
       "schemaVersion": 1,
@@ -936,10 +989,14 @@ half a minute to a run.
       service (for example Microsoft 365).
     - Analysis tools run on the collected computer leave their own traces
       in later collections.
-  Plus, when they apply: credential material in the collection
-  (-IncludeSecrets), the -MftDays window, dropped USN entries, a
-  -StartDate/-EndDate range, collector errors, an unknown or assumed time
-  zone, an unknown collection time, a mounted-image collection, no
+  Plus, when they apply: a timeline that ended incomplete (exit code 2:
+  input files that disappeared during the run, or unexpected errors;
+  listed right after the first limit above), credential material in the
+  collection (-IncludeSecrets), the -MftDays window, dropped USN entries,
+  a -StartDate/-EndDate range, collector errors, an unknown or assumed
+  time zone, an unknown collection time, a mounted-image collection
+  (running programs and connections then come only from a memory dump, if
+  one was analyzed) and an examined computer whose name is not known, no
   workbook (or one that still holds an earlier report's findings).
 
   And about the report itself:
@@ -1935,10 +1992,11 @@ Timeline Explorer at the same time.
     the work folder on every exit), it skips the rest of the step, so the
     run says so. Please report it with the log line.
 
-  - Console window -- QuickEdit is off while the builder runs (see Quick
-    Start), so a click no longer pauses it, but a selection made with the
-    window menu (Edit > Mark) still does, until Enter or Esc ends it. The
-    builder changes the mode only when its input is a console with
+  - Console window -- QuickEdit is off while the builder runs, -ReportOnly
+    included (see Quick Start), so a click no longer pauses it, but a
+    selection made with the window menu (Edit > Mark) still does, until
+    Enter or Esc ends it. The builder changes the mode only when its input
+    is a console with
     QuickEdit on: with input redirected (a script piping into it, CI) or
     QuickEdit already off, nothing is changed and the log has no QuickEdit
     line. The console's mode is put back at every end of the run (also an
@@ -2330,7 +2388,9 @@ parsing is skipped, and the timeline CSV can be opened manually.
   synthetic rows: the computer name of collection_info.json must strip
   HOST\ only for a live collection, not for a mounted image, and the log
   lines are checked. The computer name and ProfileList are read from this
-  machine's own SYSTEM and SOFTWARE keys (read only). Part 1 needs no
+  machine's own SYSTEM and SOFTWARE keys (read only); the first SYSTEM
+  hive's computer name is kept once for the findings report (the examined
+  computer of a mounted image). Part 1 needs no
   admin and always runs. Part 2 generates real events (audit policy, a
   temporary local user and group membership, scheduled task, service and
   classic event log), exports the logs with wevtutil, runs the builder on
@@ -2463,9 +2523,13 @@ parsing is skipped, and the timeline CSV can be opened manually.
   collection zip dated 2025 with two setupapi logs: both must be parsed,
   the free space must be checked, the work folder must be outside %TEMP%
   and removed afterwards, and an input file deleted during the run (by a
-  test hook) must give exit code 2 and the MISSING INPUT FILE(S) banner.
-  A zip with a copied email attachment must give exit code 0 and the
-  attachment's rows without extracting it. Part 2 needs admin like the
+  test hook) must give exit code 2 and the MISSING INPUT FILE(S) banner;
+  that run keeps its findings report (in a folder of its own; the other
+  runs use -NoReport), which must say the timeline is incomplete, list the
+  zip's SHA-256 and have collection_info.json copied next to it. A zip with
+  a copied email attachment must give exit code 0 and the attachment's
+  rows without extracting it, and a -WorkDir with [ ] in its path must
+  stop the run at the start (exit code 1). Part 2 needs admin like the
   builder (or -BuilderPath with a copy without the admin check); it
   changes nothing on the system.
 
@@ -2576,8 +2640,10 @@ parsing is skipped, and the timeline CSV can be opened manually.
   comes back (skipped when the child gets no console of its own). In the
   builder's syntax tree it checks that QuickEdit is turned off first in
   the main body, before its first long step and every exit, with the log
-  line, and put back last in its finally block. The console the test runs
-  in is never changed. No admin needed.
+  line, and put back last in its finally block, and the same for
+  -ReportOnly in its function Invoke-TimelineReportOnly (which returns its
+  exit code instead of calling exit, so its finally block runs). The
+  console the test runs in is never changed. No admin needed.
 
   Four scripts test the findings report (CI runs them after the parser
   tests, in both PowerShell versions). The first three need no admin and do
@@ -2590,7 +2656,18 @@ parsing is skipped, and the timeline CSV can be opened manually.
   maxFindings roll-ups, activityTime, the stop of a rule whose pattern
   keeps timing out, row numbers, invalid rules files (each error names the
   rule and field), the report model, findings.csv and the timeline CSV
-  reader.
+  reader. Lists are expanded in the C# helper, also when one is used
+  several times (a synthetic list of harmless words), and the expansion
+  fails closed: a stand-in for a blocked call, one that gives no regex or
+  an empty one, or an error inside it must give a rules-file error, and
+  the shipped report-rules.json must import with no error and no empty
+  condition. The model keeps accounts apart as the User column names them
+  (an older timeline's HOST\alice counts with alice), marks unnamed
+  service SIDs as not people, counts ShimCache file times as file rows,
+  names a mounted image's examined computer (SYSTEM hive, or "not known"
+  with the collector host kept apart), and says when the builder run
+  ended incomplete (its log lines, its end banners, or the counts the
+  builder passes).
 
   tests\Test-ReportRules.ps1 -- loads report\report-rules.json with the
   engine and checks it against tests\fixtures\report\rules\cases.csv: rows
@@ -2602,7 +2679,9 @@ parsing is skipped, and the timeline CSV can be opened manually.
   checks the sections and their order, the summary page, escaping (also of
   right-to-left override characters), long unbroken values, the card's
   evidence limit, the offline page (no scripts or external loads), ASCII
-  output, the charts and the appendix; then prints PDFs with Edge (skipped
+  output, the charts and the appendix, a mounted image's unknown or
+  SYSTEM-hive computer name, and the "Timeline incomplete" block of an
+  incomplete run; then prints PDFs with Edge (skipped
   without Edge) and checks
   the page size, the relative ./timeline.xlsx link, that no local path is
   in the PDF and that Edge's temporary profile is removed.
@@ -2615,11 +2694,18 @@ parsing is skipped, and the timeline CSV can be opened manually.
   copied collection_info.json and collection_log.txt, and the workbook: the
   first sheet is Findings, every row links to its Timeline row, and the
   Finding column tags exactly the rows of each finding. Then -ReportOnly
-  (the same findings, no duplicate sheet or column), -ReportOnly with
-  -ReportRules and -NoExcel (the workbook is called stale), a missing rules
-  file, -NoReport, -ReportOnly in a folder named "case [1]" and with
-  report.pdf held open by another program, and -ReportOnly without a
-  timeline. It needs admin like the builder, or -BuilderPath with
+  (the same findings, no duplicate sheet or column, and no error output,
+  also in Windows PowerShell), -ReportOnly with -ReportRules and -NoExcel
+  (the workbook is called stale; -WorkDir and -MemoryDumpPath are ignored
+  with one warning), a missing rules file, -NoReport, -ReportOnly in a
+  folder named "case [1]" and with report.pdf held open by another
+  program, -ReportOnly on a mounted-image timeline whose run ended with
+  exit code 2 (the examined computer from the run's log, the incomplete
+  timeline in the report), and -ReportOnly without a timeline. Before the
+  runs it checks what the report takes from collection_info.json (the
+  builder's Get-TimelineReportCollectionInfo): a mounted image's computer
+  name is the collector host, not the examined computer. It needs admin
+  like the builder, or -BuilderPath with
   a copy without the admin check that has the report\ folder beside it.
   Like a user run, the builder installs ImportExcel from the PowerShell
   Gallery when it is missing; if it cannot, the workbook checks are SKIPPED.

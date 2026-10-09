@@ -35,10 +35,15 @@
 #     folder) and -WorkDir: exit code 2, the "MISSING INPUT FILE(S)"
 #     banner, the USB parser's warning naming the setupapi log that the
 #     manifest lists but that is gone, the work folder made in -WorkDir
-#     and removed, -WorkDir kept;
+#     and removed, -WorkDir kept; this run keeps its findings report (in a
+#     folder of its own), which must say the timeline is incomplete, hash
+#     the zip and have collection_info.json copied next to it (the other
+#     runs use -NoReport, so no run overwrites another's report);
 #   - a zip with a copied email attachment (-Sources Email), the test hook
 #     pointed at it: it is not extracted, so there is nothing to delete;
-#     exit code 0 and its two rows, from the manifest.
+#     exit code 0 and its two rows, from the manifest;
+#   - -WorkDir with [ ] in its path: the run stops at the start with exit
+#     code 1 and an error (the parsers would find nothing there).
 #   Needs Administrator rights, like the builder itself (GitHub Actions
 #   Windows runners are elevated). For a local run without them, pass
 #   -BuilderPath with a copy of the builder that has no admin check, kept
@@ -518,13 +523,17 @@ try {
     $zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash
 
     # Runs the builder on a zip (default: $zipPath with the USB source; CSV
-    # only); returns its exit code, console output and log file
+    # only, and no findings report unless -WithReport: each run writes its
+    # own timeline, and only run B checks the report); returns its exit
+    # code, console output and log file
     function Invoke-ZipRun {
-        param([string]$OutputFile, [string[]]$ExtraArguments = @(), [string]$Zip = $zipPath, [string]$RunSources = "USB")
+        param([string]$OutputFile, [string[]]$ExtraArguments = @(), [string]$Zip = $zipPath, [string]$RunSources = "USB", [switch]$WithReport)
         $ErrorActionPreference = "Continue"
         $before = @(Get-ChildItem -LiteralPath $reportsDir -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+        $runArguments = @($ExtraArguments)
+        if (-not $WithReport) { $runArguments += "-NoReport" }
         $output = & $powershellExe -NoProfile -ExecutionPolicy Bypass -File $builder -InputPath $Zip -Sources $RunSources `
-            -OutputFile $OutputFile -NoExcel -Viewer None @ExtraArguments 2>&1
+            -OutputFile $OutputFile -NoExcel -Viewer None @runArguments 2>&1
         $exitCode = $LASTEXITCODE
         $newReport = @(Get-ChildItem -LiteralPath $reportsDir -Directory -ErrorAction SilentlyContinue | Where-Object { $before -notcontains $_.FullName }) | Select-Object -First 1
         $logText = ""
@@ -567,12 +576,16 @@ try {
     Assert-Equal -Name "run A: the zip is not changed" -Expected $zipHash -Actual (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash
 
     # --- Run B: a file deleted mid-run, -WorkDir --------------------------
-    $csvB = Join-Path $testRoot "timeline-b.csv"
+    # (with the findings report, in a folder of its own: it must say that the
+    # timeline is incomplete)
+    $dirB = Join-Path $testRoot "run-b"
+    New-Item -ItemType Directory -Path $dirB | Out-Null
+    $csvB = Join-Path $dirB "timeline-b.csv"
     $workDirB = Join-Path $testRoot "wd"
     New-Item -ItemType Directory -Path $workDirB | Out-Null
     Write-Host "Running the builder again, with the test hook deleting an extracted setupapi log and -WorkDir $workDirB ..."
     $env:TIMELINE_BUILDER_TEST_DELETE_INPUT = "USB\setupapi.dev.20241201_000000.log"
-    try { $runB = Invoke-ZipRun -OutputFile $csvB -ExtraArguments @("-WorkDir", $workDirB) }
+    try { $runB = Invoke-ZipRun -OutputFile $csvB -ExtraArguments @("-WorkDir", $workDirB) -WithReport }
     finally { Remove-Item -LiteralPath Env:\TIMELINE_BUILDER_TEST_DELETE_INPUT -ErrorAction SilentlyContinue }
     if ($runB.ExitCode -ne 2) { $runB.Lines | ForEach-Object { Write-Host "  | $_" } }
     Assert-Equal -Name "run B: exit code 2 (timeline incomplete)" -Expected 2 -Actual $runB.ExitCode
@@ -586,6 +599,34 @@ try {
     Write-TestResult -Name "run B: work folder made in -WorkDir" -Passed ($runB.WorkFolder -and (Split-Path $runB.WorkFolder -Parent) -eq $workDirB) -Message "work folder: $($runB.WorkFolder)"
     Write-TestResult -Name "run B: work folder removed, -WorkDir kept" -Passed ($runB.WorkFolder -and -not (Test-Path -LiteralPath $runB.WorkFolder) -and (Test-Path -LiteralPath $workDirB)) -Message "work folder: $($runB.WorkFolder)"
     Assert-Equal -Name "run B: the zip is not changed" -Expected $zipHash -Actual (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash
+    # The findings report of an incomplete run says so (the end banner is
+    # written after the report, so the report cannot read it from the log)
+    $modelB = $null
+    $modelPathB = Join-Path $dirB "report-model.json"
+    if (Test-Path -LiteralPath $modelPathB) { $modelB = Get-Content -LiteralPath $modelPathB -Raw | ConvertFrom-Json }
+    Write-TestResult -Name "run B: the report says the timeline is incomplete (caveat and coverage)" -Passed ($modelB -and $modelB.Coverage.TimelineCompleteness.Incomplete -and
+        $modelB.Coverage.TimelineCompleteness.MissingInputFiles -eq 1 -and @($modelB.Caveats | Where-Object { $_ -match '^The timeline is incomplete: 1 input file\(s\) disappeared' }).Count -eq 1) -Message "report-model.json: $(if ($modelB) { ($modelB.Caveats | Select-Object -First 3) -join ' / ' } else { 'missing' })"
+    $htmlB = ""
+    if (Test-Path -LiteralPath (Join-Path $dirB "report.html")) { $htmlB = [System.IO.File]::ReadAllText((Join-Path $dirB "report.html")) }
+    Assert-Equal -Name "run B: report.html shows the incomplete timeline in Evidence coverage" -Expected $true -Actual ($htmlB.Contains("<h3>Timeline incomplete</h3>"))
+    Assert-Equal -Name "run B: the zip's collection_info.json is copied next to the timeline before the work folder goes" -Expected $true -Actual (Test-Path -LiteralPath (Join-Path $dirB "collection_info.json") -PathType Leaf)
+    Assert-Equal -Name "run B: the zip is hashed for the report (input was a .zip)" -Expected $true -Actual ($modelB -and @($modelB.Files.Hashes | Where-Object { $_.Name -eq "$collName.zip" -and $_.Sha256 -eq $zipHash }).Count -eq 1)
+    $reportLeftovers = @(@("findings.csv", "report.html", "report-model.json") | Where-Object { Test-Path -LiteralPath (Join-Path $testRoot $_) })
+    Assert-Equal -Name "run A (-NoReport): no report next to its timeline" -Expected "" -Actual ($reportLeftovers -join ", ")
+
+    # --- Run D: a -WorkDir whose path has [ ] (wildcard characters) --------
+    # The parsers read the extracted collection with -Path, which would find
+    # nothing there: the run stops with a clear error instead of ending
+    # "successfully" without a timeline
+    $csvD = Join-Path $testRoot "timeline-d.csv"
+    $workDirD = Join-Path $testRoot "wd [1]"
+    New-Item -ItemType Directory -Path $workDirD | Out-Null
+    Write-Host "Running the builder with -WorkDir $workDirD ..."
+    $runD = Invoke-ZipRun -OutputFile $csvD -ExtraArguments @("-WorkDir", $workDirD)
+    if ($runD.ExitCode -ne 1) { $runD.Lines | ForEach-Object { Write-Host "  | $_" } }
+    Assert-Equal -Name "run D: exit code 1 (stopped at the start)" -Expected 1 -Actual $runD.ExitCode
+    Assert-Equal -Name "run D: the error names the work folder's wildcard characters" -Expected 1 -Actual @($runD.Lines -match "ERROR: The work folder's path has \[ \], \* or \? in it").Count
+    Write-TestResult -Name "run D: no timeline, work folder removed, -WorkDir kept" -Passed (-not (Test-Path -LiteralPath $csvD) -and $runD.WorkFolder -and -not (Test-Path -LiteralPath $runD.WorkFolder) -and (Test-Path -LiteralPath $workDirD)) -Message "work folder: $($runD.WorkFolder)"
 
     # --- Run C: a copied email attachment (antivirus may quarantine it) ----
     # It stays in the zip and is no input file, so its removal cannot stop
@@ -615,6 +656,8 @@ try {
     $mailRows = @($rowsC | Where-Object { $_.Source -eq "Email-Attachments" } | ForEach-Object { "$($_.Timestamp) $($_.Description) ($($_.User))" })
     Assert-Equal -Name "run C: attachment rows from the manifest" -Expected (
         "2024-03-01 10:00:00.000 Outlook attachment in temp folder: invoice.docm (alice) | 2024-03-02 11:00:00.000 Outlook attachment in temp folder modified: invoice.docm (alice)") -Actual ($mailRows -join " | ")
+    $reportLeftovers = @(@("findings.csv", "report.html", "report-model.json") | Where-Object { Test-Path -LiteralPath (Join-Path $testRoot $_) })
+    Assert-Equal -Name "runs A and C (-NoReport): no report next to their timelines" -Expected "" -Actual ($reportLeftovers -join ", ")
 }
 catch {
     Write-TestResult -Name "test run" -Passed $false -Message "$($_.Exception.Message) ($($_.InvocationInfo.PositionMessage))"

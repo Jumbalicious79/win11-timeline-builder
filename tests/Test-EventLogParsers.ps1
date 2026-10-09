@@ -660,6 +660,16 @@ Test-Case -Name "User column: computer name and ProfileList read from SYSTEM and
         if ($computerNames -notcontains $env:COMPUTERNAME -or -not $nameValue -or $computerNames -cnotcontains $nameValue) {
             throw "Get-OfflineComputerNames did not give this computer's name ($($computerNames.Count) name(s))"
         }
+        # Add-OfflineMachineNames keeps them for the User column, and the
+        # first one (the computer name) for the findings report, once
+        Add-OfflineMachineNames "not a registry key"
+        if ((Get-TimelineUserContext).HiveComputerName) { throw "Add-OfflineMachineNames kept a name without a hive" }
+        Add-OfflineMachineNames $systemKey
+        $context = Get-TimelineUserContext
+        if ($context.HiveComputerName -cne $nameValue -or -not $context.MachineNames.Contains($nameValue)) { throw "Add-OfflineMachineNames kept '$($context.HiveComputerName)', not the computer name" }
+        $context.HiveComputerName = "FIRST"
+        Add-OfflineMachineNames $systemKey
+        if ((Get-TimelineUserContext).HiveComputerName -cne "FIRST") { throw "a second SYSTEM hive replaced the examined computer's name" }
         Add-OfflineProfileNames $softwareKey
         $names = Get-TimelineSidNames
         $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value

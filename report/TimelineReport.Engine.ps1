@@ -13,7 +13,9 @@
 #
 # Keyword lists (tool names, folders) live ONLY in the rules JSON.
 # Never put them in this file: Defender's AMSI blocks PowerShell
-# code that holds attacker-tool names.
+# code that holds attacker-tool names. The lists are read and expanded
+# in the C# helper (RulePattern), never passed to a PowerShell method
+# call: PowerShell 7 hands those arguments to AMSI too.
 #
 # Runs in Windows PowerShell 5.1 and PowerShell 7. The helper below
 # does the per-row work (matching, grouping, statistics, CSV and
@@ -270,11 +272,13 @@ namespace TimelineReport
 
     // Reads Key=Value pairs from the Details column. Newer rows separate the
     // pairs with " | " ("Key=Value | Key2=Value2"); older rows use spaces
-    // ("LogonType=5 Source=-:-"), and the de-duplication step may append
-    // " | Occurrences=N" to those. In a row with two or more " | " pairs a
-    // value runs to the next " | Key="; otherwise a value runs to the next
-    // " Key=" (a key there starts with a capital letter and has 3+ characters,
-    // so values like "CN=x, O=y" stay whole).
+    // ("LogonType=5 Source=-:-"). Two steps of the builder append a pair
+    // with " | " to any row: de-duplication " | Occurrences=N", and the User
+    // column pass " | UserSID=<sid>" (a SID User that got a name). These
+    // appended pairs do not count for the style: in a row with two or more
+    // other " | " pairs a value runs to the next " | Key="; otherwise a value
+    // runs to the next " Key=" (a key there starts with a capital letter and
+    // has 3+ characters, so values like "CN=x, O=y" stay whole).
     public static class DetailParser
     {
         static readonly Regex PipeSplit = new Regex(@"\s\|\s(?=[A-Za-z][\w.]*(?:\([^()=|]*\))?=)", RegexOptions.CultureInvariant);
@@ -292,14 +296,14 @@ namespace TimelineReport
             {
                 Match m = FirstKey.Match(segments[s]);
                 keys[s] = m.Success ? m.Groups[1].Value : null;
-                if (keys[s] != null && !IsOccurrences(keys[s])) keyed++;
+                if (keys[s] != null && !IsAppendedKey(keys[s])) keyed++;
             }
             bool pipeStyle = keyed >= 2;
             for (int s = 0; s < segments.Length; s++)
             {
                 string segment = segments[s];
                 string key = keys[s];
-                if (key != null && (pipeStyle || IsOccurrences(key)))
+                if (key != null && (pipeStyle || IsAppendedKey(key)))
                 {
                     pairs.Add(new KeyValuePair<string, string>(key, Clean(segment.Substring(key.Length + 1))));
                     continue;
@@ -337,14 +341,99 @@ namespace TimelineReport
             return "";
         }
 
-        static bool IsOccurrences(string key)
+        // A pair the builder appends to any row (see above)
+        static bool IsAppendedKey(string key)
         {
-            return string.Equals(key, "Occurrences", StringComparison.OrdinalIgnoreCase);
+            return string.Equals(key, "Occurrences", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(key, "UserSID", StringComparison.OrdinalIgnoreCase);
         }
 
         static string Clean(string value)
         {
             return value.Trim().TrimEnd(';').Trim();
+        }
+    }
+
+    // Rule patterns of the rules file: {{list:<name>}} is expanded to
+    // (?:escaped1|escaped2|...) and the regex compiled here, in C#, never
+    // in PowerShell. The lists hold attacker-tool names and AMSI-bypass
+    // strings, and PowerShell 7 hands the string arguments of every .NET
+    // method call to AMSI: a call with an expanded list as its argument can
+    // be blocked (antivirus), so the lists stay out of PowerShell's view.
+    // Fails closed: an unknown or empty list, an expansion that comes out
+    // empty, or an invalid regex throws ArgumentException with the problem
+    // (the caller names the file, rule and field); there is never a regex
+    // that matches every row in place of the intended one.
+    public static class RulePattern
+    {
+        static readonly Regex ListReference = new Regex(@"\{\{list:([^{}]*)\}\}", RegexOptions.CultureInvariant);
+
+        // The values of a list from the JSON (an array of non-empty
+        // strings), or null when it is anything else or empty
+        public static string[] ReadList(object value)
+        {
+            PSObject pso = value as PSObject;
+            if (pso != null) value = pso.BaseObject;
+            if (value == null || value is string) return null;
+            IEnumerable items = value as IEnumerable;
+            if (items == null) return null;
+            List<string> list = new List<string>();
+            foreach (object item in items)
+            {
+                object v = item;
+                PSObject p = v as PSObject;
+                if (p != null) v = p.BaseObject;
+                string s = v as string;
+                if (string.IsNullOrEmpty(s)) return null;
+                list.Add(s);
+            }
+            return list.Count == 0 ? null : list.ToArray();
+        }
+
+        // The compiled regex of a pattern; lists maps a list name to its
+        // values (string[], from ReadList)
+        public static Regex Compile(string pattern, IDictionary lists, RegexOptions options, TimeSpan timeout)
+        {
+            if (string.IsNullOrEmpty(pattern)) throw new ArgumentException("is empty (an empty pattern matches every row)");
+            StringBuilder text = new StringBuilder(pattern.Length + 256);
+            int position = 0;
+            foreach (Match m in ListReference.Matches(pattern))
+            {
+                text.Append(pattern, position, m.Index - position);
+                string name = m.Groups[1].Value;
+                object raw = (lists != null && lists.Contains(name)) ? lists[name] : null;
+                if (raw == null) throw new ArgumentException("refers to an unknown list '" + name + "' (define it under \"lists\")");
+                PSObject pso = raw as PSObject;
+                if (pso != null) raw = pso.BaseObject;
+                string[] values = raw as string[];
+                if (values == null || values.Length == 0) throw new ArgumentException("list '" + name + "' has no values (it must be a non-empty array of strings)");
+                text.Append("(?:");
+                for (int v = 0; v < values.Length; v++)
+                {
+                    if (string.IsNullOrEmpty(values[v])) throw new ArgumentException("list '" + name + "' has an empty value");
+                    if (v > 0) text.Append('|');
+                    text.Append(Regex.Escape(values[v]));
+                }
+                text.Append(')');
+                position = m.Index + m.Length;
+            }
+            text.Append(pattern, position, pattern.Length - position);
+            if (text.Length == 0) throw new ArgumentException("is empty after its lists are expanded (it would match every row)");
+            try
+            {
+                return new Regex(text.ToString(), options, timeout);
+            }
+            catch (ArgumentException e)
+            {
+                throw new ArgumentException("invalid regular expression: " + e.Message);
+            }
+        }
+
+        // True for a missing regex or one with an empty pattern (it would
+        // match every row)
+        public static bool IsEmpty(Regex re)
+        {
+            return re == null || re.ToString().Length == 0;
         }
     }
 
@@ -831,11 +920,21 @@ namespace TimelineReport
         public int[] PerHourLocal = new int[24];
         public List<UserStat> Users = new List<UserStat>();
 
-        // Service accounts, built-in groups and profile folders that are not people
-        static readonly Regex SystemName = new Regex(@"^(?:SYSTEM|LOCAL SYSTEM|LocalSystem|LOCAL SERVICE|LocalService|NETWORK SERVICE|NetworkService|ANONYMOUS LOGON|INTERACTIVE|SERVICE|BATCH|NETWORK|Everyone|Users|Administrators|Authenticated Users|Guests|Power Users|Remote Desktop Users|Default|Default User|DefaultAppPool|Public|All Users|defaultuser\d*|WDAGUtilityAccount|DWM-\d+|UMFD-\d+|S-1-5-(?:18|19|20)|S-1-5-32-\d+)$|\$$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        // Service accounts, built-in groups and profile folders that are not
+        // people. A SID left unnamed by the builder (no ProfileList or BAM
+        // name in that run) can be a service or virtual account: per-service
+        // (S-1-5-80-...), IIS AppPool (82), Hyper-V VM (83), Window Manager
+        // (90-0) and Font Driver Host (96-0) SIDs are not people either.
+        static readonly Regex SystemName = new Regex(@"^(?:SYSTEM|LOCAL SYSTEM|LocalSystem|LOCAL SERVICE|LocalService|NETWORK SERVICE|NetworkService|ANONYMOUS LOGON|INTERACTIVE|SERVICE|BATCH|NETWORK|Everyone|Users|Administrators|Authenticated Users|Guests|Power Users|Remote Desktop Users|Default|Default User|DefaultAppPool|Public|All Users|defaultuser\d*|WDAGUtilityAccount|DWM-\d+|UMFD-\d+|S-1-5-(?:18|19|20|32-\d+|80(?:-\d+)+|82(?:-\d+)+|83(?:-\d+)+|90-0-\d+|96-0-\d+))$|\$$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
         static readonly Regex SystemDomain = new Regex(@"^(?:NT AUTHORITY|NT SERVICE|BUILTIN|Window Manager|Font Driver Host|IIS APPPOOL|NT VIRTUAL MACHINE)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
         public static Stats Compute(RowTable t, TimeZoneInfo zone)
+        {
+            return Compute(t, zone, null);
+        }
+
+        // localDomains: the examined computer's names (see the Users part)
+        public static Stats Compute(RowTable t, TimeZoneInfo zone, string[] localDomains)
         {
             Stats s = new Stats();
             s.Rows = t.Count;
@@ -846,7 +945,10 @@ namespace TimelineReport
                 bySource[i] = new SourceStat();
                 bySource[i].Source = t.Sources[i];
             }
+            // File times are not activity: FileAccess (the $MFT, the USN
+            // journal) and FileLastModified (ShimCache, often years old)
             int fileType = Array.IndexOf(t.EventTypes, "FileAccess");
+            int fileModifiedType = Array.IndexOf(t.EventTypes, "FileLastModified");
             int snapshotType = Array.IndexOf(t.EventTypes, "Snapshot");
             Dictionary<long, DayStat> days = new Dictionary<long, DayStat>();
             // Local hour per 15-minute UTC slot (every UTC offset is a multiple of 15 minutes)
@@ -856,7 +958,7 @@ namespace TimelineReport
             for (int i = 0; i < t.Count; i++)
             {
                 int type = t.EventTypeId[i];
-                bool isFile = type == fileType;
+                bool isFile = type == fileType || type == fileModifiedType;
                 if (isFile) s.FileRows++;
                 if (type == snapshotType) s.SnapshotRows++;
                 userRows[t.UserId[i]]++;
@@ -913,22 +1015,40 @@ namespace TimelineReport
             dayNumbers.Sort();
             foreach (long d in dayNumbers) s.Days.Add(days[d]);
 
-            // Users: the name without its domain, case-insensitive
+            // Users: one entry per account as the User column names it
+            // (case-insensitive). The builder writes one form per account: a
+            // local account of the examined computer is its bare name, and
+            // CORP\alice, OTHERHOST\alice, AzureAD\... and NT AUTHORITY\SYSTEM
+            // stay as they are, so accounts that share a name stay apart.
+            // Timelines from older builders (-ReportOnly) can still hold
+            // HOST\alice or .\alice: a domain of "." or one of localDomains is
+            // dropped, so those rows count with "alice".
+            HashSet<string> local = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            local.Add(".");
+            if (localDomains != null)
+            {
+                foreach (string d in localDomains)
+                {
+                    if (d != null && d.Trim().Length > 0) local.Add(d.Trim());
+                }
+            }
             Dictionary<string, UserStat> users = new Dictionary<string, UserStat>(StringComparer.OrdinalIgnoreCase);
             for (int u = 0; u < t.Users.Length; u++)
             {
                 string raw = t.Users[u].Trim();
                 if (raw.Length == 0 || raw == "-" || userRows[u] == 0) continue;
                 int slash = raw.LastIndexOf('\\');
-                string domain = slash > 0 ? raw.Substring(0, slash) : "";
+                string domain = slash > 0 ? raw.Substring(0, slash).Trim() : "";
                 string name = raw.Substring(slash + 1).Trim();
                 if (name.Length == 0 || name == "-") continue;
+                string key = raw;
+                if (slash >= 0 && (domain.Length == 0 || domain == "-" || local.Contains(domain))) key = name;
                 UserStat us;
-                if (!users.TryGetValue(name, out us))
+                if (!users.TryGetValue(key, out us))
                 {
                     us = new UserStat();
-                    us.Name = name;
-                    users[name] = us;
+                    us.Name = key;
+                    users[key] = us;
                 }
                 us.Rows += userRows[u];
                 if (SystemName.IsMatch(name) || (domain.Length > 0 && SystemDomain.IsMatch(domain))) us.IsSystem = true;
@@ -1342,11 +1462,26 @@ function Assert-ReportEngineMembers {
     }
 }
 
+# The compiled regex of a rule pattern, from the C# helper
+# ([TimelineReport.RulePattern], which also expands {{list:<name>}}). A
+# function of its own, so a test can stand in for a call that fails or is
+# blocked.
+function New-ReportEngineRuleRegex {
+    param([string]$Pattern, [hashtable]$Lists, [System.Text.RegularExpressions.RegexOptions]$Options, [TimeSpan]$Timeout)
+    return [TimelineReport.RulePattern]::Compile($Pattern, $Lists, $Options, $Timeout)
+}
+
 # Regex from a rule pattern: {{list:<name>}} becomes (?:escaped1|escaped2|...).
 # Case-insensitive, culture-invariant, and "." also matches line breaks
 # (Details can hold multi-line script blocks and privilege lists). A match
 # timeout ($script:ReportEngineRegexTimeout) plus the engine's stop after a
 # few timeouts keep a runaway pattern from hanging the builder.
+# The lists are expanded in the C# helper, never here: PowerShell 7 passes
+# the string arguments of .NET method calls to AMSI, which can block a call
+# that holds an expanded keyword list (see [TimelineReport.RulePattern]).
+# Fails closed: a call that fails or is blocked, or that gives no regex or
+# an empty one, is a rules-file error naming the rule and field, never a
+# condition that matches every row.
 function ConvertTo-ReportEngineRegex {
     param($Pattern, [hashtable]$Lists, [string]$File, [string]$Where)
     if (-not ($Pattern -is [string])) {
@@ -1355,30 +1490,28 @@ function ConvertTo-ReportEngineRegex {
     if ($Pattern.Length -eq 0) {
         throw (Format-ReportEngineRuleError -File $File -Where $Where -Problem "is empty (an empty pattern matches every row)")
     }
-    $text = New-Object System.Text.StringBuilder
-    $position = 0
-    foreach ($m in [regex]::Matches($Pattern, '\{\{list:([^{}]*)\}\}')) {
-        [void]$text.Append($Pattern, $position, $m.Index - $position)
-        $name = $m.Groups[1].Value
-        if (-not $Lists.ContainsKey($name)) {
-            throw (Format-ReportEngineRuleError -File $File -Where $Where -Problem "refers to an unknown list '$name' (define it under ""lists"")")
-        }
-        [void]$text.Append($Lists[$name])
-        $position = $m.Index + $m.Length
-    }
-    [void]$text.Append($Pattern, $position, $Pattern.Length - $position)
     $options = [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::CultureInvariant -bor
         [System.Text.RegularExpressions.RegexOptions]::Singleline
     $timeout = $script:ReportEngineRegexTimeout
     if (-not ($timeout -is [TimeSpan]) -or $timeout -le [TimeSpan]::Zero) { $timeout = [TimeSpan]::FromSeconds(2) }
-    try {
-        return [System.Text.RegularExpressions.Regex]::new($text.ToString(), $options, $timeout)
-    }
+    if ($null -eq $Lists) { $Lists = @{} }
+    $regex = $null
+    $problem = ""
+    try { $regex = New-ReportEngineRuleRegex -Pattern $Pattern -Lists $Lists -Options $options -Timeout $timeout }
     catch {
         $inner = $_.Exception
         while ($inner.InnerException) { $inner = $inner.InnerException }
-        throw (Format-ReportEngineRuleError -File $File -Where $Where -Problem "invalid regular expression: $($inner.Message)")
+        # The helper's own problems (unknown list, invalid regex) are
+        # ArgumentExceptions; anything else (e.g. antivirus blocking the
+        # call) is named as it is
+        $problem = if ($inner -is [System.ArgumentException]) { $inner.Message } else { "could not be compiled: $($inner.Message)" }
+        if (-not $problem) { $problem = "could not be compiled ($($inner.GetType().FullName))" }
     }
+    if ($problem) { throw (Format-ReportEngineRuleError -File $File -Where $Where -Problem $problem) }
+    if (-not ($regex -is [System.Text.RegularExpressions.Regex]) -or [TimelineReport.RulePattern]::IsEmpty($regex)) {
+        throw (Format-ReportEngineRuleError -File $File -Where $Where -Problem "could not be compiled: no regular expression (or an empty one, which would match every row) came back; antivirus may have blocked it")
+    }
+    return $regex
 }
 
 # Match object (JSON) -> [TimelineReport.MatchSpec]. All present conditions
@@ -1436,7 +1569,7 @@ function ConvertTo-ReportEngineKeySpec {
         $spec.DetailKeys = [string[]]$keys
         return $spec
     }
-    $kind = $Kinds | Where-Object { $_ -eq $Text } | Select-Object -First 1
+    $kind = @($Kinds | Where-Object { $_ -eq $Text })[0]
     if (-not $kind) {
         throw (Format-ReportEngineRuleError -File $File -Where $Where -Problem "'$Text' is not one of: $($Kinds -join ', '), detail:<Key>")
     }
@@ -1488,19 +1621,15 @@ function Import-ReportRules {
             if ($property.Name -notmatch '^[A-Za-z0-9_.-]+$') {
                 throw (Format-ReportEngineRuleError -File $file -Where $where -Problem "a list name may use only letters, digits, '_', '.' and '-'")
             }
-            $values = $property.Value
-            if (-not ($values -is [array]) -or $values.Count -eq 0) {
-                throw (Format-ReportEngineRuleError -File $file -Where $where -Problem "must be a non-empty array of strings")
+            # Read by the C# helper: list values (tool names, AMSI-bypass
+            # strings) never become the argument of a PowerShell method call
+            $values = $null
+            if ($property.Value -is [array]) { $values = [TimelineReport.RulePattern]::ReadList($property.Value) }
+            if ($null -eq $values) {
+                throw (Format-ReportEngineRuleError -File $file -Where $where -Problem "must be a non-empty array of strings (every value a non-empty string)")
             }
-            $items = New-Object System.Collections.Generic.List[string]
-            foreach ($value in $values) {
-                if (-not ($value -is [string]) -or $value.Length -eq 0) {
-                    throw (Format-ReportEngineRuleError -File $file -Where $where -Problem "every value must be a non-empty string")
-                }
-                $items.Add($value)
-            }
-            $lists[$property.Name] = '(?:' + (($items | ForEach-Object { [regex]::Escape($_) }) -join '|') + ')'
-            $listValues[$property.Name] = $items.ToArray()
+            $lists[$property.Name] = $values
+            $listValues[$property.Name] = $values
         }
     }
 
@@ -1536,11 +1665,14 @@ function Import-ReportRules {
         foreach ($field in @("title", "why")) {
             if (-not $texts[$field]) { throw (Format-ReportEngineRuleError -File $file -Where "$where.$field" -Problem "is required") }
         }
-        $category = $categories | Where-Object { $_ -eq (Get-ReportEngineMember $ruleJson "category") } | Select-Object -First 1
+        # @(...)[0], not Select-Object -First 1: in Windows PowerShell that
+        # records a StopUpstreamCommandsException in -ErrorVariable, which
+        # would look like an import error
+        $category = @($categories | Where-Object { $_ -eq (Get-ReportEngineMember $ruleJson "category") })[0]
         if (-not $category) {
             throw (Format-ReportEngineRuleError -File $file -Where "$where.category" -Problem "must be one of: $($categories -join ', ') (found '$(Get-ReportEngineMember $ruleJson "category")')")
         }
-        $severity = $severities | Where-Object { $_ -eq (Get-ReportEngineMember $ruleJson "severity") } | Select-Object -First 1
+        $severity = @($severities | Where-Object { $_ -eq (Get-ReportEngineMember $ruleJson "severity") })[0]
         if (-not $severity) {
             throw (Format-ReportEngineRuleError -File $file -Where "$where.severity" -Problem "must be one of: $($severities -join ', ') (found '$(Get-ReportEngineMember $ruleJson "severity")')")
         }
@@ -1623,7 +1755,7 @@ function Import-ReportRules {
         if ($null -ne $escalateJson) {
             if (-not (Test-ReportEngineJsonObject $escalateJson)) { throw (Format-ReportEngineRuleError -File $file -Where "$where.escalate" -Problem "must be an object") }
             Assert-ReportEngineMembers -Object $escalateJson -Allowed @("severity", "withinMinutes", "sameKey", "match") -File $file -Where "$where.escalate"
-            $escalateSeverity = $severities | Where-Object { $_ -eq (Get-ReportEngineMember $escalateJson "severity") } | Select-Object -First 1
+            $escalateSeverity = @($severities | Where-Object { $_ -eq (Get-ReportEngineMember $escalateJson "severity") })[0]
             if (-not $escalateSeverity) { throw (Format-ReportEngineRuleError -File $file -Where "$where.escalate.severity" -Problem "must be one of: $($severities -join ', ')") }
             $within = Get-ReportEngineMember $escalateJson "withinMinutes"
             if (-not (Test-ReportEngineNumber $within) -or [double]$within -le 0) { throw (Format-ReportEngineRuleError -File $file -Where "$where.escalate.withinMinutes" -Problem "must be a number greater than 0") }
@@ -1671,7 +1803,7 @@ function Import-ReportRules {
             $ruleId = Get-ReportEngineMember $entry "ruleId"
             if (-not ($ruleId -is [string]) -or -not $ruleId) { throw (Format-ReportEngineRuleError -File $file -Where "$where.ruleId" -Problem "is required (a rule id, or ""*"" for every rule)") }
             if ($ruleId -ne "*") {
-                $known = $rules | Where-Object { $_.Id -eq $ruleId } | Select-Object -First 1
+                $known = @($rules | Where-Object { $_.Id -eq $ruleId })[0]
                 if (-not $known) { throw (Format-ReportEngineRuleError -File $file -Where "$where.ruleId" -Problem "no rule has the id '$ruleId'") }
                 $ruleId = $known.Id
             }
@@ -2039,14 +2171,28 @@ function Read-ReportEngineCollectorLog {
     return $info
 }
 
-# What the report needs from the builder's timeline_builder_log.txt
+# What the report needs from the builder's timeline_builder_log.txt. A run
+# that ends with exit code 2 (timeline incomplete) logs each problem when it
+# happens ("ERROR: N of M input file(s) disappeared during the run",
+# "ERROR: Unexpected error at line N") and the end banner ("Timeline
+# Builder Completed WITH N MISSING INPUT FILE(S)" / "... UNEXPECTED
+# ERROR(S)"). The banner is written after the report of that run, so a full
+# run counts the problem lines; -ReportOnly reads the banner too, and the
+# larger count is kept.
 function Read-ReportEngineBuilderLog {
     param([string]$Path)
-    $info = [PSCustomObject]@{ Available = $false; Sources = ""; StartDate = ""; EndDate = ""; MftDays = $null; UsnDropped = $false; ProblemLines = @() }
+    $info = [PSCustomObject]@{
+        Available = $false; Sources = ""; StartDate = ""; EndDate = ""; MftDays = $null; UsnDropped = $false; ProblemLines = @()
+        MissingInputFiles = 0; UnexpectedErrors = 0; UnnamedSids = 0; ExaminedComputerName = ""
+    }
     $text = Read-ReportEngineLogText $Path
     if ($null -eq $text) { return $info }
     $info.Available = $true
     $problems = New-Object System.Collections.Generic.List[string]
+    $missingLogged = 0
+    $missingBanner = 0
+    $errorLines = 0
+    $errorBanner = 0
     foreach ($line in ($text -split "\r?\n")) {
         if ($line -match '^\[[^\]]*\] (?:ERROR|WARNING): ') { $problems.Add($line.TrimEnd()) }
         if ($line -match '^\[[^\]]*\] Sources\s+: (.+?)\s*$') { $info.Sources = $Matches[1] }
@@ -2055,8 +2201,16 @@ function Read-ReportEngineBuilderLog {
         elseif ($line -match 'Window: times from .+ UTC, (\d+) day\(s\) before') { $info.MftDays = [int]$Matches[1] }
         elseif ($line -match '-MftDays 0: all') { $info.MftDays = 0 }
         elseif ($line -match 'Dropped the \d+ oldest USN entries') { $info.UsnDropped = $true }
+        elseif ($line -match '^\[[^\]]*\] ERROR: (\d+) of \d+ input file\(s\) disappeared during the run') { $missingLogged = [Math]::Max($missingLogged, [int]$Matches[1]) }
+        elseif ($line -match '^\[[^\]]*\] ERROR: Unexpected error at line \d+') { $errorLines++ }
+        elseif ($line -match 'Timeline Builder (?:Completed|Finished) WITH (\d+) MISSING INPUT FILE\(S\)') { $missingBanner = [Math]::Max($missingBanner, [int]$Matches[1]) }
+        elseif ($line -match 'Timeline Builder (?:Completed|Finished) WITH (\d+) UNEXPECTED ERROR\(S\)') { $errorBanner = [Math]::Max($errorBanner, [int]$Matches[1]) }
+        elseif ($line -match '^\[[^\]]*\]\s+User column: (\d+) SID\(s\) not named') { $info.UnnamedSids = [int]$Matches[1] }
+        elseif (-not $info.ExaminedComputerName -and $line -match '^\[[^\]]*\]\s+Examined computer name \(SYSTEM hive\): (.+?)\s*$') { $info.ExaminedComputerName = $Matches[1] }
     }
     $info.ProblemLines = $problems.ToArray()
+    $info.MissingInputFiles = [Math]::Max($missingLogged, $missingBanner)
+    $info.UnexpectedErrors = [Math]::Max($errorLines, $errorBanner)
     return $info
 }
 
@@ -2105,9 +2259,20 @@ function Get-ReportEngineFileHash {
 Builds the report model from the timeline rows and the findings.
 .DESCRIPTION
 CollectionInfo may be the builder's Get-CollectionInfo object, the parsed
-collection_info.json, or the Collection of an earlier report model; fields it
-lacks are taken from -CollectorLogPath (collection_log.txt) and the
-SystemInfo rows. Call it after the workbook is final (its hash is recorded).
+collection_info.json, the builder's report view of it
+(Get-TimelineReportCollectionInfo), or the Collection of an earlier report
+model; fields it lacks are taken from -CollectorLogPath (collection_log.txt),
+-BuilderLogPath and the SystemInfo rows. Call it after the workbook is final
+(its hash is recorded).
+
+The computer named in the report is the examined one. collection_info.json's
+ComputerName is the computer the collector ran on: the examined one only in
+a live collection. For a mounted image it is used only when the info says
+where it came from (ComputerNameSource, as the builder's report view and a
+model's Collection do); otherwise it is the collector host (CollectorHost),
+and the examined computer's name comes from ExaminedComputerName (the image's
+SYSTEM hive, also read from the builder log) or the SystemInfo rows. When it
+is not known, ComputerName is empty and the report says why.
 #>
 function New-ReportModel {
     [CmdletBinding()]
@@ -2128,12 +2293,19 @@ function New-ReportModel {
         # -MftDays of the run (-1 = unknown: read from the builder log)
         [int]$MftDays = -1,
         # The collection folder or zip (a zip is hashed for the appendix)
-        [string]$CollectionPath
+        [string]$CollectionPath,
+        # Input files that disappeared during the builder run and unexpected
+        # errors it caught (exit code 2: timeline incomplete). The larger of
+        # these and the builder log's counts is used.
+        [int]$MissingInputFiles = 0,
+        [int]$UnexpectedErrors = 0
     )
     $table = Get-ReportEngineRowTable -Rows $Rows
     $collectorLog = Read-ReportEngineCollectorLog $CollectorLogPath
     $builderLog = Read-ReportEngineBuilderLog $BuilderLogPath
     if ($MftDays -lt 0 -and $null -ne $builderLog.MftDays) { $MftDays = $builderLog.MftDays }
+    $missingInputs = [Math]::Max([Math]::Max(0, $MissingInputFiles), [int]$builderLog.MissingInputFiles)
+    $unexpectedErrors = [Math]::Max([Math]::Max(0, $UnexpectedErrors), [int]$builderLog.UnexpectedErrors)
 
     # --- Collection facts ---
     $zoneId = Get-ReportEngineInfoValue $CollectionInfo @("TargetTimeZoneId", "TargetTimeZone")
@@ -2142,17 +2314,40 @@ function New-ReportModel {
     if ($zoneId) {
         try { $zone = [System.TimeZoneInfo]::FindSystemTimeZoneById([string]$zoneId) } catch { $zone = $null }
     }
-    $stats = [TimelineReport.Stats]::Compute($table, $zone)
     $collectionStart = Get-ReportEngineCollectionStart $CollectionInfo
     $mode = [string](Get-ReportEngineInfoValue $CollectionInfo @("Mode"))
     if (-not $mode -and $null -ne $collectorLog.Live) { $mode = if ($collectorLog.Live) { "Live" } else { "MountedImage" } }
+    $live = (-not $mode -or $mode -eq "Live")
 
+    # The examined computer (see .DESCRIPTION)
     $systemInfo = @(Find-ReportEngineRows -Table $table -Source '^SystemInfo$' -Description '^System: ')
     $systemDetails = if ($systemInfo.Count -gt 0) { $table.Details[$systemInfo[$systemInfo.Count - 1]] } else { "" }
-    $computer = [string](Get-ReportEngineInfoValue $CollectionInfo @("ComputerName"))
-    if (-not $computer) { $computer = [TimelineReport.DetailParser]::Get($systemDetails, "Host") }
+    $infoComputer = [string](Get-ReportEngineInfoValue $CollectionInfo @("ComputerName"))
+    $infoComputerSource = [string](Get-ReportEngineInfoValue $CollectionInfo @("ComputerNameSource"))
+    $collectorHost = [string](Get-ReportEngineInfoValue $CollectionInfo @("CollectorHost"))
+    $hiveComputer = [string](Get-ReportEngineInfoValue $CollectionInfo @("ExaminedComputerName"))
+    if (-not $hiveComputer) { $hiveComputer = $builderLog.ExaminedComputerName }
+    $computer = ""
+    $computerSource = ""
+    if ($infoComputer -and ($live -or $infoComputerSource)) {
+        $computer = $infoComputer
+        $computerSource = if ($infoComputerSource) { $infoComputerSource } else { "collection_info.json" }
+    }
+    elseif ($infoComputer -and -not $collectorHost) { $collectorHost = $infoComputer }
+    if (-not $computer -and $hiveComputer) { $computer = $hiveComputer; $computerSource = "SYSTEM hive" }
+    if (-not $computer) {
+        $computer = [TimelineReport.DetailParser]::Get($systemDetails, "Host")
+        if ($computer) { $computerSource = "systeminfo.txt" }
+    }
     # The log's computer is the collector host: the examined one only when live
-    if (-not $computer -and $mode -eq "Live") { $computer = $collectorLog.Computer }
+    if (-not $computer -and $mode -eq "Live" -and $collectorLog.Computer) { $computer = $collectorLog.Computer; $computerSource = "collection_log.txt" }
+    if (-not $live -and -not $collectorHost -and $collectorLog.Computer) { $collectorHost = $collectorLog.Computer }
+    if ($live) { $collectorHost = "" }
+
+    # Rows per user: an older timeline's HOST\alice (the examined computer's
+    # own name) counts with alice
+    $localDomains = [string[]]@(@($computer, $hiveComputer) | Where-Object { $_ })
+    $stats = [TimelineReport.Stats]::Compute($table, $zone, $localDomains)
     $os = [string](Get-ReportEngineInfoValue $CollectionInfo @("OS"))
     if (-not $os -and $systemDetails) {
         $os = [TimelineReport.DetailParser]::Get($systemDetails, "OS")
@@ -2162,6 +2357,8 @@ function New-ReportModel {
     if (-not $os -and $mode -eq "Live") { $os = $collectorLog.OS }
     $collectorUser = [string](Get-ReportEngineInfoValue $CollectionInfo @("CollectorUser"))
     if (-not $collectorUser) { $collectorUser = $collectorLog.User }
+    # The accounts as the timeline's User column names them (CORP\alice and
+    # a local alice are different accounts)
     $users = @(Get-ReportEngineInfoValue $CollectionInfo @("Users"))
     if ($users.Count -eq 0 -or $null -eq $users[0]) {
         $users = @($stats.Users | Where-Object { -not $_.IsSystem -and $_.Name -notmatch '^S-1-\d' } | Select-Object -First 20 | ForEach-Object { $_.Name })
@@ -2172,7 +2369,11 @@ function New-ReportModel {
     # does not record the examined computer's (older collections, images)
     $zoneAssumed = [bool]$zoneId -and [bool](Get-ReportEngineInfoValue $CollectionInfo @("TargetTimeZoneAssumed"))
     $collection = [PSCustomObject]@{
+        # The examined computer ("" when not known), where its name came
+        # from, and for a mounted image the computer the collector ran on
         ComputerName             = $computer
+        ComputerNameSource       = $computerSource
+        CollectorHost            = $collectorHost
         OS                       = $os
         Users                    = [string[]]@($users)
         Mode                     = $mode
@@ -2262,7 +2463,7 @@ function New-ReportModel {
             $auditNotes.Add("Process creation auditing (Security event 4688) recorded nothing: which programs ran, and their command lines, are not in the Security log. Prefetch, Amcache, BAM and UserAssist still show execution.")
         }
         if ((Find-ReportEngineRows -Table $table -Source '^Security\.evtx$' -Description '^Scheduled task (?:registered|updated|deleted|enabled|disabled):').Count -eq 0) {
-            $auditNotes.Add("Scheduled-task auditing (Security events 4698-4702) recorded nothing; task changes come only from the task files and the Task Scheduler log.")
+            $auditNotes.Add("Scheduled-task auditing (Security events 4698-4702) recorded nothing; task changes come only from the task files, the registry's TaskCache and the Task Scheduler log.")
         }
         $securitySpan = $security.LastTicks - $security.FirstTicks
         if ($security.FirstTicks -ge 0 -and $securitySpan -lt 7 * [TimeSpan]::TicksPerDay) {
@@ -2309,18 +2510,38 @@ function New-ReportModel {
         Count     = @($builderLog.ProblemLines).Count
         Lines     = [string[]]@($builderLog.ProblemLines | Select-Object -First 50)
     }
+    # The builder run: a timeline that ended incomplete (exit code 2)
+    $incompleteTexts = New-Object System.Collections.Generic.List[string]
+    if ($missingInputs -gt 0) {
+        $incompleteTexts.Add("The timeline is incomplete: $missingInputs input file(s) disappeared while it was built (the builder ended with exit code 2), so rows from them may be missing and a missing event proves even less.")
+    }
+    if ($unexpectedErrors -gt 0) {
+        $incompleteTexts.Add("The builder hit $unexpectedErrors unexpected error(s) and skipped the rest of those steps (exit code 2): the timeline may be incomplete.")
+    }
+    $completeness = [PSCustomObject]@{
+        Incomplete        = ($missingInputs -gt 0 -or $unexpectedErrors -gt 0)
+        MissingInputFiles = $missingInputs
+        UnexpectedErrors  = $unexpectedErrors
+        Lines             = $incompleteTexts.ToArray()
+    }
+
     $notes = New-Object System.Collections.Generic.List[string]
+    foreach ($text in $incompleteTexts) { $notes.Add($text) }
     $notes.Add("The timeline has $($table.Count) rows from $($stats.Sources.Count) sources, $(Format-ReportEngineUtc (ConvertFrom-ReportEngineTicks $stats.FirstTicks)) to $(Format-ReportEngineUtc (ConvertFrom-ReportEngineTicks $stats.LastTicks)).")
-    if ($stats.SnapshotRows -gt 0) { $notes.Add("$($stats.SnapshotRows) row(s) are Snapshot rows: the state at collection time, not events.") }
+    if ($stats.SnapshotRows -gt 0) { $notes.Add("$($stats.SnapshotRows) row(s) are Snapshot rows: the state when the evidence was collected (or when a memory dump was captured), not events.") }
     if ($table.Count -gt $stats.TimedRows) { $notes.Add("$($table.Count - $stats.TimedRows) row(s) have a timestamp that could not be read.") }
     if ($builderLog.Sources) { $notes.Add("Sources parsed by the builder: $($builderLog.Sources).") }
     if ($builderLog.Available -and $builderWarnings.Count -gt 0) { $notes.Add("The builder logged $($builderWarnings.Count) warning(s) or error(s).") }
     if ($collectorLog.Available -and $collectorErrorCount -gt 0) { $notes.Add("The collector logged $collectorErrorCount error(s).") }
+    if ($builderLog.UnnamedSids -gt 0) {
+        $notes.Add("$($builderLog.UnnamedSids) account SID(s) in the User column have no name (the SOFTWARE hive's ProfileList and bam_entries.csv were not read in this run, or do not list them): Rows per user can list such an account under its SID, apart from its name.")
+    }
 
     # --- Caveats: what this report can't tell you ---
     $caveats = New-Object System.Collections.Generic.List[string]
     @(
         "These are leads to review, not a verdict on whether this computer was compromised or is clean."
+        $incompleteTexts
         "Useful logging is off by default (process command lines 4688, task and remote-session events 4698-4702 and 4778/4779, full PowerShell script logging, file-share access 5140/5145): a missing event proves nothing."
         "Domain sign-ins are logged on the domain controller (Kerberos and NTLM events 4768, 4769, 4776), not on this computer."
         "Logs roll over: each reaches back only to its first event (see Evidence coverage), so older activity may be gone."
@@ -2340,7 +2561,16 @@ function New-ReportModel {
         $caveats.Add("The computer's time zone was not recorded in the collection: $zoneId (the collecting computer's) was assumed for times that Windows records in local time, and for the machine times shown here.")
     }
     if ($mode -eq "MountedImage") {
-        $caveats.Add("The collection was made from a mounted disk image, so live state (running programs, network connections, the DNS cache) is not included.")
+        if (@($stats.Sources | Where-Object { $_.Source -like "Memory-*" }).Count -gt 0) {
+            $caveats.Add("The collection was made from a mounted disk image: live command output (the DNS cache, live network listings) is not included; running programs and network connections come only from the memory dump.")
+        }
+        else {
+            $caveats.Add("The collection was made from a mounted disk image, so live state (running programs, network connections, the DNS cache) is not included.")
+        }
+        if (-not $computer) {
+            $hostText = if ($collectorHost) { " $collectorHost is the computer the collection was made on, not the examined one." } else { "" }
+            $caveats.Add("The examined computer's name is not known: the image's SYSTEM hive was not read (or had no name) and the collection records only the computer it was made on.$hostText")
+        }
     }
     if ($secrets) {
         $caveats.Add("This collection was made with -IncludeSecrets: it holds keys that can decrypt saved passwords and cookies. Store and share it like a password vault.")
@@ -2413,6 +2643,9 @@ function New-ReportModel {
             AuditNotes      = $auditNotes.ToArray()
             CollectorErrors = $collectorErrors
             BuilderWarnings = $builderWarnings
+            # Incomplete: the builder run ended with exit code 2 (input files
+            # gone during the run, or unexpected errors); Lines say so
+            TimelineCompleteness = $completeness
             Notes           = $notes.ToArray()
         }
         Activity      = [PSCustomObject]@{

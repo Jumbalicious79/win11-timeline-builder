@@ -10,16 +10,23 @@
 # "Finding" column. Then:
 #   -ReportOnly rebuilds the report in the same folder (one Findings sheet
 #      and one Finding column, the same findings, no administrator rights
-#      needed);
+#      needed, no error output -- Windows PowerShell printed a Test-Path
+#      binding error for the empty -InputPath);
 #   -ReportOnly -ReportRules <file> -NoExcel uses another rules file and
 #      leaves the workbook alone (and says its findings are from an earlier
-#      report);
+#      report); -WorkDir and -MemoryDumpPath are ignored with one warning;
+#   -ReportOnly on a mounted-image timeline whose run ended with exit code
+#      2: the examined computer from the run's log (SYSTEM hive), not the
+#      collector host, and the incomplete timeline in the report;
 #   a missing -ReportRules file and -NoReport leave the timeline intact
 #      and write no report;
 #   -ReportOnly works in a folder named "case [1]" (wildcard characters),
 #      and a report.pdf held open elsewhere is reported as out of date while
 #      the new PDF gets its own name;
 #   -ReportOnly on a folder without a timeline fails cleanly.
+# Before the runs: the builder's Get-TimelineReportCollectionInfo (from its
+# syntax tree) takes a mounted image's computer name in collection_info.json
+# as the collector host, and the SYSTEM hive's name as the examined one.
 #
 # Needs Administrator rights, like the builder (GitHub Actions Windows
 # runners are elevated). For a local run without them, pass -BuilderPath
@@ -80,12 +87,16 @@ if (-not $BuilderPath) {
 # Run the builder with the same PowerShell edition as this script
 $powershellExe = (Get-Process -Id $PID).Path
 
-# Runs the builder with the given arguments; returns its exit code and output
+# Runs the builder with the given arguments; returns its exit code, its
+# output, and the lines it wrote to stderr (errors: a red PowerShell error
+# such as Windows PowerShell's Test-Path binding error for an empty path)
 function Invoke-TimelineBuilder {
     param([string[]]$Arguments)
     $ErrorActionPreference = "Continue"
     $output = & $powershellExe -NoProfile -ExecutionPolicy Bypass -File $builder @Arguments 2>&1
-    return [PSCustomObject]@{ ExitCode = $LASTEXITCODE; Output = @($output | ForEach-Object { "$_" }) }
+    $exitCode = $LASTEXITCODE
+    $errorLines = @($output | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" } | Where-Object { $_.Trim() })
+    return [PSCustomObject]@{ ExitCode = $exitCode; Output = @($output | ForEach-Object { "$_" }); Errors = $errorLines }
 }
 
 # The workbook's sheets and cells (ImportExcel / EPPlus), or $null when the
@@ -146,6 +157,23 @@ New-Item -ItemType Directory -Path $workDir | Out-Null
 try {
     . (Join-Path $repoRoot "report\TimelineReport.Render.ps1")
     $edge = Find-ReportPdfEdge
+
+    # --- 0. What the report says about the collection (the builder's
+    # Get-TimelineReportCollectionInfo, loaded from its syntax tree) ---
+    $builderAst = [System.Management.Automation.Language.Parser]::ParseFile($builder, [ref]$null, [ref]$null)
+    $infoFunction = @($builderAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq "Get-TimelineReportCollectionInfo" }, $true))[0]
+    . ([scriptblock]::Create($infoFunction.Extent.Text))
+    function Log-Warning { param([string]$Message) Write-Host "WARNING: $Message" }
+    $infoDir = Join-Path $workDir "info"
+    New-Item -ItemType Directory -Path $infoDir | Out-Null
+    $imageJson = Join-Path $infoDir "collection_info.json"
+    [System.IO.File]::WriteAllText($imageJson, '{ "SchemaVersion": 1, "ComputerName": "ANALYST-WS", "CollectorUser": "ANALYST-WS\\examiner", "Mode": "MountedImage", "CollectionStartUtc": "2026-03-02T12:00:00Z", "TargetTimeZoneId": "UTC" }')
+    $imageInfo = Get-TimelineReportCollectionInfo -InfoJsonPath $imageJson
+    Write-TestResult -Succeeded ($imageInfo.ComputerName -eq "" -and $imageInfo.CollectorHost -eq "ANALYST-WS" -and $imageInfo.ComputerNameSource -eq "") -Message "mounted image: collection_info.json's computer is the collector host, not the examined computer ('$($imageInfo.ComputerName)', host '$($imageInfo.CollectorHost)')"
+    $hiveInfo = Get-TimelineReportCollectionInfo -InfoJsonPath $imageJson -BuilderInfo ([PSCustomObject]@{ Mode = "MountedImage"; ComputerName = "ANALYST-WS" }) -ExaminedComputerName "IMAGED-PC"
+    Write-TestResult -Succeeded ($hiveInfo.ComputerName -eq "IMAGED-PC" -and $hiveInfo.ComputerNameSource -eq "SYSTEM hive" -and $hiveInfo.CollectorHost -eq "ANALYST-WS") -Message "mounted image: the examined computer's name from the SYSTEM hive ('$($hiveInfo.ComputerName)')"
+    $liveInfo = Get-TimelineReportCollectionInfo -InfoJsonPath (Join-Path $collection "collection_info.json") -ExaminedComputerName "HIVE-NAME"
+    Write-TestResult -Succeeded ($liveInfo.ComputerName -eq "REPORT-FIXTURE" -and $liveInfo.ComputerNameSource -eq "collection_info.json" -and $liveInfo.CollectorHost -eq "" -and $liveInfo.ExaminedComputerName -eq "HIVE-NAME") -Message "live collection: the computer from collection_info.json ('$($liveInfo.ComputerName)')"
 
     # --- 1. A full builder run writes the report next to the timeline ---
     $runDir = Join-Path $workDir "run"
@@ -277,6 +305,7 @@ try {
     $rebuild = Invoke-TimelineBuilder -Arguments @("-ReportOnly", $runDir, "-Viewer", "None")
     Write-TestResult -Succeeded ($rebuild.ExitCode -eq 0 -and (Test-Path -LiteralPath (Join-Path $runDir "report_log.txt"))) -Message "-ReportOnly <folder> exits with 0 and logs to report_log.txt (exit code $($rebuild.ExitCode))"
     if ($rebuild.ExitCode -ne 0) { $rebuild.Output | Select-Object -Last 30 | ForEach-Object { Write-Host "  | $_" } }
+    Write-TestResult -Succeeded ($rebuild.Errors.Count -eq 0 -and @($rebuild.Output | Where-Object { $_ -match 'Cannot bind argument|ParameterBindingValidationException' }).Count -eq 0) -Message "-ReportOnly writes no error (no binding error for the empty -InputPath in Windows PowerShell): $($rebuild.Errors -join ' / ')"
     Write-TestResult -Succeeded ([System.IO.File]::ReadAllText($findingsCsv) -eq $firstFindings -and (Get-Item -LiteralPath $htmlPath).LastWriteTimeUtc -gt $firstHtmlTime) -Message "-ReportOnly rewrites the report with the same findings"
     $rebuiltModel = Get-Content -LiteralPath (Join-Path $runDir "report-model.json") -Raw | ConvertFrom-Json
     Write-TestResult -Succeeded ($rebuiltModel.Collection.ComputerName -eq "REPORT-FIXTURE" -and $rebuiltModel.Collection.CollectorUser -eq "FIXTURE\analyst") -Message "-ReportOnly reads the copied collection_info.json"
@@ -290,7 +319,12 @@ try {
     # --- 3. -ReportOnly with another rules file, workbook left alone ---
     $xlsxHashBefore = $null
     if (Test-Path -LiteralPath $xlsxPath) { $xlsxHashBefore = (Get-FileHash -LiteralPath $xlsxPath).Hash }
-    $custom = Invoke-TimelineBuilder -Arguments @("-ReportOnly", $timelineCsv, "-ReportRules", (Join-Path $fixtureDir "rules-one.json"), "-NoExcel", "-Viewer", "None")
+    # -WorkDir and -MemoryDumpPath bind with -ReportOnly too: ignored, with a warning
+    $ignoredWorkDir = Join-Path $workDir "ignored-workdir"
+    $custom = Invoke-TimelineBuilder -Arguments @("-ReportOnly", $timelineCsv, "-ReportRules", (Join-Path $fixtureDir "rules-one.json"), "-NoExcel", "-Viewer", "None",
+        "-WorkDir", $ignoredWorkDir, "-MemoryDumpPath", (Join-Path $workDir "no-dump.dmp"))
+    Write-TestResult -Succeeded (@($custom.Output | Where-Object { $_ -match 'WARNING: -ReportOnly parses nothing, so these are ignored: -WorkDir, -MemoryDumpPath$' }).Count -eq 1 -and -not (Test-Path -LiteralPath $ignoredWorkDir)) -Message "-ReportOnly warns once that -WorkDir and -MemoryDumpPath are ignored, and makes no work folder"
+    Write-TestResult -Succeeded ($custom.Errors.Count -eq 0) -Message "-ReportOnly -ReportRules writes no error: $($custom.Errors -join ' / ')"
     $customLines = @(Import-Csv -LiteralPath $findingsCsv)
     $customRules = @($customLines | ForEach-Object { $_.RuleId } | Sort-Object -Unique)
     $customModel = Get-Content -LiteralPath (Join-Path $runDir "report-model.json") -Raw | ConvertFrom-Json
@@ -325,7 +359,7 @@ try {
     $bracket = Invoke-TimelineBuilder -Arguments @("-ReportOnly", $bracketDir, "-Viewer", "None")
     $bracketLog = Join-Path $bracketDir "report_log.txt"
     Write-TestResult -Succeeded ($bracket.ExitCode -eq 0 -and (Test-Path -LiteralPath $bracketLog) -and (Test-Path -LiteralPath (Join-Path $bracketDir "report.html")) -and
-        @($bracket.Output | Where-Object { $_ -match 'Add-Content|Cannot find path|Could not find' }).Count -eq 0) -Message "-ReportOnly works in a folder named 'case [1]' and logs to its report_log.txt (exit code $($bracket.ExitCode))"
+        @($bracket.Output | Where-Object { $_ -match 'Add-Content|Cannot find path|Could not find' }).Count -eq 0 -and $bracket.Errors.Count -eq 0) -Message "-ReportOnly works in a folder named 'case [1]' and logs to its report_log.txt, with no error (exit code $($bracket.ExitCode)) $($bracket.Errors -join ' / ')"
     if ($workbook) {
         $bracketModel = Get-Content -LiteralPath (Join-Path $bracketDir "report-model.json") -Raw | ConvertFrom-Json
         Write-TestResult -Succeeded ($bracketModel.Workbook.Available) -Message "-ReportOnly updates the workbook in a folder whose name has [ ]"
@@ -338,6 +372,34 @@ try {
         $newPdfs = @(Get-ChildItem -LiteralPath $bracketDir -Filter "report_*.pdf" -File)
         Write-TestResult -Succeeded ($locked.ExitCode -eq 0 -and @($locked.Output | Where-Object { $_ -match 'WARNING:.*report\.pdf is open in another program.*OUT OF DATE' }).Count -eq 1 -and $newPdfs.Count -eq 1) -Message "a report.pdf held open elsewhere is reported as out of date and the new PDF gets its own name ($($newPdfs.Name -join ', '))"
     }
+
+    # --- 5b. -ReportOnly on a mounted-image timeline whose original run
+    # ended incomplete (exit code 2): the report names the examined
+    # computer from the run's log (SYSTEM hive), not the collector host, and
+    # says that the timeline is incomplete ---
+    $imageDir = Join-Path $workDir "image"
+    New-Item -ItemType Directory -Path $imageDir | Out-Null
+    Copy-Item -LiteralPath $timelineCsv -Destination (Join-Path $imageDir "timeline.csv")
+    $imageCollectionInfo = Get-Content -LiteralPath (Join-Path $collection "collection_info.json") -Raw | ConvertFrom-Json
+    $imageCollectionInfo.Mode = "MountedImage"
+    $imageCollectionInfo.ComputerName = "ANALYST-WS"
+    [System.IO.File]::WriteAllText((Join-Path $imageDir "collection_info.json"), ($imageCollectionInfo | ConvertTo-Json))
+    [System.IO.File]::WriteAllText((Join-Path $imageDir "timeline_builder_log.txt"), (@(
+            "[2026-03-02 05:00:00] === Windows 11 Forensic Timeline Builder Started ===",
+            "[2026-03-02 05:00:01] Collection metadata from collection_info.json: Mode=MountedImage Start=2026-03-02 12:00:00 UTC CollectorTZ=Pacific Standard Time TargetTZ=Pacific Standard Time",
+            "[2026-03-02 05:00:05]   Examined computer name (SYSTEM hive): IMAGED-PC",
+            "[2026-03-02 05:01:00] ERROR: 1 of 12 input file(s) disappeared during the run -- rows from them may be missing from the timeline (not if a file was deleted after its parser read it):",
+            "[2026-03-02 05:02:00] ERROR: === Timeline Builder Completed WITH 1 MISSING INPUT FILE(S) -- timeline incomplete ===") -join "`r`n") + "`r`n")
+    $image = Invoke-TimelineBuilder -Arguments @("-ReportOnly", $imageDir, "-NoExcel", "-Viewer", "None")
+    $imageModel = $null
+    if (Test-Path -LiteralPath (Join-Path $imageDir "report-model.json")) { $imageModel = Get-Content -LiteralPath (Join-Path $imageDir "report-model.json") -Raw | ConvertFrom-Json }
+    Write-TestResult -Succeeded ($image.ExitCode -eq 0 -and $imageModel -and $imageModel.Collection.ComputerName -eq "IMAGED-PC" -and $imageModel.Collection.ComputerNameSource -eq "SYSTEM hive" -and
+        $imageModel.Collection.CollectorHost -eq "ANALYST-WS") -Message "-ReportOnly, mounted image: the examined computer from the run's SYSTEM hive line, the collector host kept apart (exit code $($image.ExitCode))"
+    $imageHtml = ""
+    if (Test-Path -LiteralPath (Join-Path $imageDir "report.html")) { $imageHtml = [System.IO.File]::ReadAllText((Join-Path $imageDir "report.html")) }
+    Write-TestResult -Succeeded ($imageHtml.Contains("<h1>IMAGED-PC</h1>") -and -not $imageHtml.Contains("<h1>ANALYST-WS")) -Message "-ReportOnly, mounted image: the report's title is the examined computer"
+    Write-TestResult -Succeeded ($imageModel -and $imageModel.Coverage.TimelineCompleteness.Incomplete -and $imageModel.Coverage.TimelineCompleteness.MissingInputFiles -eq 1 -and
+        @($imageModel.Caveats | Where-Object { $_ -match '^The timeline is incomplete: 1 input file\(s\) disappeared' }).Count -eq 1 -and $imageHtml.Contains("<h3>Timeline incomplete</h3>")) -Message "-ReportOnly on a timeline that ended with exit code 2: the caveats and Evidence coverage say it is incomplete"
 
     # --- 6. -ReportOnly without a timeline fails cleanly ---
     $emptyDir = Join-Path $workDir "empty"

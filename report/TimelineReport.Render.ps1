@@ -642,6 +642,7 @@ ol.top .t { font-weight: 600; }
 .caveats ul { margin: 2px 0; padding-left: 14px; font-size: 8pt; line-height: 1.32; columns: 2; column-gap: 22px; }
 .caveats li { margin: 0 0 2px; break-inside: avoid; page-break-inside: avoid; }
 .note { border-left: 3px solid var(--accent); background: var(--panel); padding: 5px 10px; margin: 8px 0; font-size: 9pt; }
+.incomplete { border-left: 4px solid var(--high-bar); background: #FFF1F2; padding: 5px 10px; margin: 8px 0; font-size: 9pt; break-inside: avoid; }
 .empty { color: var(--muted); font-style: italic; }
 article.finding { border-left: 5px solid var(--other-bar); padding: 2px 0 2px 12px; margin: 14px 0 18px; }
 article.f-high { border-left-color: var(--high-bar); }
@@ -905,10 +906,25 @@ function Add-ReportHtmlSummary {
     }
     $null = $Builder.AppendLine('</div>')
 
-    # Key facts
+    # Key facts. The computer is the examined one; for a mounted image whose
+    # name is not known, say so (the collection's own computer name is the
+    # computer the collector ran on, not the examined one)
     $null = $Builder.AppendLine('<h3>Key facts</h3><table class="facts"><tbody>')
     $facts = New-Object System.Collections.Generic.List[object]
-    $facts.Add(@("Computer", $hostText))
+    $computerText = $hostText
+    $collectorHost = ConvertTo-ReportHtmlText (Get-ReportHtmlField $collection "CollectorHost") -MaxLength 80
+    $nameSource = [string](Get-ReportHtmlField $collection "ComputerNameSource")
+    $imageMode = [string](Get-ReportHtmlField $collection "Mode") -eq "MountedImage"
+    if (-not $Context.HostName) {
+        $computerText = "Not known"
+        if ($imageMode) { $computerText += ": the collection was made from a mounted disk image, and the image&#39;s computer name was not found (its SYSTEM hive was not read)" }
+        if ($collectorHost) { $computerText += ". The collection was made on " + $collectorHost + ", which is not the examined computer" }
+        $computerText += "."
+    }
+    elseif ($imageMode -and $nameSource -eq "SYSTEM hive") {
+        $computerText += ' <span class="muted small">(from the image&#39;s SYSTEM hive)</span>'
+    }
+    $facts.Add(@("Computer", $computerText))
     $os = ConvertTo-ReportHtmlText (Get-ReportHtmlField $collection "OS")
     if ($os) { $facts.Add(@("Operating system", $os)) }
     $userList = Get-ReportHtmlList $collection "Users"
@@ -1100,6 +1116,17 @@ function Add-ReportHtmlCoverage {
     $coverage = $Context.Coverage
     Add-ReportHtmlSectionStart -Builder $Builder -Context $Context -Id "coverage" -Number $Number -Title "Evidence coverage and integrity" `
         -Intro "What this report is based on: how far back each source reaches, signs that logs were cleared, and logging that was off. Gaps here limit every other section."
+
+    # A builder run that ended incomplete (exit code 2) comes first
+    $completeness = Get-ReportHtmlField $coverage "TimelineCompleteness"
+    if ([bool](Get-ReportHtmlField $completeness "Incomplete")) {
+        $lineList = Get-ReportHtmlList $completeness "Lines"
+        $lines = @($lineList | ForEach-Object { ConvertTo-ReportHtmlText $_ } | Where-Object { $_ })
+        if ($lines.Count -eq 0) { $lines = @("The builder ended with exit code 2: the timeline may be incomplete.") }
+        $null = $Builder.AppendLine('<h3>Timeline incomplete</h3><div class="incomplete">')
+        foreach ($line in $lines) { $null = $Builder.AppendLine('<p><b>' + $line + '</b></p>') }
+        $null = $Builder.AppendLine('<p>The builder log (timeline_builder_log.txt) names the missing files and the errors. Before drawing conclusions from what the timeline does not show, build it again from a complete copy of the collection.</p></div>')
+    }
 
     $integrity = Get-ReportHtmlCategoryFindings -Findings $Context.Findings -Category "Integrity"
     $null = $Builder.AppendLine('<h3>Integrity leads</h3>')
