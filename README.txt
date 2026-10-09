@@ -2671,8 +2671,15 @@ parsing is skipped, and the timeline CSV can be opened manually.
 
   tests\Test-ReportRules.ps1 -- loads report\report-rules.json with the
   engine and checks it against tests\fixtures\report\rules\cases.csv: rows
-  in timeline format, each tagged with the rules it must (HIT) or must not
-  (MISS) trigger; every enabled rule needs a hit and a near-miss case.
+  in timeline format, in the shapes the parsers write now (memory command
+  lines as Snapshot rows, author-supplied task dates, ShimCache
+  FileLastModified rows, the User column's forms), each tagged with the
+  rules it must (HIT) or must not (MISS) trigger, or with KEY <rule>
+  <group>: a hit whose finding must be grouped under that value. Every
+  enabled rule needs a hit and a near-miss case. The rules file must load
+  without an error, and no compiled condition may be empty (it would match
+  every row) or keep a {{list:...}} placeholder. -RulesPath and -CasesPath
+  check other files, -EnginePath another engine.
 
   tests\Test-ReportRender.ps1 -- renders report.html from the synthetic
   models in tests\fixtures\report\render\ and from in-memory models and
