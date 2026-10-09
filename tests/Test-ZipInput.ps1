@@ -8,16 +8,17 @@
 #   functions without running it and checks Expand-CollectionZip (entry
 #   names with "/" and "\", folder entries, original entry dates, an
 #   over-long name shortened with its original name kept for the manifest
-#   lookup, a ".." entry not written outside the folder, nothing extracted
-#   when the zip does not fit), the manifest lookups from an outer folder
-#   (also the email parser's), the input-file list of a collection folder
-#   and the list of missing files, the setupapi logs found (also under
-#   names shortened on extraction; email attachment copies and Secrets\
-#   skipped) and those the manifest lists but that are gone, the
-#   free-space verdict, the temp-folder check (8.3 short paths and
-#   relative paths too), the end-of-run hive list, the clean-up of work
-#   folders left by earlier runs, the SRUM database copy (made in the work
-#   folder's scratch folder, a missing transaction log reported), the
+#   lookup, a ".." entry not written outside the folder, copied email
+#   attachments left in the zip, nothing extracted when the zip does not
+#   fit), the manifest lookups from an outer folder (also the email
+#   parser's), the input-file list of a collection folder (no memory dump
+#   or attachment copy) and the list of missing files, the setupapi logs
+#   found (also under names shortened on extraction; email attachment
+#   copies and Secrets\ skipped) and those the manifest lists but that are
+#   gone, the free-space verdict, the temp-folder check (8.3 short paths
+#   and relative paths too), the end-of-run hive list, the clean-up of
+#   work folders left by earlier runs, the SRUM database copy (made in the
+#   work folder's scratch folder, a missing transaction log reported), the
 #   refusal of a network work folder and the end-of-run banners (missing
 #   input files, unexpected errors).
 # Part 2 -- builder runs: a synthetic collection zip whose entries are dated
@@ -34,7 +35,10 @@
 #     folder) and -WorkDir: exit code 2, the "MISSING INPUT FILE(S)"
 #     banner, the USB parser's warning naming the setupapi log that the
 #     manifest lists but that is gone, the work folder made in -WorkDir
-#     and removed, -WorkDir kept.
+#     and removed, -WorkDir kept;
+#   - a zip with a copied email attachment (-Sources Email), the test hook
+#     pointed at it: it is not extracted, so there is nothing to delete;
+#     exit code 0 and its two rows, from the manifest.
 #   Needs Administrator rights, like the builder itself (GitHub Actions
 #   Windows runners are elevated). For a local run without them, pass
 #   -BuilderPath with a copy of the builder that has no admin check, kept
@@ -168,12 +172,20 @@ try {
     # --- Expand-CollectionZip --------------------------------------------
     $longName = ("LongName_" * 24) + ".lnk"
     $longRel = "UserActivity\alice\Recent\$longName"
+    # Copied email attachments (both folders, both separators) stay in the
+    # zip; the email listing next to them is extracted
+    $classicCopy = "Email\alice\Outlook\SecureTemp\INetCache\ABCD1234\invoice.docm"
+    $newOutlookCopy = "Email\alice\NewOutlook\Attachments\0f1e2d3c\report.pdf"
+    $emailListing = "Email\alice\Outlook\outlook_temp_files.csv"
     $unitEntries = [ordered]@{
         "Coll/"                          = $null
         "Coll/USB/setupapi.dev.log"      = "forward slashes"
         "Coll\Registry\alice\NTUSER.DAT" = "backslashes"
         "Coll/$($longRel.Replace('\', '/'))" = "long name"
-        "Coll/collection_manifest.csv"   = (New-TestManifest -RelativePaths @("USB\setupapi.dev.log", "Registry\alice\NTUSER.DAT", $longRel))
+        "Coll/$($classicCopy.Replace('\', '/'))" = "attachment"
+        "Coll\$newOutlookCopy"           = "attachment"
+        "Coll/$($emailListing.Replace('\', '/'))" = "listing"
+        "Coll/collection_manifest.csv"   = (New-TestManifest -RelativePaths @("USB\setupapi.dev.log", "Registry\alice\NTUSER.DAT", $longRel, $classicCopy, $newOutlookCopy, $emailListing))
         "../escape.txt"                  = "must not be written"
     }
     $unitZip = Join-Path $testRoot "unit.zip"
@@ -199,9 +211,13 @@ try {
         Write-TestResult -Name "over-long name shortened to 240 characters or less, with a hash" -Passed ($shortPath.Length -le 240 -and $shortFile[0].Name -match '^LongName_.*~[0-9A-F]{8}\.lnk$') -Message "$($shortPath.Length) characters: $($shortFile[0].Name)"
         Assert-Equal -Name "shortened file mapped to its full-length path" -Expected (Join-Path $recent $longName) -Actual $script:shortenedNames[$shortPath]
     }
+    Assert-Equal -Name "copied email attachments not extracted (/ and \ entry names)" -Expected "False False" -Actual "$(Test-Path -LiteralPath (Join-Path $coll $classicCopy)) $(Test-Path -LiteralPath (Join-Path $coll $newOutlookCopy))"
+    Assert-Equal -Name "the email listing next to them is extracted" -Expected $true -Actual (Test-Path -LiteralPath (Join-Path $coll $emailListing) -PathType Leaf)
+    Assert-Equal -Name "zip size logged with every file, attachments left in the zip logged" -Expected $true -Actual (
+        $unitLog -match "Zip: .+ -- 9 entries, 8 file\(s\)" -and $unitLog -match "Not extracted: 2 copied email attachment\(s\)")
     $extracted = @(Get-ChildItem -LiteralPath $dest -Recurse -File)
-    Assert-Equal -Name "files extracted (folder entry and '..' entry skipped)" -Expected 4 -Actual $extracted.Count
-    Assert-Equal -Name "extracted files recorded as input files" -Expected 4 -Actual $script:inputFiles.Count
+    Assert-Equal -Name "files extracted (folder entry, '..' entry and attachment copies skipped)" -Expected 5 -Actual $extracted.Count
+    Assert-Equal -Name "extracted files recorded as input files" -Expected 5 -Actual $script:inputFiles.Count
     $wrongDates = @($extracted | Where-Object { $_.LastWriteTime -ne $entryDate } | ForEach-Object { "$($_.Name)=$($_.LastWriteTime.ToString('s'))" })
     Assert-Equal -Name "extracted files keep the zip entry date (2025-01-01)" -Expected "" -Actual ($wrongDates -join ", ")
 
@@ -215,7 +231,7 @@ try {
         catch { $_.Exception.Message }
     }
     Assert-Equal -Name "zip that does not fit: extraction stops" -Expected "not enough free space to extract the zip" -Actual $noSpaceError
-    Assert-Equal -Name "zip that does not fit: nothing extracted or recorded" -Expected "0 4" -Actual "$(@(Get-ChildItem -LiteralPath $noSpaceDest -Recurse -File -ErrorAction SilentlyContinue).Count) $($script:inputFiles.Count)"
+    Assert-Equal -Name "zip that does not fit: nothing extracted or recorded" -Expected "0 5" -Actual "$(@(Get-ChildItem -LiteralPath $noSpaceDest -Recurse -File -ErrorAction SilentlyContinue).Count) $($script:inputFiles.Count)"
 
     # --- Manifest lookups (shortened name, outer folder) -----------------
     # -InputPath as the builder's functions read it
@@ -258,19 +274,19 @@ try {
 
     # --- Input files of a collection folder ------------------------------
     $folderColl = Join-Path $testRoot "folder\Coll"
-    foreach ($rel in @("USB\setupapi.dev.log", "Registry\SYSTEM", "Memory\Coll_memory_dump.dmp")) {
+    foreach ($rel in @("USB\setupapi.dev.log", "Registry\SYSTEM", "Memory\Coll_memory_dump.dmp", $classicCopy)) {
         $file = Join-Path $folderColl $rel
         New-Item -ItemType Directory -Path (Split-Path $file -Parent) -Force | Out-Null
         [System.IO.File]::WriteAllText($file, "x")
     }
     [System.IO.File]::WriteAllText((Join-Path $folderColl "collection_manifest.csv"),
-        (New-TestManifest -RelativePaths @("USB\setupapi.dev.log", "Registry\SYSTEM", "Memory\Coll_memory_dump.dmp", "USB\gone_before_the_run.log")))
+        (New-TestManifest -RelativePaths @("USB\setupapi.dev.log", "Registry\SYSTEM", "Memory\Coll_memory_dump.dmp", $classicCopy, "USB\gone_before_the_run.log")))
     Set-Variable -Name InputPath -Value (Split-Path $folderColl -Parent) -Scope Script
     $script:collectionManifest = $null
     $script:inputFiles = New-Object System.Collections.Generic.List[string]
     Add-ManifestInputFiles
     $tracked = @($script:inputFiles | ForEach-Object { $_.Substring($folderColl.Length + 1) } | Sort-Object) -join ", "
-    Assert-Equal -Name "folder input: manifest files present at the start are tracked (no memory dump)" -Expected "Registry\SYSTEM, USB\setupapi.dev.log" -Actual $tracked
+    Assert-Equal -Name "folder input: manifest files present at the start are tracked (no memory dump or attachment copy)" -Expected "Registry\SYSTEM, USB\setupapi.dev.log" -Actual $tracked
     Remove-Item -LiteralPath (Join-Path $folderColl "USB\setupapi.dev.log")
     $missing = @(Get-MissingInputFiles)
     Assert-Equal -Name "a deleted input file is reported missing" -Expected (Join-Path $folderColl "USB\setupapi.dev.log") -Actual ($missing -join ", ")
@@ -501,13 +517,13 @@ try {
     New-TestZip -Path $zipPath -Entries $zipEntries -EntryDate $entryDate
     $zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash
 
-    # Runs the builder on the zip (USB source, CSV only); returns its exit
-    # code, console output and log file
+    # Runs the builder on a zip (default: $zipPath with the USB source; CSV
+    # only); returns its exit code, console output and log file
     function Invoke-ZipRun {
-        param([string]$OutputFile, [string[]]$ExtraArguments = @())
+        param([string]$OutputFile, [string[]]$ExtraArguments = @(), [string]$Zip = $zipPath, [string]$RunSources = "USB")
         $ErrorActionPreference = "Continue"
         $before = @(Get-ChildItem -LiteralPath $reportsDir -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
-        $output = & $powershellExe -NoProfile -ExecutionPolicy Bypass -File $builder -InputPath $zipPath -Sources "USB" `
+        $output = & $powershellExe -NoProfile -ExecutionPolicy Bypass -File $builder -InputPath $Zip -Sources $RunSources `
             -OutputFile $OutputFile -NoExcel -Viewer None @ExtraArguments 2>&1
         $exitCode = $LASTEXITCODE
         $newReport = @(Get-ChildItem -LiteralPath $reportsDir -Directory -ErrorAction SilentlyContinue | Where-Object { $before -notcontains $_.FullName }) | Select-Object -First 1
@@ -570,6 +586,35 @@ try {
     Write-TestResult -Name "run B: work folder made in -WorkDir" -Passed ($runB.WorkFolder -and (Split-Path $runB.WorkFolder -Parent) -eq $workDirB) -Message "work folder: $($runB.WorkFolder)"
     Write-TestResult -Name "run B: work folder removed, -WorkDir kept" -Passed ($runB.WorkFolder -and -not (Test-Path -LiteralPath $runB.WorkFolder) -and (Test-Path -LiteralPath $workDirB)) -Message "work folder: $($runB.WorkFolder)"
     Assert-Equal -Name "run B: the zip is not changed" -Expected $zipHash -Actual (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash
+
+    # --- Run C: a copied email attachment (antivirus may quarantine it) ----
+    # It stays in the zip and is no input file, so its removal cannot stop
+    # the run or mark the timeline incomplete. The test hook is pointed at
+    # it and must find nothing to delete; the rows come from the manifest.
+    $mailZipPath = Join-Path $testRoot "mail\$collName.zip"
+    New-Item -ItemType Directory -Path (Split-Path $mailZipPath -Parent) | Out-Null
+    $mailEntries = [ordered]@{
+        "$collName/collection_info.json"               = $collectionInfo
+        "$collName/collection_manifest.csv"            = (New-TestManifest -RelativePaths @($classicCopy))
+        "$collName/$($classicCopy.Replace('\', '/'))"  = "attachment"
+    }
+    New-TestZip -Path $mailZipPath -Entries $mailEntries -EntryDate $entryDate
+    $csvC = Join-Path $testRoot "timeline-c.csv"
+    Write-Host "Running the builder on a zip with a copied email attachment, the test hook pointed at it ..."
+    $env:TIMELINE_BUILDER_TEST_DELETE_INPUT = $classicCopy
+    try { $runC = Invoke-ZipRun -OutputFile $csvC -Zip $mailZipPath -RunSources "Email" }
+    finally { Remove-Item -LiteralPath Env:\TIMELINE_BUILDER_TEST_DELETE_INPUT -ErrorAction SilentlyContinue }
+    if ($runC.ExitCode -ne 0) { $runC.Lines | ForEach-Object { Write-Host "  | $_" } }
+    Assert-Equal -Name "run C: exit code" -Expected 0 -Actual $runC.ExitCode
+    Assert-Equal -Name "run C: completed successfully" -Expected 1 -Actual @($runC.Lines -match "=== Timeline Builder Completed Successfully ===").Count
+    Assert-Equal -Name "run C: attachment left in the zip (logged; the test hook found no file)" -Expected $true -Actual (
+        $runC.Log -match "Not extracted: 1 copied email attachment\(s\)" -and $runC.Log -match "Test hook ignored \(not a file in the work folder\)")
+    Assert-Equal -Name "run C: the attachment is no input file" -Expected $true -Actual ($runC.Log -match "All 2 input file\(s\) were still present")
+    $rowsC = @()
+    if (Test-Path -LiteralPath $csvC) { $rowsC = @(Import-Csv -LiteralPath $csvC) }
+    $mailRows = @($rowsC | Where-Object { $_.Source -eq "Email-Attachments" } | ForEach-Object { "$($_.Timestamp) $($_.Description) ($($_.User))" })
+    Assert-Equal -Name "run C: attachment rows from the manifest" -Expected (
+        "2024-03-01 10:00:00.000 Outlook attachment in temp folder: invoice.docm (alice) | 2024-03-02 11:00:00.000 Outlook attachment in temp folder modified: invoice.docm (alice)") -Actual ($mailRows -join " | ")
 }
 catch {
     Write-TestResult -Name "test run" -Passed $false -Message "$($_.Exception.Message) ($($_.InvocationInfo.PositionMessage))"
