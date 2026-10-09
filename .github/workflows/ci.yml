@@ -71,6 +71,22 @@ jobs:
         if: ${{ !cancelled() }}
         run: ./tests/Test-BrowserParsers.ps1
 
+      - name: Run browser extras parser tests
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-BrowserExtrasParsers.ps1
+
+      - name: Run secrets handling parser test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-SecretsHandling.ps1
+
+      - name: Run email parser tests
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-EmailParsers.ps1
+
+      - name: Run Defender parser tests
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-DefenderParsers.ps1
+
       # These two change the runner (audit policy, a temporary user, task,
       # service and event log; temporary registry keys saved with reg save)
       # and undo it afterwards; they do that only when GITHUB_ACTIONS is set
@@ -81,6 +97,18 @@ jobs:
       - name: Run registry parser tests
         if: ${{ !cancelled() }}
         run: ./tests/Test-RegistryParsers.ps1
+
+      # Phase 2 event logs: also changes the runner (a temporary firewall
+      # rule, WMI subscription and NTLM audit settings), undone afterwards
+      - name: Run Phase 2 event log parser tests
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-EventLogParsers2.ps1
+
+      # Runs esentutl on test databases and saves a temporary registry key
+      # with reg save (removed afterwards)
+      - name: Run SRUM parser tests
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-SrumParsers.ps1
 
   analyze:
     name: PSScriptAnalyzer
