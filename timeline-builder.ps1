@@ -15071,29 +15071,225 @@ function Find-MemoryDump {
     return $null
 }
 
-# CPU architecture of a Microsoft crash dump from its header ("PAGEDU64":
-# machine type at 0x30; "PAGEDUMP": 32-bit x86). "Raw" for raw images,
-# "Unknown" if the header can't be read.
-function Get-MemoryDumpArchitecture {
+# What the header of a memory dump says, read once:
+# - Architecture: of a Microsoft crash dump ("PAGEDU64": machine type at
+#   0x30; "PAGEDUMP": 32-bit x86); "Raw" for raw images, "Unknown" if the
+#   header can't be read.
+# - CaptureTimeUtc: when the memory was captured. 64-bit crash dumps store
+#   it as DUMP_HEADER64.SystemTime at 0xFA8 (DumpIt: the start of the
+#   acquisition). Raw images, 32-bit dumps and a header time that is zero,
+#   before 1980 or more than a day after the file's last write fall back to
+#   the file's last-write time. TimeSource says which one it is.
+# - LastWriteUtc: the file's last-write time, the end of the acquisition.
+# The file is opened read-only, also while another program has it open.
+function Get-MemoryDumpInfo {
     param([string]$Path)
-    $header = New-Object byte[] 0x40
+    $info = [PSCustomObject]@{ Architecture = "Unknown"; CaptureTimeUtc = $null; TimeSource = ""; LastWriteUtc = $null }
+    $header = New-Object byte[] 0xFB0
+    $read = 0
     try {
-        $stream = [System.IO.File]::OpenRead($Path)
-        try { $read = $stream.Read($header, 0, $header.Length) } finally { $stream.Dispose() }
+        $file = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        $info.LastWriteUtc = $file.LastWriteTimeUtc
+        $info.CaptureTimeUtc = $file.LastWriteTimeUtc
+        $info.TimeSource = "dump file last-write time"
+        $stream = New-Object System.IO.FileStream($file.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try {
+            while ($read -lt $header.Length) {
+                $count = $stream.Read($header, $read, $header.Length - $read)
+                if ($count -le 0) { break }
+                $read += $count
+            }
+        }
+        finally { $stream.Dispose() }
     }
     catch {
         Write-Verbose "Could not read memory dump header of ${Path}: $($_.Exception.Message)"
-        return "Unknown"
+        return $info
     }
-    if ($read -lt $header.Length) { return "Unknown" }
+    if ($read -lt 0x40) { return $info }
     $signature = [System.Text.Encoding]::ASCII.GetString($header, 0, 8)
-    if ($signature -eq "PAGEDUMP") { return "x86" }
-    if ($signature -ne "PAGEDU64") { return "Raw" }
+    if ($signature -eq "PAGEDUMP") { $info.Architecture = "x86"; return $info }
+    if ($signature -ne "PAGEDU64") { $info.Architecture = "Raw"; return $info }
     switch ([BitConverter]::ToUInt32($header, 0x30)) {
-        0x8664 { return "x64" }
-        0xAA64 { return "ARM64" }
-        default { return "Unknown" }
+        0x8664 { $info.Architecture = "x64" }
+        0xAA64 { $info.Architecture = "ARM64" }
     }
+    if ($read -lt 0xFB0) { return $info }
+    $fileTime = [BitConverter]::ToInt64($header, 0xFA8)
+    if ($fileTime -le 0 -or $fileTime -gt [datetime]::MaxValue.ToFileTimeUtc()) { return $info }
+    $systemTime = [datetime]::FromFileTimeUtc($fileTime)
+    if ($systemTime.Year -ge 1980 -and $systemTime -le $info.LastWriteUtc.AddDays(1)) {
+        $info.CaptureTimeUtc = $systemTime
+        $info.TimeSource = "crash dump header"
+    }
+    return $info
+}
+
+# Runs one Volatility 3 plugin on the dump with JSON output. The JSON goes
+# to a file in the work folder's scratch folder and is read back; the file
+# is deleted again. stderr is kept in memory: a 2> redirection cannot write
+# to a path with [ ] in it (-WorkDir may have them), and its lines must not
+# stop the run (Windows PowerShell makes them errors). Returns Json (the
+# output, "" for none) and Errors (the stderr lines).
+function Invoke-VolatilityPlugin {
+    param([string]$VolExe, [string]$DumpPath, [string]$Plugin)
+    $ErrorActionPreference = "Continue"
+    $jsonFile = Join-Path (Get-ScratchFolder) "vol3_$($Plugin -replace '\.','_')_$(Get-Random).json"
+    $errorLines = New-Object System.Collections.Generic.List[string]
+    try {
+        & $VolExe -f $DumpPath -r json $Plugin 2>&1 | ForEach-Object {
+            if ($_ -is [System.Management.Automation.ErrorRecord]) { $errorLines.Add("$_") } else { $_ }
+        } | Out-File -LiteralPath $jsonFile -Encoding utf8
+        $json = ""
+        if (Test-Path -LiteralPath $jsonFile) { $json = [System.IO.File]::ReadAllText($jsonFile) }
+        return [PSCustomObject]@{ Json = $json; Errors = ($errorLines -join "`n") }
+    }
+    finally { Remove-Item -LiteralPath $jsonFile -Force -ErrorAction SilentlyContinue }
+}
+
+# Own time of a Volatility entry (pslist CreateTime, netscan Created): text,
+# or a [datetime] where PowerShell 7's ConvertFrom-Json made one. TimeUtc is
+# set when the time is valid, from 1980 up to -LatestUtc. Text is a time
+# that is there but not used: in UTC as yyyy-MM-dd HH:mm:ss.fff when it
+# parses (the same in both PowerShell versions), else as found.
+function Get-MemoryEntryTime {
+    param($Value, [datetime]$LatestUtc)
+    $result = [PSCustomObject]@{ TimeUtc = $null; Text = "" }
+    $raw = "$Value".Trim()
+    if ($raw -eq "" -or $raw -eq "N/A") { return $result }
+    $time = ConvertFrom-UtcText $Value
+    if ($null -eq $time) { $result.Text = $raw }
+    elseif ($time.Year -lt 1980 -or $time -gt $LatestUtc) {
+        $result.Text = $time.ToString("yyyy-MM-dd HH:mm:ss.fff", [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    else { $result.TimeUtc = $time }
+    return $result
+}
+
+# Timeline rows for the entries of one Volatility 3 plugin (its JSON output
+# through ConvertFrom-Json). Every row starts as a Snapshot row at the
+# dump's capture time and is an event only when its entry has a valid time
+# of its own (Get-MemoryEntryTime, up to a day after the end of the
+# acquisition):
+# - pslist: CreateTime -> ProcessCreation at that time
+# - netscan: Created -> NetworkConnection at that time
+# - cmdline, svcscan: always Snapshot. A command line is read from the
+#   process's own memory, which the process can change, and a service
+#   record is the service's state; neither says when something happened.
+# A time that is there but not valid is kept in Details (CreateTime=,
+# Created=). Returns the row counts: Entries, Timed and Snapshot.
+function Add-MemoryPluginRows {
+    param(
+        [string]$Plugin,
+        [string]$Source,
+        [object[]]$Entries,
+        [datetime]$CaptureTimeUtc,
+        [datetime]$AcquisitionEndUtc,
+        [string]$DumpPath
+    )
+    $latestUtc = $AcquisitionEndUtc.AddDays(1)
+    $timed = 0
+    $snapshot = 0
+
+    foreach ($entry in $Entries) {
+        $ts = $CaptureTimeUtc
+        $eventType = "Snapshot"
+
+        # The counters are inside each branch: "continue" in a switch only
+        # leaves the switch, so a counter after it would count skipped entries
+        switch ($Plugin) {
+            "windows.pslist" {
+                $created = Get-MemoryEntryTime -Value $entry.CreateTime -LatestUtc $latestUtc
+                $procId = if ($entry.PID) { $entry.PID } else { "" }
+                $ppid = if ($entry.PPID) { $entry.PPID } else { "" }
+                $name = if ($entry.ImageFileName) { $entry.ImageFileName } else { "Unknown" }
+                $threads = if ($entry.Threads) { $entry.Threads } else { "" }
+                $session = if ($entry.SessionId) { $entry.SessionId } else { "" }
+                $details = "Threads=$threads SessionId=$session"
+                if ($null -ne $created.TimeUtc) {
+                    $ts = $created.TimeUtc
+                    $eventType = "ProcessCreation"
+                    $timed++
+                }
+                else {
+                    if ($created.Text) { $details += " CreateTime=$($created.Text)" }
+                    $snapshot++
+                }
+
+                Add-TimelineEntry -Timestamp $ts -Source $Source -EventType $eventType `
+                    -Description "Process in memory: $name (PID: $procId, PPID: $ppid)" `
+                    -Details $details `
+                    -Artifact "MemoryDump" -RawPath $DumpPath
+            }
+            "windows.netscan" {
+                $created = Get-MemoryEntryTime -Value $entry.Created -LatestUtc $latestUtc
+                $proto = if ($entry.Proto) { $entry.Proto } else { "" }
+                $localAddr = if ($entry.LocalAddr) { "$($entry.LocalAddr):$($entry.LocalPort)" } else { "" }
+                $foreignAddr = if ($entry.ForeignAddr) { "$($entry.ForeignAddr):$($entry.ForeignPort)" } else { "" }
+                $state = if ($entry.State) { $entry.State } else { "" }
+                $procId = if ($entry.PID) { $entry.PID } else { "" }
+                $owner = if ($entry.Owner) { $entry.Owner } else { "" }
+                $details = "PID=$procId"
+                if ($null -ne $created.TimeUtc) {
+                    $ts = $created.TimeUtc
+                    $eventType = "NetworkConnection"
+                    $timed++
+                }
+                else {
+                    if ($created.Text) { $details += " Created=$($created.Text)" }
+                    $snapshot++
+                }
+
+                Add-TimelineEntry -Timestamp $ts -Source $Source -EventType $eventType `
+                    -Description "Memory network: $proto $localAddr -> $foreignAddr ($state)" `
+                    -User $owner -Details $details `
+                    -Artifact "MemoryDump" -RawPath $DumpPath
+            }
+            "windows.cmdline" {
+                $procId = if ($entry.PID) { $entry.PID } else { "" }
+                $procName = if ($entry.Process) { $entry.Process } else { "" }
+                $cmdArgs = if ($entry.Args) { $entry.Args } else { "" }
+                if (-not $cmdArgs -or $cmdArgs -eq "N/A") { continue }
+
+                Add-TimelineEntry -Timestamp $ts -Source $Source -EventType $eventType `
+                    -Description "Process command line: $procName (PID: $procId)" `
+                    -Details "Args=$cmdArgs" `
+                    -Artifact "MemoryDump" -RawPath $DumpPath
+                $snapshot++
+            }
+            "windows.svcscan" {
+                $svcName = if ($entry.Name) { $entry.Name } else { "" }
+                $display = if ($entry.Display) { $entry.Display } else { $svcName }
+                $binary = if ($entry.Binary) { $entry.Binary } else { "" }
+                $state = if ($entry.State) { $entry.State } else { "" }
+                $start = if ($entry.Start) { $entry.Start } else { "" }
+                $procId = if ($entry.PID) { $entry.PID } else { "" }
+
+                Add-TimelineEntry -Timestamp $ts -Source $Source -EventType $eventType `
+                    -Description "Service in memory: $display ($svcName)" `
+                    -Details "State=$state StartType=$start Binary=$binary PID=$procId" `
+                    -Artifact "MemoryDump" -RawPath $DumpPath
+                $snapshot++
+            }
+        }
+    }
+    return [PSCustomObject]@{ Entries = $timed + $snapshot; Timed = $timed; Snapshot = $snapshot }
+}
+
+# Volatility 3 next to the builder (tools\volatility3\, tools\ or the
+# builder's folder). Returns the full path or $null. A function of its own
+# so a test can put a stub in its place.
+function Find-VolatilityExe {
+    $volLocations = @(
+        (Join-Path $PSScriptRoot "tools\volatility3\vol.exe"),
+        (Join-Path $PSScriptRoot "tools\volatility3\volatility3.exe"),
+        (Join-Path $PSScriptRoot "tools\vol.exe"),
+        (Join-Path $PSScriptRoot "vol.exe")
+    )
+    foreach ($loc in $volLocations) {
+        if (Test-Path $loc) { return $loc }
+    }
+    return $null
 }
 
 function Parse-Memory {
@@ -15112,8 +15308,11 @@ function Parse-Memory {
     }
 
     $dumpSizeGB = [math]::Round((Get-Item -LiteralPath $dumpPath).Length / 1GB, 2)
-    $dumpArch = Get-MemoryDumpArchitecture -Path $dumpPath
+    $dumpInfo = Get-MemoryDumpInfo -Path $dumpPath
+    $dumpArch = $dumpInfo.Architecture
     Log "  Found memory dump: $dumpPath ($dumpSizeGB GB, $dumpArch)"
+    # The time of the Snapshot rows (entries without a valid time of their own)
+    Log "  Dump time: $($dumpInfo.CaptureTimeUtc.ToString('yyyy-MM-dd HH:mm:ss.fff', [System.Globalization.CultureInfo]::InvariantCulture)) UTC ($($dumpInfo.TimeSource))"
 
     # Volatility 3's Windows support is for Intel x86/x64 memory only
     if ($dumpArch -eq "ARM64") {
@@ -15126,16 +15325,7 @@ function Parse-Memory {
     Log "  Analyzing in-place (not copied to temp)"
 
     # --- Find Volatility 3 ---
-    $volExe = $null
-    $volLocations = @(
-        (Join-Path $PSScriptRoot "tools\volatility3\vol.exe"),
-        (Join-Path $PSScriptRoot "tools\volatility3\volatility3.exe"),
-        (Join-Path $PSScriptRoot "tools\vol.exe"),
-        (Join-Path $PSScriptRoot "vol.exe")
-    )
-    foreach ($loc in $volLocations) {
-        if (Test-Path $loc) { $volExe = $loc; break }
-    }
+    $volExe = Find-VolatilityExe
 
     if (-not $volExe) {
         Log-Warning "  Volatility 3 not found in tools\ directory."
@@ -15154,118 +15344,42 @@ function Parse-Memory {
     Log "  Using Volatility 3: $volExe"
 
     # --- Define plugins to run ---
+    # The EventType of each row depends on the entry (Add-MemoryPluginRows)
     $plugins = @(
-        @{ Name = "windows.pslist";  EventType = "ProcessCreation";   Source = "Memory-Processes";   Desc = "Running processes" },
-        @{ Name = "windows.netscan"; EventType = "NetworkConnection"; Source = "Memory-Network";     Desc = "Network connections" },
-        @{ Name = "windows.cmdline"; EventType = "Execution";         Source = "Memory-CommandLine"; Desc = "Process command lines" },
-        @{ Name = "windows.svcscan"; EventType = "ServiceChange";     Source = "Memory-Services";    Desc = "Windows services" }
+        @{ Name = "windows.pslist";  Source = "Memory-Processes";   Desc = "Running processes" },
+        @{ Name = "windows.netscan"; Source = "Memory-Network";     Desc = "Network connections" },
+        @{ Name = "windows.cmdline"; Source = "Memory-CommandLine"; Desc = "Process command lines" },
+        @{ Name = "windows.svcscan"; Source = "Memory-Services";    Desc = "Windows services" }
     )
 
-    $dumpTimestamp = (Get-Item -LiteralPath $dumpPath).LastWriteTimeUtc
     $totalMemEntries = 0
 
     foreach ($plugin in $plugins) {
         $pluginTimer = [System.Diagnostics.Stopwatch]::StartNew()
         Log "  Running $($plugin.Name) ($($plugin.Desc))..."
 
-        $jsonFile = Join-Path $env:TEMP "vol3_$($plugin.Name -replace '\.','_')_$(Get-Random).json"
-        $errFile = Join-Path $env:TEMP "vol3_$($plugin.Name -replace '\.','_')_err.txt"
-
         try {
             # Run Volatility 3 with JSON output
-            & $volExe -f $dumpPath -r json $plugin.Name 2>$errFile | Out-File $jsonFile -Encoding utf8
+            $volResult = Invoke-VolatilityPlugin -VolExe $volExe -DumpPath $dumpPath -Plugin $plugin.Name
 
-            if (-not (Test-Path $jsonFile) -or (Get-Item $jsonFile).Length -eq 0) {
-                $errContent = if (Test-Path $errFile) { Get-Content $errFile -Raw } else { "No output" }
+            if (-not $volResult.Json.Trim()) {
+                $errContent = if ($volResult.Errors) { $volResult.Errors } else { "No output" }
                 Log-Warning "    $($plugin.Name) produced no output. Error: $($errContent.Substring(0, [Math]::Min(200, $errContent.Length)))"
                 continue
             }
 
-            $jsonContent = Get-Content $jsonFile -Raw -ErrorAction Stop
-            $entries = $jsonContent | ConvertFrom-Json -ErrorAction Stop
-            $pluginCount = 0
-
-            foreach ($entry in $entries) {
-                $ts = $dumpTimestamp  # default timestamp
-
-                switch ($plugin.Name) {
-                    "windows.pslist" {
-                        # Parse CreateTime if available
-                        if ($entry.CreateTime -and $entry.CreateTime -ne "N/A" -and $entry.CreateTime -notmatch "^0") {
-                            try { $ts = [datetime]::Parse($entry.CreateTime) }
-                            catch { Write-Verbose "Could not parse CreateTime '$($entry.CreateTime)', using dump time: $($_.Exception.Message)" }
-                        }
-                        $procId = if ($entry.PID) { $entry.PID } else { "" }
-                        $ppid = if ($entry.PPID) { $entry.PPID } else { "" }
-                        $name = if ($entry.ImageFileName) { $entry.ImageFileName } else { "Unknown" }
-                        $threads = if ($entry.Threads) { $entry.Threads } else { "" }
-                        $session = if ($entry.SessionId) { $entry.SessionId } else { "" }
-
-                        Add-TimelineEntry -Timestamp $ts -Source $plugin.Source -EventType $plugin.EventType `
-                            -Description "Process in memory: $name (PID: $procId, PPID: $ppid)" `
-                            -Details "Threads=$threads SessionId=$session" `
-                            -Artifact "MemoryDump" -RawPath $dumpPath
-                        $pluginCount++
-                    }
-                    "windows.netscan" {
-                        if ($entry.Created -and $entry.Created -ne "N/A" -and $entry.Created -notmatch "^0") {
-                            try { $ts = [datetime]::Parse($entry.Created) }
-                            catch { Write-Verbose "Could not parse Created '$($entry.Created)', using dump time: $($_.Exception.Message)" }
-                        }
-                        $proto = if ($entry.Proto) { $entry.Proto } else { "" }
-                        $localAddr = if ($entry.LocalAddr) { "$($entry.LocalAddr):$($entry.LocalPort)" } else { "" }
-                        $foreignAddr = if ($entry.ForeignAddr) { "$($entry.ForeignAddr):$($entry.ForeignPort)" } else { "" }
-                        $state = if ($entry.State) { $entry.State } else { "" }
-                        $procId = if ($entry.PID) { $entry.PID } else { "" }
-                        $owner = if ($entry.Owner) { $entry.Owner } else { "" }
-
-                        Add-TimelineEntry -Timestamp $ts -Source $plugin.Source -EventType $plugin.EventType `
-                            -Description "Memory network: $proto $localAddr -> $foreignAddr ($state)" `
-                            -User $owner -Details "PID=$procId" `
-                            -Artifact "MemoryDump" -RawPath $dumpPath
-                        $pluginCount++
-                    }
-                    "windows.cmdline" {
-                        $procId = if ($entry.PID) { $entry.PID } else { "" }
-                        $procName = if ($entry.Process) { $entry.Process } else { "" }
-                        $cmdArgs = if ($entry.Args) { $entry.Args } else { "" }
-                        if (-not $cmdArgs -or $cmdArgs -eq "N/A") { continue }
-
-                        Add-TimelineEntry -Timestamp $ts -Source $plugin.Source -EventType $plugin.EventType `
-                            -Description "Process command line: $procName (PID: $procId)" `
-                            -Details "Args=$cmdArgs" `
-                            -Artifact "MemoryDump" -RawPath $dumpPath
-                        $pluginCount++
-                    }
-                    "windows.svcscan" {
-                        $svcName = if ($entry.Name) { $entry.Name } else { "" }
-                        $display = if ($entry.Display) { $entry.Display } else { $svcName }
-                        $binary = if ($entry.Binary) { $entry.Binary } else { "" }
-                        $state = if ($entry.State) { $entry.State } else { "" }
-                        $start = if ($entry.Start) { $entry.Start } else { "" }
-                        $procId = if ($entry.PID) { $entry.PID } else { "" }
-
-                        Add-TimelineEntry -Timestamp $ts -Source $plugin.Source -EventType $plugin.EventType `
-                            -Description "Service in memory: $display ($svcName)" `
-                            -Details "State=$state StartType=$start Binary=$binary PID=$procId" `
-                            -Artifact "MemoryDump" -RawPath $dumpPath
-                        $pluginCount++
-                    }
-                }
-            }
+            $entries = $volResult.Json | ConvertFrom-Json -ErrorAction Stop
+            $rowCounts = Add-MemoryPluginRows -Plugin $plugin.Name -Source $plugin.Source -Entries $entries `
+                -CaptureTimeUtc $dumpInfo.CaptureTimeUtc -AcquisitionEndUtc $dumpInfo.LastWriteUtc -DumpPath $dumpPath
 
             $pluginTimer.Stop()
             $elapsed = [math]::Round($pluginTimer.Elapsed.TotalSeconds, 1)
-            Log "    $($plugin.Name): $pluginCount entries ($elapsed seconds)"
-            $totalMemEntries += $pluginCount
+            Log "    $($plugin.Name): $($rowCounts.Entries) entries ($($rowCounts.Timed) timed, $($rowCounts.Snapshot) snapshot) in $elapsed seconds"
+            $totalMemEntries += $rowCounts.Entries
             $memParsed = $true
         }
         catch {
             Log-Warning "    $($plugin.Name) failed: $($_.Exception.Message)"
-        }
-        finally {
-            Remove-Item $jsonFile -Force -ErrorAction SilentlyContinue
-            Remove-Item $errFile -Force -ErrorAction SilentlyContinue
         }
     }
 
@@ -16467,7 +16581,7 @@ function Parse-AntiVirus {
 if ($Sources -notcontains "Memory") {
     # Check if a memory dump exists alongside the collection
     $detectedDump = Find-MemoryDump
-    if ($detectedDump -and (Get-MemoryDumpArchitecture -Path $detectedDump) -eq "ARM64") {
+    if ($detectedDump -and (Get-MemoryDumpInfo -Path $detectedDump).Architecture -eq "ARM64") {
         # Volatility 3 cannot analyze Windows ARM64 memory: don't offer it
         Log ""
         Log "Memory dump detected: $(Split-Path $detectedDump -Leaf) (Windows ARM64)."
@@ -16859,7 +16973,7 @@ if (-not $skipExcel -and (Get-Module -ListAvailable -Name ImportExcel)) {
         Log "    Yellow       ScheduledTaskChange  -- task scheduler changes"
         Log "    Purple       USBDevice            -- USB device connections"
         Log "    Light Blue   Installation         -- application, device and driver installs"
-        Log "    Light gray   Snapshot             -- state at collection time, not an event"
+        Log "    Light gray   Snapshot             -- state when collected or captured, not an event"
     }
     catch {
         Log-Warning "  Failed to generate Excel file: $($_.Exception.Message)"
