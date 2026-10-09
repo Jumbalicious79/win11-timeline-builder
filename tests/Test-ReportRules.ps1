@@ -11,8 +11,16 @@
 #                              finding's severity must match)
 #   MISS <RuleId>              the row must NOT appear in any finding of
 #                              that rule
+#   KEY  <RuleId> <group>      like HIT, and the finding's group value (what
+#                              {{group}} in its title shows) must be <group>
+#                              (the rest of the tag, any case): rows tagged
+#                              with the same group must form one finding
 # Row i of the CSV (0-based among data rows) is Excel row i + 2, the same
 # numbering Invoke-ReportRules uses.
+#
+# Before the cases, the rules file must load without an error, and no
+# compiled pattern may be empty or keep a {{list:...}} placeholder: an empty
+# pattern matches every row (a rule that "fails open").
 #
 # Exit code 0 = every expectation held, 1 = a failure (a missing engine,
 # rules file or cases file is a failure). Runs in Windows PowerShell 5.1 and
@@ -20,6 +28,7 @@
 #
 #   powershell -ExecutionPolicy Bypass -File tests\Test-ReportRules.ps1
 #   ... -EnginePath <TimelineReport.Engine.ps1>   (override the engine path)
+#   ... -RulesPath <rules .json> -CasesPath <cases .csv>   (other files)
 # =============================================================
 param(
     [string]$EnginePath = "",
@@ -58,23 +67,88 @@ Write-Host "PowerShell $($PSVersionTable.PSVersion)"
 Write-Host ""
 
 # --- Load rules and cases ------------------------------------
-$imported = Import-ReportRules -Path $RulesPath
+# A rules file that does not load (bad JSON, a bad pattern, or a list
+# expansion that fails, for example one blocked by the antivirus) is a
+# failure with the engine's message, not a script error
+$importErrors = @()
+try {
+    $imported = Import-ReportRules -Path $RulesPath -ErrorVariable importErrors
+}
+catch {
+    Write-Host "FAIL: the rules file did not load: $($_.Exception.Message)" -ForegroundColor Red
+    if ($env:GITHUB_ACTIONS) { Write-Host "::error file=tests/Test-ReportRules.ps1::the rules file did not load: $($_.Exception.Message)" }
+    exit 1
+}
+# Windows PowerShell 5.1 also records Select-Object -First stopping its
+# pipeline (StopUpstreamCommandsException) in -ErrorVariable: not an error
+$importErrors = @($importErrors | Where-Object {
+        $exception = if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception } else { $_ }
+        $null -eq $exception -or $exception.GetType().Name -ne "StopUpstreamCommandsException"
+    })
+if (@($importErrors).Count -gt 0) {
+    foreach ($importError in $importErrors) { Write-Host "FAIL: loading the rules wrote an error: $importError" -ForegroundColor Red }
+    if ($env:GITHUB_ACTIONS) { Write-Host "::error file=tests/Test-ReportRules.ps1::loading the rules wrote $(@($importErrors).Count) error(s)" }
+    exit 1
+}
 $ruleIds = @{}
 foreach ($rule in $imported.Rules) { $ruleIds[$rule.Id] = $true }
+
+# Every compiled pattern (match, anyOf, escalate.match and allowlist
+# conditions) must be a non-empty regex with its lists expanded
+function Get-CompiledPatternProblem {
+    param($Spec, [string]$Where)
+    if ($null -eq $Spec) { return }
+    foreach ($property in $Spec.PSObject.Properties) {
+        if (-not ($property.Value -is [regex])) { continue }
+        $pattern = $property.Value.ToString()
+        if ($pattern.Length -eq 0) { "$Where.$($property.Name) compiled to an empty pattern (it would match every row)" }
+        elseif ($pattern.IndexOf('{{list:', [System.StringComparison]::Ordinal) -ge 0) { "$Where.$($property.Name) still has a {{list:...}} placeholder" }
+    }
+}
+$patternProblems = @()
+$patternCount = 0
+foreach ($rule in $imported.Rules) {
+    $compiled = $rule.Compiled
+    $specs = @(@{ Where = "match"; Spec = $compiled.Match }, @{ Where = "escalate.match"; Spec = $compiled.EscalateMatch })
+    $a = 0
+    foreach ($spec in @($compiled.AnyOf | Where-Object { $null -ne $_ })) { $specs += @{ Where = "anyOf[$a]"; Spec = $spec }; $a++ }
+    $a = 0
+    foreach ($spec in @($compiled.Allowlist | Where-Object { $null -ne $_ })) { $specs += @{ Where = "allowlist entry $a"; Spec = $spec }; $a++ }
+    foreach ($item in $specs) {
+        if ($null -eq $item.Spec) { continue }
+        $patternCount += @($item.Spec.PSObject.Properties | Where-Object { $_.Value -is [regex] }).Count
+        $patternProblems += @(Get-CompiledPatternProblem -Spec $item.Spec -Where "rule $($rule.Id) $($item.Where)")
+    }
+}
+if ($patternCount -eq 0) { $patternProblems += "no compiled pattern found on the imported rules (has the engine's rule object changed?)" }
+if ($patternProblems.Count -gt 0) {
+    foreach ($problem in $patternProblems) {
+        Write-Host "  FAIL  $problem" -ForegroundColor Red
+        if ($env:GITHUB_ACTIONS) { Write-Host "::error file=tests/Test-ReportRules.ps1::$problem" }
+    }
+    Write-Host "FAIL: $($patternProblems.Count) compiled pattern problem(s)." -ForegroundColor Red
+    exit 1
+}
+Write-Host "Compiled patterns: $patternCount, none empty or with a {{list:...}} placeholder."
 
 # Use the engine's own loader so Excel row numbers match exactly
 $rows = Import-TimelineCsvForReport -Path $CasesPath
 $findings = Invoke-ReportRules -Rows $rows -Rules $imported
 
-# ruleId -> set of row numbers; "ruleId|rowNumber" -> finding severity
+# ruleId -> set of row numbers; "ruleId|rowNumber" -> finding severity and
+# the group values of the findings that hold the row
 $ruleRows = @{}
 $ruleRowSeverity = @{}
+$ruleRowGroups = @{}
 foreach ($finding in $findings) {
     $id = [string]$finding.RuleId
     if (-not $ruleRows.ContainsKey($id)) { $ruleRows[$id] = New-Object 'System.Collections.Generic.HashSet[int]' }
     foreach ($rowNumber in $finding.RowNumbers) {
         [void]$ruleRows[$id].Add([int]$rowNumber)
         $ruleRowSeverity["$id|$([int]$rowNumber)"] = [string]$finding.Severity
+        $groupKey = "$id|$([int]$rowNumber)"
+        if (-not $ruleRowGroups.ContainsKey($groupKey)) { $ruleRowGroups[$groupKey] = @() }
+        $ruleRowGroups[$groupKey] += [string]$finding.GroupKey
     }
 }
 
@@ -98,11 +172,17 @@ for ($i = 0; $i -lt $rows.Count; $i++) {
         $parts = @($tag -split '\s+')
         $verb = $parts[0].ToUpperInvariant()
         $id = if ($parts.Count -ge 2) { $parts[1] } else { "" }
-        $wantSeverity = if ($parts.Count -ge 3) { $parts[2] } else { "" }
+        $wantSeverity = if ($parts.Count -ge 3 -and $verb -ne "KEY") { $parts[2] } else { "" }
+        # KEY: the group value is the rest of the tag (it may hold spaces)
+        $wantGroup = ""
+        if ($verb -eq "KEY") {
+            $keyParts = @($tag -split '\s+', 3)
+            if ($keyParts.Count -ge 3) { $wantGroup = $keyParts[2] }
+        }
         $label = "row $rowNumber  $tag"
 
-        if ($verb -ne "HIT" -and $verb -ne "MISS") {
-            Write-Host "  FAIL  $label -- tag must start with HIT or MISS" -ForegroundColor Red
+        if ($verb -ne "HIT" -and $verb -ne "MISS" -and $verb -ne "KEY") {
+            Write-Host "  FAIL  $label -- tag must start with HIT, MISS or KEY" -ForegroundColor Red
             if ($env:GITHUB_ACTIONS) { Write-Host "::error::$label -- bad tag" }
             $fail++; continue
         }
@@ -111,14 +191,27 @@ for ($i = 0; $i -lt $rows.Count; $i++) {
             if ($env:GITHUB_ACTIONS) { Write-Host "::error::$label -- unknown rule id" }
             $fail++; continue
         }
+        if ($verb -eq "KEY" -and -not $wantGroup) {
+            Write-Host "  FAIL  $label -- KEY needs a group value after the rule id" -ForegroundColor Red
+            if ($env:GITHUB_ACTIONS) { Write-Host "::error::$label -- KEY without a group value" }
+            $fail++; continue
+        }
 
         $inFinding = Test-RuleRow -Id $id -RowNumber $rowNumber
-        if ($verb -eq "HIT") {
+        if ($verb -eq "HIT" -or $verb -eq "KEY") {
             $hitRules[$id] = $true
             if (-not $inFinding) {
                 Write-Host "  FAIL  $label -- expected this row in a '$id' finding, but it is not" -ForegroundColor Red
                 if ($env:GITHUB_ACTIONS) { Write-Host "::error::$label -- row not flagged by $id" }
                 $fail++; continue
+            }
+            if ($wantGroup) {
+                $groups = @($ruleRowGroups["$id|$rowNumber"])
+                if (@($groups | Where-Object { $_ -eq $wantGroup }).Count -eq 0) {
+                    Write-Host "  FAIL  $label -- expected the '$id' finding of group '$wantGroup', got '$($groups -join "', '")'" -ForegroundColor Red
+                    if ($env:GITHUB_ACTIONS) { Write-Host "::error::$label -- group '$($groups -join "', '")', expected '$wantGroup'" }
+                    $fail++; continue
+                }
             }
             if ($wantSeverity) {
                 $got = $ruleRowSeverity["$id|$rowNumber"]
