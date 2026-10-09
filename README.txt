@@ -139,6 +139,18 @@ themselves are never committed.
   are fine, and a relative path is turned into a full path first (the
   elevated window starts in C:\Windows\System32).
 
+  While the builder runs, QuickEdit is off in its console window, so a
+  click in the window cannot pause the run. (With QuickEdit on, a click
+  starts a text selection, and every write to the window -- and with it
+  the whole run, log file included -- waits until the selection ends.)
+  The log says "Console QuickEdit is off for this run ...". To copy text
+  during the run, use the window menu (the icon at the top left, or
+  Alt+Space): Edit > Mark, select, then Enter to copy; that selection
+  pauses the run too until Enter or Esc ends it. Or copy from the log
+  file or the window after the run. The console's own setting comes back
+  when the run ends. In Windows Terminal a selection does not pause the
+  run, and text is selected and copied as usual.
+
   The collection's memory dump is found as well, also when the collector
   wrote it to another drive (e.g. D:\TriageMemory\ when the system drive
   was low on space): collection_manifest.csv records where the collector
@@ -1491,6 +1503,18 @@ Timeline Explorer at the same time.
     the work folder on every exit), it skips the rest of the step, so the
     run says so. Please report it with the log line.
 
+  - Console window -- QuickEdit is off while the builder runs (see Quick
+    Start), so a click no longer pauses it, but a selection made with the
+    window menu (Edit > Mark) still does, until Enter or Esc ends it. The
+    builder changes the mode only when its input is a console with
+    QuickEdit on: with input redirected (a script piping into it, CI) or
+    QuickEdit already off, nothing is changed and the log has no QuickEdit
+    line. The console's mode is put back at every end of the run (also an
+    error, exit or Ctrl+C), not when the process is killed: closing the
+    window kills the run (the next run removes its work folder), and a
+    console the builder was started from keeps QuickEdit off after its
+    process was ended from Task Manager, until that window is closed.
+
   - "No service data found" -- Appears for mounted-image collections, which
     have no services.csv (it needs live queries). Scheduled tasks of mounted
     images are parsed from the collected task XML files instead.
@@ -1835,10 +1859,10 @@ parsing is skipped, and the timeline CSV can be opened manually.
   SRUM, Defender and scheduled task parsers, the USB parser's mounted
   devices, the Memory parser (where it finds the dump, the dump's capture
   time and the rows made from Volatility's output), the ShimCache rows of
-  the PowerShellHistory parser, the run summary's counts per artifact, and
-  how the builder handles its input (secrets, zip input). CI runs them
-  after Test-Parsers.ps1 in both PowerShell versions (GitHub Actions
-  runners are elevated):
+  the PowerShellHistory parser, the run summary's counts per artifact,
+  how the builder handles its input (secrets, zip input) and its console
+  window (QuickEdit). CI runs them after Test-Parsers.ps1 in both
+  PowerShell versions (GitHub Actions runners are elevated):
 
   tests\Test-EventLogParsers.ps1 -- Part 1 feeds the Security, System,
   Defender and Application handlers synthetic event records and checks
@@ -2087,6 +2111,19 @@ parsing is skipped, and the timeline CSV can be opened manually.
   unchanged. It also checks that the Registry source runs first. No admin
   needed; the TaskCache rows are checked by Test-RegistryParsers.ps1.
 
+  tests\Test-ConsoleMode.ps1 -- checks how the builder turns console
+  QuickEdit off for a run: the mode without QuickEdit for known console
+  modes (QuickEdit cleared, the extended-flags bit set, other bits kept);
+  in a child PowerShell with redirected input (as in CI), that turning it
+  off and back changes nothing and writes nothing; in a child with a new
+  hidden console of its own, that QuickEdit is off afterwards, stays off
+  through a Read-Host, and that the mode from before comes back (skipped
+  when the child gets no console of its own). In the builder's syntax
+  tree it checks that QuickEdit is turned off first in the main body,
+  before its first long step and every exit, with the log line, and put
+  back last in its finally block. The console the test runs in is never
+  changed. No admin needed.
+
   Run them from an elevated PowerShell; -AllowSystemChanges lets the event
   log, registry and SRUM tests change this machine:
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers.ps1
@@ -2104,6 +2141,7 @@ parsing is skipped, and the timeline CSV can be opened manually.
     powershell -ExecutionPolicy Bypass -File tests\Test-ShimCacheParser.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-SummaryCounts.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-ScheduledTasks.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-ConsoleMode.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers.ps1 -AllowSystemChanges
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers2.ps1 -AllowSystemChanges
     powershell -ExecutionPolicy Bypass -File tests\Test-RegistryParsers.ps1 -AllowSystemChanges
@@ -2226,6 +2264,8 @@ Temporary actions (all cleaned up automatically, also after an error or Ctrl+C):
   - Writes Volatility 3's JSON output (Memory parser) into the work folder
     -- deleted after each plugin
   - Downloads zip files to %TEMP% (first run) -- deleted after extraction
+  - Turns QuickEdit off in its console window, so a click cannot pause the
+    run (see Quick Start) -- the console's own mode is put back at the end
 
 Event log entries (not removed):
   - Only when the in-process recovery of a SRUM database fails, or a copy
