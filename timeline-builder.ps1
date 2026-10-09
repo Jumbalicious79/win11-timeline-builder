@@ -398,6 +398,21 @@ function Test-ExtractionSpace {
     return $true
 }
 
+# $true for a path (relative to the collection, or a zip entry name with
+# "\") inside the email attachment copies the collector makes
+# (Email\<user>\Outlook\SecureTemp\, Email\<user>\NewOutlook\Attachments\).
+# No parser reads them: Parse-Email takes their rows from the manifest and
+# the email listings. They can have any name -- an attached .lnk or .evtx
+# is not this system's shortcut or event log -- so Find-ArtifactFiles never
+# returns them to a parser. They can be malware, which antivirus on this
+# machine may quarantine, so they are not extracted from a collection zip
+# and are not input files (their removal does not make a timeline
+# incomplete).
+function Test-EmailAttachmentCopy {
+    param([string]$RelativePath)
+    return $RelativePath -match '(?:^|\\)Email\\[^\\]+\\(?:Outlook\\SecureTemp|NewOutlook\\Attachments)\\'
+}
+
 # Extract a collection zip into $Destination entry by entry (not
 # Expand-Archive), so that:
 #  - entry names with "/" (the zip standard) and "\" (older collectors)
@@ -407,7 +422,8 @@ function Test-ExtractionSpace {
 #    in $script:shortenedNames, so manifest lookups still find the file;
 #  - no entry is written outside $Destination ("..", rooted names);
 #  - files keep the date stored in the zip. Several parsers fall back to a
-#    file's date, so it is never changed to "now".
+#    file's date, so it is never changed to "now";
+#  - copied email attachments stay in the zip (see Test-EmailAttachmentCopy).
 # Every extracted file is recorded as an input file. Throws when the zip
 # cannot be read, does not fit on the drive, or an entry fails to extract.
 function Expand-CollectionZip {
@@ -419,10 +435,24 @@ function Expand-CollectionZip {
     $sha1 = $null
     try {
         # Folder entries end with a separator
-        $fileEntries = @($zipArchive.Entries | Where-Object { $_.FullName -and $_.FullName -notmatch '[/\\]$' })
+        $fileEntries = New-Object System.Collections.Generic.List[object]
+        $attachmentCount = 0
+        $attachmentBytes = 0L
         $totalBytes = 0L
-        foreach ($entry in $fileEntries) { $totalBytes += $entry.Length }
-        Log "  Zip: $ZipPath -- $($zipArchive.Entries.Count) entries, $($fileEntries.Count) file(s), $([math]::Round($totalBytes / 1MB, 1)) MB uncompressed"
+        foreach ($entry in $zipArchive.Entries) {
+            if (-not $entry.FullName -or $entry.FullName -match '[/\\]$') { continue }
+            if (Test-EmailAttachmentCopy $entry.FullName.Replace('/', '\')) {
+                $attachmentCount++
+                $attachmentBytes += $entry.Length
+                continue
+            }
+            $fileEntries.Add($entry)
+            $totalBytes += $entry.Length
+        }
+        Log "  Zip: $ZipPath -- $($zipArchive.Entries.Count) entries, $($fileEntries.Count + $attachmentCount) file(s), $([math]::Round(($totalBytes + $attachmentBytes) / 1MB, 1)) MB uncompressed"
+        if ($attachmentCount -gt 0) {
+            Log "  Not extracted: $attachmentCount copied email attachment(s), $([math]::Round($attachmentBytes / 1MB, 1)) MB. No parser reads them (their rows come from the manifest and the email listings), and antivirus may quarantine them."
+        }
         if (-not (Test-ExtractionSpace -Folder $Destination -NeededBytes $totalBytes)) {
             throw "not enough free space to extract the zip"
         }
@@ -517,8 +547,10 @@ function Get-CollectionRootFolder {
 
 # Input files of a collection folder: the files collection_manifest.csv
 # lists that exist now (files gone before the run are not tracked).
-# Memory dumps are left out: they are large and found separately. Without
-# a manifest nothing is tracked.
+# Memory dumps are left out: they are large and found separately. So are
+# copied email attachments: no parser reads them, and antivirus may
+# quarantine them (see Test-EmailAttachmentCopy). Without a manifest
+# nothing is tracked.
 function Add-ManifestInputFiles {
     $manifest = Get-CollectionManifest
     if (-not $manifest.Path) {
@@ -528,7 +560,7 @@ function Add-ManifestInputFiles {
     $root = [System.IO.Path]::GetFullPath($manifest.Folder).TrimEnd('\')
     $listed = 0
     foreach ($rel in $manifest.RelativePaths) {
-        if ($rel -match '^Memory\\.+\.dmp$') { continue }
+        if ($rel -match '^Memory\\.+\.dmp$' -or (Test-EmailAttachmentCopy $rel)) { continue }
         $listed++
         $full = Join-Path $root $rel
         if ([System.IO.File]::Exists($full)) { $script:inputFiles.Add($full) }
@@ -870,16 +902,6 @@ function Add-TimelineEntry {
 # =============================================================
 # Helper: Find files recursively with extensions
 # =============================================================
-# $true for a path (relative to the collection) inside the email attachment
-# copies the collector makes (Email\<user>\Outlook\SecureTemp\,
-# Email\<user>\NewOutlook\Attachments\). They can have any name: an attached
-# .lnk or .evtx is not this system's shortcut or event log, so
-# Find-ArtifactFiles never returns them to a parser (Parse-Email reports them)
-function Test-EmailAttachmentCopy {
-    param([string]$RelativePath)
-    return $RelativePath -match '(?:^|\\)Email\\[^\\]+\\(?:Outlook\\SecureTemp|NewOutlook\\Attachments)\\'
-}
-
 function Find-ArtifactFiles {
     param(
         [string]$BasePath,
