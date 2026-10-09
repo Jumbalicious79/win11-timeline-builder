@@ -1584,10 +1584,10 @@ parsing is skipped, and the timeline CSV can be opened manually.
   committing.
 
   The scripts below test the event log, browser, registry, $MFT, email,
-  SRUM and Defender parsers, the USB parser's mounted devices, and how the
-  builder handles its input (secrets, zip input). CI runs them after
-  Test-Parsers.ps1 in both PowerShell versions (GitHub Actions runners are
-  elevated):
+  SRUM and Defender parsers, the USB parser's mounted devices, where the
+  Memory parser finds the dump, and how the builder handles its input
+  (secrets, zip input). CI runs them after Test-Parsers.ps1 in both
+  PowerShell versions (GitHub Actions runners are elevated):
 
   tests\Test-EventLogParsers.ps1 -- Part 1 feeds the Security, System,
   Defender and Application handlers synthetic event records and checks
@@ -1739,7 +1739,8 @@ parsing is skipped, and the timeline CSV can be opened manually.
   where the memory dump is found, on synthetic folders: -MemoryDumpPath
   first (also a relative path and one with [ ] in it; a missing file or
   a folder gives one warning, then the other places are searched), next
-  to the collection zip (.dmp or .raw), Memory\ inside the collection,
+  to the collection zip (.dmp or .raw), Memory\ inside the collection
+  (nothing from the Secrets\ folder or the email attachment copies),
   and next to the collection folder or -InputPath only under the
   collection folder's name (another collection's dump in the same folder
   is not used; also with collection_manifest.csv below -InputPath, an

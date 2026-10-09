@@ -4,7 +4,8 @@
 # (Find-MemoryDump) on synthetic folders: -MemoryDumpPath first (also a
 # relative path and one with [ ] in it; a path that is not a file is
 # reported once, then the other places are tried), the dump next to the
-# collection zip (.dmp or .raw), Memory\ inside the collection, and the
+# collection zip (.dmp or .raw), Memory\ inside the collection (never the
+# Secrets\ folder of -IncludeSecrets or the email attachment copies), and the
 # dump next to the collection folder or next to -InputPath (an outer
 # folder of another name, also given as a relative path), which must be
 # named after the collection folder: another collection's dump in the same
@@ -82,7 +83,8 @@ function New-TestCollection {
 }
 
 # The script-scope state the builder sets up for a run: -InputPath (the
-# extracted folder for a zip), the zip, -MemoryDumpPath, and a new log file
+# extracted folder for a zip), the zip, -MemoryDumpPath, the collection
+# root and a new log file
 function Set-TestRunState {
     param([string]$Collection, [string]$Zip = "", [string]$DumpPath = "")
     $script:InputPath = $Collection
@@ -90,6 +92,11 @@ function Set-TestRunState {
     $script:MemoryDumpPath = $DumpPath
     $script:collectionManifest = $null
     $script:memoryDumpPathWarned = $false
+    # Find-ArtifactFiles skips the email attachment copies (relative to the
+    # collection root) and the Secrets\ folder, which the builder looks up
+    # once per run
+    $script:collectionRoot = Get-CollectionRootFolder
+    $script:secretsRoot = $null
     $script:logFile = Join-Path $workDir ("builder-" + [guid]::NewGuid().ToString("N") + ".log")
 }
 
@@ -117,6 +124,7 @@ $nameG = "TriageCollection_2025-06-24_16-45"   # a folder named like its dump
 $nameH = "TriageCollection_2025-06-23_11-20"   # no collection_manifest.csv
 $nameR = "TriageCollection_2025-06-22_13-55"   # a raw image next to the zip
 $nameI = "TriageCollection_2025-06-21_15-35"   # extracted into a folder of another name
+$nameJ = "TriageCollection_2025-06-20_18-25"   # -IncludeSecrets: dump names in excluded folders
 $missingWarning = "-MemoryDumpPath is not an existing file:"
 
 $workDir = Join-Path ([System.IO.Path]::GetTempPath()) ("memory-parser-test-" + [guid]::NewGuid().ToString("N"))
@@ -145,7 +153,8 @@ try {
     $bracketedC = Join-Path $workDir "dumps [7]\${nameC}_memory_dump.dmp"
     $dumpI = Join-Path $caseDir "${nameI}_memory_dump.dmp"
     $otherI = Join-Path $caseDir "${nameB}_memory_dump.dmp"
-    foreach ($file in @($dumpA, $dumpB, $dumpR, $dumpE, $dumpF, $dumpH, $dumpD, $elsewhereA, $elsewhereC, $bracketedC, $dumpI, $otherI)) { New-TestFile $file }
+    $dumpJ = Join-Path $reports "${nameJ}_memory_dump.dmp"
+    foreach ($file in @($dumpA, $dumpB, $dumpR, $dumpE, $dumpF, $dumpH, $dumpD, $elsewhereA, $elsewhereC, $bracketedC, $dumpI, $otherI, $dumpJ)) { New-TestFile $file }
     foreach ($name in @($nameA, $nameC, $nameD, $nameG)) { New-TestCollection (Join-Path $reports $name) }
     New-TestCollection (Join-Path $reports "$nameE\$nameE")
     New-TestCollection (Join-Path $reports "Extracted\$nameC")
@@ -153,6 +162,15 @@ try {
     New-TestCollection (Join-Path $caseDir "Extracted\$nameI")
     New-TestFile (Join-Path $reports "$nameH\USB\setupapi.dev.log")
     [void][System.IO.Directory]::CreateDirectory((Join-Path $reports "${nameG}_memory_dump.dmp"))
+    # A collection made with the collector's -IncludeSecrets: files named like
+    # a dump in its Secrets\ folder and in both email attachment folders,
+    # which no parser reads
+    $collectionJ = Join-Path $reports $nameJ
+    New-TestCollection $collectionJ
+    [System.IO.File]::WriteAllText((Join-Path $collectionJ "collection_info.json"), '{"SchemaVersion":1,"SecretsIncluded":true}')
+    foreach ($rel in @("Secrets\memory_dump.raw", "Email\alice\Outlook\SecureTemp\memory_dump.dmp", "Email\alice\NewOutlook\Attachments\memory.raw")) {
+        New-TestFile (Join-Path $collectionJ $rel)
+    }
 
     # --- Next to the collection zip (browse mode, or a zip as -InputPath) -----
     $zipA = Join-Path $reports "$nameA.zip"
@@ -198,6 +216,8 @@ try {
     # --- Inside the collection folder (-NoCompress) ---------------------------
     $run = Invoke-FindMemoryDump -Collection (Join-Path $reports $nameD)
     Assert-Equal -Name "collection folder: Memory\memory_dump.raw inside it" -Expected $dumpD -Actual $run.Path
+    $run = Invoke-FindMemoryDump -Collection $collectionJ
+    Assert-Equal -Name "collection folder: nothing taken from Secrets\ or the email attachment copies, the dump next to it instead" -Expected $dumpJ -Actual $run.Path
 
     # --- Next to the collection folder ----------------------------------------
     $run = Invoke-FindMemoryDump -Collection (Join-Path $reports $nameA)
