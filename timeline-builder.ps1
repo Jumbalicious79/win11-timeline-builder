@@ -67,7 +67,14 @@ param(
     # is created. Default: %LOCALAPPDATA%\TimelineBuilder. Not a temp folder:
     # Windows cleans those up during the run.
     [Parameter(Mandatory = $false)]
-    [string]$WorkDir
+    [string]$WorkDir,
+
+    # Memory dump file (.dmp or .raw) of this collection, for a dump that is
+    # not next to the collection zip or folder (e.g. one the collector wrote
+    # with -MemoryOutputPath). Used before the other places Find-MemoryDump
+    # looks in.
+    [Parameter(Mandatory = $false)]
+    [string]$MemoryDumpPath
 )
 
 # --- Require Administrator ---
@@ -739,6 +746,7 @@ Log "Sources    : $($Sources -join ', ')"
 if ($StartDate) { Log "Start Date : $StartDate" }
 if ($EndDate)   { Log "End Date   : $EndDate" }
 if ($Keywords)  { Log "Keywords   : $($Keywords -join ', ')" }
+if ($MemoryDumpPath) { Log "Memory Dump: $MemoryDumpPath" }
 Log ""
 
 # =============================================================
@@ -14998,14 +15006,32 @@ function Parse-PowerShellHistory {
 # ----------------------------------------------------------
 # 15. Memory Dump Parser (Volatility 3)
 # ----------------------------------------------------------
+$script:memoryDumpPathWarned = $false   # Find-MemoryDump has reported a bad -MemoryDumpPath
+
 # Memory dump for this collection: the collector saves it next to the zip
-# (<zip name>_memory_dump.dmp / .raw) because it is too large to zip.
-# DumpIt writes Microsoft crash dumps (.dmp); WinPmem and Magnet RAM
-# Capture write raw images (.raw). Returns the full path or $null.
+# and the collection folder (<collection>_memory_dump.dmp / .raw, named
+# after the folder, like the zip) because it is too large to zip; with
+# -NoCompress it stays in the collection's Memory\ folder. DumpIt writes
+# Microsoft crash dumps (.dmp); WinPmem and Magnet RAM Capture write raw
+# images (.raw). Returns the full path or $null.
 function Find-MemoryDump {
     $extensions = @("dmp", "raw")
 
-    # Check 1: Sibling of the selected zip (browse mode)
+    # Check 1: -MemoryDumpPath. A path that is not a file is reported once
+    # (a dump that is offered and then analyzed is looked for twice), and
+    # the other places are tried.
+    if ($MemoryDumpPath) {
+        $dumpItem = $null
+        try { $dumpItem = Get-Item -LiteralPath $MemoryDumpPath -Force -ErrorAction Stop }
+        catch { Write-Verbose "-MemoryDumpPath ${MemoryDumpPath}: $($_.Exception.Message)" }
+        if ($dumpItem -is [System.IO.FileInfo]) { return $dumpItem.FullName }
+        if (-not $script:memoryDumpPathWarned) {
+            Log-Warning "-MemoryDumpPath is not an existing file: $MemoryDumpPath -- looking for the memory dump in and next to the collection instead."
+            $script:memoryDumpPathWarned = $true
+        }
+    }
+
+    # Check 2: Sibling of the selected zip (browse mode, or a zip as -InputPath)
     if ($script:selectedZipPath -and (Test-Path -LiteralPath $script:selectedZipPath)) {
         $zipDir = Split-Path $script:selectedZipPath -Parent
         $zipBaseName = [System.IO.Path]::GetFileNameWithoutExtension($script:selectedZipPath)
@@ -15015,15 +15041,32 @@ function Find-MemoryDump {
         }
     }
 
-    # Check 2: Inside the collection directory (uncompressed collections)
+    # Check 3: Inside the collection directory (uncompressed collections)
     $memFiles = @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("memory_dump.dmp", "memory_dump.raw", "memdump.raw", "memory.raw", "physmem.raw"))
     if ($memFiles.Count -gt 0) { return $memFiles[0].FullName }
 
-    # Check 3: Alongside the InputPath directory
-    $parentDir = Split-Path $InputPath -Parent
-    foreach ($ext in $extensions) {
-        $dumpFiles = @(Get-ChildItem -LiteralPath $parentDir -Filter "*_memory_dump.$ext" -File -ErrorAction SilentlyContinue)
-        if ($dumpFiles.Count -gt 0) { return $dumpFiles[0].FullName }
+    # Check 4: Next to the collection folder (the folder of
+    # collection_manifest.csv, else -InputPath) and next to -InputPath (an
+    # outer folder that holds the collection), by the collection folder's
+    # name only: a folder such as the collector's reports\ holds the dumps
+    # of other collections too. Windows "Extract All" of <name>.zip makes
+    # <name>\<name>\, so the dump next to the zip is then next to the outer
+    # folder.
+    $root = Get-CollectionRootFolder
+    $collectionName = [System.IO.Path]::GetFileName($root)
+    $parentDir = [System.IO.Path]::GetDirectoryName($root)
+    if (-not $collectionName -or -not $parentDir) { return $null }
+    $dumpDirs = @($parentDir)
+    $outerParentDir = [System.IO.Path]::GetDirectoryName($parentDir)
+    if ($outerParentDir -and [System.IO.Path]::GetFileName($parentDir) -eq $collectionName) { $dumpDirs += $outerParentDir }
+    $inputDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($InputPath).TrimEnd('\')
+    $inputParentDir = [System.IO.Path]::GetDirectoryName($inputDir)
+    if ($inputParentDir -and $dumpDirs -notcontains $inputParentDir) { $dumpDirs += $inputParentDir }
+    foreach ($dumpDir in $dumpDirs) {
+        foreach ($ext in $extensions) {
+            $namedDump = Join-Path $dumpDir "${collectionName}_memory_dump.$ext"
+            if (Test-Path -LiteralPath $namedDump -PathType Leaf) { return $namedDump }
+        }
     }
     return $null
 }
@@ -15062,7 +15105,7 @@ function Parse-Memory {
     $dumpPath = Find-MemoryDump
 
     if (-not $dumpPath) {
-        Log-Warning "No memory dump found in collection or alongside zip."
+        Log-Warning "No memory dump found in the collection or next to it (pass -MemoryDumpPath with the dump file if it was saved elsewhere)."
         Log "  Memory parsing complete."
         Log ""
         return
@@ -15118,7 +15161,7 @@ function Parse-Memory {
         @{ Name = "windows.svcscan"; EventType = "ServiceChange";     Source = "Memory-Services";    Desc = "Windows services" }
     )
 
-    $dumpTimestamp = (Get-Item $dumpPath).LastWriteTimeUtc
+    $dumpTimestamp = (Get-Item -LiteralPath $dumpPath).LastWriteTimeUtc
     $totalMemEntries = 0
 
     foreach ($plugin in $plugins) {
@@ -16447,7 +16490,7 @@ if ($Sources -notcontains "Memory") {
         }
 
         if ($volAvailable) {
-            $dumpSizeGB = [math]::Round((Get-Item $detectedDump).Length / 1GB, 2)
+            $dumpSizeGB = [math]::Round((Get-Item -LiteralPath $detectedDump).Length / 1GB, 2)
             Write-Host ""
             Write-Host "========================================" -ForegroundColor Cyan
             Write-Host "  Memory Dump Detected" -ForegroundColor Cyan

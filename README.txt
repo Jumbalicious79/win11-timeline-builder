@@ -144,6 +144,7 @@ themselves are never committed.
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -Browse
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection"
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\TriageCollection_2025-01-20_14-05.zip" -WorkDir "D:\Work"
+  powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\TriageCollection_2025-01-20_14-05.zip" -MemoryDumpPath "E:\Dumps\TriageCollection_2025-01-20_14-05_memory_dump.dmp"
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -StartDate "2025-01-15" -EndDate "2025-01-20"
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -Sources "EventLogs,Prefetch,Registry"
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -Keywords "mimikatz,psexec,powershell -enc"
@@ -173,7 +174,8 @@ themselves are never committed.
                   UsnJournal, Amcache, PowerShellHistory, SystemInfo,
                   AntiVirus, Email, SRUM, Memory
                   Note: Memory is opt-in. Requires Volatility 3 in tools\ and
-                  a memory dump in the collection. Adds 5-30 minutes.
+                  a memory dump in or next to the collection, or
+                  -MemoryDumpPath (see parser #15). Adds 5-30 minutes.
   -Keywords       Strings to flag in the timeline, as an array or a
                   comma-separated string ("mimikatz,psexec"). Spaces around
                   each keyword are trimmed and empty items ignored. Matching is
@@ -201,6 +203,17 @@ themselves are never committed.
                   space, and never a temp folder. A network share or mapped
                   network drive is refused (reg load cannot load hives
                   from there).
+  -MemoryDumpPath The collection's memory dump file (a DumpIt .dmp or a
+                  .raw image) when it is not next to the collection zip or
+                  folder, e.g. a dump the triage collector saved on another
+                  drive with -MemoryOutputPath
+                  (<MemoryOutputPath>\<collection>_memory_dump.dmp). It is
+                  used before the places listed under parser #15; if it is
+                  not an existing file, a warning is logged and those
+                  places are searched instead. It does not turn on the
+                  Memory parser: add Memory to -Sources, or choose [1] when
+                  the builder offers the dump. Run-TimelineBuilder.bat does
+                  not pass it; start the script from PowerShell.
 
 
 ## Auto-Downloaded Dependencies
@@ -943,8 +956,22 @@ Parses command history:
 ### 15. Memory Dump (opt-in, requires Volatility 3)
 Analyzes memory dumps captured by the triage collector using Volatility 3:
 the crash dump from DumpIt (<collection>_memory_dump.dmp) or a raw image
-(_memory_dump.raw), found next to the collection zip.
+(<collection>_memory_dump.raw). The collector saves it next to the zip, as
+it is too large to zip. The dump is looked for in this order:
+  1. -MemoryDumpPath, for a dump saved elsewhere (if it is not an existing
+     file, a warning is logged and the places below are searched)
+  2. next to the collection zip: <zip name>_memory_dump.dmp or .raw
+  3. inside the collection folder (Memory\memory_dump.dmp or .raw, where
+     the collector leaves it with -NoCompress)
+  4. next to the collection folder (the folder of collection_manifest.csv)
+     or next to -InputPath (an outer folder that holds the collection):
+     only <folder name>_memory_dump.dmp or .raw, so the dump of another
+     collection in the same folder (e.g. the collector's reports\) is
+     never used. After Windows "Extract All" (<name>\<name>\), a dump next
+     to the outer folder is found too
 Opt-in only -- not included in default Sources. Add "Memory" to -Sources to enable.
+Without it, the builder offers to analyze a dump it finds when vol.exe is
+in tools\.
 Requires vol.exe in tools\volatility3\ (see tools\volatility3\README.txt).
 Windows ARM64 dumps are detected from the dump header and skipped:
 Volatility 3 analyzes Intel x86/x64 Windows memory only (use WinDbg).
@@ -1526,6 +1553,9 @@ parsing is skipped, and the timeline CSV can be opened manually.
 
   The Memory parser is opt-in. Add "Memory" to -Sources to enable it.
   If vol.exe is not found, the parser logs download instructions and skips.
+  The dump is found next to the collection zip or folder, or inside the
+  collection (see parser #15); pass -MemoryDumpPath for a dump saved
+  elsewhere.
 
   Plugins run (4 core plugins):
     windows.pslist   -- running processes with creation timestamps
@@ -1565,10 +1595,10 @@ parsing is skipped, and the timeline CSV can be opened manually.
   committing.
 
   The scripts below test the event log, browser, registry, $MFT, email,
-  SRUM and Defender parsers, the USB parser's mounted devices, and how the
-  builder handles its input (secrets, zip input). CI runs them after
-  Test-Parsers.ps1 in both PowerShell versions (GitHub Actions runners are
-  elevated):
+  SRUM and Defender parsers, the USB parser's mounted devices, where the
+  Memory parser finds the dump, and how the builder handles its input
+  (secrets, zip input). CI runs them after Test-Parsers.ps1 in both
+  PowerShell versions (GitHub Actions runners are elevated):
 
   tests\Test-EventLogParsers.ps1 -- Part 1 feeds the Security, System,
   Defender and Application handlers synthetic event records and checks
@@ -1718,6 +1748,19 @@ parsing is skipped, and the timeline CSV can be opened manually.
   and reading the hive; reading a real SYSTEM hive is covered by
   Test-RegistryParsers.ps1.
 
+  tests\Test-MemoryParser.ps1 -- loads the builder's functions and checks
+  where the memory dump is found, on synthetic folders: -MemoryDumpPath
+  first (also a relative path and one with [ ] in it; a missing file or
+  a folder gives one warning, then the other places are searched), next
+  to the collection zip (.dmp or .raw), Memory\ inside the collection
+  (nothing from the Secrets\ folder or the email attachment copies),
+  and next to the collection folder or -InputPath only under the
+  collection folder's name (another collection's dump in the same folder
+  is not used; also with collection_manifest.csv below -InputPath, an
+  outer -InputPath of another name and after Windows "Extract All"). It
+  also checks the Memory parser's warning when there is no dump.
+  Volatility 3 is not run; no admin needed.
+
   Run them from an elevated PowerShell; -AllowSystemChanges lets the event
   log, registry and SRUM tests change this machine:
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers.ps1
@@ -1731,6 +1774,7 @@ parsing is skipped, and the timeline CSV can be opened manually.
     powershell -ExecutionPolicy Bypass -File tests\Test-MftParser.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-ZipInput.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-MountedDevices.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-MemoryParser.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers.ps1 -AllowSystemChanges
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers2.ps1 -AllowSystemChanges
     powershell -ExecutionPolicy Bypass -File tests\Test-RegistryParsers.ps1 -AllowSystemChanges
