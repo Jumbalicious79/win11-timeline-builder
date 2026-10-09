@@ -378,14 +378,15 @@ Both timeline.csv and timeline.xlsx contain the same columns:
   Some artifacts describe the state of the system when it was collected, not
   an event: the service and driver list, DNS and ARP cache, current TCP
   connections, shares, Wi-Fi profiles, loaded DLLs, browser settings, email
-  accounts, and scheduled tasks, services, run keys or browser extensions
-  that have no usable time of their own. These rows have EventType
-  "Snapshot" and the collection time as their Timestamp. A few context rows
-  are Snapshot rows at a time of their own: a security product reported ON
-  to Security Center (event time), the Outlook attachment folder and the
-  triage collector's own Defender exclusion (registry key last-write time).
-  Snapshot rows are colored light gray in Excel. Filter them out
-  (EventType <> Snapshot) to see only real events.
+  accounts, the drive letters and volumes in MountedDevices, and scheduled
+  tasks, services, run keys or browser extensions that have no usable time
+  of their own. These rows have EventType "Snapshot" and the collection
+  time as their Timestamp. A few context rows are Snapshot rows at a time
+  of their own: a security product reported ON to Security Center (event
+  time), the Outlook attachment folder and the triage collector's own
+  Defender exclusion (registry key last-write time). Snapshot rows are
+  colored light gray in Excel. Filter them out (EventType <> Snapshot) to
+  see only real events.
 
 ### User column
 
@@ -882,7 +883,29 @@ Parses USB device history:
     collection_manifest.csv lists one that is missing (lost after
     collection)
   - USB devices and storage devices (usb_devices.txt, usb_storage_devices.txt)
-  - Mounted devices (mounted_devices.txt)
+  - Mounted devices (HKLM\SYSTEM\MountedDevices): one Snapshot row per
+    value (Source USB-MountedDevices) saying which disk, partition or
+    device a drive letter or volume GUID last belonged to, e.g.
+      Drive letter H: -> MBR disk 0A1B2C3D, partition at offset 1048576
+      Volume {...} -> USB storage Generic- SD/MMC (serial 0123456789)
+    Read from USB\mounted_devices.csv (decoded by the collector), else from
+    MountedDevices in the collected SYSTEM hive (also for mounted-image
+    collections), else from the mounted_devices.txt of older collectors,
+    which shows only the first 4 bytes of each value (see Known
+    Limitations). Details: Kind (GPT, MBR, DevicePath or Other) and the
+    decoded fields (partition GUID; disk signature and partition offset;
+    device path with its InstanceId and Serial); VolumeGuid (the
+    \??\Volume{} name with the same data, else the GPT partition GUID, or
+    {<disk signature>-0000-0000-<offset bytes>} for MBR -- the names
+    MountPoints2 keys in NTUSER.DAT use); SameDataAs (values with the same
+    data, e.g. a drive letter and its volume GUID); SameDisk (other
+    partitions of the same MBR disk); KeyLastWriteUtc (when the key was
+    last written); PnPRecord for USB storage, when usb_storage_devices.csv
+    is there ("in USBSTOR at collection time: <instance ID>", or "not in
+    USBSTOR at collection time" -- a device Windows no longer lists);
+    CollectorDrive=yes for the drive letter the triage collector wrote its
+    output to (live collections). The log says how many values of each kind
+    were read and from where
 
 ### 12. Persistence
 Parses persistence mechanisms from triage collection:
@@ -1338,7 +1361,13 @@ Timeline Explorer at the same time.
     manifest, no bam_entries.csv / run_keys.csv / startup_folders.csv /
     usb_storage_devices.csv (BAM is read from the SYSTEM hive; run keys and
     startup items become Snapshot rows), and only setupapi.dev.log is
-    collected (it may be missing if Windows rotated it).
+    collected (it may be missing if Windows rotated it). They have no
+    mounted_devices.csv either: MountedDevices is read from the collected
+    SYSTEM hive, and only without one (or when it cannot be loaded) from
+    mounted_devices.txt, whose values those collectors cut off after 4
+    bytes. Such a row says "(value cut off)": the kind is taken from the
+    first bytes (an MBR disk signature is complete in them), but the
+    partition GUID, offset and device name are missing, and the log warns.
 
   - Snapshot rows -- Services, drivers, network state, DLLs and items with
     no recorded time are shown at the collection time with EventType
@@ -1360,6 +1389,19 @@ Timeline Explorer at the same time.
     as it nearly always is a USB drive, but an SD card in a built-in card
     reader gives one too. Such a row names only the volume GUID and the
     partition offset, not the drive.
+
+  - Mounted devices -- MountedDevices keeps the last disk, partition or
+    device each drive letter and volume GUID belonged to, not when it was
+    mounted: the rows are Snapshot rows, and KeyLastWriteUtc is the last
+    change to any value. Volume GUIDs of removable drives are version 1
+    UUIDs with a time inside, but that time is not a mount or install time
+    (in a real collection it was hours before the devices' first setupapi
+    installs, and different devices had times microseconds apart), so it
+    gives no row. The instance ID is rebuilt from the device path, where
+    every "\" of the ID and a "/" in a product name (SD/MMC) are both
+    written "#": the fields between the first and the last are joined with
+    "/". PnPRecord compares serial numbers with usb_storage_devices.csv
+    (live collections only).
 
   - Excel row limit -- Timelines over 1,048,575 rows are written to CSV only.
 
@@ -1507,6 +1549,8 @@ parsing is skipped, and the timeline CSV can be opened manually.
                README.txt)
     setupapi\  USB -- two synthetic setupapi logs (current and rotated)
                with USB and other device installs and deletions
+    usb\       USB -- a synthetic mounted_devices.csv (GPT, MBR, USB and
+               other device paths) and usb_storage_devices.csv
   CI runs it on every pull request in Windows PowerShell 5.1 and
   PowerShell 7.
 
@@ -1521,9 +1565,10 @@ parsing is skipped, and the timeline CSV can be opened manually.
   committing.
 
   The scripts below test the event log, browser, registry, $MFT, email,
-  SRUM and Defender parsers and how the builder handles its input
-  (secrets, zip input). CI runs them after Test-Parsers.ps1 in both
-  PowerShell versions (GitHub Actions runners are elevated):
+  SRUM and Defender parsers, the USB parser's mounted devices, and how the
+  builder handles its input (secrets, zip input). CI runs them after
+  Test-Parsers.ps1 in both PowerShell versions (GitHub Actions runners are
+  elevated):
 
   tests\Test-EventLogParsers.ps1 -- Part 1 feeds the Security, System,
   Defender and Application handlers synthetic event records and checks
@@ -1546,13 +1591,16 @@ parsing is skipped, and the timeline CSV can be opened manually.
   sqlite3.exe is missing, the builder is run once to download it.
 
   tests\Test-RegistryParsers.ps1 -- writes known values (IFEO, Winlogon, a
-  hidden TaskCache task, Defender exclusions, Office, Remote Desktop, ...)
-  below a temporary key HKCU\Software\TriageTimelineTest_<guid>, saves them
-  as SOFTWARE, SYSTEM and NTUSER.DAT hives with reg save, deletes the key,
-  runs the builder with -Sources Registry,ScheduledTasks and checks the
-  rows and times. Needs admin; because it writes to the registry it runs
-  only in GitHub Actions or with -AllowSystemChanges (otherwise it prints
-  SKIP).
+  hidden TaskCache task, Defender exclusions, Office, Remote Desktop,
+  MountedDevices, ...) below a temporary key
+  HKCU\Software\TriageTimelineTest_<guid>, saves them as SOFTWARE, SYSTEM
+  and NTUSER.DAT hives with reg save, deletes the key, runs the builder
+  with -Sources Registry,ScheduledTasks,USB and checks the rows and times
+  (the MountedDevices rows must come from the SYSTEM hive, not from the
+  empty mounted_devices.csv or the cut-off mounted_devices.txt of an older
+  collector next to it). Needs admin;
+  because it writes to the registry it runs only in GitHub Actions or with
+  -AllowSystemChanges (otherwise it prints SKIP).
 
   tests\Test-MftParser.ps1 -- builds a small synthetic $MFT and checks the
   $MFT parser's rows (Mark of the Web: downloaded, extracted, deleted,
@@ -1657,6 +1705,19 @@ parsing is skipped, and the timeline CSV can be opened manually.
   builder (or -BuilderPath with a copy without the admin check); it
   changes nothing on the system.
 
+  tests\Test-MountedDevices.ps1 -- loads the builder's functions and checks
+  the MountedDevices decoder (GPT, MBR, device paths, unrecognized values),
+  the instance ID rebuilt from a device path (Prod_SD#MMC -> SD/MMC), the
+  salvage of the cut-off mounted_devices.txt of older collectors ("..."
+  and the ellipsis character), each row's Description and Details, and
+  which source Parse-USB uses (mounted_devices.csv with rows first, then
+  the SYSTEM hive, also after an empty CSV, then the .txt; the hive is
+  unloaded also after a read error; no rows from the decoded .txt of newer
+  collectors; no CSV or SYSTEM hive read from the Secrets\ folder or the
+  email attachment copies). No admin needed: stubs stand in for loading
+  and reading the hive; reading a real SYSTEM hive is covered by
+  Test-RegistryParsers.ps1.
+
   Run them from an elevated PowerShell; -AllowSystemChanges lets the event
   log, registry and SRUM tests change this machine:
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers.ps1
@@ -1669,6 +1730,7 @@ parsing is skipped, and the timeline CSV can be opened manually.
     powershell -ExecutionPolicy Bypass -File tests\Test-DefenderParsers.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-MftParser.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-ZipInput.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-MountedDevices.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers.ps1 -AllowSystemChanges
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers2.ps1 -AllowSystemChanges
     powershell -ExecutionPolicy Bypass -File tests\Test-RegistryParsers.ps1 -AllowSystemChanges
@@ -1683,8 +1745,9 @@ parsing is skipped, and the timeline CSV can be opened manually.
                        RunMRU, RecentDocs, ShellBags, Office and Remote
                        Desktop history, IFEO / Winlogon / AppInit_DLLs, the
                        TaskCache, Defender exclusions, LSA settings, BAM,
-                       ShimCache and Amcache entries, including key
-                       last-write times. Unloads after.
+                       ShimCache, MountedDevices (when there is no
+                       mounted_devices.csv) and Amcache entries, including
+                       key last-write times. Unloads after.
 
   Get-WinEvent         Parses .evtx event log files with XPath filtering.
                        Used for targeted extraction of high-value Security,

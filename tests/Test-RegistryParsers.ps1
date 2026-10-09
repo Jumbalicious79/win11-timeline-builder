@@ -1,11 +1,15 @@
 # =============================================================
 # Registry parser test
 # Builds SOFTWARE, SYSTEM and NTUSER.DAT test hives with known values,
-# runs timeline-builder.ps1 (-Sources Registry,ScheduledTasks) on them and
-# checks the rows of the registry parsers: IFEO / SilentProcessExit,
+# runs timeline-builder.ps1 (-Sources Registry,ScheduledTasks,USB) on them
+# and checks the rows of the registry parsers: IFEO / SilentProcessExit,
 # Winlogon, AppInit_DLLs, TaskCache, Defender exclusions, LSA packages,
 # WDigest, Office TrustRecords / File MRU / OutlookSecureTempFolder,
-# Terminal Server Client, Open/Save dialog MRUs and WordWheelQuery. The
+# Terminal Server Client, Open/Save dialog MRUs and WordWheelQuery, and
+# the USB parser's MountedDevices rows read from the SYSTEM hive (the
+# collection's USB\mounted_devices.csv has no rows and its
+# mounted_devices.txt is the cut-off one of older collectors: the hive
+# must win over both). The
 # fixture collection also has a scheduled_tasks.csv (a task listed there
 # gets no TaskCache rows) and a collection_log.txt (the collector's own
 # Defender exclusion). Hives the builder leaves loaded, and work folders it
@@ -288,6 +292,26 @@ function New-TestRegistryFixture {
     Set-TestKey -Root $NtUser -Path "$comDlg\LastVisitedPidlMRU" -Values @(@("0", $lastVisited, $binary), @("MRUListEx", (New-MruListEx @(0)), $binary))
     Set-TestKey -Root $NtUser -Path "Software\Microsoft\Windows\CurrentVersion\Explorer\WordWheelQuery" -Values @(
         @("0", [System.Text.Encoding]::Unicode.GetBytes("quarterly report" + [char]0), $binary), @("MRUListEx", (New-MruListEx @(0)), $binary))
+
+    New-TestMountedDevicesFixture -System $System
+}
+
+# SYSTEM: MountedDevices (at the hive root) with a GPT partition (C:, the
+# collector's output drive), two MBR partitions of one disk, a USB device
+# path with a "/" in its product name (SD/MMC, written "#") under a volume
+# GUID and a drive letter, and an unrecognized value
+function New-TestMountedDevicesFixture {
+    param([Microsoft.Win32.RegistryKey]$System)
+    $binary = [Microsoft.Win32.RegistryValueKind]::Binary
+    $gpt = [byte[]]([System.Text.Encoding]::ASCII.GetBytes("DMIO:ID:") + (New-Object System.Guid "b0000000-0000-4000-8000-000000000001").ToByteArray())
+    $sdCard = [System.Text.Encoding]::Unicode.GetBytes("_??_USBSTOR#Disk&Ven_Generic-&Prod_SD#MMC&Rev_1.00#FXSERIAL0003&0#{53f56307-b6bf-11d0-94f2-00a0c91efb8b}" + [char]0)
+    Set-TestKey -Root $System -Path "MountedDevices" -Values @(
+        @("\DosDevices\C:", $gpt, $binary),
+        @("\DosDevices\H:", [byte[]]([BitConverter]::GetBytes([uint32]0x0A1B2C3D) + [BitConverter]::GetBytes([uint64]1048576)), $binary),
+        @("\DosDevices\I:", [byte[]]([BitConverter]::GetBytes([uint32]0x0A1B2C3D) + [BitConverter]::GetBytes([uint64]5368709120)), $binary),
+        @("\??\Volume{00000000-0000-11f0-8000-000000000201}", $sdCard, $binary),
+        @("\DosDevices\F:", $sdCard, $binary),
+        @("\??\Volume{00000000-0000-11f0-8000-000000000202}", [byte[]](1, 2, 3, 4, 5, 6), $binary))
 }
 
 # Rows the builder must produce from the fixture. Time = exact UTC text for
@@ -300,6 +324,10 @@ function Get-ExpectedRegistryRows {
     }
     $ifeo = "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
     $lastSuccess = $script:FixtureTimes.FolderTaskLastSuccess.ToString("yyyy-MM-dd HH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture)
+    # Snapshot rows: CollectionStartUtc of the fixture's collection_info.json
+    $collectionTime = "2026-01-01 00:00:00.000"
+    $sdVolume = "\??\Volume{00000000-0000-11f0-8000-000000000201}"
+    $sdInstance = "InstanceId=USBSTOR\Disk&Ven_Generic-&Prod_SD/MMC&Rev_1.00\FXSERIAL0003&0"
     # Rows timed with a key's last-write time must say so in Time= (the
     # fallback, the hive file time, falls inside the test window too)
     $rows = @(
@@ -369,7 +397,20 @@ function Get-ExpectedRegistryRows {
         @("Registry-LastVisitedMRU", "FileAccess", "Open/Save dialog folder last used by notepad.exe: C:\Data", $null, "testuser",
             @("Program=notepad.exe", "Time=LastVisitedPidlMRU key last write; MRU position 1")),
         @("Registry-WordWheelQuery", "FileAccess", "Explorer search: quarterly report", $null, "testuser",
-            @("MRUIndex=0", "Time=key last write; MRU position 1 (most recent entry)"))
+            @("MRUIndex=0", "Time=key last write; MRU position 1 (most recent entry)")),
+        # MountedDevices from the SYSTEM hive (USB parser)
+        @("USB-MountedDevices", "Snapshot", "Drive letter C: -> GPT partition {b0000000-0000-4000-8000-000000000001}", $collectionTime, "",
+            @("Kind=GPT | PartitionGuid={b0000000-0000-4000-8000-000000000001} | VolumeGuid={b0000000-0000-4000-8000-000000000001}", "KeyLastWriteUtc=", "CollectorDrive=yes")),
+        @("USB-MountedDevices", "Snapshot", "Drive letter H: -> MBR disk 0A1B2C3D, partition at offset 1048576", $collectionTime, "",
+            @("VolumeGuid={0a1b2c3d-0000-0000-0000-100000000000}", "SameDisk=\DosDevices\I:", "KeyLastWriteUtc=")),
+        @("USB-MountedDevices", "Snapshot", "Drive letter I: -> MBR disk 0A1B2C3D, partition at offset 5368709120", $collectionTime, "",
+            @("VolumeGuid={0a1b2c3d-0000-0000-0000-004001000000}", "SameDisk=\DosDevices\H:")),
+        @("USB-MountedDevices", "Snapshot", "Volume {00000000-0000-11f0-8000-000000000201} -> USB storage Generic- SD/MMC (serial FXSERIAL0003)", $collectionTime, "",
+            @($sdInstance, "Serial=FXSERIAL0003", "DevicePath=_??_USBSTOR#Disk&Ven_Generic-&Prod_SD#MMC&Rev_1.00#FXSERIAL0003&0#{53f56307-b6bf-11d0-94f2-00a0c91efb8b}", "SameDataAs=\DosDevices\F:")),
+        @("USB-MountedDevices", "Snapshot", "Drive letter F: -> USB storage Generic- SD/MMC (serial FXSERIAL0003)", $collectionTime, "",
+            @("VolumeGuid={00000000-0000-11f0-8000-000000000201}", $sdInstance, "SameDataAs=$sdVolume")),
+        @("USB-MountedDevices", "Snapshot", "Volume {00000000-0000-11f0-8000-000000000202} -> unrecognized data (6 bytes)", $collectionTime, "",
+            @("Kind=Other", "HexData=010203040506"))
     )
     foreach ($r in $rows) {
         [PSCustomObject]@{ Source = $r[0]; EventType = $r[1]; Description = $r[2]; Time = $r[3]; User = $r[4]; Details = $r[5] }
@@ -377,10 +418,31 @@ function Get-ExpectedRegistryRows {
 }
 
 # Sources of the registry rows covered by this test
-$script:TestedSources = @("Registry-IFEO", "Registry-SilentProcessExit", "Registry-Winlogon", "Registry-AppInitDLLs",
-    "Registry-TaskCache", "Registry-DefenderExclusions", "Registry-LSA", "Registry-WDigest", "Registry-TrustRecords",
-    "Registry-OfficeMRU", "Registry-OutlookSecureTemp", "Registry-RDPClient", "Registry-OpenSaveMRU",
-    "Registry-LastVisitedMRU", "Registry-WordWheelQuery")
+$script:TestedSources = @(
+    "Registry-IFEO"
+    "Registry-SilentProcessExit"
+    "Registry-Winlogon"
+    "Registry-AppInitDLLs"
+    "Registry-TaskCache"
+    "Registry-DefenderExclusions"
+    "Registry-LSA"
+    "Registry-WDigest"
+    "Registry-TrustRecords"
+    "Registry-OfficeMRU"
+    "Registry-OutlookSecureTemp"
+    "Registry-RDPClient"
+    "Registry-OpenSaveMRU"
+    "Registry-LastVisitedMRU"
+    "Registry-WordWheelQuery"
+    "USB-MountedDevices"
+)
+
+# Builder -Sources of the test run
+$script:TestSources = @(
+    "Registry"
+    "ScheduledTasks"
+    "USB"
+)
 
 # Compare the timeline rows (objects with Timestamp, Source, EventType,
 # Description, User, Details) with the expected rows. Rows of the tested
@@ -466,6 +528,32 @@ function New-TestScheduledTasksCsv {
     }
     New-Item -ItemType Directory -Path (Split-Path $Path -Parent) -Force | Out-Null
     $row | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8
+}
+
+# USB\ of the fixture collection: MountedDevices sources the builder must
+# NOT use while the SYSTEM hive has the key -- a mounted_devices.csv with
+# the header only, and the mounted_devices.txt of older collectors
+# (Format-List output with only the first 4 bytes of each value, cut off
+# with "..." or the ellipsis character). Rows from the .txt would say
+# "(value cut off)" and miss the expected Descriptions.
+function New-TestMountedDevicesFiles {
+    param([string]$Folder)
+    New-Item -ItemType Directory -Path $Folder -Force | Out-Null
+    $columns = @("Name", "Kind", "DiskSignature", "PartitionOffset", "PartitionGuid", "DevicePath", "DataLength", "HexData", "KeyLastWriteUtc")
+    $utf8Bom = New-Object System.Text.UTF8Encoding($true)
+    [System.IO.File]::WriteAllText((Join-Path $Folder "mounted_devices.csv"), '"' + ($columns -join '","') + '"' + "`r`n", $utf8Bom)
+    $lines = @(
+        "",
+        "\DosDevices\C:                                   : {68, 77, 73, 79...}",
+        "\DosDevices\H:                                   : {61, 44, 27, 10...}",
+        "\DosDevices\I:                                   : {61, 44, 27, 10$([char]0x2026)}",
+        "\??\Volume{00000000-0000-11f0-8000-000000000201} : {95, 0, 63, 0...}",
+        "\DosDevices\F:                                   : {95, 0, 63, 0$([char]0x2026)}",
+        "\??\Volume{00000000-0000-11f0-8000-000000000202} : {1, 2, 3, 4...}",
+        "PSChildName                                      : MountedDevices",
+        ""
+    )
+    [System.IO.File]::WriteAllText((Join-Path $Folder "mounted_devices.txt"), ($lines -join "`r`n"), $utf8Bom)
 }
 
 # collection_log.txt of the fixture collection: the output folder and the
@@ -577,7 +665,8 @@ try {
 
     # Collector metadata: the Defender exclusion of the output folder is
     # recognised from collection_log.txt, the scheduled task list decides
-    # which TaskCache times are new to the timeline
+    # which TaskCache times are new to the timeline, and USB\ holds the
+    # MountedDevices sources the SYSTEM hive must win over
     $info = [ordered]@{
         SchemaVersion = 1; ComputerName = "TESTHOST"; CollectorUser = "TESTHOST\tester"; Mode = "Live"
         TargetDrive = "C"; TargetRoot = "C:\"; CollectionStartUtc = "2026-01-01T00:00:00.0000000Z"
@@ -586,12 +675,13 @@ try {
     [System.IO.File]::WriteAllText((Join-Path $collection "collection_info.json"), ($info | ConvertTo-Json))
     New-TestCollectionLog -Path (Join-Path $collection "collection_log.txt")
     New-TestScheduledTasksCsv -Path (Join-Path $collection "Persistence\scheduled_tasks.csv")
+    New-TestMountedDevicesFiles -Folder (Join-Path $collection "USB")
 
     $timelineCsv = Join-Path $workDir "timeline.csv"
     Write-Host "Running the builder ($powershellExe) on $collection ..."
     $hivesBefore = Get-BuilderHiveState
     $builderOutput = & $powershellExe -NoProfile -ExecutionPolicy Bypass -File $builder `
-        -InputPath $collection -Sources "Registry,ScheduledTasks" -OutputFile $timelineCsv -NoExcel -Viewer None 2>&1
+        -InputPath $collection -Sources ($script:TestSources -join ",") -OutputFile $timelineCsv -NoExcel -Viewer None 2>&1
     $windowEnd = [datetime]::UtcNow.AddMinutes(2)
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $timelineCsv)) {
         $builderOutput | ForEach-Object { Write-Host "  | $_" }
@@ -612,6 +702,14 @@ try {
 
     $rows = @(Import-Csv -LiteralPath $timelineCsv)
     $failures += Test-RegistryRows -Rows $rows -WindowStart $windowStart -WindowEnd $windowEnd
+    # The MountedDevices rows come from the SYSTEM hive, not from the empty
+    # mounted_devices.csv or the cut-off mounted_devices.txt next to it
+    $mountedPaths = @($rows | Where-Object { $_.Source -eq "USB-MountedDevices" } | ForEach-Object { $_.RawPath } | Select-Object -Unique)
+    if ($mountedPaths.Count -ne 1 -or $mountedPaths[0] -notlike "*\Registry\SYSTEM") {
+        Write-TestFailure "USB-MountedDevices rows from '$($mountedPaths -join "', '")' (expected the SYSTEM hive, not USB\mounted_devices.csv or .txt)"
+        $failures++
+    }
+    else { Write-Host "PASS: USB-MountedDevices rows from the SYSTEM hive (not the empty mounted_devices.csv or the cut-off .txt)" -ForegroundColor Green }
     if ($failures -gt 0) {
         Write-Host "FAIL: $failures problem(s) in the registry parser rows" -ForegroundColor Red
         exit 1
