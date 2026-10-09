@@ -12,17 +12,20 @@
 #   attachments left in the zip, nothing extracted when the zip does not
 #   fit), the manifest lookups from an outer folder (also the email
 #   parser's), the input-file list of a collection folder (no memory dump
-#   or attachment copy) and the list of missing files, the free-space
-#   verdict, the temp-folder check (8.3 short paths and relative paths
-#   too), the end-of-run hive list, the clean-up of work folders left by
-#   earlier runs, the SRUM database copy (made in the work folder's
-#   scratch folder, a missing transaction log reported), the refusal of a
-#   network work folder and the end-of-run banners (missing input files,
-#   unexpected errors).
+#   or attachment copy) and the list of missing files, the setupapi logs
+#   found (also under names shortened on extraction; email attachment
+#   copies and Secrets\ skipped) and those the manifest lists but that are
+#   gone, the free-space verdict, the temp-folder check (8.3 short paths
+#   and relative paths too), the end-of-run hive list, the clean-up of
+#   work folders left by earlier runs, the SRUM database copy (made in the
+#   work folder's scratch folder, a missing transaction log reported), the
+#   refusal of a network work folder and the end-of-run banners (missing
+#   input files, unexpected errors).
 # Part 2 -- builder runs: a synthetic collection zip whose entries are dated
 #   2025, with two setupapi logs (USBSTOR devices) under "/" and "\" entry
 #   names and a manifest, passed as -InputPath (-Sources USB):
-#   - both logs are parsed, exit code 0, the extraction and the free-space
+#   - both logs are parsed (USBDevice rows; the USB parser logs "Found 2
+#     SetupAPI log(s)"), exit code 0, the extraction and the free-space
 #     check are in the log;
 #   - the work folder is in %LOCALAPPDATA%\TimelineBuilder, outside every
 #     temp folder, and removed at the end; no TriageExtract_* or
@@ -30,7 +33,9 @@
 #   - with the builder's test hook deleting one extracted file mid-run
 #     (TIMELINE_BUILDER_TEST_DELETE_INPUT; it only deletes inside the work
 #     folder) and -WorkDir: exit code 2, the "MISSING INPUT FILE(S)"
-#     banner, the work folder made in -WorkDir and removed, -WorkDir kept;
+#     banner, the USB parser's warning naming the setupapi log that the
+#     manifest lists but that is gone, the work folder made in -WorkDir
+#     and removed, -WorkDir kept;
 #   - a zip with a copied email attachment (-Sources Email), the test hook
 #     pointed at it: it is not extracted, so there is nothing to delete;
 #     exit code 0 and its two rows, from the manifest.
@@ -298,6 +303,49 @@ try {
     Assert-Equal -Name "25 missing files: all 25 names in the log file" -Expected 25 -Actual $logNames.Count
     Assert-Equal -Name "25 missing files: 20 names and a count on the console" -Expected "20 1" -Actual "$(@($console -match 'Browser\\file\d\d\.db$').Count) $(@($console -match '\.\.\. and 5 more \(all listed in the log file\)$').Count)"
 
+    # --- SetupAPI logs the manifest lists (USB parser) --------------------
+    # Logs shortened on extraction, named the way Expand-CollectionZip does
+    # (the name's start, 8 characters or more, and a hash), are found and
+    # count by their full-length names; only a listed log that is gone is
+    # reported. Email attachment copies and the Secrets\ folder are skipped
+    # like Find-ArtifactFiles skips them, also under a shortened name, and
+    # are not counted as listed.
+    $usbColl = Join-Path $testRoot "usb\Coll"
+    $shortSetupApi = Join-Path $usbColl "USB\setupapi~0123ABCD.log"
+    $shortRotated = Join-Path $usbColl "USB\setupapi.dev.2023~4567CDEF.log"
+    $attachedLog = Join-Path $usbColl "Email\alice\NewOutlook\Attachments\setupapi.dev.log"
+    $shortAttached = Join-Path $usbColl "Email\alice\NewOutlook\Attachments\setupapi~89ABCDEF.log"
+    $shortSecrets = Join-Path $usbColl "Secrets\setupapi~CDEF0123.log"
+    foreach ($file in @((Join-Path $usbColl "USB\setupapi.dev.log"), $shortSetupApi, $shortRotated, $attachedLog, $shortAttached, $shortSecrets)) {
+        New-Item -ItemType Directory -Path (Split-Path $file -Parent) -Force | Out-Null
+        [System.IO.File]::WriteAllText($file, "x")
+    }
+    [System.IO.File]::WriteAllText((Join-Path $usbColl "collection_manifest.csv"),
+        (New-TestManifest -RelativePaths @("USB\setupapi.dev.log", "USB\setupapi.dev.20241201_000000.log", "USB\setupapi.dev.20230601_000000.log", "USB\setupapi.dev.20240101_000000.log", "Registry\SYSTEM",
+            "Email\alice\NewOutlook\Attachments\setupapi.dev.log", "Email\alice\NewOutlook\Attachments\setupapi.dev.20220101_000000.log", "Secrets\setupapi.dev.20220202_000000.log")))
+    Set-Variable -Name InputPath -Value (Split-Path $usbColl -Parent) -Scope Script
+    $script:collectionManifest = $null
+    $script:collectionRoot = Get-CollectionRootFolder
+    $script:secretsRoot = $null
+    $script:shortenedNames = @{
+        $shortSetupApi = (Join-Path $usbColl "USB\setupapi.dev.20241201_000000.log")
+        $shortRotated  = (Join-Path $usbColl "USB\setupapi.dev.20230601_000000.log")
+        $shortAttached = (Join-Path $usbColl "Email\alice\NewOutlook\Attachments\setupapi.dev.20220101_000000.log")
+        $shortSecrets  = (Join-Path $usbColl "Secrets\setupapi.dev.20220202_000000.log")
+    }
+    $foundLogs = @(Find-SetupApiLogFiles)
+    $foundNames = [string[]]@($foundLogs | ForEach-Object { $_.Name })
+    [Array]::Sort($foundNames, [System.StringComparer]::Ordinal)
+    Assert-Equal -Name "SetupAPI logs: found, also under a shortened name, each once" -Expected "setupapi.dev.2023~4567CDEF.log, setupapi.dev.log, setupapi~0123ABCD.log" -Actual ($foundNames -join ", ")
+    Assert-Equal -Name "SetupAPI logs: email attachment copies and Secrets\ skipped, also under a shortened name" -Expected "" -Actual (@($foundLogs | Where-Object { $_.FullName -notlike "$usbColl\USB\*" } | ForEach-Object { $_.FullName }) -join ", ")
+    $setupApiCheck = Compare-ManifestSetupApiLogs -Found $foundLogs
+    Assert-Equal -Name "SetupAPI logs: listed in the manifest (not email attachment copies or Secrets\)" -Expected "USB\setupapi.dev.20230601_000000.log, USB\setupapi.dev.20240101_000000.log, USB\setupapi.dev.20241201_000000.log, USB\setupapi.dev.log" -Actual ($setupApiCheck.Listed -join ", ")
+    Assert-Equal -Name "SetupAPI logs: only the one that is gone is missing (shortened ones found)" -Expected "USB\setupapi.dev.20240101_000000.log" -Actual ($setupApiCheck.Missing -join ", ")
+    $setupApiCheck = Compare-ManifestSetupApiLogs -Found @()
+    Assert-Equal -Name "SetupAPI logs: none found, all listed are missing" -Expected 4 -Actual $setupApiCheck.Missing.Count
+    $script:shortenedNames = @{}
+    $script:secretsRoot = $null
+
     # --- Free space verdict ----------------------------------------------
     $need = 2GB
     Assert-Equal -Name "free space: below size + 256 MB is an error" -Expected "Error" -Actual (Get-ExtractionSpaceVerdict -FreeBytes ($need + 255MB) -TotalBytes 1000GB -NeededBytes $need -IsSystemDrive $false)
@@ -502,8 +550,9 @@ try {
     if (Test-Path -LiteralPath $csvA) { $rowsA = @(Import-Csv -LiteralPath $csvA) }
     $rowA = @(Get-SetupApiRow -Rows $rowsA -Serial "TESTSERIAL0001")
     $rowB = @(Get-SetupApiRow -Rows $rowsA -Serial "TESTSERIAL0002")
-    Assert-Equal -Name "run A: device from setupapi.dev.log (/ entry name)" -Expected "1 2025-01-02 10:00:00.000 Device install: TestVen DiskA (serial TESTSERIAL0001)" -Actual "$($rowA.Count) $($rowA[0].Timestamp) $($rowA[0].Description)"
-    Assert-Equal -Name "run A: device from the rotated setupapi log (\ entry name)" -Expected "1 2024-11-30 09:00:00.000 Device install: TestVen DiskB (serial TESTSERIAL0002)" -Actual "$($rowB.Count) $($rowB[0].Timestamp) $($rowB[0].Description)"
+    Assert-Equal -Name "run A: device from setupapi.dev.log (/ entry name)" -Expected "1 2025-01-02 10:00:00.000 USBDevice Device install: TestVen DiskA (serial TESTSERIAL0001)" -Actual "$($rowA.Count) $($rowA[0].Timestamp) $($rowA[0].EventType) $($rowA[0].Description)"
+    Assert-Equal -Name "run A: device from the rotated setupapi log (\ entry name)" -Expected "1 2024-11-30 09:00:00.000 USBDevice Device install: TestVen DiskB (serial TESTSERIAL0002)" -Actual "$($rowB.Count) $($rowB[0].Timestamp) $($rowB[0].EventType) $($rowB[0].Description)"
+    Assert-Equal -Name "run A: both SetupAPI logs found, none reported missing" -Expected "True False" -Actual "$($runA.Log -match 'Found 2 SetupAPI log\(s\)\.') $($runA.Log -match 'SetupAPI log\(s\) missing')"
     Assert-Equal -Name "run A: completed successfully" -Expected 1 -Actual @($runA.Lines -match "=== Timeline Builder Completed Successfully ===").Count
     Assert-Equal -Name "run A: extraction written to the log file" -Expected $true -Actual ($runA.Log -match "Extracting the collection zip" -and $runA.Log -match "Zip: .+ 4 file\(s\)" -and $runA.Log -match "Work folder: ")
     Assert-Equal -Name "run A: free space checked before the extraction" -Expected $true -Actual ($runA.Log -match "Free space on |Low free space on |Free space check skipped")
@@ -533,6 +582,7 @@ try {
     $rowsB = @()
     if (Test-Path -LiteralPath $csvB) { $rowsB = @(Import-Csv -LiteralPath $csvB) }
     Assert-Equal -Name "run B: the remaining log is parsed, the deleted one is not" -Expected "1 0" -Actual "$(@(Get-SetupApiRow -Rows $rowsB -Serial 'TESTSERIAL0001').Count) $(@(Get-SetupApiRow -Rows $rowsB -Serial 'TESTSERIAL0002').Count)"
+    Assert-Equal -Name "run B: the USB parser names the SetupAPI log the manifest lists but that is gone" -Expected "True True" -Actual "$($runB.Log -match 'Found 1 SetupAPI log\(s\)\.') $($runB.Log -match 'SetupAPI log\(s\) missing: the collection manifest lists 2, 1 of them are not here -- their device installs are not in the timeline: USB\\setupapi\.dev\.20241201_000000\.log')"
     Write-TestResult -Name "run B: work folder made in -WorkDir" -Passed ($runB.WorkFolder -and (Split-Path $runB.WorkFolder -Parent) -eq $workDirB) -Message "work folder: $($runB.WorkFolder)"
     Write-TestResult -Name "run B: work folder removed, -WorkDir kept" -Passed ($runB.WorkFolder -and -not (Test-Path -LiteralPath $runB.WorkFolder) -and (Test-Path -LiteralPath $workDirB)) -Message "work folder: $($runB.WorkFolder)"
     Assert-Equal -Name "run B: the zip is not changed" -Expected $zipHash -Actual (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash

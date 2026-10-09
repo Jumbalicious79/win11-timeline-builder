@@ -1,0 +1,92 @@
+[Device Install Log]
+     OS Version = 10.0.26100
+     Service Pack = 0.0
+     Suite = 0x0100
+     ProductType = 1
+     Architecture = amd64
+
+[BeginLog]
+
+[Boot Session: 2025/03/01 10:13:00.000]
+
+>>>  [Device Install (Hardware initiated) - BTHENUM\{0000110b-0000-1000-8000-00805f9b34fb}_VID&0001fff2_PID&0001\7&2B3C4D5E&0&000000000000_C00000000]
+>>>  Section start 2025/03/01 10:14:00.000
+     dvi: {Build Driver List} 10:14:00.000
+     dvi: {Build Driver List - exit(0x00000000)} 10:14:00.000
+<<<  Section end 2025/03/01 10:14:02.000
+<<<  [Exit status: SUCCESS]
+
+>>>  [Device Install (Hardware initiated) - HID\VID_FFF1&PID_0002&MI_00\8&1F2E3D4C&0&0000]
+>>>  Section start 2025/04/02 14:20:30.500
+     dvi: {Build Driver List} 14:20:30.500
+     dvi: {Build Driver List - exit(0x00000000)} 14:20:30.500
+<<<  Section end 2025/04/02 14:20:31.000
+<<<  [Exit status: SUCCESS]
+
+>>>  [Device Install (Hardware initiated) - swc\vid_fff1&pid_0003]
+>>>  Section start 2025/04/02 14:20:33.750
+     dvi: {Build Driver List} 14:20:33.750
+     dvi: {Build Driver List - exit(0x00000000)} 14:20:33.750
+<<<  Section end 2025/04/02 14:20:34.000
+<<<  [Exit status: SUCCESS]
+
+>>>  [Device Install (UpdateDriverForPlugAndPlayDevices) - ROOT\FIXTUREDRV\0000]
+>>>  Section start 2025/04/15 11:00:00.000
+     dvi: {Build Driver List} 11:00:00.000
+     dvi: {Build Driver List - exit(0x00000000)} 11:00:00.000
+<<<  Section end 2025/04/15 11:00:02.000
+<<<  [Exit status: SUCCESS]
+
+>>>  [Device Install (Install Windows Update driver) - PCI\VEN_FFF0&DEV_0A01&SUBSYS_0001FFF0&REV_01\3&11223344&0&10]
+>>>  Section start 2025/05/05 03:10:45.678
+     dvi: {Build Driver List} 03:10:45.678
+     dvi: {Build Driver List - exit(0x00000000)} 03:10:45.678
+<<<  Section end 2025/05/05 03:11:30.000
+<<<  [Exit status: SUCCESS]
+
+>>>  [Device Install (Hardware initiated) - SWD\WPDBUSENUM\{00000000-0000-11f0-8000-000000000001}#0000000000100000]
+>>>  Section start 2025/05/20 19:30:15.250
+     dvi: {Build Driver List} 19:30:15.250
+     dvi: {Build Driver List - exit(0x00000000)} 19:30:15.250
+<<<  Section end 2025/05/20 19:30:16.000
+<<<  [Exit status: SUCCESS]
+
+>>>  [Device Install (Hardware initiated) - USB\VID_FFF1&PID_0004\FIXTURESERIAL0002]
+>>>  Section start 2025/06/01 16:45:00.010
+     dvi: {Build Driver List} 16:45:00.010
+     dvi: {Build Driver List - exit(0x00000000)} 16:45:00.010
+<<<  Section end 2025/06/01 16:45:01.000
+<<<  [Exit status: SUCCESS]
+
+>>>  [Device Install (Hardware initiated) - SCSI\Disk&Ven_Fixture&Prod_UAS_Drive\5&ABCDEF0&0&000000]
+>>>  Section start 2025/06/01 16:45:02.020
+     dvi: {Build Driver List} 16:45:02.020
+     dvi: {Build Driver List - exit(0x00000000)} 16:45:02.020
+<<<  Section end 2025/06/01 16:45:03.000
+<<<  [Exit status: SUCCESS]
+
+>>>  [Device Install (Hardware initiated) - STORAGE\VOLUME\_??_USBSTOR#Disk&Ven_Fixture&Prod_Test_Disk&Rev_1.00#FIXTURESERIAL0001&0#{53f56307-b6bf-11d0-94f2-00a0c91efb8b}]
+>>>  Section start 2025/06/10 08:00:00.300
+     dvi: {Build Driver List} 08:00:00.300
+     dvi: {Build Driver List - exit(0x00000000)} 08:00:00.300
+<<<  Section end 2025/06/10 08:00:01.000
+<<<  [Exit status: SUCCESS]
+
+>>>  [Delete Device - PCI\VEN_FFF0&DEV_0A01&SUBSYS_0001FFF0&REV_01\3&11223344&0&10]
+>>>  Section start 2025/06/20 09:00:00.000
+     dvi: Device removed
+<<<  Section end 2025/06/20 09:00:00.500
+<<<  [Exit status: SUCCESS]
+
+>>>  [Delete Device - USBSTOR\Disk&Ven_Fixture&Prod_Test_Disk&Rev_1.00\FIXTURESERIAL0001&0]
+>>>  Section start 2025/06/20 09:05:00.900
+     dvi: Device removed
+<<<  Section end 2025/06/20 09:05:01.000
+<<<  [Exit status: SUCCESS]
+
+>>>  [Delete Device - SWD\WPDBUSENUM\{00000000-0000-11f0-8000-000000000002}#0000000000100000]
+>>>  Section start 2025/06/20 09:10:00.000
+     dvi: Device removed
+<<<  Section end 2025/06/20 09:10:00.500
+<<<  [Exit status: SUCCESS]
+

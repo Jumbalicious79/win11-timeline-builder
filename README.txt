@@ -871,7 +871,16 @@ Parses USB device history:
     install, last arrival (connected) and last removal times per device
   - All SetupAPI device install logs (setupapi.dev.log and the rotated
     setupapi.dev.<date>.log files): first-install times, converted from the
-    examined system's local time to UTC
+    examined system's local time to UTC. The logs record every device and
+    driver install, so only USB devices -- instance IDs that start with
+    USB\ or contain USBSTOR or VID_xxxx, and volumes on removable drives
+    (SWD\WPDBUSENUM\{volume GUID}#<partition offset>) -- are EventType
+    USBDevice; all others (graphics card, audio, Bluetooth, software
+    devices, driver packages, ...) are EventType Installation. Source is
+    USB-SetupAPI for both. Device deletions are reported for USB devices
+    only. The log says how many setupapi logs were found and warns when
+    collection_manifest.csv lists one that is missing (lost after
+    collection)
   - USB devices and storage devices (usb_devices.txt, usb_storage_devices.txt)
   - Mounted devices (mounted_devices.txt)
 
@@ -1025,9 +1034,10 @@ logs one line about it at the start):
   - A top-level Secrets\ folder with DPAPI credential material (per-user and
     system master keys, Credentials, Vault). No parser ever reads anything
     there: the Secrets\ exclusion is applied at the Find-ArtifactFiles choke
-    point (so all of its callers skip it) and on every other recursive search
+    point (so all of its callers skip it), on every other recursive search
     that walks the whole collection -- the $MFT search, the ScheduledTasks_XML
-    folders, the SRUDB.dat search and the AntiVirus vendor / Defender folders.
+    folders, the SRUDB.dat search and the AntiVirus vendor / Defender folders
+    -- and on the setupapi logs whose names were shortened on extraction.
     A $MFT, Preferences, Task XML, SRUDB.dat or antivirus file left in Secrets\
     is not parsed. Only the collection's own top-level Secrets\ folder (next to
     collection_info.json) is excluded, so a user profile folder named "Secrets"
@@ -1118,7 +1128,8 @@ differences" above for details.
     ServiceChange           Yellow      -- service state changes
     ScheduledTaskChange     Yellow      -- task scheduler changes
     USBDevice               Purple      -- USB device connections
-    Installation            Light Blue  -- application installs
+    Installation            Light Blue  -- application installs, and device and
+                                           driver installs (setupapi)
     SecurityAlert           Bright red  -- AV detections, security tampering
                                            (Defender disabled, exclusion added);
                                            text in bold
@@ -1338,6 +1349,18 @@ Timeline Explorer at the same time.
     inside the hour that repeats when daylight saving time ends cannot be
     told apart and may be off by one hour.
 
+  - SetupAPI USB devices -- A setupapi install counts as a USB device
+    (USBDevice) only by its instance ID (USB\, USBSTOR, VID_xxxx, or
+    SWD\WPDBUSENUM\{volume GUID}#...). The disk of a USB drive that uses
+    UAS (USB Attached SCSI) is installed as SCSI\Disk&Ven_...; that row is
+    Installation, while the drive's own USB\VID_... install just before it
+    is USBDevice. Bluetooth devices are Installation. The portable device
+    Windows makes for a volume on a removable drive (the
+    SWD\WPDBUSENUM\{volume GUID}#<partition offset> rows) is USBDevice,
+    as it nearly always is a USB drive, but an SD card in a built-in card
+    reader gives one too. Such a row names only the volume GUID and the
+    partition offset, not the drive.
+
   - Excel row limit -- Timelines over 1,048,575 rows are written to CSV only.
 
   - Excel "Repaired Records" or recovery prompt -- Known ImportExcel/EPPlus
@@ -1475,17 +1498,27 @@ parsing is skipped, and the timeline CSV can be opened manually.
 
 ## Tests
 
-  tests\Test-Parsers.ps1 runs the builder on the fixture collection in
-  tests\fixtures\av\ (public Symantec, Sophos and McAfee sample logs from the
-  plaso project, Apache-2.0 -- see that folder's README.txt) and compares the
-  timeline with tests\fixtures\av\expected.csv. CI runs it on every pull
-  request in Windows PowerShell 5.1 and PowerShell 7.
+  tests\Test-Parsers.ps1 runs the builder on every fixture collection in
+  tests\fixtures\<name>\ and compares each timeline with that folder's
+  expected.csv. A fixture folder holds collection\ (the collection),
+  sources.txt (the -Sources to run) and expected.csv:
+    av\        AntiVirus -- public Symantec, Sophos and McAfee sample logs
+               from the plaso project (Apache-2.0, see that folder's
+               README.txt)
+    setupapi\  USB -- two synthetic setupapi logs (current and rotated)
+               with USB and other device installs and deletions
+  CI runs it on every pull request in Windows PowerShell 5.1 and
+  PowerShell 7.
 
-  Run it locally from an elevated PowerShell (the builder needs admin):
+  Run it locally from an elevated PowerShell (the builder needs admin), or
+  pass -BuilderPath with a copy of the builder without the admin check;
+  -Fixture <name> runs only that fixture:
     powershell -ExecutionPolicy Bypass -File tests\Test-Parsers.ps1
 
   After an intended change to the parser output, regenerate the expected rows
-  with -UpdateExpected and review the diff before committing.
+  with -UpdateExpected (with -Fixture <name> for one fixture; it also
+  creates expected.csv for a new fixture folder) and review the diff before
+  committing.
 
   The scripts below test the event log, browser, registry, $MFT, email,
   SRUM and Defender parsers and how the builder handles its input
