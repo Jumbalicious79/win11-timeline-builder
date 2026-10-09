@@ -139,12 +139,18 @@ themselves are never committed.
   are fine, and a relative path is turned into a full path first (the
   elevated window starts in C:\Windows\System32).
 
+  The collection's memory dump is found as well, also when the collector
+  wrote it to another drive (e.g. D:\TriageMemory\ when the system drive
+  was low on space): collection_manifest.csv records where the collector
+  saved it. With Volatility 3 in tools\, the builder offers to analyze it
+  (see parser #15).
+
 ### PowerShell (Admin)
 
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -Browse
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection"
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\TriageCollection_2025-01-20_14-05.zip" -WorkDir "D:\Work"
-  powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\TriageCollection_2025-01-20_14-05.zip" -MemoryDumpPath "E:\Dumps\TriageCollection_2025-01-20_14-05_memory_dump.dmp"
+  powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\TriageCollection_2025-01-20_14-05.zip" -MemoryDumpPath "E:\Moved\TriageCollection_2025-01-20_14-05_memory_dump.dmp"
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -StartDate "2025-01-15" -EndDate "2025-01-20"
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -Sources "EventLogs,Prefetch,Registry"
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -Keywords "mimikatz,psexec,powershell -enc"
@@ -154,6 +160,10 @@ themselves are never committed.
   one string ("a,b"). The script splits -Sources and -Keywords on commas
   itself, so both forms work. From a PowerShell prompt (.\timeline-builder.ps1)
   normal arrays (-Keywords "a","b") work as well.
+
+  -MemoryDumpPath (fourth line) is needed only for a dump that was moved
+  after the collection; a dump where the collector saved it is found
+  without it.
 
 
 ## Parameters
@@ -174,7 +184,8 @@ themselves are never committed.
                   UsnJournal, Amcache, PowerShellHistory, SystemInfo,
                   AntiVirus, Email, SRUM, Memory
                   Note: Memory is opt-in. Requires Volatility 3 in tools\ and
-                  a memory dump in or next to the collection, or
+                  a memory dump where the collector saved it (also on
+                  another drive), in or next to the collection, or
                   -MemoryDumpPath (see parser #15). Adds 5-30 minutes.
   -Keywords       Strings to flag in the timeline, as an array or a
                   comma-separated string ("mimikatz,psexec"). Spaces around
@@ -204,16 +215,19 @@ themselves are never committed.
                   network drive is refused (reg load cannot load hives
                   from there).
   -MemoryDumpPath The collection's memory dump file (a DumpIt .dmp or a
-                  .raw image) when it is not next to the collection zip or
-                  folder, e.g. a dump the triage collector saved on another
-                  drive with -MemoryOutputPath
-                  (<MemoryOutputPath>\<collection>_memory_dump.dmp). It is
-                  used before the places listed under parser #15; if it is
-                  not an existing file, a warning is logged and those
-                  places are searched instead. It does not turn on the
-                  Memory parser: add Memory to -Sources, or choose [1] when
-                  the builder offers the dump. Run-TimelineBuilder.bat does
-                  not pass it; start the script from PowerShell.
+                  .raw image), only for a dump that was moved after the
+                  collection. A dump the triage collector saved on another
+                  drive (with -MemoryOutputPath, or the drive picked at its
+                  memory prompt when the system drive was low on space,
+                  e.g. D:\TriageMemory\<collection>_memory_dump.dmp) is
+                  found without it: collection_manifest.csv records where
+                  the collector saved it (see parser #15). It is used
+                  before the places listed under parser #15; if it is not
+                  an existing file, a warning is logged and those places
+                  are searched instead. It does not turn on the Memory
+                  parser: add Memory to -Sources, or choose [1] when the
+                  builder offers the dump. Run-TimelineBuilder.bat does not
+                  pass it; start the script from PowerShell.
 
 
 ## Auto-Downloaded Dependencies
@@ -1035,13 +1049,35 @@ Parses command history:
 Analyzes memory dumps captured by the triage collector using Volatility 3:
 the crash dump from DumpIt (<collection>_memory_dump.dmp) or a raw image
 (<collection>_memory_dump.raw). The collector saves it next to the zip, as
-it is too large to zip. The dump is looked for in this order:
-  1. -MemoryDumpPath, for a dump saved elsewhere (if it is not an existing
-     file, a warning is logged and the places below are searched)
-  2. next to the collection zip: <zip name>_memory_dump.dmp or .raw
-  3. inside the collection folder (Memory\memory_dump.dmp or .raw, where
+it is too large to zip, or on another drive (its -MemoryOutputPath, or the
+drive picked at its memory prompt: <drive>\TriageMemory\). The dump is
+looked for in this order:
+  1. -MemoryDumpPath, for a dump moved after the collection (if it is not
+     an existing file, a warning is logged and the places below are
+     searched)
+  2. where the collector saved it: the "(memory dump via <tool>)" row of
+     collection_manifest.csv (read from the work folder for a zip). Its
+     DestPath for a dump outside the collection (e.g.
+     D:\TriageMemory\<collection>_memory_dump.dmp), its RelativePath in
+     the collection (Memory\memory_dump.dmp or .raw) otherwise. It is used
+     only when the file is there and its size is the one in the manifest;
+     the dump is not hashed again (it is as large as RAM), but the log
+     shows the manifest's SHA-256 for checking it with Get-FileHash. A
+     manifest comes from the examined machine, so only the names the
+     collector writes are used (<collection folder name>_memory_dump.dmp
+     or .raw, also under the folder's name at collection time, and
+     Memory\memory_dump.dmp or .raw), and outside the collection only a
+     path on a drive letter (never a network or device path). If the file
+     is not there now (moved, deleted, or another machine), the log says
+     so once and the places below are searched; a dump the collector
+     saved in the collection is missing from every zip (the collector
+     moves it next to the zip), which is not logged. A file of another
+     size gets one warning and is not used, also not by the checks below.
+     A collection without that row (no memory captured) skips this step
+  3. next to the collection zip: <zip name>_memory_dump.dmp or .raw
+  4. inside the collection folder (Memory\memory_dump.dmp or .raw, where
      the collector leaves it with -NoCompress)
-  4. next to the collection folder (the folder of collection_manifest.csv)
+  5. next to the collection folder (the folder of collection_manifest.csv)
      or next to -InputPath (an outer folder that holds the collection):
      only <folder name>_memory_dump.dmp or .raw, so the dump of another
      collection in the same folder (e.g. the collector's reports\) is
@@ -1049,7 +1085,12 @@ it is too large to zip. The dump is looked for in this order:
      to the outer folder is found too
 Opt-in only -- not included in default Sources. Add "Memory" to -Sources to enable.
 Without it, the builder offers to analyze a dump it finds when vol.exe is
-in tools\.
+in tools\; the offer shows the dump's full path when it is outside the
+collection, and says when collection_manifest.csv gave the place. When no
+dump is found, the parser's warning says what collection_manifest.csv
+lists (the path the collector saved the dump to, which is not there now;
+a dump in the collection, which the collector moves next to the zip; or
+none).
 Requires vol.exe in tools\volatility3\ (see tools\volatility3\README.txt).
 Windows ARM64 dumps are detected from the dump header and skipped:
 Volatility 3 analyzes Intel x86/x64 Windows memory only (use WinDbg).
@@ -1518,6 +1559,25 @@ Timeline Explorer at the same time.
     does not keep the file's dates (most copies do) gives the time of the
     copy instead.
 
+  - Memory dump on another drive -- collection_manifest.csv records where
+    the collector saved the dump as a path on the machine that ran the
+    collector (e.g. D:\TriageMemory\<collection>_memory_dump.dmp). On
+    another machine, or after the dump was moved, that path is gone: the
+    log says once that the dump is not there now, and the dump is found
+    only next to the zip or the collection folder (copy it there under
+    its own name, <collection>_memory_dump.dmp or .raw) or with
+    -MemoryDumpPath. A path on a network share (collector -MemoryOutputPath
+    \\server\share) is never opened from the manifest; a warning says so.
+    The dump is not hashed again: only its size is compared with the
+    manifest, and the log shows the manifest's SHA-256 to check it with
+    Get-FileHash.
+
+  - "Memory dump not used: ... bytes, but collection_manifest.csv lists
+    ..." -- The file at the place collection_manifest.csv names has
+    another size than the manifest lists (e.g. a copy cut short). It is not analyzed, also
+    not when the same file is next to the zip. To analyze it anyway, pass
+    it as -MemoryDumpPath.
+
   - Local-time sources -- USN and setupapi times are local-time text. Times
     inside the hour that repeats when daylight saving time ends cannot be
     told apart and may be off by one hour.
@@ -1681,9 +1741,10 @@ parsing is skipped, and the timeline CSV can be opened manually.
 
   The Memory parser is opt-in. Add "Memory" to -Sources to enable it.
   If vol.exe is not found, the parser logs download instructions and skips.
-  The dump is found next to the collection zip or folder, or inside the
-  collection (see parser #15); pass -MemoryDumpPath for a dump saved
-  elsewhere.
+  The dump is found where the collector saved it (collection_manifest.csv
+  records the path, also on another drive), next to the collection zip or
+  folder, or inside the collection (see parser #15); pass -MemoryDumpPath
+  only for a dump moved after the collection.
 
   Plugins run (4 core plugins):
     windows.pslist   -- running processes with creation timestamps
@@ -1902,19 +1963,34 @@ parsing is skipped, and the timeline CSV can be opened manually.
   tests\Test-MemoryParser.ps1 -- loads the builder's functions and checks
   where the memory dump is found, on synthetic folders: -MemoryDumpPath
   first (also a relative path and one with [ ] in it; a missing file or
-  a folder gives one warning, then the other places are searched), next
-  to the collection zip (.dmp or .raw), Memory\ inside the collection
-  (nothing from the Secrets\ folder or the email attachment copies),
-  and next to the collection folder or -InputPath only under the
-  collection folder's name (another collection's dump in the same folder
-  is not used; also with collection_manifest.csv below -InputPath, an
-  outer -InputPath of another name and after Windows "Extract All"). It
-  also checks the Memory parser's warning when there is no dump. Then it
+  a folder gives one warning, then the other places are searched), then
+  where the collector saved it by collection_manifest.csv (a dump on
+  another drive, also for a zip extracted into a work folder, where it
+  wins over the dump next to the zip; a renamed collection folder;
+  Memory\ with -NoCompress; the manifest's SHA-256 logged once; a dump
+  that is gone, also on a drive that does not exist, logged once and the
+  other places searched; one of another size warned about once and used
+  by no check, also when it is next to the zip or the folder; a name the
+  collector does not write, a \\?\ or network path and a RelativePath
+  outside Memory\ refused with a warning; a zipped collection, the first
+  collector's manifest and one without a dump row unchanged, with
+  nothing logged), next to the collection zip (.dmp or .raw), Memory\
+  inside the collection (nothing from the Secrets\ folder or the email
+  attachment copies), and next to the collection folder or -InputPath
+  only under the collection folder's name (another collection's dump in
+  the same folder is not used; also with collection_manifest.csv below
+  -InputPath, an outer -InputPath of another name and after Windows
+  "Extract All"). It checks how the offer shows the dump (its path in the
+  collection, else its full path), and the Memory parser's warning when
+  there is no dump: what collection_manifest.csv lists (nothing, no
+  manifest, a dump that is gone, a dump in the collection, one not used),
+  and -MemoryDumpPath only for a dump moved after the collection. Then it
   reads synthetic dump headers: the architecture and the capture time
   (64-bit SystemTime used; zero, before 1980, more than a day after the
   last write, cut off, 32-bit and raw fall back to the last-write time;
   also with [ ] in the path and while another program has the file open),
-  and the "Dump time" line of the Memory parser. It turns canned Volatility
+  and the "Dump time" line of the Memory parser, also for the dump the
+  manifest names. It turns canned Volatility
   JSON for pslist, netscan, cmdline and svcscan into rows and checks each
   row's time, EventType, User and Details (rejected times kept; a PID,
   PPID, Threads, SessionId or port of 0 is kept, not left empty; netscan's

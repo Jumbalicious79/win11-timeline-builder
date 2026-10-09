@@ -3,17 +3,30 @@
 # Checks where the Memory parser finds a collection's memory dump
 # (Find-MemoryDump) on synthetic folders: -MemoryDumpPath first (also a
 # relative path and one with [ ] in it; a path that is not a file is
-# reported once, then the other places are tried), the dump next to the
-# collection zip (.dmp or .raw), Memory\ inside the collection (never the
-# Secrets\ folder of -IncludeSecrets or the email attachment copies), and the
-# dump next to the collection folder or next to -InputPath (an outer
-# folder of another name, also given as a relative path), which must be
-# named after the collection folder: another collection's dump in the same
-# folder (e.g. the collector's reports\) is never used. The collection
-# folder is the folder of collection_manifest.csv (also below -InputPath
-# and in the <name>\<name>\ layout of Windows "Extract All"), else
-# -InputPath. Parse-Memory without a dump must point to -MemoryDumpPath.
-# Then the dump header (Get-MemoryDumpInfo) on synthetic headers: the
+# reported once, then the other places are tried), then where the
+# collector saved it by collection_manifest.csv (its "(memory dump via
+# <tool>)" row: a dump on another drive, also from a zip extracted with
+# Expand-CollectionZip and before the dump next to the zip, a renamed
+# collection folder, Memory\ with -NoCompress; logged once with the
+# manifest's SHA-256; a dump that is gone is logged once and the other
+# places are tried; one of another size gets one warning and is used by
+# no check; a name the collector does not write, a \\?\ or network path,
+# and a RelativePath outside Memory\ are refused with a warning; a zipped
+# collection, the first collector's manifest and one without a dump row
+# find the dump next to the zip as before, logging nothing), the dump next
+# to the collection zip (.dmp or .raw), Memory\ inside the collection
+# (never the Secrets\ folder of -IncludeSecrets or the email attachment
+# copies), and the dump next to the collection folder or next to
+# -InputPath (an outer folder of another name, also given as a relative
+# path), which must be named after the collection folder: another
+# collection's dump in the same folder (e.g. the collector's reports\) is
+# never used. The collection folder is the folder of
+# collection_manifest.csv (also below -InputPath and in the <name>\<name>\
+# layout of Windows "Extract All"), else -InputPath. How the offer shows
+# the dump (its path in the collection, else its full path). Parse-Memory
+# with the manifest's dump, and without a dump: the warning says what the
+# manifest lists and points to -MemoryDumpPath for a dump moved after the
+# collection. Then the dump header (Get-MemoryDumpInfo) on synthetic headers: the
 # architecture and the capture time (DUMP_HEADER64.SystemTime; zero,
 # implausible, 32-bit and raw fall back to the file's last-write time),
 # also through Parse-Memory's "Dump time" line; and the rows made from
@@ -98,6 +111,49 @@ function New-TestCollection {
     [System.IO.File]::WriteAllText((Join-Path $Path "collection_manifest.csv"), "SHA256,SourcePath,DestPath,SizeBytes,CollectedAt,RelativePath`r`n")
 }
 
+# A collection folder whose collection_manifest.csv has the rows the
+# collector writes for a memory capture, every field quoted: the
+# collection's metadata and the acquisition log (DestPath = -CollectedAt,
+# the collection folder on the collecting machine, + RelativePath) and,
+# unless -NoDumpRow, the dump: "(memory dump via -Tool)" with -DumpDest,
+# -DumpSize and -DumpRel (RelativePath; empty for a dump outside the
+# collection). -OldColumns: the first collector's columns (no
+# RelativePath, no source times).
+function New-TestManifestCollection {
+    param([string]$Path, [string]$CollectedAt, [string]$DumpDest = "", [string]$DumpSize = "16", [string]$DumpRel = "",
+        [string]$Tool = "DumpIt", [switch]$NoDumpRow, [switch]$OldColumns)
+    $rows = @(
+        @("(collection metadata)", "$CollectedAt\collection_info.json", "120", "collection_info.json"),
+        @("(memory capture tool output: $Tool)", "$CollectedAt\Memory\memory_acquisition_log.txt", "730", "Memory\memory_acquisition_log.txt")
+    )
+    if (-not $NoDumpRow) { $rows += , @("(memory dump via $Tool)", $DumpDest, $DumpSize, $DumpRel) }
+    $header = "SHA256,SourcePath,DestPath,SizeBytes,CollectedAt,RelativePath,SourceCreatedUtc,SourceModifiedUtc,SourceAccessedUtc"
+    if ($OldColumns) { $header = "SHA256,SourcePath,DestPath,SizeBytes,CollectedAt" }
+    $lines = @($header)
+    foreach ($row in $rows) {
+        $fields = @($testHash, $row[0], $row[1], $row[2], "2025-06-30 12:05:00")
+        if (-not $OldColumns) { $fields += @($row[3], "", "", "") }
+        $lines += (($fields | ForEach-Object { '"' + ($_ -replace '"', '""') + '"' }) -join ",")
+    }
+    [void][System.IO.Directory]::CreateDirectory($Path)
+    [System.IO.File]::WriteAllText((Join-Path $Path "collection_manifest.csv"), (($lines -join "`r`n") + "`r`n"), (New-Object System.Text.UTF8Encoding($true)))
+}
+
+# A collection zip as the collector writes it ("<folder>/" before every
+# entry name) of the files in -Folder
+function New-TestCollectionZip {
+    param([string]$Folder, [string]$ZipPath)
+    $folderName = Split-Path $Folder -Leaf
+    $zip = [System.IO.Compression.ZipFile]::Open($ZipPath, [System.IO.Compression.ZipArchiveMode]::Create)
+    try {
+        foreach ($file in (Get-ChildItem -LiteralPath $Folder -Recurse -File)) {
+            $entryName = $folderName + "/" + $file.FullName.Substring($Folder.Length + 1).Replace('\', '/')
+            [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $file.FullName, $entryName)
+        }
+    }
+    finally { $zip.Dispose() }
+}
+
 # The script-scope state the builder sets up for a run: -InputPath (the
 # extracted folder for a zip), the zip, -MemoryDumpPath, the collection
 # root and a new log file
@@ -108,6 +164,8 @@ function Set-TestRunState {
     $script:MemoryDumpPath = $DumpPath
     $script:collectionManifest = $null
     $script:memoryDumpPathWarned = $false
+    $script:manifestDumpNoticeLogged = $false
+    $script:memoryDumpFromManifest = $false
     # Find-ArtifactFiles skips the email attachment copies (relative to the
     # collection root) and the Secrets\ folder, which the builder looks up
     # once per run
@@ -190,11 +248,28 @@ $nameH = "TriageCollection_2025-06-23_11-20"   # no collection_manifest.csv
 $nameR = "TriageCollection_2025-06-22_13-55"   # a raw image next to the zip
 $nameI = "TriageCollection_2025-06-21_15-35"   # extracted into a folder of another name
 $nameJ = "TriageCollection_2025-06-20_18-25"   # -IncludeSecrets: dump names in excluded folders
+# Collections whose collection_manifest.csv lists the dump (the collector's
+# "(memory dump via <tool>)" row)
+$nameK = "TriageCollection_2025-06-19_09-55"   # dump on another drive, as picked at the collector's prompt
+$nameM = "TriageCollection_2025-06-18_10-20"   # the same as a zip (WinPmem .raw), a dump next to the zip too
+$nameL = "TriageCollection_2025-06-17_11-45"   # the listed dump is gone, one next to the folder
+$nameS = "TriageCollection_2025-06-16_12-05"   # the listed dump has another size
+$nameT = "TriageCollection_2025-06-15_13-25"   # ... and is next to the zip (-MemoryOutputPath = the zip's folder)
+$nameU = "TriageCollection_2025-06-14_14-50"   # -NoCompress: in Memory\, another size
+$nameV = "TriageCollection_2025-06-13_15-10"   # -NoCompress: in Memory\, the listed size
+$nameN = "TriageCollection_2025-06-12_16-30"   # collection folder renamed after the collection
+$nameW = "TriageCollection_2025-06-11_17-15"   # rows naming a file the collector does not write
+$nameO = "TriageCollection_2025-06-10_18-40"   # zipped: the dump row in the collection, the dump next to the zip
+$nameX = "TriageCollection_2025-06-09_19-05"   # the listed dump is gone, nothing else
+$nameY = "TriageCollection_2025-06-08_20-30"   # zipped, extracted, the dump not copied along
+$nameP = "TriageCollection_2025-06-07_21-55"   # no collection_manifest.csv, no dump
+$testHash = "0123456789ABCDEF" * 4             # synthetic SHA-256
 $missingWarning = "-MemoryDumpPath is not an existing file:"
 
 $workDir = Join-Path ([System.IO.Path]::GetTempPath()) ("memory-parser-test-" + [guid]::NewGuid().ToString("N"))
 $pushed = $false
 try {
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
     Write-Host "Testing Find-MemoryDump ($($PSVersionTable.PSEdition) $($PSVersionTable.PSVersion)) ..."
     $reports = Join-Path $workDir "reports"
     $extracted = Join-Path $workDir "work\in"
@@ -262,7 +337,7 @@ try {
 
     $missing = Join-Path $dumps "missing_memory_dump.dmp"
     $run = Invoke-FindMemoryDump -Collection (Join-Path $extracted $nameA) -Zip $zipA -DumpPath $missing
-    Assert-Equal -Name "-MemoryDumpPath missing: warning, then the dump next to the zip" -Expected "$dumpA|True" -Actual "$($run.Path)|$($run.Log.Contains("WARNING: $missingWarning $missing -- looking for the memory dump in and next to the collection instead."))"
+    Assert-Equal -Name "-MemoryDumpPath missing: warning, then the dump next to the zip" -Expected "$dumpA|True" -Actual "$($run.Path)|$($run.Log.Contains("WARNING: $missingWarning $missing -- looking for the memory dump where the collector saved it and in and next to the collection instead."))"
     $again = Find-MemoryDump
     $warnings = ([regex]::Matches((Get-TestLog), [regex]::Escape($missingWarning))).Count
     Assert-Equal -Name "-MemoryDumpPath missing: reported once when the dump is looked for twice" -Expected "$dumpA|1" -Actual "$again|$warnings"
@@ -314,16 +389,192 @@ try {
     $run = Invoke-FindMemoryDump -Collection (Join-Path $reports "Extracted")
     Assert-Equal -Name "outer folder as -InputPath: other collections' dumps next to it are not used" -Expected "" -Actual $run.Path
 
-    # --- Parse-Memory without a dump ------------------------------------------
-    $noDumpWarning = "WARNING: No memory dump found in the collection or next to it (pass -MemoryDumpPath with the dump file if it was saved elsewhere)."
-    Set-TestRunState -Collection (Join-Path $reports $nameC)
-    Parse-Memory | Out-Null
+    # --- Where the collector saved it (collection_manifest.csv) ---------------
+    # The collector records a complete dump as "(memory dump via <tool>)":
+    # outside the collection by DestPath (its -MemoryOutputPath, or
+    # <drive>\TriageMemory\ picked at its memory prompt when the system
+    # drive is low on space), in the collection by RelativePath. $memDrive
+    # stands in for D:\TriageMemory, $origReports for the collector's
+    # reports\ on the collecting machine. Every test dump is 16 bytes.
+    $memDrive = Join-Path $workDir "TriageMemory"
+    $origReports = "C:\Triage\reports"
+    $foundNotice = "Memory dump where the collector saved it (collection_manifest.csv):"
+    $goneNotice = "The collector saved the memory dump to"
+    $sizeWarning = "WARNING: Memory dump not used:"
+    $refusedWarning = "WARNING: Memory dump in collection_manifest.csv not used:"
+
+    # Found on the other drive: its size and the manifest's SHA-256 logged once
+    $driveK = Join-Path $memDrive "${nameK}_memory_dump.dmp"
+    New-TestFile $driveK
+    New-TestManifestCollection -Path (Join-Path $reports $nameK) -CollectedAt "$origReports\$nameK" -DumpDest $driveK
+    $run = Invoke-FindMemoryDump -Collection (Join-Path $reports $nameK)
+    $foundLine = "$foundNotice $driveK (16 bytes, as listed). SHA-256 in the manifest: $testHash -- the dump is not hashed again here (it is as large as RAM); Get-FileHash -Algorithm SHA256 checks it."
+    Assert-Equal -Name "manifest: the dump where the collector saved it (another drive), its size and SHA-256 logged" -Expected "$driveK|True|True" -Actual "$($run.Path)|$($run.Log.Contains($foundLine))|$($script:memoryDumpFromManifest)"
+    $again = Find-MemoryDump
+    $notices = ([regex]::Matches((Get-TestLog), [regex]::Escape($foundNotice))).Count
+    Assert-Equal -Name "manifest: logged once when the dump is looked for twice" -Expected "$driveK|1" -Actual "$again|$notices"
+    $run = Invoke-FindMemoryDump -Collection (Join-Path $reports $nameK) -DumpPath $elsewhereA
+    Assert-Equal -Name "manifest: -MemoryDumpPath is still used first, nothing logged" -Expected "$elsewhereA||False" -Actual "$($run.Path)|$($run.Log)|$($script:memoryDumpFromManifest)"
+
+    # A collection zip, extracted into a work folder as the builder does
+    # (Expand-CollectionZip): the manifest's dump (WinPmem, .raw) is used
+    # before the one next to the zip
+    $driveM = Join-Path $memDrive "${nameM}_memory_dump.raw"
+    $siblingM = Join-Path $reports "${nameM}_memory_dump.raw"
+    foreach ($file in @($driveM, $siblingM)) { New-TestFile $file }
+    $sourceM = Join-Path $workDir "zip-source\$nameM"
+    New-TestManifestCollection -Path $sourceM -CollectedAt "$origReports\$nameM" -DumpDest $driveM -Tool "WinPmem"
+    New-TestFile (Join-Path $sourceM "USB\setupapi.dev.log")
+    $zipM = Join-Path $reports "$nameM.zip"
+    New-TestCollectionZip -Folder $sourceM -ZipPath $zipM
+    $script:inputFiles = New-Object System.Collections.Generic.List[string]
+    $script:shortenedNames = @{}
+    $script:logFile = $null
+    $extractM = Join-Path $workDir "w1234_120000\in"
+    Expand-CollectionZip -ZipPath $zipM -Destination $extractM | Out-Null
+    $run = Invoke-FindMemoryDump -Collection (Join-Path $extractM $nameM) -Zip $zipM
+    Assert-Equal -Name "manifest from a zip extracted into the work folder: its dump on another drive, not the one next to the zip" -Expected "$driveM|True" -Actual "$($run.Path)|$($run.Log.Contains("$foundNotice $driveM (16 bytes, as listed)."))"
+
+    # Gone (moved, deleted, or another machine): logged once, then the
+    # other places, here the dump next to the collection folder
+    $goneL = Join-Path $memDrive "${nameL}_memory_dump.dmp"
+    $nextToL = Join-Path $reports "${nameL}_memory_dump.dmp"
+    New-TestFile $nextToL
+    New-TestManifestCollection -Path (Join-Path $reports $nameL) -CollectedAt "$origReports\$nameL" -DumpDest $goneL
+    $run = Invoke-FindMemoryDump -Collection (Join-Path $reports $nameL)
+    $again = Find-MemoryDump
     $log = Get-TestLog
-    Assert-Equal -Name "Parse-Memory without a dump: the warning names -MemoryDumpPath, then it stops" -Expected "True|False|True" -Actual "$($log.Contains($noDumpWarning))|$($log.Contains('Found memory dump'))|$($log.Contains('Memory parsing complete.'))"
+    $notices = ([regex]::Matches($log, [regex]::Escape($goneNotice))).Count
+    $goneLine = "$goneNotice $goneL (collection_manifest.csv); it is not there now (moved, deleted, or this is another machine). Looking in and next to the collection instead."
+    Assert-Equal -Name "manifest: the listed dump is gone: logged once (no warning), then the dump next to the collection folder" -Expected "$nextToL|$nextToL|1|True|False" -Actual "$($run.Path)|$again|$notices|$($log.Contains($goneLine))|$($log.Contains('WARNING'))"
+    if ($freeDrive) {
+        $noDriveL = "${freeDrive}:\TriageMemory\${nameL}_memory_dump.dmp"
+        New-TestManifestCollection -Path (Join-Path $reports $nameL) -CollectedAt "$origReports\$nameL" -DumpDest $noDriveL
+        $run = Invoke-FindMemoryDump -Collection (Join-Path $reports $nameL)
+        Assert-Equal -Name "manifest: the listed dump on a drive that does not exist here: logged, then the dump next to the collection folder" -Expected "$nextToL|True" -Actual "$($run.Path)|$($run.Log.Contains("$goneNotice $noDriveL "))"
+    }
+
+    # Another size: not the dump the collector saved (a copy cut short).
+    # One warning; the file is not used, also not by the checks after the
+    # manifest's: next to the zip (-MemoryOutputPath set to the zip's
+    # folder) or in Memory\ (-NoCompress)
+    $driveS = Join-Path $memDrive "${nameS}_memory_dump.dmp"
+    New-TestFile $driveS
+    New-TestManifestCollection -Path (Join-Path $reports $nameS) -CollectedAt "$origReports\$nameS" -DumpDest $driveS -DumpSize "34359738368"
+    $run = Invoke-FindMemoryDump -Collection (Join-Path $reports $nameS)
+    $again = Find-MemoryDump
+    $log = Get-TestLog
+    $warnings = ([regex]::Matches($log, [regex]::Escape($sizeWarning))).Count
+    $sizeLine = "$sizeWarning $driveS is 16 bytes, but collection_manifest.csv lists 34359738368 bytes for the dump the collector saved there (a copy cut short?)."
+    Assert-Equal -Name "manifest: the listed dump has another size: one warning, not used" -Expected "||1|True" -Actual "$($run.Path)|$again|$warnings|$($log.Contains($sizeLine))"
+    $siblingT = Join-Path $reports "${nameT}_memory_dump.dmp"
+    $zipT = Join-Path $reports "$nameT.zip"
+    foreach ($file in @($siblingT, $zipT)) { New-TestFile $file }
+    New-TestManifestCollection -Path (Join-Path $extracted $nameT) -CollectedAt "$origReports\$nameT" -DumpDest $siblingT -DumpSize "4096"
+    $run = Invoke-FindMemoryDump -Collection (Join-Path $extracted $nameT) -Zip $zipT
+    Assert-Equal -Name "manifest: a listed dump of another size next to the zip is not taken by the next-to-the-zip check" -Expected "|True" -Actual "$($run.Path)|$($run.Log.Contains("$sizeWarning $siblingT is 16 bytes, but collection_manifest.csv lists 4096 bytes"))"
+    New-TestManifestCollection -Path (Join-Path $reports $nameT) -CollectedAt "$origReports\$nameT" -DumpDest $siblingT -DumpSize "4096"
+    $run = Invoke-FindMemoryDump -Collection (Join-Path $reports $nameT)
+    Assert-Equal -Name "manifest: ... nor, for the collection folder next to it, by the next-to-the-folder check" -Expected "|True" -Actual "$($run.Path)|$($run.Log.Contains("$sizeWarning $siblingT is 16 bytes"))"
+    $inU = Join-Path $reports "$nameU\Memory\memory_dump.raw"
+    New-TestFile $inU
+    New-TestManifestCollection -Path (Join-Path $reports $nameU) -CollectedAt "$origReports\$nameU" -DumpDest "$origReports\$nameU\Memory\memory_dump.raw" -DumpRel "Memory\memory_dump.raw" -DumpSize "20" -Tool "MagnetRAM"
+    $run = Invoke-FindMemoryDump -Collection (Join-Path $reports $nameU)
+    Assert-Equal -Name "manifest: a dump in Memory\ of another size is not taken by the in-collection check" -Expected "|True" -Actual "$($run.Path)|$($run.Log.Contains("$sizeWarning $inU is 16 bytes, but collection_manifest.csv lists 20 bytes"))"
+
+    # In Memory\ with the listed size (-NoCompress): found by its RelativePath
+    $inV = Join-Path $reports "$nameV\Memory\memory_dump.dmp"
+    New-TestFile $inV
+    New-TestManifestCollection -Path (Join-Path $reports $nameV) -CollectedAt "$origReports\$nameV" -DumpDest "$origReports\$nameV\Memory\memory_dump.dmp" -DumpRel "Memory\memory_dump.dmp"
+    $run = Invoke-FindMemoryDump -Collection (Join-Path $reports $nameV)
+    Assert-Equal -Name "manifest: a dump in Memory\ (-NoCompress) with the listed size, by its RelativePath" -Expected "$inV|True" -Actual "$($run.Path)|$($run.Log.Contains("$foundNotice $inV (16 bytes, as listed)."))"
+
+    # A collection folder renamed after the collection: the dump keeps the
+    # name the collector gave it (the folder's name then, from the other
+    # rows' DestPath and RelativePath)
+    $driveN = Join-Path $memDrive "${nameN}_memory_dump.dmp"
+    New-TestFile $driveN
+    $renamedN = Join-Path $workDir "Case042 laptop"
+    New-TestManifestCollection -Path $renamedN -CollectedAt "$origReports\$nameN" -DumpDest $driveN
+    $run = Invoke-FindMemoryDump -Collection $renamedN
+    Assert-Equal -Name "manifest: a renamed collection folder: the dump named after the folder's name at collection time" -Expected $driveN -Actual $run.Path
+
+    # Names the collector does not write, and paths not on a drive letter:
+    # a warning, and nothing is used, also when the file is there with the
+    # listed size. 192.0.2.10 is a documentation address (never reached:
+    # the path is refused before it is opened).
+    $collectionW = Join-Path $reports $nameW
+    $notesW = Join-Path $memDrive "notes.txt"
+    $otherW = Join-Path $memDrive "${nameB}_memory_dump.dmp"
+    $ownW = Join-Path $memDrive "${nameW}_memory_dump.dmp"
+    foreach ($file in @($notesW, $otherW, $ownW, (Join-Path $collectionW "Registry\SAM"))) { New-TestFile $file }
+    $wrongName = "not a name the collector gives this collection's memory dump (${nameW}_memory_dump.dmp or .raw)"
+    $notDrive = "not a path on a drive letter (a network or device path named in a collection is never opened)"
+    $refusedCases = @(
+        @{ Name = "a file of another name"; Dest = $notesW; Rel = ""; Shown = $notesW; Reason = $wrongName },
+        @{ Name = "another collection's dump"; Dest = $otherW; Rel = ""; Shown = $otherW; Reason = $wrongName },
+        @{ Name = "a \\?\ path"; Dest = "\\?\$ownW"; Rel = ""; Shown = "\\?\$ownW"; Reason = $notDrive },
+        @{ Name = "a network path"; Dest = "\\192.0.2.10\evidence\${nameW}_memory_dump.dmp"; Rel = ""; Shown = "\\192.0.2.10\evidence\${nameW}_memory_dump.dmp"; Reason = $notDrive },
+        @{ Name = "a RelativePath outside Memory\"; Dest = "$origReports\$nameW\Registry\SAM"; Rel = "Registry\SAM"; Shown = "Registry\SAM"; Reason = "not a name the collector gives a memory dump in the collection (Memory\memory_dump.dmp or .raw)" }
+    )
+    foreach ($case in $refusedCases) {
+        New-TestManifestCollection -Path $collectionW -CollectedAt "$origReports\$nameW" -DumpDest $case.Dest -DumpRel $case.Rel
+        $run = Invoke-FindMemoryDump -Collection $collectionW
+        Assert-Equal -Name "manifest names $($case.Name): a warning, nothing used" -Expected "|True" -Actual "$($run.Path)|$($run.Log.Contains("$refusedWarning $($case.Shown) is $($case.Reason)."))"
+    }
+
+    # Zipped: a dump the collector saved in the collection is moved next to
+    # the zip, so it is missing from the collection: the dump next to the
+    # zip, nothing logged. The same with the first collector's manifest (no
+    # RelativePath column) and without a dump row (no memory captured, or
+    # a failed capture: only the acquisition log is listed)
+    $siblingO = Join-Path $reports "${nameO}_memory_dump.dmp"
+    $zipO = Join-Path $reports "$nameO.zip"
+    foreach ($file in @($siblingO, $zipO)) { New-TestFile $file }
+    $collectionO = Join-Path $extracted $nameO
+    $zippedCases = @(
+        @{ Name = "the dump row in the collection"; Row = @{ DumpDest = "$origReports\$nameO\Memory\memory_dump.dmp"; DumpRel = "Memory\memory_dump.dmp" } },
+        @{ Name = "the first collector's manifest"; Row = @{ DumpDest = "$origReports\$nameO\Memory\memory_dump.dmp"; OldColumns = $true } },
+        @{ Name = "no dump row"; Row = @{ NoDumpRow = $true } }
+    )
+    foreach ($case in $zippedCases) {
+        $row = $case.Row
+        New-TestManifestCollection -Path $collectionO -CollectedAt "$origReports\$nameO" @row
+        $run = Invoke-FindMemoryDump -Collection $collectionO -Zip $zipO
+        Assert-Equal -Name "zipped, $($case.Name): the dump next to the zip, nothing logged" -Expected "$siblingO|" -Actual "$($run.Path)|$($run.Log)"
+    }
+
+    # How the dump is shown (the "Memory Dump Detected" offer): its path in
+    # the collection, else its full path
+    Set-TestRunState -Collection (Join-Path $reports $nameD)
+    Assert-Equal -Name "dump shown as its path in the collection, or as its full path outside it" -Expected "Memory\memory_dump.raw in the collection|$driveK" -Actual "$(Get-MemoryDumpDisplayName $dumpD)|$(Get-MemoryDumpDisplayName $driveK)"
+
+    # --- Parse-Memory without a dump ------------------------------------------
+    # The warning says what collection_manifest.csv lists, and names
+    # -MemoryDumpPath only for a dump moved after the collection
+    $noDumpStart = "WARNING: No memory dump found in or next to the collection; "
+    $movedHint = ". If the dump was moved after the collection, pass -MemoryDumpPath with its new path."
+    $goneX = Join-Path $memDrive "${nameX}_memory_dump.dmp"
+    New-TestFile (Join-Path $reports "$nameP\USB\setupapi.dev.log")
+    New-TestManifestCollection -Path (Join-Path $reports $nameX) -CollectedAt "$origReports\$nameX" -DumpDest $goneX
+    New-TestManifestCollection -Path (Join-Path $reports $nameY) -CollectedAt "$origReports\$nameY" -DumpDest "$origReports\$nameY\Memory\memory_dump.dmp" -DumpRel "Memory\memory_dump.dmp"
+    $noDumpCases = @(
+        @{ Name = "no dump row"; Collection = (Join-Path $reports $nameC); Note = "collection_manifest.csv lists none (the collector saved no complete dump)" },
+        @{ Name = "no collection_manifest.csv"; Collection = (Join-Path $reports $nameP); Note = "there is no collection_manifest.csv that says where the collector saved one" },
+        @{ Name = "the listed dump is gone"; Collection = (Join-Path $reports $nameX); Note = "the collector saved it to $goneX (collection_manifest.csv), and it is not there now" },
+        @{ Name = "the dump row in the collection, no dump next to it"; Collection = (Join-Path $reports $nameY); Note = "collection_manifest.csv lists one in the collection (Memory\memory_dump.dmp), which the collector moves next to the zip as ${nameY}_memory_dump.dmp when it zips the collection" },
+        @{ Name = "the listed dump has another size"; Collection = (Join-Path $reports $nameS); Note = "collection_manifest.csv lists one at $driveS, which was not used (see the warning above)" }
+    )
+    foreach ($case in $noDumpCases) {
+        Set-TestRunState -Collection $case.Collection
+        Parse-Memory | Out-Null
+        $log = Get-TestLog
+        Assert-Equal -Name "Parse-Memory without a dump, $($case.Name): the warning says what the manifest lists, then it stops" -Expected "True|False|True" -Actual "$($log.Contains($noDumpStart + $case.Note + $movedHint))|$($log.Contains('Found memory dump'))|$($log.Contains('Memory parsing complete.'))"
+    }
     Set-TestRunState -Collection (Join-Path $reports $nameC) -DumpPath $missing
     Parse-Memory | Out-Null
     $log = Get-TestLog
-    Assert-Equal -Name "Parse-Memory with a missing -MemoryDumpPath and no other dump: both warnings" -Expected "True|True|False" -Actual "$($log.Contains("$missingWarning $missing "))|$($log.Contains($noDumpWarning))|$($log.Contains('Found memory dump'))"
+    Assert-Equal -Name "Parse-Memory with a missing -MemoryDumpPath and no other dump: both warnings" -Expected "True|True|False" -Actual "$($log.Contains("$missingWarning $missing "))|$($log.Contains($noDumpStart))|$($log.Contains('Found memory dump'))"
 
     # --- Dump header: architecture and capture time ---------------------------
     Write-Host "Testing Get-MemoryDumpInfo, Add-MemoryPluginRows and Invoke-VolatilityPlugin ..."
@@ -378,6 +629,14 @@ try {
     Parse-Memory | Out-Null
     $log = Get-TestLog
     Assert-Equal -Name "Parse-Memory: the dump time from the header is logged" -Expected "True|True" -Actual "$($log.Contains("Found memory dump: $armDump (0 GB, ARM64)"))|$($log.Contains("Dump time: $captureText UTC (crash dump header)"))"
+    # Without -MemoryDumpPath: the dump where the collector saved it, on
+    # another drive (collection_manifest.csv)
+    New-TestDump -Path $driveK -Machine 0xAA64 -SystemTime $captureFileTime -LastWriteUtc $endUtc
+    New-TestManifestCollection -Path (Join-Path $reports $nameK) -CollectedAt "$origReports\$nameK" -DumpDest $driveK -DumpSize "8192"
+    Set-TestRunState -Collection (Join-Path $reports $nameK)
+    Parse-Memory | Out-Null
+    $log = Get-TestLog
+    Assert-Equal -Name "Parse-Memory: the dump where the collector saved it, by collection_manifest.csv" -Expected "True|True|True" -Actual "$($log.Contains("$foundNotice $driveK (8192 bytes, as listed)."))|$($log.Contains("Found memory dump: $driveK (0 GB, ARM64)"))|$($log.Contains("Dump time: $captureText UTC (crash dump header)"))"
 
     # --- Rows from Volatility output ------------------------------------------
     # Volatility 3's JSON renderer writes times as ISO 8601 in UTC and absent
