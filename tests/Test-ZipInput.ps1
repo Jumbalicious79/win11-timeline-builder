@@ -9,9 +9,10 @@
 #   names with "/" and "\", folder entries, original entry dates, an
 #   over-long name shortened with its original name kept for the manifest
 #   lookup, a ".." entry not written outside the folder, nothing extracted
-#   when the zip does not fit), the manifest lookups from an outer folder,
-#   the input-file list of a collection folder and the list of missing
-#   files, the free-space verdict, the temp-folder check (8.3 short paths
+#   when the zip does not fit), the manifest lookups from an outer folder
+#   (also the email parser's), the input-file list of a collection folder
+#   and the list of missing files, the free-space verdict, the
+#   temp-folder check (8.3 short paths
 #   too), the end-of-run hive list, the clean-up of work folders left by
 #   earlier runs, the SRUM database copy (made in the work folder's
 #   scratch folder, a missing transaction log reported), the refusal of a
@@ -235,6 +236,20 @@ try {
     Assert-Equal -Name "original file times found below an outer folder" -Expected "2024-03-02 11:00:00" -Actual $modified
     Assert-Equal -Name "manifest lists a collected file" -Expected $true -Actual (Test-ManifestListsFile (Join-Path $coll "Registry\alice\NTUSER.DAT"))
     Assert-Equal -Name "manifest does not list a file it lacks" -Expected $false -Actual (Test-ManifestListsFile (Join-Path $coll "Registry\alice\NTUSER.DAT.LOG1"))
+    # The email parser reads the same manifest: the collection's own (the
+    # nearest), not the first one a recursive search finds (a deeper one
+    # in a folder that sorts first)
+    $emailOuter = Join-Path $testRoot "email-outer"
+    $emailColl = Join-Path $emailOuter "Coll"
+    $decoyDir = Join-Path $emailOuter "Aaa\deeper"
+    New-Item -ItemType Directory -Path $emailColl, $decoyDir -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $decoyDir "collection_manifest.csv"), (New-TestManifest -RelativePaths @("Email\decoy\NewOutlook\UserSettings.json")))
+    [System.IO.File]::WriteAllText((Join-Path $emailColl "collection_manifest.csv"), (New-TestManifest -RelativePaths @("Email\alice\NewOutlook\UserSettings.json", "USB\setupapi.dev.log")))
+    Set-Variable -Name InputPath -Value $emailOuter -Scope Script
+    $script:collectionManifest = $null
+    $script:collectionInfo = $null
+    $script:collectionRoot = Get-CollectionRootFolder
+    Assert-Equal -Name "email manifest rows from the collection's own manifest below an outer folder" -Expected "Email\alice\NewOutlook\UserSettings.json" -Actual (@((Get-EmailManifestRows).Keys | Sort-Object) -join ", ")
 
     # --- Input files of a collection folder ------------------------------
     $folderColl = Join-Path $testRoot "folder\Coll"

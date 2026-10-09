@@ -11265,14 +11265,17 @@ $script:ThunderbirdAuthMethods = @{
 # Email\ rows of collection_manifest.csv by RelativePath: SHA256, SourcePath,
 # Size and the original file's Created/Modified/Accessed times (UTC). A copy
 # taken from the shadow copy is recorded as "(shadow)<path below the target
-# root>"; its SourcePath is given the target root again ("C:\Users\...")
+# root>"; its SourcePath is given the target root again ("C:\Users\...").
+# Read through the shared reader (Get-CollectionManifest): the manifest
+# nearest to -InputPath, whose folder is the collection root that
+# Get-RelativeCollectionPath looks the RelativePath keys up against.
 function Get-EmailManifestRows {
     $rows = @{}
-    $mf = Get-ChildItem -Path $InputPath -Filter "collection_manifest.csv" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $mf) { return $rows }
+    $manifestRows = @((Get-CollectionManifest).Rows)
+    if ($manifestRows.Count -eq 0) { return $rows }
     $targetRoot = (Get-CollectionInfo).TargetRoot
     try {
-        foreach ($row in (Import-Csv -Path $mf.FullName -ErrorAction Stop)) {
+        foreach ($row in $manifestRows) {
             if (-not $row.PSObject.Properties["RelativePath"] -or $row.RelativePath -notlike "Email\*") { continue }
             $sourcePath = $row.SourcePath
             if ($sourcePath -like "(shadow)*") {
@@ -11289,7 +11292,7 @@ function Get-EmailManifestRows {
             }
         }
     }
-    catch { Log-Warning "  Could not read the collection manifest: $($_.Exception.Message)" }
+    catch { Log-Warning "  Could not read the Email\ rows of the collection manifest: $($_.Exception.Message)" }
     return $rows
 }
 
