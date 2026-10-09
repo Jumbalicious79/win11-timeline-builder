@@ -208,7 +208,10 @@ themselves are never committed.
                   containing supported artifacts. A collection directory
                   whose path has [ ], * or ? in it is refused (exit code
                   1): PowerShell reads them as wildcards, so its files
-                  would not be found. Rename it, or pass the .zip.
+                  would not be found. Rename it, or pass the .zip: when a
+                  zip's one top folder has them in its name ("Case [1]"
+                  zipped with Explorer), its extracted copy in the work
+                  folder is renamed ("Case _1_") and read as usual.
   -OutputFile     Output CSV path. Defaults to reports\timeline_<timestamp>\timeline.csv
   -StartDate      Only include events after this date (UTC).
   -EndDate        Only include events before this date (UTC).
@@ -258,7 +261,10 @@ themselves are never committed.
                   -MaxUsnEntries, -OutputFile, -WorkDir, -MemoryDumpPath)
                   are ignored with a warning.
                   Cannot be combined with -InputPath, -Browse or -NoReport.
-                  Exit code 1 when no report could be made.
+                  Exit code 1 when no report could be made, or when an
+                  error stopped the rebuild (an unexpected error in one of
+                  its steps is logged, that step skipped, and the report
+                  still made, as in a full run).
   -ReportRules    Rules file for the findings report (default:
                   report\report-rules.json next to the script). See "Report
                   rules file". A missing or invalid file is logged as a
@@ -400,7 +406,11 @@ See "Findings Report".
   example -WorkDir "D:\Work [1]": the parsers find the collection's files
   with PowerShell paths that read those characters as wildcards, so they
   would find nothing there and the run would end without a timeline. The
-  same holds for a collection folder passed as -InputPath.
+  same holds for a collection folder passed as -InputPath. A zip whose one
+  top folder has such a name (a folder "Case [1]" zipped with Explorer's
+  "Send to > Compressed folder") is fine: after the extraction that folder,
+  a copy in the work folder, is renamed with "_" for each of those
+  characters ("Case _1_"), and the log says so.
 
   Copied email attachments (Email\<user>\Outlook\SecureTemp\ and
   Email\<user>\NewOutlook\Attachments\) stay in the zip: no parser reads
@@ -667,7 +677,12 @@ once more.
          and latest flagged time (in UTC and the machine's local time).
          Leads dated by file times -- timestomp candidates and
          Amcache/ShimCache entries, whose times can be years old or forged
-         -- are left out of that window and counted beside it;
+         -- are left out of that window and counted beside it, and so are
+         leads dated only by a scheduled task's author-supplied
+         registration date (the task XML's RegistrationInfo/Date, which
+         whoever wrote the task sets). A lead that also has a time Windows
+         recorded (the TaskCache "registered" or a "last run" row) is dated
+         by those times, not by the author-supplied one;
        - key facts: computer, operating system, user accounts, when the
          evidence was collected and how, the machine's time zone (marked
          "assumed" when the collection does not record it), the time span
@@ -677,7 +692,9 @@ once more.
          computer the collector ran on); when that is not known, the
          report says "Not known" and why, and names the collector's
          computer only as such. User accounts are named as in the
-         timeline's User column (alice and CORP\alice are two accounts);
+         timeline's User column (alice and CORP\alice are two accounts),
+         and so is the account the collector ran as: in a live collection
+         a local account HOST\examiner (or .\examiner) is examiner;
        - the top five leads in one plain sentence each: the first lead of
          each rule (High first), so one rule cannot fill the list, with
          "and N similar leads" where a rule has more;
@@ -735,8 +752,16 @@ once more.
                            the severity (that row is among the evidence);
                            rows set aside by the allowlist; "Every row is
                            from during the collection" (maybe the collector
-                           itself); "Folds N similar groups" (see
-                           maxFindings below); "Dated by file times"
+                           itself: its first event time is at or after the
+                           collection start); "Seen only in Snapshot rows
+                           from during the collection" instead when every
+                           row is a Snapshot row -- a process in the memory
+                           dump, whose time is the capture time, may have
+                           started earlier, so check that it is not the
+                           collector or its memory tool; "Folds N similar
+                           groups" (see maxFindings below); "Dated by file
+                           times", or "Dated only by a scheduled task's
+                           author-supplied registration date"
     evidence rows          row number, time, source and event type,
                            description and details, user -- at most 15 on
                            the card: the rows that raised the severity and
@@ -909,7 +934,11 @@ once more.
   every row still gets its id in the Finding column.
   activityTime false: the rule's row times are file times (which can be
   years old or forged), so its leads are left out of the summary's
-  flagged-activity window and their cards say so.
+  flagged-activity window and their cards say so. For every rule, a row
+  whose Details say its time is "author-supplied, not recorded by Windows"
+  (a task XML registration date) does not set a lead's first and last time
+  when the lead has a row with another time; a lead with only such rows
+  keeps their dates but is treated like activityTime false.
   Members whose names start with "_", and "comment" and "notes", are
   comments. Any other unknown member, a bad regular expression or an
   unknown list stops the report with an error that names the rule and the
@@ -2529,7 +2558,11 @@ parsing is skipped, and the timeline CSV can be opened manually.
   zip's SHA-256 and have collection_info.json copied next to it. A zip with
   a copied email attachment must give exit code 0 and the attachment's
   rows without extracting it, and a -WorkDir with [ ] in its path must
-  stop the run at the start (exit code 1). Part 2 needs admin like the
+  stop the run at the start (exit code 1). A zip "Case [1].zip" whose top
+  folder is "Case [1]" must give exit code 0 and both devices: its
+  extracted copy is renamed "Case _1_" (Part 1 checks the rename and that
+  the input-file list follows it). The kept report must say "incomplete"
+  twice only (the caveat and Evidence coverage). Part 2 needs admin like the
   builder (or -BuilderPath with a copy without the admin check); it
   changes nothing on the system.
 
@@ -2665,15 +2698,23 @@ parsing is skipped, and the timeline CSV can be opened manually.
   (an older timeline's HOST\alice counts with alice), marks unnamed
   service SIDs as not people, counts ShimCache file times as file rows,
   names a mounted image's examined computer (SYSTEM hive, or "not known"
-  with the collector host kept apart), and says when the builder run
-  ended incomplete (its log lines, its end banners, or the counts the
-  builder passes).
+  with the collector host kept apart), names a live collection's local
+  collector account as the User column does, and says when the builder
+  run ended incomplete (its log lines, its end banners, or the counts the
+  builder passes) without repeating it in the notes. A lead seen only in
+  Snapshot rows from during the collection (a process in the memory dump)
+  must be CapturedDuringCollection, not DuringCollection; a task's
+  author-supplied registration date must not set a lead's first and last
+  time when the lead has a time Windows recorded, and a lead with only
+  such dates must be left out of the flagged-activity window.
 
   tests\Test-ReportRules.ps1 -- loads report\report-rules.json with the
   engine and checks it against tests\fixtures\report\rules\cases.csv: rows
   in timeline format, in the shapes the parsers write now (memory command
-  lines as Snapshot rows, author-supplied task dates, ShimCache
-  FileLastModified rows, the User column's forms), each tagged with the
+  lines as Snapshot rows, author-supplied task dates, task actions written
+  with environment variables (%TEMP%, %PUBLIC%, ...), Security 4698/4702
+  Command/Arguments rows, ShimCache FileLastModified rows, the User
+  column's forms), each tagged with the
   rules it must (HIT) or must not (MISS) trigger, or with KEY <rule>
   <group>: a hit whose finding must be grouped under that value. Every
   enabled rule needs a hit and a near-miss case. The rules file must load
@@ -2687,8 +2728,11 @@ parsing is skipped, and the timeline CSV can be opened manually.
   right-to-left override characters), long unbroken values, the card's
   evidence limit, the offline page (no scripts or external loads), ASCII
   output, the charts and the appendix, a mounted image's unknown or
-  SYSTEM-hive computer name, and the "Timeline incomplete" block of an
-  incomplete run; then prints PDFs with Edge (skipped
+  SYSTEM-hive computer name, the "Timeline incomplete" block of an
+  incomplete run, and the card notes of a lead from during the collection,
+  one seen only in Snapshot rows then, and one dated only by an
+  author-supplied task date (also in the summary's activity window); then
+  prints PDFs with Edge (skipped
   without Edge) and checks
   the page size, the relative ./timeline.xlsx link, that no local path is
   in the PDF and that Edge's temporary profile is removed.
@@ -2708,7 +2752,11 @@ parsing is skipped, and the timeline CSV can be opened manually.
   folder named "case [1]" and with report.pdf held open by another
   program, -ReportOnly on a mounted-image timeline whose run ended with
   exit code 2 (the examined computer from the run's log, the incomplete
-  timeline in the report), and -ReportOnly without a timeline. Before the
+  timeline in the report), -ReportOnly without a timeline, and a copy of
+  the builder (in the test's folder) with an injected error: an
+  unexpected error in the rebuild is logged and the report still made
+  (exit code 0), and a rebuild that stops before it gives its exit code,
+  or an error thrown out of it, exits with 1, not 0. Before the
   runs it checks what the report takes from collection_info.json (the
   builder's Get-TimelineReportCollectionInfo): a mounted image's computer
   name is the collector host, not the examined computer. It needs admin

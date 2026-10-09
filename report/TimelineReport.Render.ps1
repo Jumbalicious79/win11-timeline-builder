@@ -809,11 +809,17 @@ function Add-ReportHtmlFinding {
     if ([bool](Get-ReportHtmlField $Finding "DuringCollection")) {
         $flags.Add('<span class="flag">Every row is from during the collection: this may be the collector&#39;s own activity</span>')
     }
+    elseif ([bool](Get-ReportHtmlField $Finding "CapturedDuringCollection")) {
+        $flags.Add('<span class="flag">Seen only in Snapshot rows from during the collection (the state when it was collected or the memory dump captured): it may have started earlier. Check that it is not the collector or its memory tool</span>')
+    }
     $folded = ConvertTo-ReportHtmlNumber (Get-ReportHtmlField $Finding "FoldedGroups")
     if ($folded -gt 0) {
         $flags.Add('<span class="flag">Folds ' + (Format-ReportHtmlNumber $folded) + ' similar groups of this rule into one lead (the rule&#39;s limit of separate leads); they are listed under &quot;Grouped by&quot;</span>')
     }
-    if ((Get-ReportHtmlField $Finding "ActivityTime") -eq $false) {
+    if ([bool](Get-ReportHtmlField $Finding "TimesAuthorSupplied")) {
+        $flags.Add('<span class="flag">Dated only by a scheduled task&#39;s author-supplied registration date, which whoever wrote the task sets (it can be old or forged)</span>')
+    }
+    elseif ((Get-ReportHtmlField $Finding "ActivityTime") -eq $false) {
         $flags.Add('<span class="flag">Dated by file times, which can be older than the activity or altered</span>')
     }
     if ($flags.Count -gt 0) { $null = $Builder.AppendLine('<div>' + ($flags -join "") + '</div>') }
@@ -884,18 +890,23 @@ function Add-ReportHtmlSummary {
         '<div class="stat stat-info"><span class="n">' + $Context.Info + '</span><span class="l">Informational items (Appendix A)</span></div></div>')
     if ($leads -gt 0) {
         # The window leaves out leads dated by file times (timestomp
-        # candidates, Amcache/ShimCache): those times can be old or forged
+        # candidates, Amcache/ShimCache) or only by a task author's date:
+        # those times can be old or forged
         $timed = Get-ReportHtmlActivityFindings -Findings $Context.Findings
         $fileTimed = $Context.Findings.Count - $timed.Count
+        $authorDated = @($Context.Findings | Where-Object { [bool](Get-ReportHtmlField $_ "TimesAuthorSupplied") }).Count
+        $datedBy = "file times"
+        if ($authorDated -gt 0 -and $authorDated -eq $fileTimed) { $datedBy = "author-supplied task dates" }
+        elseif ($authorDated -gt 0) { $datedBy = "file times or author-supplied task dates" }
         $span = Get-ReportHtmlFindingSpan -Findings $timed
         $text = "The rules flagged " + (Format-ReportHtmlCount -Value $leads -Singular "lead" -Plural "leads") + " to review."
         if ($span.First) {
             $text += " The flagged activity falls between <b>" + (Format-ReportHtmlUtcAndLocal -Value $span.First -TimeZone $tz) + "</b> and <b>" + (Format-ReportHtmlUtcAndLocal -Value $span.Last -TimeZone $tz) + "</b>"
-            if ($fileTimed -gt 0) { $text += " (plus " + (Format-ReportHtmlCount -Value $fileTimed -Singular "lead" -Plural "leads") + " dated by file times, which can be older than the activity or altered)" }
+            if ($fileTimed -gt 0) { $text += " (plus " + (Format-ReportHtmlCount -Value $fileTimed -Singular "lead" -Plural "leads") + " dated by $datedBy, which can be older than the activity or altered)" }
             $text += "."
         }
         elseif ($fileTimed -gt 0) {
-            $text += " The flagged items are dated by file times, which can be older than the activity or altered, so they give no activity window."
+            $text += " The flagged items are dated by $datedBy, which can be older than the activity or altered, so they give no activity window."
         }
         $null = $Builder.AppendLine('<p>' + $text + '</p>')
         $null = $Builder.AppendLine('<p class="framing">A lead is a reason to look closer, not proof that the computer was compromised. Each one needs a person to review the evidence rows listed with it.</p>')

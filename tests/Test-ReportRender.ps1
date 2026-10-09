@@ -265,6 +265,15 @@ try {
     Write-TestResult -Succeeded ($engineShape.Contains($csvHash) -and $engineShape.Contains("Collection (zip)</td><td>collection.zip</td>") -and $engineShape.Contains($zipHash) -and -not $engineShape.Contains(">Hashes<")) -Message "Appendix D uses the model's Files.Hashes (timeline.csv, the collection zip) and does not list Hashes as a file"
     Write-TestResult -Succeeded ($engineShape.Contains("Every row is from during the collection")) -Message "a lead whose rows are all from during the collection says it may be the collector's own activity"
     Write-TestResult -Succeeded ($engineShape.Contains(">CSV row</th>") -and -not $engineShape.Contains(">Excel row</th>") -and $engineShape.Contains("Rows are numbered as in timeline.csv")) -Message "without the workbook, row numbers are labelled as timeline.csv rows"
+    # A lead seen only in Snapshot rows from during the collection (a process
+    # in the memory dump): when it was seen, not "the collector's own activity"
+    $finding.DuringCollection = $false
+    $finding.CapturedDuringCollection = $true
+    Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath
+    $captured = [System.IO.File]::ReadAllText($memoryHtmlPath)
+    Write-TestResult -Succeeded ($captured.Contains("Seen only in Snapshot rows from during the collection (the state when it was collected or the memory dump captured): it may have started earlier. Check that it is not the collector or its memory tool") -and
+        -not $captured.Contains("Every row is from during the collection")) -Message "a lead seen only in Snapshot rows from during the collection (the memory dump) says so and to check it is not the collector, instead of 'may be the collector's own activity'"
+    $finding.CapturedDuringCollection = $false
 
     # --- Hostile and edge values: bidi controls, a long unbroken title, more
     # evidence than a card prints, a lead dated by file times, a folded lead,
@@ -308,6 +317,15 @@ try {
     Write-TestResult -Succeeded ($hostile.Contains("collection_log.txt) was not available, so problems during the collection are unknown") -and -not $hostile.Contains("logged no errors")) -Message "a missing collector log is not reported as a collection without errors"
     Write-TestResult -Succeeded ($hostile.Contains(">Lead about</td>") -and -not $hostile.Contains("{{group}}")) -Message "Appendix B shows rule titles without the {{group}} placeholder"
     Write-TestResult -Succeeded ($hostile.Contains("2001, 2002, 2003 +27 more")) -Message "the leads index counts every row of a lead after the first ones, not only evidence rows"
+    # A lead dated only by a scheduled task's author-supplied date: left out
+    # of the window like file times, with its own wording
+    $fileTimed.TimesAuthorSupplied = $true
+    Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath -NoFileHashes
+    $authorDated = [System.IO.File]::ReadAllText($memoryHtmlPath)
+    $authorSummary = $authorDated.Substring($authorDated.IndexOf('id="summary"'), $authorDated.IndexOf('" id="leads">') - $authorDated.IndexOf('id="summary"'))
+    Write-TestResult -Succeeded ($authorSummary.Contains("(plus 1 lead dated by author-supplied task dates, which can be older than the activity or altered)") -and -not $authorSummary.Contains("<b>2020-01-01") -and
+        $authorDated.Contains("Dated only by a scheduled task&#39;s author-supplied registration date") -and -not $authorDated.Contains("Dated by file times")) -Message "a lead dated only by a task's author-supplied date is left out of the activity window, and its card and the summary say so"
+    $fileTimed.TimesAuthorSupplied = $false
     $memoryModel.Coverage.CollectorErrors = [ordered]@{ Available = $true; Count = 0; WarningCount = 1; Lines = @("[2026-10-08 14:20:00] WARNING: Could not copy BBI") }
     Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath -NoFileHashes
     $warned = [System.IO.File]::ReadAllText($memoryHtmlPath)

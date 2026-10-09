@@ -338,6 +338,44 @@ try {
     foreach ($lead in $topLeads) { $ruleOfId[$lead.Id] = $lead.RuleId }
     Assert-Equal "$(@($topLeads | ForEach-Object { $_.RuleId }) -join ',')|$(@($topModel.TopFindings | ForEach-Object { $ruleOfId[$_] }) -join ',')|$(Format-TestUtc $topModel.LeadSpan.FirstUtc)" "FILETIME,ACTIVITY|ACTIVITY,FILETIME|2026-01-01 00:00:00" -Message "numbering keeps time order, but the top leads and the lead window put a lead dated by an old file time after one dated by activity"
 
+    # DuringCollection is about event times: a lead seen only in Snapshot rows
+    # from during the collection (a process in the memory dump, whose time is
+    # the capture time) is CapturedDuringCollection instead; one with an
+    # event row (Prefetch) from during the collection is DuringCollection
+    $snapRulesPath = Join-Path $workDir "snapshot-rules.json"
+    New-TestTextFile $snapRulesPath '{ "schemaVersion": 1, "rules": [ { "id": "SNAP", "title": "Seen: {{group}}", "category": "Execution", "severity": "High", "match": { "description": "^(?:Process command line|Prefetch execution): (?<key>[^\\s(]+)" }, "groupBy": "capture", "why": "w" } ] }'
+    $snapRows = @(
+        @{ Timestamp = "2026-05-15 07:00:00.000"; Source = "Prefetch"; EventType = "Execution"; Description = "Prefetch execution: before.exe"; User = ""; Details = "" },
+        @{ Timestamp = "2026-05-14 09:00:00.000"; Source = "Memory-CommandLine"; EventType = "Snapshot"; Description = "Process command line: olddump.exe (PID: 9)"; User = ""; Details = "Args=olddump.exe" },
+        @{ Timestamp = "2026-05-15 08:59:00.000"; Source = "Prefetch"; EventType = "Execution"; Description = "Prefetch execution: mixed.exe"; User = ""; Details = "" },
+        @{ Timestamp = "2026-05-15 09:00:00.000"; Source = "Memory-CommandLine"; EventType = "Snapshot"; Description = "Process command line: memonly.exe (PID: 1)"; User = ""; Details = "Args=memonly.exe -x" },
+        @{ Timestamp = "2026-05-15 09:00:00.000"; Source = "Memory-CommandLine"; EventType = "Snapshot"; Description = "Process command line: mixed.exe (PID: 2)"; User = ""; Details = "Args=mixed.exe" },
+        @{ Timestamp = "2026-05-15 09:00:00.000"; Source = "Memory-CommandLine"; EventType = "Snapshot"; Description = "Process command line: before.exe (PID: 3)"; User = ""; Details = "Args=before.exe" })
+    $snapInfo = [PSCustomObject]@{ Mode = "Live"; ComputerName = "WS01"; CollectionStartUtc = "2026-05-15T08:58:00Z" }
+    $snapLeads = @(Invoke-ReportRules -Rows $snapRows -Rules (Import-ReportRules -Path $snapRulesPath) -CollectionInfo $snapInfo)
+    Assert-Equal (@($snapLeads | Sort-Object GroupKey | ForEach-Object { "$($_.GroupKey)=$($_.DuringCollection)/$($_.CapturedDuringCollection)" }) -join ",") "before.exe=False/False,memonly.exe=False/True,mixed.exe=True/False,olddump.exe=False/False" -Message "DuringCollection only from event rows: a memory-only lead from during the collection is CapturedDuringCollection; one with a Prefetch row then is DuringCollection; earlier rows, or a dump captured before the collection, are neither"
+    $snapModel = New-ReportModel -Rows $snapRows -Findings $snapLeads -CollectionInfo $snapInfo
+    Assert-Equal "$(Format-TestUtc $snapModel.LeadSpan.FirstUtc)|$(Format-TestUtc $snapModel.LeadSpan.LastUtc)|$($snapModel.LeadSpan.FileTimeLeads)" "2026-05-14 09:00:00|2026-05-15 09:00:00|0" -Message "Snapshot leads stay in the flagged-activity window (only their card note changes)"
+
+    # A task's author-supplied registration date (task XML, can be forged)
+    # does not date a lead that has a time Windows recorded; a lead with
+    # only such dates is left out of the activity window, like file times
+    $taskRulesPath = Join-Path $workDir "task-rules.json"
+    New-TestTextFile $taskRulesPath '{ "schemaVersion": 1, "rules": [ { "id": "TASK", "title": "Task {{group}}", "category": "Persistence", "severity": "High", "match": { "description": "^Scheduled task (?:registered|registration date \\(author-supplied\\)|last run): (?<key>.+)$" }, "groupBy": "capture", "why": "w" } ] }'
+    $authorNote = "Time=task XML RegistrationInfo/Date (author-supplied, not recorded by Windows)"
+    $taskRows = @(
+        @{ Timestamp = "2004-01-01 00:00:00.000"; Source = "ScheduledTasks"; EventType = "ScheduledTaskChange"; Description = "Scheduled task registration date (author-supplied): \OnlyAuthor"; User = ""; Details = "Actions=b.exe | $authorNote" },
+        @{ Timestamp = "2005-10-11 13:21:17.000"; Source = "ScheduledTasks"; EventType = "ScheduledTaskChange"; Description = "Scheduled task registration date (author-supplied): \EvilTask"; User = ""; Details = "Actions=a.exe | $authorNote" },
+        @{ Timestamp = "2026-05-04 11:02:01.000"; Source = "Registry-TaskCache"; EventType = "ScheduledTaskChange"; Description = "Scheduled task registered: \EvilTask"; User = ""; Details = "Actions=a.exe | Time=TaskCache DynamicInfo created (registered) time" },
+        @{ Timestamp = "2026-05-06 08:00:00.000"; Source = "ScheduledTasks"; EventType = "Execution"; Description = "Scheduled task last run: \EvilTask"; User = ""; Details = "Actions=a.exe" },
+        @{ Timestamp = "2031-01-01 00:00:00.000"; Source = "ScheduledTasks-XML"; EventType = "ScheduledTaskChange"; Description = "Scheduled task registration date (author-supplied): \EvilTask"; User = ""; Details = "Actions=a.exe | $authorNote" })
+    $taskLeads = @(Invoke-ReportRules -Rows $taskRows -Rules (Import-ReportRules -Path $taskRulesPath))
+    Assert-Equal (@($taskLeads | ForEach-Object { "$($_.GroupKey)|$($_.Count)|$(Format-TestUtc $_.FirstSeenUtc)|$(Format-TestUtc $_.LastSeenUtc)|$($_.ActivityTime)|$($_.TimesAuthorSupplied)" }) -join " / ") "\OnlyAuthor|1|2004-01-01 00:00:00|2004-01-01 00:00:00|False|True / \EvilTask|4|2026-05-04 11:02:01|2026-05-06 08:00:00|True|False" -Message "author-supplied task dates (2005, 2031) do not set a lead's first and last time when it has times Windows recorded; a lead with only such dates keeps them and is not dated by activity"
+    $taskModel = New-ReportModel -Rows $taskRows -Findings $taskLeads
+    $taskRuleOf = @{}
+    foreach ($lead in $taskLeads) { $taskRuleOf[$lead.Id] = $lead.GroupKey }
+    Assert-Equal "$(Format-TestUtc $taskModel.LeadSpan.FirstUtc)|$(Format-TestUtc $taskModel.LeadSpan.LastUtc)|$($taskModel.LeadSpan.FileTimeLeads)|$(@($taskModel.TopFindings | ForEach-Object { $taskRuleOf[$_] }) -join ',')" "2026-05-04 11:02:01|2026-05-06 08:00:00|1|\EvilTask,\OnlyAuthor" -Message "the flagged-activity window and the top leads leave a lead dated only by an author-supplied date out of the window and put it last"
+
     # A pattern that keeps timing out stops its rule after a few timeouts
     # instead of costing the timeout on every row; other rules still run
     $script:ReportEngineRegexTimeout = [TimeSpan]::FromMilliseconds(50)
@@ -643,6 +681,13 @@ try {
     $oldDay = $userModel.Activity.PerDay | Where-Object { $_.Day -eq "2019-05-01" }
     Assert-Equal "$($oldDay.Rows)|$($oldDay.NonFileRows)" "1|0" -Message "PerDay: a ShimCache FileLastModified row (a file time) is not counted as activity (NonFileRows)"
     Write-TestResult -Succeeded (@($userModel.Coverage.Notes | Where-Object { $_ -eq "1 row(s) are Snapshot rows: the state when the evidence was collected (or when a memory dump was captured), not events." }).Count -eq 1) -Message "Notes: Snapshot rows are the state when collected or when the memory dump was captured"
+    # The collector user as the User column names it: a live collection's
+    # local account without the computer's name (a domain account and a
+    # mounted image's collector account stay as they are)
+    $collectorUsers = @(foreach ($pair in @(@("Live", "WS01\examiner"), @("Live", ".\examiner"), @("Live", "ws01\examiner"), @("Live", "CORP\examiner"), @("MountedImage", "WS01\examiner"))) {
+            (New-ReportModel -Rows $userRows -CollectionInfo ([PSCustomObject]@{ Mode = $pair[0]; ComputerName = "WS01"; CollectorUser = $pair[1] })).Collection.CollectorUser
+        })
+    Assert-Equal ($collectorUsers -join "|") "examiner|examiner|examiner|CORP\examiner|WS01\examiner" -Message "Collection.CollectorUser: a live collection's WS01\examiner or .\examiner is examiner, as in the User column; CORP\examiner and a mounted image's collector account are kept"
 
     # --- The examined computer of a mounted-image collection ---
     $imageJson = [PSCustomObject]@{ Mode = "MountedImage"; ComputerName = "COLLECTORPC"; CollectionStartUtc = "2026-02-02T00:00:00Z" }
@@ -677,7 +722,7 @@ try {
     $incompleteCaveats = @($incomplete.Caveats)
     Write-TestResult -Succeeded ($incompleteCaveats[1].StartsWith("The timeline is incomplete: 2 input file(s) disappeared while it was built (the builder ended with exit code 2)") -and
         $incompleteCaveats[2].StartsWith("The builder hit 2 unexpected error(s) and skipped the rest of those steps")) -Message "caveats: the incomplete timeline right after the leads-not-verdict caveat"
-    Write-TestResult -Succeeded (@($incomplete.Coverage.Notes | Where-Object { $_.StartsWith("The timeline is incomplete:") }).Count -eq 1) -Message "Coverage.Notes: the incomplete timeline"
+    Write-TestResult -Succeeded (@($incomplete.Coverage.Notes | Where-Object { $_.StartsWith("The timeline is incomplete:") -or $_.StartsWith("The builder hit ") }).Count -eq 0) -Message "Coverage.Notes does not repeat the incomplete timeline (the report shows TimelineCompleteness first in Evidence coverage, and the caveats)"
     $bannerLog = Join-Path $workDir "banner_builder_log.txt"
     New-TestTextFile $bannerLog ("[2026-02-02 01:00:30] ERROR: 3 of 40 input file(s) disappeared during the run -- rows from them may be missing`r`n" +
         "[2026-02-02 01:05:00] ERROR: === Timeline Builder Completed WITH 4 MISSING INPUT FILE(S) -- timeline incomplete ===`r`n" +

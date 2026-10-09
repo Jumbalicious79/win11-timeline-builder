@@ -23,7 +23,11 @@
 #   -ReportOnly works in a folder named "case [1]" (wildcard characters),
 #      and a report.pdf held open elsewhere is reported as out of date while
 #      the new PDF gets its own name;
-#   -ReportOnly on a folder without a timeline fails cleanly.
+#   -ReportOnly on a folder without a timeline fails cleanly;
+#   an unexpected error injected into a copy of the builder (in this test's
+#      folder): in the rebuild it is logged and the report is still made
+#      (exit code 0); a rebuild that stops before it gives its exit code,
+#      or an error thrown out of it, gives exit code 1, not 0.
 # Before the runs: the builder's Get-TimelineReportCollectionInfo (from its
 # syntax tree) takes a mounted image's computer name in collection_info.json
 # as the collector host, and the SYSTEM hive's name as the examined one.
@@ -406,6 +410,49 @@ try {
     New-Item -ItemType Directory -Path $emptyDir | Out-Null
     $noTimeline = Invoke-TimelineBuilder -Arguments @("-ReportOnly", $emptyDir, "-Viewer", "None")
     Write-TestResult -Succeeded ($noTimeline.ExitCode -eq 1 -and @($noTimeline.Output | Where-Object { $_ -match '-ReportOnly needs a timeline\.csv' }).Count -eq 1) -Message "-ReportOnly on a folder without timeline.csv exits with 1 and says why"
+
+    # --- 7. An unexpected error during -ReportOnly: a copy of the builder
+    # (with report\ beside it, in this test's folder) with one injected
+    # change. A statement-terminating error in the rebuild's body is logged
+    # and only its statement is skipped (the report is still made, exit code
+    # 0); a rebuild that stops before it gives its exit code, or an error
+    # thrown out of it, gives exit code 1, never 0 ---
+    $injectDir = Join-Path $workDir "inject"
+    New-Item -ItemType Directory -Path $injectDir | Out-Null
+    Copy-Item -LiteralPath (Join-Path $builderDir "report") -Destination (Join-Path $injectDir "report") -Recurse
+    $builderText = [System.IO.File]::ReadAllText($builder)
+    # A .NET exception whose message names the file in both PowerShell
+    # editions (Windows PowerShell's [int]::Parse message has no value)
+    $injection = '[void][System.IO.File]::ReadAllText("' + (Join-Path $injectDir "injected-report-error.txt") + '")'
+    $bodyAnchor = "`r`n        `$reportInfo = Get-TimelineReportCollectionInfo -InfoJsonPath (Join-Path `$reportDir"
+    $finallyAnchor = "`r`n        Restore-ConsoleMode `$consoleMode`r`n"
+    $anchorsFound = ($builderText.IndexOf($bodyAnchor) -ge 0 -and $builderText.IndexOf($bodyAnchor) -eq $builderText.LastIndexOf($bodyAnchor) -and
+        $builderText.IndexOf($finallyAnchor) -ge 0 -and $builderText.IndexOf($finallyAnchor) -eq $builderText.LastIndexOf($finallyAnchor))
+    Write-TestResult -Succeeded $anchorsFound -Message "the places to inject an error are in Invoke-TimelineReportOnly (once each)"
+    if ($anchorsFound) {
+        $injectedBuilder = Join-Path $injectDir "timeline-builder.ps1"
+        $injectRun = Join-Path $workDir "inject-run"
+        New-Item -ItemType Directory -Path $injectRun | Out-Null
+        foreach ($name in @("timeline.csv", "collection_info.json", "collection_log.txt")) { Copy-Item -LiteralPath (Join-Path $runDir $name) -Destination (Join-Path $injectRun $name) }
+        $savedBuilder = $builder
+        try {
+            $builder = $injectedBuilder
+            [System.IO.File]::WriteAllText($injectedBuilder, $builderText.Replace($bodyAnchor, "`r`n        $injection$bodyAnchor"))
+            $bodyError = Invoke-TimelineBuilder -Arguments @("-ReportOnly", $injectRun, "-NoExcel", "-Viewer", "None")
+            Write-TestResult -Succeeded ($bodyError.ExitCode -eq 0 -and (Test-Path -LiteralPath (Join-Path $injectRun "report.html")) -and
+                @($bodyError.Output | Where-Object { $_ -match 'ERROR: Unexpected error at line \d+ \(rest of this step skipped\): .*injected-report-error' }).Count -eq 1) -Message "-ReportOnly: an unexpected error in the rebuild is logged, its statement skipped, and the report still made (exit code $($bodyError.ExitCode))"
+            # A rebuild that ends without giving its exit code (as when an
+            # error stops it) exits with 1: before the fix it exited with 0
+            [System.IO.File]::WriteAllText($injectedBuilder, $builderText.Replace($bodyAnchor, "`r`n        return$bodyAnchor"))
+            $noCode = Invoke-TimelineBuilder -Arguments @("-ReportOnly", $injectRun, "-NoExcel", "-Viewer", "None")
+            Write-TestResult -Succeeded ($noCode.ExitCode -eq 1) -Message "-ReportOnly: a rebuild stopped before it gives an exit code exits with 1, not 0 (exit code $($noCode.ExitCode))"
+            # An error thrown out of the rebuild (here from its finally block)
+            [System.IO.File]::WriteAllText($injectedBuilder, $builderText.Replace($finallyAnchor, "`r`n        throw `"injected-report-error`"$finallyAnchor"))
+            $stopError = Invoke-TimelineBuilder -Arguments @("-ReportOnly", $injectRun, "-NoExcel", "-Viewer", "None")
+            Write-TestResult -Succeeded ($stopError.ExitCode -eq 1 -and @($stopError.Output | Where-Object { $_ -match 'injected-report-error' }).Count -ge 1) -Message "-ReportOnly: an error thrown out of the rebuild gives exit code 1, not 0 (exit code $($stopError.ExitCode))"
+        }
+        finally { $builder = $savedBuilder }
+    }
 
     if ($script:failures -gt 0) {
         Write-Host "FAIL: $($script:failures) check(s) failed" -ForegroundColor Red

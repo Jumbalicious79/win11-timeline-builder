@@ -611,6 +611,40 @@ function Expand-CollectionZip {
     }
 }
 
+# The extracted collection folder to use as -InputPath. The parsers find the
+# collection's files with -Path, which reads [ ] * ? (and the backtick) as
+# wildcard characters: under a folder named "Case [1]" they would find
+# nothing. A zip of such a folder (Explorer's "Send to > Compressed
+# folder") extracts under that name, so the extracted copy -- inside the
+# work folder, deleted at the end -- is renamed, each of those characters
+# becoming "_". The input-file list and the shortened-name map follow the
+# rename. Returns the folder's (new) path.
+function Get-WildcardSafeFolder {
+    param([string]$Folder)
+    $Folder = $Folder.TrimEnd('\')
+    $name = Split-Path $Folder -Leaf
+    if (-not ($name -match '[\[\]*?`]')) { return $Folder }
+    $safeFolder = Join-Path (Split-Path $Folder -Parent) ($name -replace '[\[\]*?`]', '_')
+    [System.IO.Directory]::Move($Folder, $safeFolder)
+    $oldPrefix = $Folder + '\'
+    $newPrefix = $safeFolder + '\'
+    for ($i = 0; $i -lt $script:inputFiles.Count; $i++) {
+        $file = $script:inputFiles[$i]
+        if ($file.StartsWith($oldPrefix, [System.StringComparison]::OrdinalIgnoreCase)) { $script:inputFiles[$i] = $newPrefix + $file.Substring($oldPrefix.Length) }
+    }
+    $renamed = @{}
+    foreach ($key in @($script:shortenedNames.Keys)) {
+        $newKey = [string]$key
+        $value = [string]$script:shortenedNames[$key]
+        if ($newKey.StartsWith($oldPrefix, [System.StringComparison]::OrdinalIgnoreCase)) { $newKey = $newPrefix + $newKey.Substring($oldPrefix.Length) }
+        if ($value.StartsWith($oldPrefix, [System.StringComparison]::OrdinalIgnoreCase)) { $value = $newPrefix + $value.Substring($oldPrefix.Length) }
+        $renamed[$newKey] = $value
+    }
+    $script:shortenedNames = $renamed
+    Log "  The zip's collection folder '$name' has [ ], * or ? in its name, which PowerShell reads as wildcards: its extracted copy was renamed to '$(Split-Path $safeFolder -Leaf)'."
+    return $safeFolder
+}
+
 # collection_manifest.csv of the collection (written by the triage
 # collector): the one nearest to -InputPath, so an outer folder (e.g. the
 # zip extracted with Windows "Extract All") works too. Its RelativePath
@@ -1152,6 +1186,8 @@ function Add-TimelineReportWorkbookSheets {
         if ($rowNumbers.Count -gt $evidence.Count) { $summary += "; the first $($evidence.Count) of $($rowNumbers.Count) rows are listed (filter the Finding column of the Timeline sheet for all)" }
         if ($finding.AllowlistedCount) { $summary += "; $($finding.AllowlistedCount) allowlisted row(s) not counted" }
         if ($finding.DuringCollection) { $summary += "; all rows are from during the collection (possibly the collector itself)" }
+        elseif ($finding.CapturedDuringCollection) { $summary += "; seen only in Snapshot rows from during the collection (the state then, e.g. the memory dump; check it is not the collector)" }
+        if ($finding.TimesAuthorSupplied) { $summary += "; dated only by a task's author-supplied registration date (can be old or forged)" }
 
         # Summary row: the whole row in the severity color, linked to the first row
         $values = @($finding.Id, $severity, "Summary", $null, $first, $finding.Title, $summary, "", "", "", $finding.Category, $finding.RuleId)
@@ -1521,6 +1557,15 @@ function Invoke-TimelineReportOnly {
     param([string[]]$BoundParameterNames)
     $consoleMode = Disable-ConsoleQuickEdit
     try {
+        # As in the main body: a statement-terminating error (a .NET
+        # exception, a method call on $null) outside an inner try/catch is
+        # logged and only its statement is skipped, so the report is still
+        # made. Ctrl+C (PipelineStoppedException) is passed on.
+        trap {
+            if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { break }
+            Log-Error "Unexpected error at line $($_.InvocationInfo.ScriptLineNumber) (rest of this step skipped): $($_.Exception.Message)"
+            continue
+        }
         Log "=== Timeline Report Rebuild (-ReportOnly) Started ==="
         if ($null -ne $consoleMode) {
             Log "Console QuickEdit is off for this run, so a click in the window cannot pause it (copy text with the window menu: Edit > Mark)."
@@ -1586,8 +1631,12 @@ function Invoke-TimelineReportOnly {
 }
 
 if ($ReportOnly) {
-    # The exit code is the function's last output
+    # The exit code is the function's last output: 0, else 1. It stays 1 when
+    # an error stops the function (the assignment is then skipped), so a
+    # failed rebuild never exits with 0.
+    $reportOnlyExitCode = 1
     $reportOnlyExitCode = @(Invoke-TimelineReportOnly -BoundParameterNames @($PSBoundParameters.Keys)) | Select-Object -Last 1
+    if ("$reportOnlyExitCode" -ne "0") { $reportOnlyExitCode = 1 }
     exit ([int]$reportOnlyExitCode)
 }
 
@@ -1670,7 +1719,9 @@ if (-not (Test-Path -LiteralPath $InputPath)) {
 # as wildcards: under a folder whose path has them they find nothing, and
 # the run would end without a timeline (or with an incomplete one) as if
 # the collection were empty. A zip is extracted into the work folder, so
-# that path counts; a collection folder is read where it is.
+# that path counts (a top folder in the zip with them in its name is
+# renamed after the extraction, see Get-WildcardSafeFolder); a collection
+# folder is read where it is.
 $collectionFolderToCheck = if ($script:selectedZipPath) { $script:runWorkDir } else { (Get-LongPath $InputPath) }
 if ([System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters($collectionFolderToCheck)) {
     if ($script:selectedZipPath) {
@@ -1690,10 +1741,15 @@ if ($script:selectedZipPath) {
         Log-Error "Failed to extract the zip: $($_.Exception.Message)"
         exit 1
     }
-    # The zip normally holds one folder, the collection: use it as the input path
+    # The zip normally holds one folder, the collection: use it as the input
+    # path (renamed when its name has wildcard characters)
     $children = @(Get-ChildItem -LiteralPath $extractDir -Directory)
     if ($children.Count -eq 1 -and -not (Get-ChildItem -LiteralPath $extractDir -File)) {
-        $InputPath = $children[0].FullName
+        try { $InputPath = Get-WildcardSafeFolder -Folder $children[0].FullName }
+        catch {
+            Log-Error "Could not rename the extracted collection folder $($children[0].FullName), whose name has [ ], * or ? in it (PowerShell reads them as wildcards, so its files could not be read): $($_.Exception.Message)"
+            exit 1
+        }
     } else {
         $InputPath = $extractDir
     }

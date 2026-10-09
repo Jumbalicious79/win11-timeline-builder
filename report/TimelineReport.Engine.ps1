@@ -91,6 +91,11 @@ namespace TimelineReport
         public int[] EvidenceRows;
         public long FirstTicks = -1;
         public long LastTicks = -1;
+        // Every row is a Snapshot row (state when the evidence was collected or
+        // a memory dump captured): its time is when it was seen, not an event
+        public bool SnapshotOnly;
+        // The only times are dates a task's author wrote (Engine.Summarize)
+        public bool AuthorTimesOnly;
         // A roll-up group (Engine.Fold): how many groups it stands for, and their keys
         public int FoldedGroups;
         public List<string> FoldedKeys = new List<string>();
@@ -840,9 +845,23 @@ namespace TimelineReport
             result.Groups = kept;
         }
 
+        // The builder's note on a row whose time is a date the task's author
+        // wrote (task XML RegistrationInfo/Date), which can be old or forged
+        public const string AuthorSuppliedTimeMark = "author-supplied, not recorded by Windows";
+
+        public static bool IsAuthorSuppliedTime(string details)
+        {
+            return details != null && details.IndexOf(AuthorSuppliedTimeMark, StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
         // All rows (rule rows and escalation rows, ascending), the first and
         // last time, and the evidence rows: escalation rows first (they are
-        // why the severity was raised), then the earliest rule rows
+        // why the severity was raised), then the earliest rule rows. A row
+        // whose time is author-supplied does not set the first and last time
+        // when the group has a row with a time Windows recorded (a forged old
+        // date would otherwise date the whole lead); when it has none, those
+        // dates are the times and AuthorTimesOnly is set. SnapshotOnly: every
+        // row is a Snapshot row.
         public static void Summarize(RowTable t, GroupResult g, int maxEvidence)
         {
             List<int> all = new List<int>(g.Rows.Count + g.EscalationRows.Count);
@@ -852,17 +871,35 @@ namespace TimelineReport
             g.AllRows = all.ToArray();
             g.RowNumbers = new int[g.AllRows.Length];
             for (int n = 0; n < g.AllRows.Length; n++) g.RowNumbers[n] = g.AllRows[n] + 2;
+            int snapshotType = Array.IndexOf(t.EventTypes, "Snapshot");
+            bool snapshotOnly = all.Count > 0;
             long first = -1;
             long last = -1;
+            long authorFirst = -1;
+            long authorLast = -1;
             foreach (int r in all)
             {
+                if (t.EventTypeId[r] != snapshotType) snapshotOnly = false;
                 long tk = t.Ticks[r];
                 if (tk < 0) continue;
+                if (IsAuthorSuppliedTime(t.Details[r]))
+                {
+                    if (authorFirst < 0 || tk < authorFirst) authorFirst = tk;
+                    if (tk > authorLast) authorLast = tk;
+                    continue;
+                }
                 if (first < 0 || tk < first) first = tk;
                 if (tk > last) last = tk;
             }
+            g.AuthorTimesOnly = first < 0 && authorFirst >= 0;
+            if (g.AuthorTimesOnly)
+            {
+                first = authorFirst;
+                last = authorLast;
+            }
             g.FirstTicks = first;
             g.LastTicks = last;
+            g.SnapshotOnly = snapshotOnly;
             if (maxEvidence < 1) maxEvidence = 1;
             if (all.Count <= maxEvidence)
             {
@@ -1984,32 +2021,42 @@ function Invoke-ReportRules {
                 if ($rule.Title.Contains("{{group}}")) { $title = $rule.Title.Replace("{{group}}", $label) } else { $title = "$($rule.Title) ($label)" }
                 $why = $rule.Why.Replace("{{group}}", "several") + " This lead folds together $($group.FoldedGroups) more groups of the rule (it keeps at most $($rule.MaxFindings) leads); every row is in the Findings sheet and findings.csv."
             }
+            # Every row from the collection start on: maybe the collector's
+            # own activity. When every row is a Snapshot row (the state seen
+            # when the evidence was collected or a memory dump captured, such
+            # as a process in the dump), its time is when it was seen, not
+            # when it happened: CapturedDuringCollection instead.
+            $fromCollection = ($startTicks -ge 0 -and $group.FirstTicks -ge $startTicks)
             $findings.Add([PSCustomObject]@{
-                Id                = ""
-                RuleId            = $rule.Id
-                Title             = $title
-                Category          = $rule.Category
-                Severity          = $severity
-                Why               = $why
-                Technical         = $rule.Technical
-                NextSteps         = $rule.NextSteps
-                FalsePositives    = $rule.FalsePositives
-                References        = $rule.References
-                GroupKey          = $groupKey
-                Count             = $group.Rows.Count
-                FirstSeenUtc      = ConvertFrom-ReportEngineTicks $group.FirstTicks
-                LastSeenUtc       = ConvertFrom-ReportEngineTicks $group.LastTicks
-                Evidence          = [object[]]$evidence
-                EvidenceTruncated = $group.AllRows.Length -gt $group.EvidenceRows.Length
-                Escalated         = $escalated
-                AllowlistedCount  = $group.Allowlisted
-                BaseSeverity      = $rule.Severity
-                EscalationCount   = $group.EscalationRows.Count
-                RowNumbers        = $group.RowNumbers
-                DuringCollection  = ($startTicks -ge 0 -and $group.FirstTicks -ge $startTicks)
-                ActivityTime      = [bool]$rule.ActivityTime
-                FoldedGroups      = $group.FoldedGroups
-                FoldedKeys        = $foldedKeys
+                Id                       = ""
+                RuleId                   = $rule.Id
+                Title                    = $title
+                Category                 = $rule.Category
+                Severity                 = $severity
+                Why                      = $why
+                Technical                = $rule.Technical
+                NextSteps                = $rule.NextSteps
+                FalsePositives           = $rule.FalsePositives
+                References               = $rule.References
+                GroupKey                 = $groupKey
+                Count                    = $group.Rows.Count
+                FirstSeenUtc             = ConvertFrom-ReportEngineTicks $group.FirstTicks
+                LastSeenUtc              = ConvertFrom-ReportEngineTicks $group.LastTicks
+                Evidence                 = [object[]]$evidence
+                EvidenceTruncated        = $group.AllRows.Length -gt $group.EvidenceRows.Length
+                Escalated                = $escalated
+                AllowlistedCount         = $group.Allowlisted
+                BaseSeverity             = $rule.Severity
+                EscalationCount          = $group.EscalationRows.Count
+                RowNumbers               = $group.RowNumbers
+                DuringCollection         = ($fromCollection -and -not $group.SnapshotOnly)
+                CapturedDuringCollection = ($fromCollection -and $group.SnapshotOnly)
+                # A lead whose only times are a task author's dates is not
+                # dated by activity either (left out of the activity window)
+                ActivityTime             = ([bool]$rule.ActivityTime -and -not $group.AuthorTimesOnly)
+                TimesAuthorSupplied      = [bool]$group.AuthorTimesOnly
+                FoldedGroups             = $group.FoldedGroups
+                FoldedKeys               = $foldedKeys
             })
         }
         if ($null -ne $Statistics) {
@@ -2357,6 +2404,11 @@ function New-ReportModel {
     if (-not $os -and $mode -eq "Live") { $os = $collectorLog.OS }
     $collectorUser = [string](Get-ReportEngineInfoValue $CollectionInfo @("CollectorUser"))
     if (-not $collectorUser) { $collectorUser = $collectorLog.User }
+    # A live collection's local account (HOST\examiner or .\examiner) as the
+    # timeline's User column names it: examiner
+    if ($live -and $collectorUser -match '^([^\\]+)\\(.+)$' -and ($Matches[1] -eq "." -or ($computer -and $Matches[1] -eq $computer))) {
+        $collectorUser = $Matches[2]
+    }
     # The accounts as the timeline's User column names them (CORP\alice and
     # a local alice are different accounts)
     $users = @(Get-ReportEngineInfoValue $CollectionInfo @("Users"))
@@ -2525,8 +2577,9 @@ function New-ReportModel {
         Lines             = $incompleteTexts.ToArray()
     }
 
+    # (An incomplete timeline is not repeated here: the report shows
+    # TimelineCompleteness first in Evidence coverage, and in the caveats)
     $notes = New-Object System.Collections.Generic.List[string]
-    foreach ($text in $incompleteTexts) { $notes.Add($text) }
     $notes.Add("The timeline has $($table.Count) rows from $($stats.Sources.Count) sources, $(Format-ReportEngineUtc (ConvertFrom-ReportEngineTicks $stats.FirstTicks)) to $(Format-ReportEngineUtc (ConvertFrom-ReportEngineTicks $stats.LastTicks)).")
     if ($stats.SnapshotRows -gt 0) { $notes.Add("$($stats.SnapshotRows) row(s) are Snapshot rows: the state when the evidence was collected (or when a memory dump was captured), not events.") }
     if ($table.Count -gt $stats.TimedRows) { $notes.Add("$($table.Count - $stats.TimedRows) row(s) have a timestamp that could not be read.") }

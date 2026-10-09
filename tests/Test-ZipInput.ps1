@@ -10,7 +10,9 @@
 #   over-long name shortened with its original name kept for the manifest
 #   lookup, a ".." entry not written outside the folder, copied email
 #   attachments left in the zip, nothing extracted when the zip does not
-#   fit), the manifest lookups from an outer folder (also the email
+#   fit), the rename of an extracted top folder whose name has [ ] (the
+#   input-file list and shortened-name map follow it), the manifest
+#   lookups from an outer folder (also the email
 #   parser's), the input-file list of a collection folder (no memory dump
 #   or attachment copy) and the list of missing files, the setupapi logs
 #   found (also under names shortened on extraction; email attachment
@@ -43,7 +45,11 @@
 #     pointed at it: it is not extracted, so there is nothing to delete;
 #     exit code 0 and its two rows, from the manifest;
 #   - -WorkDir with [ ] in its path: the run stops at the start with exit
-#     code 1 and an error (the parsers would find nothing there).
+#     code 1 and an error (the parsers would find nothing there);
+#   - a zip "Case [1].zip" whose top folder is "Case [1]": its extracted
+#     copy is renamed "Case _1_", exit code 0, both logs parsed, every
+#     input file found; run B's report says "incomplete" only twice (the
+#     caveat and Evidence coverage).
 #   Needs Administrator rights, like the builder itself (GitHub Actions
 #   Windows runners are elevated). For a local run without them, pass
 #   -BuilderPath with a copy of the builder that has no admin check, kept
@@ -237,6 +243,33 @@ try {
     }
     Assert-Equal -Name "zip that does not fit: extraction stops" -Expected "not enough free space to extract the zip" -Actual $noSpaceError
     Assert-Equal -Name "zip that does not fit: nothing extracted or recorded" -Expected "0 5" -Actual "$(@(Get-ChildItem -LiteralPath $noSpaceDest -Recurse -File -ErrorAction SilentlyContinue).Count) $($script:inputFiles.Count)"
+
+    # --- A zip's top folder with [ ] in its name: the extracted copy is
+    # renamed, and the input-file list and the shortened-name map follow ---
+    $savedInputFiles = $script:inputFiles
+    $savedShortenedNames = $script:shortenedNames
+    $wildIn = Join-Path $testRoot "wild\in"
+    $wildFolder = Join-Path $wildIn "Case [1]"
+    [void][System.IO.Directory]::CreateDirectory((Join-Path $wildFolder "USB"))
+    $wildFile = Join-Path $wildFolder "USB\setupapi.dev.log"
+    [System.IO.File]::WriteAllText($wildFile, "x")
+    $otherFile = Join-Path $testRoot "wild\other.txt"
+    $script:inputFiles = New-Object System.Collections.Generic.List[string]
+    $script:inputFiles.Add($wildFile)
+    $script:inputFiles.Add($otherFile)
+    $script:shortenedNames = @{ $wildFile = (Join-Path $wildFolder "USB\setupapi.dev.full-length-name.log") }
+    $logBefore = @(Get-Content -LiteralPath $logFile).Count
+    $safeFolder = Get-WildcardSafeFolder -Folder $wildFolder
+    $renameLog = @(Get-Content -LiteralPath $logFile | Select-Object -Skip $logBefore) -join "`n"
+    $expectedSafe = Join-Path $wildIn "Case _1_"
+    Assert-Equal -Name "zip top folder with [ ]: renamed to Case _1_" -Expected $expectedSafe -Actual $safeFolder
+    Assert-Equal -Name "zip top folder with [ ]: the folder and its files moved" -Expected "True False" -Actual "$(Test-Path -LiteralPath (Join-Path $expectedSafe 'USB\setupapi.dev.log') -PathType Leaf) $([System.IO.Directory]::Exists($wildFolder))"
+    Assert-Equal -Name "zip top folder with [ ]: the input-file list follows (a file elsewhere is kept)" -Expected "$(Join-Path $expectedSafe 'USB\setupapi.dev.log')|$otherFile" -Actual ($script:inputFiles -join "|")
+    Assert-Equal -Name "zip top folder with [ ]: the shortened-name map follows" -Expected "$(Join-Path $expectedSafe 'USB\setupapi.dev.full-length-name.log')" -Actual $script:shortenedNames[(Join-Path $expectedSafe 'USB\setupapi.dev.log')]
+    Assert-Equal -Name "zip top folder with [ ]: the rename is logged" -Expected $true -Actual ($renameLog -match [regex]::Escape("its extracted copy was renamed to 'Case _1_'"))
+    Assert-Equal -Name "a folder name without wildcard characters is used as it is" -Expected $expectedSafe -Actual (Get-WildcardSafeFolder -Folder $expectedSafe)
+    $script:inputFiles = $savedInputFiles
+    $script:shortenedNames = $savedShortenedNames
 
     # --- Manifest lookups (shortened name, outer folder) -----------------
     # -InputPath as the builder's functions read it
@@ -609,6 +642,7 @@ try {
     $htmlB = ""
     if (Test-Path -LiteralPath (Join-Path $dirB "report.html")) { $htmlB = [System.IO.File]::ReadAllText((Join-Path $dirB "report.html")) }
     Assert-Equal -Name "run B: report.html shows the incomplete timeline in Evidence coverage" -Expected $true -Actual ($htmlB.Contains("<h3>Timeline incomplete</h3>"))
+    Assert-Equal -Name "run B: report.html says it twice (summary caveat, Evidence coverage), not again in the notes" -Expected 2 -Actual ([regex]::Matches($htmlB, [regex]::Escape("The timeline is incomplete: 1 input file(s) disappeared")).Count)
     Assert-Equal -Name "run B: the zip's collection_info.json is copied next to the timeline before the work folder goes" -Expected $true -Actual (Test-Path -LiteralPath (Join-Path $dirB "collection_info.json") -PathType Leaf)
     Assert-Equal -Name "run B: the zip is hashed for the report (input was a .zip)" -Expected $true -Actual ($modelB -and @($modelB.Files.Hashes | Where-Object { $_.Name -eq "$collName.zip" -and $_.Sha256 -eq $zipHash }).Count -eq 1)
     $reportLeftovers = @(@("findings.csv", "report.html", "report-model.json") | Where-Object { Test-Path -LiteralPath (Join-Path $testRoot $_) })
@@ -627,6 +661,27 @@ try {
     Assert-Equal -Name "run D: exit code 1 (stopped at the start)" -Expected 1 -Actual $runD.ExitCode
     Assert-Equal -Name "run D: the error names the work folder's wildcard characters" -Expected 1 -Actual @($runD.Lines -match "ERROR: The work folder's path has \[ \], \* or \? in it").Count
     Write-TestResult -Name "run D: no timeline, work folder removed, -WorkDir kept" -Passed (-not (Test-Path -LiteralPath $csvD) -and $runD.WorkFolder -and -not (Test-Path -LiteralPath $runD.WorkFolder) -and (Test-Path -LiteralPath $workDirD)) -Message "work folder: $($runD.WorkFolder)"
+
+    # --- Run E: a zip whose top folder has [ ] in its name (a folder named
+    # "Case [1]" zipped with Explorer): its extracted copy is renamed, so the
+    # parsers find the collection's files ----------------------------------
+    $bracketZipPath = Join-Path $testRoot "bracket\Case [1].zip"
+    [void][System.IO.Directory]::CreateDirectory((Split-Path $bracketZipPath -Parent))
+    $bracketEntries = [ordered]@{}
+    foreach ($key in $zipEntries.Keys) { $bracketEntries[$key.Replace($collName, "Case [1]")] = $zipEntries[$key] }
+    New-TestZip -Path $bracketZipPath -Entries $bracketEntries -EntryDate $entryDate
+    $csvE = Join-Path $testRoot "timeline-e.csv"
+    Write-Host "Running the builder on $bracketZipPath (top folder 'Case [1]') ..."
+    $runE = Invoke-ZipRun -OutputFile $csvE -Zip $bracketZipPath
+    if ($runE.ExitCode -ne 0) { $runE.Lines | ForEach-Object { Write-Host "  | $_" } }
+    Assert-Equal -Name "run E: exit code" -Expected 0 -Actual $runE.ExitCode
+    $rowsE = @()
+    if (Test-Path -LiteralPath $csvE) { $rowsE = @(Import-Csv -LiteralPath $csvE) }
+    Assert-Equal -Name "run E: both devices read from the renamed folder" -Expected "1 1" -Actual "$(@(Get-SetupApiRow -Rows $rowsE -Serial 'TESTSERIAL0001').Count) $(@(Get-SetupApiRow -Rows $rowsE -Serial 'TESTSERIAL0002').Count)"
+    Assert-Equal -Name "run E: the rename and the collection folder are logged, metadata from collection_info.json" -Expected $true -Actual (
+        $runE.Log -match [regex]::Escape("its extracted copy was renamed to 'Case _1_'") -and $runE.Log -match "Collection folder: .+\\in\\Case _1_" -and $runE.Log -match "Collection metadata from collection_info\.json")
+    Assert-Equal -Name "run E: every input file found under the new name (none reported missing)" -Expected $true -Actual ($runE.Log -match "All 4 input file\(s\) were still present")
+    Write-TestResult -Name "run E: work folder removed at the end" -Passed ($runE.WorkFolder -and -not (Test-Path -LiteralPath $runE.WorkFolder)) -Message "still there: $($runE.WorkFolder)"
 
     # --- Run C: a copied email attachment (antivirus may quarantine it) ----
     # It stays in the zip and is no input file, so its removal cannot stop
