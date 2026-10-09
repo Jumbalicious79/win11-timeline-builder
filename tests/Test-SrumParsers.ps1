@@ -26,9 +26,9 @@
 # it prints SKIPPED. With Administrator rights it also saves a SOFTWARE hive
 # with a ProfileList entry (a temporary HKCU key and reg save, undone
 # afterwards) so a SID is named from it; without them that check is SKIPPED.
-# Every run checks that the collection's files are not changed, that the
-# builder's copies are made in its work folder (none in %TEMP%) and that
-# the work folder is removed.
+# Every run checks that the collection's files are not changed, that no
+# SRUM copy is left in %TEMP% and that each builder run's work folder,
+# which holds the copies, is removed.
 #
 # Needs Administrator rights, like the builder itself (GitHub Actions
 # Windows runners are elevated). For a local run without them, pass
@@ -81,9 +81,10 @@ if (-not $BuilderPath -and -not $isAdmin) {
 # Run the builder with the same PowerShell edition as this script
 $powershellExe = (Get-Process -Id $PID).Path
 
-# Runs the builder on a collection (SRUM source, CSV only); returns its output
 # The work folder of every builder run (the log names it), checked at the end
 $script:builderWorkFolders = New-Object System.Collections.Generic.List[string]
+
+# Runs the builder on a collection (SRUM source, CSV only); returns its output
 function Invoke-TimelineBuilder {
     param([string]$CollectionPath, [string]$OutputFile)
     $ErrorActionPreference = "Continue"
