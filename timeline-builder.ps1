@@ -13621,10 +13621,11 @@ function Repair-SrumWorkingCopy {
 }
 
 # Copies SRUDB.dat and its ESE companion files (SRU*.log, SRU.chk,
-# SRUres*.jrs, SRUDB.jfm) from the collection to the (empty) temp folder and
-# brings the copy to a clean state if needed: soft recovery with the
-# collected logs (in this process, else esentutl /r), else repair (esentutl
-# /p, which can lose data). The collection itself is never changed. Returns
+# SRUres*.jrs, SRUDB.jfm) from the collection to the (empty) folder
+# -TempDir in the work folder's scratch folder and brings the copy to a
+# clean state if needed: soft recovery with the collected logs (in this
+# process, else esentutl /r), else repair (esentutl /p, which can lose
+# data). The collection itself is never changed. Returns
 # Database (the copy), Header (Header.IsEse is false for a file that is not
 # an ESE database, Header.IsClean false if neither recovery nor repair
 # worked) and Method (what was needed: "" for a clean copy).
@@ -13636,6 +13637,20 @@ function Get-SrumWorkingCopy {
         Where-Object { $_.Name -match '^SRU.*\.(log|jtx|chk|jrs)$' -or $_.Name -eq "SRUDB.jfm" })
     foreach ($companion in $companions) {
         Copy-Item -LiteralPath $companion.FullName -Destination (Join-Path $TempDir $companion.Name) -Force -ErrorAction SilentlyContinue
+    }
+    # A transaction log the collector saved (listed in collection_manifest.csv)
+    # that is not here any more was deleted after the collection
+    $relDb = Get-RelativeCollectionPath $File.FullName
+    if ($relDb) {
+        $relDir = [System.IO.Path]::GetDirectoryName($relDb)
+        foreach ($rel in @((Get-CollectionManifest).RelativePaths | Sort-Object)) {
+            $leaf = [System.IO.Path]::GetFileName($rel)
+            if ($leaf -notmatch '^SRU.*\.(log|jtx)$' -or [System.IO.Path]::GetDirectoryName($rel) -ne $relDir) { continue }
+            $logSrc = Join-Path $File.DirectoryName $leaf
+            if (-not (Test-Path -LiteralPath $logSrc)) {
+                Log-Warning "  Transaction log missing: $logSrc is in the collection manifest but not here -- the database is read without it (records not yet written to the database are lost)"
+            }
+        }
     }
     # Copies keep the attributes of the collection's files; a read-only copy
     # (evidence marked read-only, read-only media) cannot be recovered or
@@ -13704,7 +13719,9 @@ function Get-SrumWorkingCopy {
 function Add-SrumTimelineEntries {
     param([System.IO.FileInfo]$File)
     Log "  Parsing: $($File.FullName) ($([Math]::Round($File.Length / 1MB, 1)) MB)"
-    $tempDir = Join-Path $env:TEMP "TimelineSrum_$(Get-Random)"
+    # Scratch copy in the work folder, not %TEMP% (Windows cleans that up
+    # during the run)
+    $tempDir = Join-Path (Get-ScratchFolder) "TimelineSrum_$(Get-Random)"
     $database = $null
     try {
         New-Item -ItemType Directory -Path $tempDir -Force | Out-Null

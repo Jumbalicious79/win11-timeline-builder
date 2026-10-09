@@ -258,13 +258,15 @@ The script creates a timestamped report folder next to the script:
 
 ### Work folder
 
-  A collection zip is extracted, and hives and browser databases are copied
-  for reading, into a work folder that exists only while the builder runs:
+  A collection zip is extracted, and hives, browser databases and SRUM
+  databases are copied for reading, into a work folder that exists only
+  while the builder runs:
 
     %LOCALAPPDATA%\TimelineBuilder\w<PID>_<HHmmss>\
       .lock                          -- held open for the whole run
       in\                            -- the extracted collection zip
-      scratch\                       -- copies for reg load and sqlite3
+      scratch\                       -- copies for reg load, sqlite3 and
+                                        the SRUM reader
 
   It is deleted at the end of every run, also after an error or Ctrl+C. A
   folder left by a run that was killed (window closed, crash) is deleted by
@@ -1054,14 +1056,17 @@ tools. Artifact SRUM:
     (app); Records, FirstRecordUtc, LastRecordUtc, Interfaces (Wi-Fi,
     Ethernet, ...), L2ProfileIds (not resolved to network names), and
     Database=... and Partial=yes when they apply
-  - The database is read from a temp copy; the collection is never
-    changed. A copy of an open database is normally in "dirty shutdown"
-    state: the collected logs are replayed into the copy in the builder's
-    own process ("Database=soft recovery (in-process)"); if that fails,
-    with esentutl /r, then by repairing the copy with esentutl /p
-    ("Database=repair (esentutl /p)"), which can lose the newest records.
-    A damaged page stops the reading of a table; its rows then carry
-    "Partial=yes (read error; later records of this table are missing)"
+  - The database is read from a scratch copy in the work folder (see "Work
+    folder"); the collection is never changed. A transaction log listed in
+    collection_manifest.csv but no longer in the collection is reported
+    ("Transaction log missing: ..."). A copy of an open database is
+    normally in "dirty shutdown" state: the collected logs are replayed
+    into the copy in the builder's own process ("Database=soft recovery
+    (in-process)"); if that fails, with esentutl /r, then by repairing the
+    copy with esentutl /p ("Database=repair (esentutl /p)"), which can lose
+    the newest records. A damaged page stops the reading of a table; its
+    rows then carry "Partial=yes (read error; later records of this table
+    are missing)"
   - Not parsed: the Network Connectivity, energy and push-notification
     tables. SRUM keeps hourly totals per application, not connections: a
     row says how much an app sent and received that day, not where to
@@ -1217,10 +1222,11 @@ Timeline Explorer at the same time.
     with them often hit this warning and Amcache parsing is skipped.
     Re-collect with the current collector to get the logs.
 
-  - "Transaction log missing: ..." -- A hive's .LOG1/.LOG2 file is listed
-    in collection_manifest.csv but is not in the collection any more. The
-    hive is loaded without it, so changes Windows had not yet written into
-    the hive file are missing.
+  - "Transaction log missing: ..." -- A hive's .LOG1/.LOG2 file, or a SRUM
+    database's SRU*.log file, is listed in collection_manifest.csv but is
+    not in the collection any more. The hive or database is read without
+    it, so changes Windows had not yet written into the hive or database
+    file are missing.
 
   - "Completed WITH N MISSING INPUT FILE(S) -- timeline incomplete" (exit
     code 2) -- Input files were deleted while the timeline was being built,
@@ -1594,14 +1600,16 @@ parsing is skipped, and the timeline CSV can be opened manually.
   names shortened, no ".." entry written outside the folder, nothing
   extracted when the zip does not fit), the manifest lookups, the list of
   input files, the free-space and temp-folder checks, the refusal of a
-  network work folder, the clean-up of work folders left by killed runs
-  and the end-of-run banners; it needs no admin. Part 2 runs the builder
-  on a synthetic collection zip dated 2025 with two setupapi logs: both
-  must be parsed, the free space must be checked, the work folder must be
-  outside %TEMP% and removed afterwards, and an input file deleted during
-  the run (by a test hook) must give exit code 2 and the MISSING INPUT
-  FILE(S) banner. Part 2 needs admin like the builder (or -BuilderPath
-  with a copy without the admin check); it changes nothing on the system.
+  network work folder, the clean-up of work folders left by killed runs,
+  the SRUM database copy (made in the work folder; a missing transaction
+  log reported) and the end-of-run banners; it needs no admin. Part 2
+  runs the builder on a synthetic collection zip dated 2025 with two
+  setupapi logs: both must be parsed, the free space must be checked, the
+  work folder must be outside %TEMP% and removed afterwards, and an input
+  file deleted during the run (by a test hook) must give exit code 2 and
+  the MISSING INPUT FILE(S) banner. Part 2 needs admin like the builder
+  (or -BuilderPath with a copy without the admin check); it changes
+  nothing on the system.
 
   Run them from an elevated PowerShell; -AllowSystemChanges lets the event
   log, registry and SRUM tests change this machine:
@@ -1641,12 +1649,12 @@ parsing is skipped, and the timeline CSV can be opened manually.
                        OAlerts and antivirus product logs.
 
   esent.dll            The Windows ESE database engine. Reads the SRUM
-                       database (SRUDB.dat) from a temp copy and replays its
-                       transaction logs into that copy, with event logging
-                       off.
+                       database (SRUDB.dat) from a scratch copy in the work
+                       folder and replays its transaction logs into that
+                       copy, with event logging off.
 
   esentutl.exe         Fallback only: recovery (/r) or repair (/p) of the
-                       temp copy of a SRUM database, when the recovery in
+                       scratch copy of a SRUM database, when the recovery in
                        the builder's process fails or the copy is damaged.
 
   WScript.Shell COM    Reads LNK shortcut files to extract target paths,
@@ -1729,13 +1737,14 @@ Temporary actions (all cleaned up automatically, also after an error or Ctrl+C):
     after processing (a hive a parser left loaded is unloaded at the end)
   - Copies browser DBs into the work folder for sqlite3 -- deleted after
     processing
-  - Copies SRUDB.dat and its logs to %TEMP%\TimelineSrum_<n> for recovery
-    and reading (the copies are made writable) -- deleted after processing
+  - Copies SRUDB.dat and its logs into the work folder
+    (scratch\TimelineSrum_<n>) for recovery and reading (the copies are
+    made writable) -- deleted after processing
   - Downloads zip files to %TEMP% (first run) -- deleted after extraction
 
 Event log entries (not removed):
   - Only when the in-process recovery of a SRUM database fails, or a copy
-    has to be repaired, esentutl.exe runs on the temp copy. It writes
+    has to be repaired, esentutl.exe runs on the scratch copy. It writes
     ESENT events (information, and for a repair also warnings and an
     error) to the Application event log of the machine running the
     builder. If that machine is collected later, its timeline shows them

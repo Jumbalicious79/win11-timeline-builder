@@ -13,8 +13,10 @@
 #   the input-file list of a collection folder and the list of missing
 #   files, the free-space verdict, the temp-folder check (8.3 short paths
 #   too), the end-of-run hive list, the clean-up of work folders left by
-#   earlier runs, the refusal of a network work folder and the end-of-run
-#   banners (missing input files, unexpected errors).
+#   earlier runs, the SRUM database copy (made in the work folder's
+#   scratch folder, a missing transaction log reported), the refusal of a
+#   network work folder and the end-of-run banners (missing input files,
+#   unexpected errors).
 # Part 2 -- builder runs: a synthetic collection zip whose entries are dated
 #   2025, with two setupapi logs (USBSTOR devices) under "/" and "\" entry
 #   names and a manifest, passed as -InputPath (-Sources USB):
@@ -322,6 +324,49 @@ try {
         $held.Close()
         if ($script:runWorkLock) { $script:runWorkLock.Close() }
     }
+
+    # --- SRUM: scratch copy in the work folder, missing transaction log ----
+    # A SRUDB.dat that is not an ESE database is copied and then skipped:
+    # the copy must be made in the work folder's scratch folder (not
+    # %TEMP%) and removed. Its manifest lists a log that is gone.
+    $srumColl = Join-Path $testRoot "srum\Coll"
+    $srumDir = Join-Path $srumColl "Execution\SRUM"
+    New-Item -ItemType Directory -Path $srumDir -Force | Out-Null
+    foreach ($name in @("SRUDB.dat", "SRU.log", "SRUtmp.jrs")) { [System.IO.File]::WriteAllText((Join-Path $srumDir $name), "not an ESE file") }
+    [System.IO.File]::WriteAllText((Join-Path $srumColl "collection_manifest.csv"),
+        (New-TestManifest -RelativePaths @("Execution\SRUM\SRUDB.dat", "Execution\SRUM\SRU.log", "Execution\SRUM\SRU00001.log", "Execution\SRUM\SRUtmp.jrs", "Execution\SRUM\SRUres00001.jrs")))
+    Set-Variable -Name InputPath -Value $srumColl -Scope Script
+    $script:collectionManifest = $null
+    $script:manifestTimes = $null
+    $script:collectionRoot = Get-CollectionRootFolder
+    $script:runScratchDir = Join-Path $testRoot "srum-work\scratch"
+    New-Item -ItemType Directory -Path $script:runScratchDir -Force | Out-Null
+    if (Initialize-SrumReader) {
+        $script:srumCopyDir = ""
+        $script:srumCopyMade = $false
+        $logBefore = @(Get-Content -LiteralPath $logFile).Count
+        # The real Get-SrumWorkingCopy, wrapped to see where it copies to
+        & {
+            $realGetCopy = ${function:Get-SrumWorkingCopy}
+            function Get-SrumWorkingCopy {
+                param([System.IO.FileInfo]$File, [string]$TempDir)
+                $copy = & $realGetCopy -File $File -TempDir $TempDir
+                $script:srumCopyDir = $TempDir
+                $script:srumCopyMade = Test-Path -LiteralPath (Join-Path $TempDir "SRUDB.dat") -PathType Leaf
+                return $copy
+            }
+            Add-SrumTimelineEntries -File (Get-Item -LiteralPath (Join-Path $srumDir "SRUDB.dat"))
+        }
+        $srumLog = @(Get-Content -LiteralPath $logFile | Select-Object -Skip $logBefore)
+        Write-TestResult -Name "SRUM copy made in the work folder's scratch folder" -Passed ($script:srumCopyMade -and
+            $script:srumCopyDir.StartsWith($script:runScratchDir + "\", [System.StringComparison]::OrdinalIgnoreCase)) -Message "copy folder: $($script:srumCopyDir)"
+        Assert-Equal -Name "SRUM copy removed after reading" -Expected $false -Actual (Test-Path -LiteralPath $script:srumCopyDir)
+        $missingLogLines = @($srumLog | Where-Object { $_ -match 'Transaction log missing: ' } | ForEach-Object { $_ -replace '^\[[^\]]+\] ', '' })
+        Assert-Equal -Name "SRUM: only the transaction log listed in the manifest but gone is reported" -Expected (
+            "WARNING:   Transaction log missing: $(Join-Path $srumDir 'SRU00001.log') is in the collection manifest but not here -- the database is read without it (records not yet written to the database are lost)") -Actual ($missingLogLines -join " | ")
+    }
+    else { Write-TestResult -Name "SRUM reader compiles" -Passed $false -Message "Initialize-SrumReader failed" }
+    $script:runScratchDir = $null
 
     # --- A network work folder is refused (reg load needs local hives) -----
     # Only the path is looked at: no network access
