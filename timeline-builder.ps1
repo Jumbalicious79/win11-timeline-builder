@@ -12056,13 +12056,16 @@ function Test-UsbDeviceInstance {
 
 # The setupapi.dev*.log files under -InputPath. A log shortened on
 # extraction to fit the path limit (setupapi.dev.log becomes e.g.
-# setupapi~1A2B3C4D.log) is found by its full-length name.
+# setupapi~1A2B3C4D.log) is found by its full-length name. Like
+# Find-ArtifactFiles, it skips email attachment copies and the Secrets\
+# folder (only the file name is shortened, so the folder still shows).
 function Find-SetupApiLogFiles {
     $files = @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("setupapi.dev*.log") |
         Where-Object { $_.Name -like "setupapi.dev*.log" })
     if ($script:shortenedNames) {
         foreach ($shortPath in @($script:shortenedNames.Keys)) {
-            if ([System.IO.Path]::GetFileName($script:shortenedNames[$shortPath]) -like "setupapi.dev*.log" -and [System.IO.File]::Exists($shortPath)) {
+            if ([System.IO.Path]::GetFileName($script:shortenedNames[$shortPath]) -like "setupapi.dev*.log" -and [System.IO.File]::Exists($shortPath) -and
+                -not (Test-EmailAttachmentCopy (Get-RelativeCollectionPath $shortPath)) -and -not (Test-SecretsPath $shortPath)) {
                 $files += Get-Item -LiteralPath $shortPath
             }
         }
@@ -12074,8 +12077,9 @@ function Find-SetupApiLogFiles {
 # paths): Listed, and Missing = those not among $Found (the files the USB
 # parser found). A missing log was saved by the collector but lost
 # afterwards, and its device installs are not in the timeline. A found log
-# that was shortened on extraction counts by its full-length name. Both
-# are empty without a manifest.
+# that was shortened on extraction counts by its full-length name. Email
+# attachment copies and files in the Secrets\ folder are not listed: the
+# parser never reads them. Both are empty without a manifest.
 function Compare-ManifestSetupApiLogs {
     param([object[]]$Found)
     $result = [PSCustomObject]@{ Listed = @(); Missing = @() }
@@ -12084,7 +12088,10 @@ function Compare-ManifestSetupApiLogs {
     $foundPaths = @($Found | Where-Object { $_ } | ForEach-Object {
             if ($script:shortenedNames -and $script:shortenedNames.ContainsKey($_.FullName)) { $script:shortenedNames[$_.FullName] } else { $_.FullName }
         })
-    $result.Listed = @($manifest.RelativePaths | Where-Object { [System.IO.Path]::GetFileName($_) -like "setupapi.dev*.log" } | Sort-Object)
+    $result.Listed = @($manifest.RelativePaths | Where-Object {
+            [System.IO.Path]::GetFileName($_) -like "setupapi.dev*.log" -and -not (Test-EmailAttachmentCopy $_) -and
+            -not (Test-SecretsPath (Join-Path $manifest.Folder $_))
+        } | Sort-Object)
     $result.Missing = @($result.Listed | Where-Object { $foundPaths -notcontains (Join-Path $manifest.Folder $_) })
     return $result
 }

@@ -12,13 +12,14 @@
 #   when the zip does not fit), the manifest lookups from an outer folder
 #   (also the email parser's), the input-file list of a collection folder
 #   and the list of missing files, the setupapi logs found (also under
-#   names shortened on extraction) and those the manifest lists but that
-#   are gone, the free-space verdict, the temp-folder check (8.3 short
-#   paths and relative paths too), the end-of-run hive list, the clean-up
-#   of work folders left by earlier runs, the SRUM database copy (made in
-#   the work folder's scratch folder, a missing transaction log reported),
-#   the refusal of a network work folder and the end-of-run banners
-#   (missing input files, unexpected errors).
+#   names shortened on extraction; email attachment copies and Secrets\
+#   skipped) and those the manifest lists but that are gone, the
+#   free-space verdict, the temp-folder check (8.3 short paths and
+#   relative paths too), the end-of-run hive list, the clean-up of work
+#   folders left by earlier runs, the SRUM database copy (made in the work
+#   folder's scratch folder, a missing transaction log reported), the
+#   refusal of a network work folder and the end-of-run banners (missing
+#   input files, unexpected errors).
 # Part 2 -- builder runs: a synthetic collection zip whose entries are dated
 #   2025, with two setupapi logs (USBSTOR devices) under "/" and "\" entry
 #   names and a manifest, passed as -InputPath (-Sources USB):
@@ -290,30 +291,44 @@ try {
     # Logs shortened on extraction, named the way Expand-CollectionZip does
     # (the name's start, 8 characters or more, and a hash), are found and
     # count by their full-length names; only a listed log that is gone is
-    # reported
+    # reported. Email attachment copies and the Secrets\ folder are skipped
+    # like Find-ArtifactFiles skips them, also under a shortened name, and
+    # are not counted as listed.
     $usbColl = Join-Path $testRoot "usb\Coll"
     $shortSetupApi = Join-Path $usbColl "USB\setupapi~0123ABCD.log"
     $shortRotated = Join-Path $usbColl "USB\setupapi.dev.2023~4567CDEF.log"
-    New-Item -ItemType Directory -Path (Join-Path $usbColl "USB") -Force | Out-Null
-    foreach ($file in @((Join-Path $usbColl "USB\setupapi.dev.log"), $shortSetupApi, $shortRotated)) { [System.IO.File]::WriteAllText($file, "x") }
+    $attachedLog = Join-Path $usbColl "Email\alice\NewOutlook\Attachments\setupapi.dev.log"
+    $shortAttached = Join-Path $usbColl "Email\alice\NewOutlook\Attachments\setupapi~89ABCDEF.log"
+    $shortSecrets = Join-Path $usbColl "Secrets\setupapi~CDEF0123.log"
+    foreach ($file in @((Join-Path $usbColl "USB\setupapi.dev.log"), $shortSetupApi, $shortRotated, $attachedLog, $shortAttached, $shortSecrets)) {
+        New-Item -ItemType Directory -Path (Split-Path $file -Parent) -Force | Out-Null
+        [System.IO.File]::WriteAllText($file, "x")
+    }
     [System.IO.File]::WriteAllText((Join-Path $usbColl "collection_manifest.csv"),
-        (New-TestManifest -RelativePaths @("USB\setupapi.dev.log", "USB\setupapi.dev.20241201_000000.log", "USB\setupapi.dev.20230601_000000.log", "USB\setupapi.dev.20240101_000000.log", "Registry\SYSTEM")))
+        (New-TestManifest -RelativePaths @("USB\setupapi.dev.log", "USB\setupapi.dev.20241201_000000.log", "USB\setupapi.dev.20230601_000000.log", "USB\setupapi.dev.20240101_000000.log", "Registry\SYSTEM",
+            "Email\alice\NewOutlook\Attachments\setupapi.dev.log", "Email\alice\NewOutlook\Attachments\setupapi.dev.20220101_000000.log", "Secrets\setupapi.dev.20220202_000000.log")))
     Set-Variable -Name InputPath -Value (Split-Path $usbColl -Parent) -Scope Script
     $script:collectionManifest = $null
+    $script:collectionRoot = Get-CollectionRootFolder
+    $script:secretsRoot = $null
     $script:shortenedNames = @{
         $shortSetupApi = (Join-Path $usbColl "USB\setupapi.dev.20241201_000000.log")
         $shortRotated  = (Join-Path $usbColl "USB\setupapi.dev.20230601_000000.log")
+        $shortAttached = (Join-Path $usbColl "Email\alice\NewOutlook\Attachments\setupapi.dev.20220101_000000.log")
+        $shortSecrets  = (Join-Path $usbColl "Secrets\setupapi.dev.20220202_000000.log")
     }
     $foundLogs = @(Find-SetupApiLogFiles)
     $foundNames = [string[]]@($foundLogs | ForEach-Object { $_.Name })
     [Array]::Sort($foundNames, [System.StringComparer]::Ordinal)
     Assert-Equal -Name "SetupAPI logs: found, also under a shortened name, each once" -Expected "setupapi.dev.2023~4567CDEF.log, setupapi.dev.log, setupapi~0123ABCD.log" -Actual ($foundNames -join ", ")
+    Assert-Equal -Name "SetupAPI logs: email attachment copies and Secrets\ skipped, also under a shortened name" -Expected "" -Actual (@($foundLogs | Where-Object { $_.FullName -notlike "$usbColl\USB\*" } | ForEach-Object { $_.FullName }) -join ", ")
     $setupApiCheck = Compare-ManifestSetupApiLogs -Found $foundLogs
-    Assert-Equal -Name "SetupAPI logs: listed in the manifest" -Expected "USB\setupapi.dev.20230601_000000.log, USB\setupapi.dev.20240101_000000.log, USB\setupapi.dev.20241201_000000.log, USB\setupapi.dev.log" -Actual ($setupApiCheck.Listed -join ", ")
+    Assert-Equal -Name "SetupAPI logs: listed in the manifest (not email attachment copies or Secrets\)" -Expected "USB\setupapi.dev.20230601_000000.log, USB\setupapi.dev.20240101_000000.log, USB\setupapi.dev.20241201_000000.log, USB\setupapi.dev.log" -Actual ($setupApiCheck.Listed -join ", ")
     Assert-Equal -Name "SetupAPI logs: only the one that is gone is missing (shortened ones found)" -Expected "USB\setupapi.dev.20240101_000000.log" -Actual ($setupApiCheck.Missing -join ", ")
     $setupApiCheck = Compare-ManifestSetupApiLogs -Found @()
     Assert-Equal -Name "SetupAPI logs: none found, all listed are missing" -Expected 4 -Actual $setupApiCheck.Missing.Count
     $script:shortenedNames = @{}
+    $script:secretsRoot = $null
 
     # --- Free space verdict ----------------------------------------------
     $need = 2GB

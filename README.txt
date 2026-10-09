@@ -1025,9 +1025,10 @@ logs one line about it at the start):
   - A top-level Secrets\ folder with DPAPI credential material (per-user and
     system master keys, Credentials, Vault). No parser ever reads anything
     there: the Secrets\ exclusion is applied at the Find-ArtifactFiles choke
-    point (so all of its callers skip it) and on every other recursive search
+    point (so all of its callers skip it), on every other recursive search
     that walks the whole collection -- the $MFT search, the ScheduledTasks_XML
-    folders, the SRUDB.dat search and the AntiVirus vendor / Defender folders.
+    folders, the SRUDB.dat search and the AntiVirus vendor / Defender folders
+    -- and on the setupapi logs whose names were shortened on extraction.
     A $MFT, Preferences, Task XML, SRUDB.dat or antivirus file left in Secrets\
     is not parsed. Only the collection's own top-level Secrets\ folder (next to
     collection_info.json) is excluded, so a user profile folder named "Secrets"
