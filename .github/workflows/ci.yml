@@ -122,6 +122,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: ./tests/Test-MemoryParser.ps1
 
+      - name: Run ShimCache parser test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-ShimCacheParser.ps1
+
   analyze:
     name: PSScriptAnalyzer
     runs-on: windows-latest

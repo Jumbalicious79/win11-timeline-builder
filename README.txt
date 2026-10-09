@@ -347,10 +347,10 @@ Both timeline.csv and timeline.xlsx contain the same columns:
 
   Timestamp     UTC-normalized datetime (yyyy-MM-dd HH:mm:ss.fff)
   Source        Which artifact produced the entry (e.g., Security.evtx, Prefetch)
-  EventType     Category: Execution, FileAccess, Logon, NetworkConnection,
-                PersistenceChange, AccountChange, ProcessCreation, ServiceChange,
-                ScheduledTaskChange, USBDevice, Installation, SecurityAlert,
-                Snapshot (see below)
+  EventType     Category: Execution, FileAccess, FileLastModified, Logon,
+                NetworkConnection, PersistenceChange, AccountChange,
+                ProcessCreation, ServiceChange, ScheduledTaskChange, USBDevice,
+                Installation, SecurityAlert, Snapshot (see below)
   Description   Human-readable summary of what happened
   User          Account the artifact belongs to, if known (see below)
   Details       Additional context (command line, file path, IP, etc.)
@@ -372,6 +372,9 @@ Both timeline.csv and timeline.xlsx contain the same columns:
     ...): the registry key's last-write time. Values that store a time of
     their own use it (TaskCache, Office TrustRecords and File/Place MRU)
   - BAM: bam_entries.csv, or the collected SYSTEM hive
+  - ShimCache (AppCompatCache): the file's last-modified time stored in
+    each cache entry, not when the program ran (EventType
+    FileLastModified)
   - Browser history, downloads, logins, cookies, form entries and
     permissions: times the browsers store in UTC
   - USN journal and setupapi logs: these are local-time text. They are
@@ -670,7 +673,13 @@ From the SYSTEM hive:
   - BAM/DAM: Background/Desktop Activity Moderator last execution times,
     from bam_entries.csv (current collector) or the collected SYSTEM hive
   - AppCompatCache (ShimCache): programs recorded by the compatibility
-    cache, from the collected SYSTEM hive / appcompat_cache.reg
+    cache, from the collected SYSTEM hive / appcompat_cache.reg (read with
+    -Sources PowerShellHistory, like BAM). The time in an entry is the
+    file's last-modified time, not an execution time, and on Windows 10/11
+    an entry alone does not prove that the program ran: such rows are
+    EventType FileLastModified, "ShimCache entry (file last modified):
+    <path>" (tan in Excel). Entries without a time (e.g. packaged apps)
+    are Snapshot rows at the collection time
 MRU-style entries (TypedPaths, RunMRU, RecentDocs, Open/Save dialogs,
 WordWheelQuery, Remote Desktop MRU) are timed with the registry key's
 last-write time, which is when the most recent entry was added -- older
@@ -1199,6 +1208,8 @@ differences" above for details.
     AccountChange           Red         -- user accounts created/modified
     NetworkConnection       Blue        -- network activity, browser, DNS
     FileAccess              Gray        -- file system activity
+    FileLastModified        Tan         -- file last-modified time (ShimCache),
+                                           not execution
     ServiceChange           Yellow      -- service state changes
     ScheduledTaskChange     Yellow      -- task scheduler changes
     USBDevice               Purple      -- USB device connections
@@ -1635,7 +1646,8 @@ parsing is skipped, and the timeline CSV can be opened manually.
   The scripts below test the event log, browser, registry, $MFT, email,
   SRUM and Defender parsers, the USB parser's mounted devices, the Memory
   parser (where it finds the dump, the dump's capture time and the rows
-  made from Volatility's output), and how the builder handles its input
+  made from Volatility's output), the ShimCache rows of the
+  PowerShellHistory parser, and how the builder handles its input
   (secrets, zip input). CI runs them after Test-Parsers.ps1 in both
   PowerShell versions (GitHub Actions runners are elevated):
 
@@ -1813,6 +1825,17 @@ parsing is skipped, and the timeline CSV can be opened manually.
   file's last write), the counts per plugin in the log, and the warning
   for a plugin without output. Volatility 3 is not run; no admin needed.
 
+  tests\Test-ShimCacheParser.ps1 -- loads the builder's functions and runs
+  the PowerShellHistory parser (which also reads BAM and the ShimCache) on
+  a synthetic collection whose appcompat_cache.reg holds a synthetic
+  Windows 10/11 AppCompatCache value, saved like the collector does (reg
+  query output) and as a regedit export. Entries with a file time must be
+  FileLastModified rows at that time, not Execution; entries without one
+  Snapshot rows at the collection time (a packaged app once, not once per
+  architecture). It also checks that the Excel color map has
+  FileLastModified in tan and that the console color legend lists every
+  EventType of the color map. No admin needed.
+
   Run them from an elevated PowerShell; -AllowSystemChanges lets the event
   log, registry and SRUM tests change this machine:
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers.ps1
@@ -1827,6 +1850,7 @@ parsing is skipped, and the timeline CSV can be opened manually.
     powershell -ExecutionPolicy Bypass -File tests\Test-ZipInput.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-MountedDevices.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-MemoryParser.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-ShimCacheParser.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers.ps1 -AllowSystemChanges
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers2.ps1 -AllowSystemChanges
     powershell -ExecutionPolicy Bypass -File tests\Test-RegistryParsers.ps1 -AllowSystemChanges
