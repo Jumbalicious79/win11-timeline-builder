@@ -1138,10 +1138,12 @@ function ConvertTo-TimelineUserName {
 # The User column pass, after all parsers and before deduplication: each
 # row's User through ConvertTo-TimelineUserName (once per distinct value,
 # compared exactly). A row whose User was a SID that now has a name keeps
-# the SID in Details as UserSID=<sid>, unless Details already has it as a
-# SID field (UserSID=, SID=, ...). Returns Rows (rows changed), SidRows
-# (rows given UserSID=), Transitions (From, To and Rows per changed value,
-# most rows first) and Unresolved (Sid and Rows per SID left as it is).
+# the SID in Details as UserSID=<sid>, unless Details already has a field
+# whose value is that SID (UserSID=, SID=, ModifyingUser=, UserId=, ...;
+# not a path such as Location=HKU\<sid>\...). Returns Rows (rows changed),
+# SidRows (rows given UserSID=), Transitions (From, To and Rows per changed
+# value, most rows first) and Unresolved (Sid and Rows per SID left as it
+# is).
 function Update-TimelineUserColumn {
     param($Entries, [hashtable]$SidNames, [string[]]$MachineNames)
     # Value -> its new form and the SID it is (if it is one)
@@ -1176,7 +1178,7 @@ function Update-TimelineUserColumn {
         $changedRows[$value] = $count + 1
         if ($sid -and $new -cne $sid) {
             $details = [string]$entry.Details
-            if ($details -notmatch ('SID=' + [regex]::Escape($sid) + '(?![\d-])')) {
+            if ($details -notmatch ('=' + [regex]::Escape($sid) + '(?=$|[\s|;,])')) {
                 $entry.Details = if ($details) { "$details | UserSID=$sid" } else { "UserSID=$sid" }
                 $sidRows++
             }

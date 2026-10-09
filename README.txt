@@ -436,8 +436,10 @@ Both timeline.csv and timeline.xlsx contain the same columns:
     computer and host names in the collected SYSTEM hive.
   - A SID gets the account name from the collected SOFTWARE hive's
     ProfileList (the profile folder name) or from bam_entries.csv, and the
-    SID stays in Details as UserSID=<SID>. A SID with no name is left as
-    it is; the log lists such SIDs.
+    SID stays in Details as UserSID=<SID>, unless a Details field already
+    holds it (for example BAM's SID=, the firewall's ModifyingUser= or a
+    scheduled task's UserId=). A SID with no name is left as it is; the
+    log lists such SIDs.
   - The built-in accounts are NT AUTHORITY\SYSTEM (also for SYSTEM,
     LocalSystem and S-1-5-18), NT AUTHORITY\LOCAL SERVICE and NT
     AUTHORITY\NETWORK SERVICE, and Window Manager\DWM-n and Font Driver

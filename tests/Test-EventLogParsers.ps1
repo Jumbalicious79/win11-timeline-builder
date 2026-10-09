@@ -685,6 +685,12 @@ Test-Case -Name "User column pass: rows rewritten once per value, a named SID ke
         @("S-1-5-21-1111-2222-3333-1001", "EventID=1033 | UserSID=S-1-5-21-1111-2222-3333-1001"),
         @("S-1-5-21-1111-2222-3333-1001", "SID=S-1-5-21-1111-2222-3333-1001; Time=last execution (BAM)"),
         @("S-1-5-21-1111-2222-3333-1001", "MemberSID=S-1-5-21-1111-2222-3333-10011"),
+        # The SID as the value of a field that is not named ...SID (firewall
+        # ModifyingUser, scheduled task UserId) is in Details already; inside
+        # a path it is not
+        @("S-1-5-21-1111-2222-3333-1001", "EventID=2052 | RuleName=Open RDP | ModifyingUser=S-1-5-21-1111-2222-3333-1001"),
+        @("S-1-5-21-1111-2222-3333-1001", "Actions=x.exe | UserId=S-1-5-21-1111-2222-3333-1001 | State=Ready"),
+        @("S-1-5-21-1111-2222-3333-1001", "Location=HKU\S-1-5-21-1111-2222-3333-1001\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
         @("S-1-5-18", "ScriptBlock=Get-Date ScriptBlockId={00000000-0000-0000-0000-000000000001}"),
         @("S-1-5-21-1111-2222-3333-1009", "x"),
         @("S-1-5-21-1111-2222-3333-1009", ""),
@@ -707,6 +713,9 @@ Test-Case -Name "User column pass: rows rewritten once per value, a named SID ke
         "alice|EventID=1033 | UserSID=S-1-5-21-1111-2222-3333-1001",
         "alice|SID=S-1-5-21-1111-2222-3333-1001; Time=last execution (BAM)",
         "alice|MemberSID=S-1-5-21-1111-2222-3333-10011 | UserSID=S-1-5-21-1111-2222-3333-1001",
+        "alice|EventID=2052 | RuleName=Open RDP | ModifyingUser=S-1-5-21-1111-2222-3333-1001",
+        "alice|Actions=x.exe | UserId=S-1-5-21-1111-2222-3333-1001 | State=Ready",
+        "alice|Location=HKU\S-1-5-21-1111-2222-3333-1001\SOFTWARE\Microsoft\Windows\CurrentVersion\Run | UserSID=S-1-5-21-1111-2222-3333-1001",
         "NT AUTHORITY\SYSTEM|ScriptBlock=Get-Date ScriptBlockId={00000000-0000-0000-0000-000000000001} | UserSID=S-1-5-18",
         "S-1-5-21-1111-2222-3333-1009|x",
         "S-1-5-21-1111-2222-3333-1009|",
@@ -719,12 +728,12 @@ Test-Case -Name "User column pass: rows rewritten once per value, a named SID ke
     ) -join "`n"
     if ($rowsText -cne $expectedRows) { throw "rows:`n$rowsText" }
     $transitions = (@($result.Transitions | ForEach-Object { "$($_.From) -> $($_.To) x$($_.Rows)" })) -join "; "
-    $expectedTransitions = "S-1-5-21-1111-2222-3333-1001 -> alice x4; TESTHOST\alice -> alice x2; LocalSystem -> NT AUTHORITY\SYSTEM x1; " +
+    $expectedTransitions = "S-1-5-21-1111-2222-3333-1001 -> alice x7; TESTHOST\alice -> alice x2; LocalSystem -> NT AUTHORITY\SYSTEM x1; " +
         "S-1-5-18 -> NT AUTHORITY\SYSTEM x1; testhost\alice -> alice x1"
     if ($transitions -cne $expectedTransitions) { throw "transitions: $transitions" }
     $unresolved = (@($result.Unresolved | ForEach-Object { "$($_.Sid) x$($_.Rows)" })) -join "; "
     if ($unresolved -cne "S-1-5-21-1111-2222-3333-1009 x2; S-1-5-32-544 x1") { throw "unresolved: $unresolved" }
-    if ("$($result.Rows)|$($result.SidRows)" -ne "9|3") { throw "rows changed|given UserSID: $($result.Rows)|$($result.SidRows)" }
+    if ("$($result.Rows)|$($result.SidRows)" -ne "12|4") { throw "rows changed|given UserSID: $($result.Rows)|$($result.SidRows)" }
     if (@($entries | Where-Object { $_.Timestamp -ne "2026-01-05 00:00:00.000" -or $_.Source -ne "Test" }).Count -gt 0) { throw "other columns changed" }
 } -Expected @()
 
