@@ -147,7 +147,9 @@ $script:unexpectedErrorCount = 0  # errors caught by the main body's trap (rest 
 
 # Long form of a path: full, with 8.3 short names expanded (GitHub runners
 # have a %TEMP% like C:\Users\RUNNER~1\...) and no trailing backslash. A
-# path that does not exist is only made full.
+# path that does not exist is only made full. A relative path (e.g. a
+# relative -InputPath) is resolved against the PowerShell location, as the
+# parsers' Get-ChildItem calls do, not the process working directory.
 if (-not ([System.Management.Automation.PSTypeName]'TimelineNative.LongPath').Type) {
     Add-Type -Namespace TimelineNative -Name LongPath -MemberDefinition @'
 [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -159,8 +161,11 @@ function Get-LongPath {
     param([string]$Path)
     if (-not $Path) { return "" }
     $full = $Path
-    try { $full = [System.IO.Path]::GetFullPath($Path) }
-    catch { Write-Verbose "Could not make $Path a full path: $($_.Exception.Message)" }
+    try { $full = [System.IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)) }
+    catch {
+        try { $full = [System.IO.Path]::GetFullPath($Path) }
+        catch { Write-Verbose "Could not make $Path a full path: $($_.Exception.Message)" }
+    }
     $buffer = New-Object System.Text.StringBuilder 1024
     $length = [TimelineNative.LongPath]::GetLongPathName($full, $buffer, [uint32]$buffer.Capacity)
     if ($length -gt 0 -and $length -lt $buffer.Capacity) { $full = $buffer.ToString() }

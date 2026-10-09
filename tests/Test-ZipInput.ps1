@@ -12,11 +12,11 @@
 #   when the zip does not fit), the manifest lookups from an outer folder
 #   (also the email parser's), the input-file list of a collection folder
 #   and the list of missing files, the free-space verdict, the
-#   temp-folder check (8.3 short paths
-#   too), the end-of-run hive list, the clean-up of work folders left by
-#   earlier runs, the SRUM database copy (made in the work folder's
-#   scratch folder, a missing transaction log reported), the refusal of a
-#   network work folder and the end-of-run banners (missing input files,
+#   temp-folder check (8.3 short paths and relative paths too), the
+#   end-of-run hive list, the clean-up of work folders left by earlier
+#   runs, the SRUM database copy (made in the work folder's scratch
+#   folder, a missing transaction log reported), the refusal of a network
+#   work folder and the end-of-run banners (missing input files,
 #   unexpected errors).
 # Part 2 -- builder runs: a synthetic collection zip whose entries are dated
 #   2025, with two setupapi logs (USBSTOR devices) under "/" and "\" entry
@@ -298,6 +298,12 @@ try {
     if ($shortTemp) {
         Write-TestResult -Name "an 8.3 short path of it is too ($shortTemp)" -Passed ([bool](Get-ContainingTempFolder $shortTemp)) -Message "no temp folder found for $shortTemp"
     }
+    # A relative -InputPath is resolved against the PowerShell location (as
+    # the parsers do), not the process working directory
+    Push-Location -LiteralPath $testRoot
+    try { $relativeTemp = Get-ContainingTempFolder "." }
+    finally { Pop-Location }
+    Write-TestResult -Name "a relative path is resolved against the PowerShell location" -Passed ([bool]$relativeTemp) -Message "no temp folder found for '.' in $testRoot (process directory: $([Environment]::CurrentDirectory))"
     $defaultBase = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) "TimelineBuilder"
     Assert-Equal -Name "the default work folder base is not inside a temp folder" -Expected "" -Actual (Get-ContainingTempFolder $defaultBase)
 
