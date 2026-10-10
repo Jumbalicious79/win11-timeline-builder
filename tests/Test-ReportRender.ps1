@@ -15,6 +15,10 @@
 #     (ISO 8601, "/Date(ms)/", the timeline's text, [datetime]) are shown;
 #   - the minimal model (no findings, no workbook) renders the "no leads"
 #     wording and no workbook link;
+#   - the card notes of a lead from during the collection, one seen only in
+#     Snapshot rows then, and one seen only in the memory dump: exactly
+#     "Captured in the memory dump" (with the during-collection note when
+#     the dump shows the process started then);
 #   - a mounted image: an unknown examined computer is "Not known" (the
 #     collector host named only as such, never the title or footer), a
 #     SYSTEM-hive name is the title with its source; an incomplete builder
@@ -272,8 +276,28 @@ try {
     Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath
     $captured = [System.IO.File]::ReadAllText($memoryHtmlPath)
     Write-TestResult -Succeeded ($captured.Contains("Seen only in Snapshot rows from during the collection (the state when it was collected or the memory dump captured): it may have started earlier. Check that it is not the collector or its memory tool") -and
-        -not $captured.Contains("Every row is from during the collection")) -Message "a lead seen only in Snapshot rows from during the collection (the memory dump) says so and to check it is not the collector, instead of 'may be the collector's own activity'"
+        -not $captured.Contains("Every row is from during the collection") -and -not $captured.Contains("Captured in the memory dump")) -Message "a lead seen only in Snapshot rows from during the collection (not all from the memory dump) says so and to check it is not the collector, instead of 'may be the collector's own activity'"
+    # A lead whose rows all come from the memory dump says exactly "Captured
+    # in the memory dump", without the Snapshot note or a collector hint,
+    # even in a model that also sets CapturedDuringCollection
+    $finding.MemoryOnly = $true
+    $finding.MemoryOnlyNote = "Captured in the memory dump"
+    Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath
+    $memoryOnly = [System.IO.File]::ReadAllText($memoryHtmlPath)
+    $memoryCard = $memoryOnly.Substring($memoryOnly.IndexOf('id="finding-F001"'), $memoryOnly.IndexOf('</article>', $memoryOnly.IndexOf('id="finding-F001"')) - $memoryOnly.IndexOf('id="finding-F001"'))
+    $memoryFlags = @([regex]::Matches($memoryCard, '<span class="flag[^"]*">(.*?)</span>') | ForEach-Object { $_.Groups[1].Value })
+    Write-TestResult -Succeeded (($memoryFlags -join "|") -ceq "Captured in the memory dump" -and $memoryCard.Contains('<span class="flag">Captured in the memory dump</span>') -and
+        -not $memoryOnly.Contains("Seen only in Snapshot rows") -and -not $memoryOnly.Contains("its memory tool")) -Message "a memory-only lead's card note is exactly 'Captured in the memory dump', with no Snapshot note or collector hint ($($memoryFlags -join ' | '))"
+    # A process the dump shows started during the collection: both notes
     $finding.CapturedDuringCollection = $false
+    $finding.DuringCollection = $true
+    Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath
+    $memoryStarted = [System.IO.File]::ReadAllText($memoryHtmlPath)
+    $startedFlags = @([regex]::Matches($memoryStarted, '<span class="flag[^"]*">(.*?)</span>') | ForEach-Object { $_.Groups[1].Value })
+    Write-TestResult -Succeeded (($startedFlags -join "|") -ceq "Captured in the memory dump|Every row is from during the collection: this may be the collector&#39;s own activity") -Message "a memory-only lead whose process started during the collection (a creation time in the dump) gets both notes ($($startedFlags -join ' | '))"
+    $finding.DuringCollection = $false
+    $finding.MemoryOnly = $false
+    $finding.MemoryOnlyNote = ""
 
     # --- Hostile and edge values: bidi controls, a long unbroken title, more
     # evidence than a card prints, a lead dated by file times, a folded lead,

@@ -1185,8 +1185,10 @@ function Add-TimelineReportWorkbookSheets {
         if ($finding.Escalated) { $summary += "; severity raised by $($finding.EscalationCount) related row(s)" }
         if ($rowNumbers.Count -gt $evidence.Count) { $summary += "; the first $($evidence.Count) of $($rowNumbers.Count) rows are listed (filter the Finding column of the Timeline sheet for all)" }
         if ($finding.AllowlistedCount) { $summary += "; $($finding.AllowlistedCount) allowlisted row(s) not counted" }
+        # Every row from the memory dump: the engine's note, "Captured in the memory dump"
+        if ($finding.MemoryOnly) { $summary += "; $($finding.MemoryOnlyNote)" }
         if ($finding.DuringCollection) { $summary += "; all rows are from during the collection (possibly the collector itself)" }
-        elseif ($finding.CapturedDuringCollection) { $summary += "; seen only in Snapshot rows from during the collection (the state then, e.g. the memory dump; check it is not the collector)" }
+        elseif ($finding.CapturedDuringCollection) { $summary += "; seen only in Snapshot rows from during the collection (the state when it was collected or the memory dump captured; it may have started earlier: check it is not the collector or its memory tool)" }
         if ($finding.TimesAuthorSupplied) { $summary += "; dated only by a task's author-supplied registration date (can be old or forged)" }
 
         # Summary row: the whole row in the severity color, linked to the first row

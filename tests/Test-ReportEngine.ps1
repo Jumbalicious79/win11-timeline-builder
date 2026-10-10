@@ -9,6 +9,10 @@
 #     (per rule and "*", duringCollection), disabled rules, numbering and
 #     ordering, evidence caps and Excel row numbers, maxFindings roll-ups,
 #     activityTime, and the stop of a rule whose pattern keeps timing out;
+#   - leads from during the collection: DuringCollection (event times),
+#     CapturedDuringCollection (Snapshot rows) and MemoryOnly (every row
+#     from the memory dump: "Captured in the memory dump" in MemoryOnlyNote,
+#     findings.csv and report-model.json, with its rows' numbers);
 #   - invalid rules files fail with an error that names the rule and field;
 #   - {{list:...}} is expanded in the C# helper (a synthetic list of
 #     harmless words, used several times) and fails closed: a blocked call,
@@ -339,23 +343,50 @@ try {
     Assert-Equal "$(@($topLeads | ForEach-Object { $_.RuleId }) -join ',')|$(@($topModel.TopFindings | ForEach-Object { $ruleOfId[$_] }) -join ',')|$(Format-TestUtc $topModel.LeadSpan.FirstUtc)" "FILETIME,ACTIVITY|ACTIVITY,FILETIME|2026-01-01 00:00:00" -Message "numbering keeps time order, but the top leads and the lead window put a lead dated by an old file time after one dated by activity"
 
     # DuringCollection is about event times: a lead seen only in Snapshot rows
-    # from during the collection (a process in the memory dump, whose time is
-    # the capture time) is CapturedDuringCollection instead; one with an
-    # event row (Prefetch) from during the collection is DuringCollection
+    # from during the collection (a task listed then) is
+    # CapturedDuringCollection instead; one with an event row (Prefetch) from
+    # during the collection is DuringCollection. A lead whose rows all come
+    # from the memory dump (Memory-* sources, whatever their event type) is
+    # MemoryOnly, "Captured in the memory dump", and never
+    # CapturedDuringCollection; a process creation time in the dump after
+    # the collection start still makes it DuringCollection
     $snapRulesPath = Join-Path $workDir "snapshot-rules.json"
-    New-TestTextFile $snapRulesPath '{ "schemaVersion": 1, "rules": [ { "id": "SNAP", "title": "Seen: {{group}}", "category": "Execution", "severity": "High", "match": { "description": "^(?:Process command line|Prefetch execution): (?<key>[^\\s(]+)" }, "groupBy": "capture", "why": "w" } ] }'
+    New-TestTextFile $snapRulesPath '{ "schemaVersion": 1, "rules": [ { "id": "SNAP", "title": "Seen: {{group}}", "category": "Execution", "severity": "High", "match": { "description": "^(?:Process command line|Process in memory|Prefetch execution|Listed task): (?<key>[^\\s(]+)" }, "groupBy": "capture", "why": "w" } ] }'
     $snapRows = @(
         @{ Timestamp = "2026-05-15 07:00:00.000"; Source = "Prefetch"; EventType = "Execution"; Description = "Prefetch execution: before.exe"; User = ""; Details = "" },
         @{ Timestamp = "2026-05-14 09:00:00.000"; Source = "Memory-CommandLine"; EventType = "Snapshot"; Description = "Process command line: olddump.exe (PID: 9)"; User = ""; Details = "Args=olddump.exe" },
         @{ Timestamp = "2026-05-15 08:59:00.000"; Source = "Prefetch"; EventType = "Execution"; Description = "Prefetch execution: mixed.exe"; User = ""; Details = "" },
+        @{ Timestamp = "2026-05-15 08:59:30.000"; Source = "Memory-Processes"; EventType = "ProcessCreation"; Description = "Process in memory: memstart.exe (PID: 5, PPID: 4)"; User = ""; Details = "Threads=1 SessionId=1" },
         @{ Timestamp = "2026-05-15 09:00:00.000"; Source = "Memory-CommandLine"; EventType = "Snapshot"; Description = "Process command line: memonly.exe (PID: 1)"; User = ""; Details = "Args=memonly.exe -x" },
         @{ Timestamp = "2026-05-15 09:00:00.000"; Source = "Memory-CommandLine"; EventType = "Snapshot"; Description = "Process command line: mixed.exe (PID: 2)"; User = ""; Details = "Args=mixed.exe" },
-        @{ Timestamp = "2026-05-15 09:00:00.000"; Source = "Memory-CommandLine"; EventType = "Snapshot"; Description = "Process command line: before.exe (PID: 3)"; User = ""; Details = "Args=before.exe" })
+        @{ Timestamp = "2026-05-15 09:00:00.000"; Source = "Memory-CommandLine"; EventType = "Snapshot"; Description = "Process command line: before.exe (PID: 3)"; User = ""; Details = "Args=before.exe" },
+        @{ Timestamp = "2026-05-15 09:00:00.000"; Source = "Memory-CommandLine"; EventType = "Snapshot"; Description = "Process command line: memstart.exe (PID: 5)"; User = ""; Details = "Args=memstart.exe" },
+        @{ Timestamp = "2026-05-15 09:00:00.000"; Source = "Memory-CommandLine"; EventType = "Snapshot"; Description = "Process command line: memmix.exe (PID: 6)"; User = ""; Details = "Args=memmix.exe" },
+        @{ Timestamp = "2026-05-15 09:00:00.000"; Source = "ScheduledTasks"; EventType = "Snapshot"; Description = "Listed task: memmix.exe"; User = ""; Details = "" },
+        @{ Timestamp = "2026-05-15 09:00:00.000"; Source = "ScheduledTasks"; EventType = "Snapshot"; Description = "Listed task: tasksnap.exe"; User = ""; Details = "" })
     $snapInfo = [PSCustomObject]@{ Mode = "Live"; ComputerName = "WS01"; CollectionStartUtc = "2026-05-15T08:58:00Z" }
     $snapLeads = @(Invoke-ReportRules -Rows $snapRows -Rules (Import-ReportRules -Path $snapRulesPath) -CollectionInfo $snapInfo)
-    Assert-Equal (@($snapLeads | Sort-Object GroupKey | ForEach-Object { "$($_.GroupKey)=$($_.DuringCollection)/$($_.CapturedDuringCollection)" }) -join ",") "before.exe=False/False,memonly.exe=False/True,mixed.exe=True/False,olddump.exe=False/False" -Message "DuringCollection only from event rows: a memory-only lead from during the collection is CapturedDuringCollection; one with a Prefetch row then is DuringCollection; earlier rows, or a dump captured before the collection, are neither"
+    Assert-Equal (@($snapLeads | Sort-Object GroupKey | ForEach-Object { "$($_.GroupKey)=$($_.DuringCollection)/$($_.CapturedDuringCollection)/$($_.MemoryOnly)" }) -join ",") "before.exe=False/False/False,memmix.exe=False/True/False,memonly.exe=False/False/True,memstart.exe=True/False/True,mixed.exe=True/False/False,olddump.exe=False/False/True,tasksnap.exe=False/True/False" -Message "Snapshot and memory leads (DuringCollection/CapturedDuringCollection/MemoryOnly): every row from the memory dump is MemoryOnly and never CapturedDuringCollection, also when captured before the collection; a process start in the dump after the collection start is still DuringCollection; a task listed during the collection, alone or with a memory row, is CapturedDuringCollection; a Prefetch row then is DuringCollection"
+    Assert-Equal (@($snapLeads | Sort-Object GroupKey | ForEach-Object { "$($_.GroupKey)=[$($_.MemoryOnlyNote)]" }) -join ",") "before.exe=[],memmix.exe=[],memonly.exe=[Captured in the memory dump],memstart.exe=[Captured in the memory dump],mixed.exe=[],olddump.exe=[Captured in the memory dump],tasksnap.exe=[]" -Message "MemoryOnlyNote is exactly 'Captured in the memory dump' for a memory-only lead and empty otherwise"
     $snapModel = New-ReportModel -Rows $snapRows -Findings $snapLeads -CollectionInfo $snapInfo
-    Assert-Equal "$(Format-TestUtc $snapModel.LeadSpan.FirstUtc)|$(Format-TestUtc $snapModel.LeadSpan.LastUtc)|$($snapModel.LeadSpan.FileTimeLeads)" "2026-05-14 09:00:00|2026-05-15 09:00:00|0" -Message "Snapshot leads stay in the flagged-activity window (only their card note changes)"
+    Assert-Equal "$(Format-TestUtc $snapModel.LeadSpan.FirstUtc)|$(Format-TestUtc $snapModel.LeadSpan.LastUtc)|$($snapModel.LeadSpan.FileTimeLeads)|$($snapModel.Counts.High)" "2026-05-14 09:00:00|2026-05-15 09:00:00|0|7" -Message "Snapshot and memory-only leads stay High leads in the flagged-activity window (only their card note changes)"
+    # findings.csv's summary line and report-model.json carry the note
+    $snapCsv = Join-Path $workDir "snapshot-findings.csv"
+    Export-ReportFindingsCsv -Findings $snapLeads -Path $snapCsv
+    $snapLines = @(Import-Csv -LiteralPath $snapCsv)
+    $snapSummaries = @{}
+    foreach ($line in @($snapLines | Where-Object { -not $_.RowNumber })) { $snapSummaries[$line.Title] = $line.Description }
+    Write-TestResult -Succeeded ($snapSummaries["Seen: memonly.exe"].EndsWith("; group: memonly.exe; Captured in the memory dump") -and $snapSummaries["Seen: memstart.exe"].EndsWith("; Captured in the memory dump") -and
+        -not $snapSummaries["Seen: mixed.exe"].Contains("memory dump") -and -not $snapSummaries["Seen: memmix.exe"].Contains("memory dump")) -Message "findings.csv: a memory-only lead's summary line ends with 'Captured in the memory dump', a mixed lead's does not ($($snapSummaries['Seen: memonly.exe']))"
+    # The memory-only lead's evidence lines point at its Memory-* rows
+    $memstartLead = @($snapLeads | Where-Object { $_.MemoryOnly -and $_.GroupKey -eq "memstart.exe" })
+    $memstartEvidence = @($snapLines | Where-Object { $memstartLead.Count -eq 1 -and $_.FindingId -eq $memstartLead[0].Id -and $_.RowNumber })
+    Assert-Equal "$(@($memstartEvidence | ForEach-Object { "$($_.RowNumber)=$($_.Source)" }) -join ',')|$(@($memstartLead | ForEach-Object { $_.RowNumbers }) -join ',')" "5=Memory-Processes,9=Memory-CommandLine|5,9" -Message "findings.csv: the memory-only lead's evidence lines have the row numbers of its Memory-* rows (Excel rows, as its RowNumbers)"
+    Export-ReportModelJson -Model $snapModel -Path (Join-Path $workDir "snapshot-model.json")
+    $snapJson = Get-Content -LiteralPath (Join-Path $workDir "snapshot-model.json") -Raw | ConvertFrom-Json
+    $memonlyJson = @($snapJson.Findings | Where-Object { $_.GroupKey -eq "memonly.exe" })[0]
+    $mixedJson = @($snapJson.Findings | Where-Object { $_.GroupKey -eq "mixed.exe" })[0]
+    Assert-Equal "$($memonlyJson.MemoryOnly)|$($memonlyJson.MemoryOnlyNote)|$($memonlyJson.CapturedDuringCollection)|$($mixedJson.MemoryOnly)|$($mixedJson.MemoryOnlyNote)" "True|Captured in the memory dump|False|False|" -Message "report-model.json: MemoryOnly and MemoryOnlyNote on every finding"
 
     # A task's author-supplied registration date (task XML, can be forged)
     # does not date a lead that has a time Windows recorded; a lead with

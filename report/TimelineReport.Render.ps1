@@ -806,10 +806,16 @@ function Add-ReportHtmlFinding {
     if ($allowlisted -gt 0) {
         $flags.Add('<span class="flag">' + (Format-ReportHtmlCount -Value $allowlisted -Singular "more matching row was" -Plural "more matching rows were") + ' set aside by the allowlist as known benign</span>')
     }
+    # Every row is from the memory dump (Memory-* sources): said as just that.
+    # A process start the dump records during the collection still gets the
+    # next note; the Snapshot-only note is for leads with other sources
+    if ([bool](Get-ReportHtmlField $Finding "MemoryOnly")) {
+        $flags.Add('<span class="flag">Captured in the memory dump</span>')
+    }
     if ([bool](Get-ReportHtmlField $Finding "DuringCollection")) {
         $flags.Add('<span class="flag">Every row is from during the collection: this may be the collector&#39;s own activity</span>')
     }
-    elseif ([bool](Get-ReportHtmlField $Finding "CapturedDuringCollection")) {
+    elseif ([bool](Get-ReportHtmlField $Finding "CapturedDuringCollection") -and -not [bool](Get-ReportHtmlField $Finding "MemoryOnly")) {
         $flags.Add('<span class="flag">Seen only in Snapshot rows from during the collection (the state when it was collected or the memory dump captured): it may have started earlier. Check that it is not the collector or its memory tool</span>')
     }
     $folded = ConvertTo-ReportHtmlNumber (Get-ReportHtmlField $Finding "FoldedGroups")

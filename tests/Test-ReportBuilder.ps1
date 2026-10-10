@@ -12,6 +12,15 @@
 #      and one Finding column, the same findings, no administrator rights
 #      needed, no error output -- Windows PowerShell printed a Test-Path
 #      binding error for the empty -InputPath);
+#   a copy of the builder (in this test's folder) whose Find-VolatilityExe
+#      gives a stub with canned Volatility 3 output, run with -MemoryDumpPath
+#      on a synthetic dump header: the lead seen only in the memory dump says
+#      "Captured in the memory dump" (report-model.json MemoryOnly,
+#      findings.csv, the card, the Findings sheet) and the card's row
+#      numbers, findings.csv's RowNumber, the Findings sheet's links and the
+#      Finding column all point at its Memory-CommandLine row, also after a
+#      -ReportOnly that updates the workbook; a lead that also has a BAM row
+#      is not memory-only;
 #   -ReportOnly -ReportRules <file> -NoExcel uses another rules file and
 #      leaves the workbook alone (and says its findings are from an earlier
 #      report); -WorkDir and -MemoryDumpPath are ignored with one warning;
@@ -123,13 +132,14 @@ function Read-TestWorkbook {
                 $linkText = ""
                 if ($link) { $linkText = [string]$link.ReferenceAddress }
                 $findingsRows.Add([PSCustomObject]@{
-                    Finding  = $values[0]
-                    Severity = $values[1]
-                    RowType  = $values[2]
-                    Row      = $values[3]
-                    Link     = $linkText
-                    Time     = $values[4]
-                    Rule     = $values[11]
+                    Finding     = $values[0]
+                    Severity    = $values[1]
+                    RowType     = $values[2]
+                    Row         = $values[3]
+                    Link        = $linkText
+                    Time        = $values[4]
+                    Description = $values[6]
+                    Rule        = $values[11]
                 })
             }
         }
@@ -140,7 +150,7 @@ function Read-TestWorkbook {
             $timestamp = [string]$timeline.Cells[$r, 1].Value
             $tag = ""
             if ($findingColumn -gt 0) { $tag = [string]$timeline.Cells[$r, $findingColumn].Value }
-            [PSCustomObject]@{ Row = $r; Timestamp = $timestamp; Finding = $tag }
+            [PSCustomObject]@{ Row = $r; Timestamp = $timestamp; Source = [string]$timeline.Cells[$r, 2].Value; Finding = $tag }
         })
         return [PSCustomObject]@{
             Sheets           = $sheets
@@ -151,6 +161,70 @@ function Read-TestWorkbook {
         }
     }
     finally { Close-ExcelPackage $package -NoSave }
+}
+
+# Checks the lead seen only in the memory dump of the memory run (section
+# 2b) in a run folder: "Captured in the memory dump" in report-model.json
+# (MemoryOnly), findings.csv, the card and the Findings sheet, and every
+# pointer to its rows -- RowNumbers, findings.csv's RowNumber, the card's
+# row numbers, the Findings sheet's links and the Finding column -- on its
+# Memory-CommandLine row of the timeline. The lead that also has a BAM row
+# is not memory-only.
+function Test-MemoryOnlyLead {
+    param([string]$Folder, [string]$Label)
+    $note = "Captured in the memory dump"
+    $rows = @(Import-Csv -LiteralPath (Join-Path $Folder "timeline.csv"))
+    $memoryModel = Get-Content -LiteralPath (Join-Path $Folder "report-model.json") -Raw | ConvertFrom-Json
+    $memoryLeads = @($memoryModel.Findings | Where-Object { $_.MemoryOnly })
+    $lead = @($memoryLeads | Where-Object { $_.RuleId -eq "EXEC-STAGING" -and $_.GroupKey -eq "fixture-stage.exe" })
+    $mixed = @($memoryModel.Findings | Where-Object { $_.RuleId -eq "EXEC-STAGING" -and $_.GroupKey -eq "fixture-invoice.exe" })
+    Write-TestResult -Succeeded ($memoryLeads.Count -eq 1 -and $lead.Count -eq 1 -and $lead[0].MemoryOnlyNote -ceq $note -and -not $lead[0].CapturedDuringCollection -and $lead[0].Severity -eq "Medium" -and
+        $mixed.Count -eq 1 -and $mixed[0].PSObject.Properties["MemoryOnly"] -and -not $mixed[0].MemoryOnly -and -not $mixed[0].MemoryOnlyNote) -Message "${Label}: report-model.json marks the lead seen only in the memory dump MemoryOnly ('$note', still a Medium lead, not CapturedDuringCollection), and not the lead that also has a BAM row"
+    $id = "(no memory-only lead)"
+    if ($lead.Count -eq 1) { $id = [string]$lead[0].Id }
+    $memoryRows = (@(for ($i = 0; $i -lt $rows.Count; $i++) { if ($rows[$i].Source -eq "Memory-CommandLine" -and $rows[$i].Description -like "Process command line: fixture-stage.exe *") { $i + 2 } }) -join ",")
+    Write-TestResult -Succeeded ($memoryRows -match '^\d+$' -and (@($lead | ForEach-Object { $_.RowNumbers }) -join ",") -eq $memoryRows) -Message "${Label}: ${id}'s RowNumbers are its Memory-CommandLine row of the timeline ($memoryRows)"
+
+    # findings.csv: the note on the summary line, the row on the evidence line
+    $lines = @(Import-Csv -LiteralPath (Join-Path $Folder "findings.csv") | Where-Object { $_.FindingId -eq $id })
+    $summaryLine = @($lines | Where-Object { -not $_.RowNumber })
+    $evidenceLines = @($lines | Where-Object { $_.RowNumber })
+    Write-TestResult -Succeeded ($summaryLine.Count -eq 1 -and $summaryLine[0].Description.EndsWith("; $note") -and (@($evidenceLines | ForEach-Object { $_.RowNumber }) -join ",") -eq $memoryRows -and
+        @($evidenceLines | Where-Object { $_.Source -ne "Memory-CommandLine" }).Count -eq 0) -Message "${Label}: findings.csv ends ${id}'s summary line with '$note' and gives its evidence line RowNumber $memoryRows"
+
+    # report.html (printed to report.pdf): the card's note and row numbers
+    $html = [System.IO.File]::ReadAllText((Join-Path $Folder "report.html"))
+    $cardStart = $html.IndexOf('id="finding-' + $id + '"')
+    $card = ""
+    if ($cardStart -ge 0) { $card = $html.Substring($cardStart, $html.IndexOf('</article>', $cardStart) - $cardStart) }
+    $cardRows = @([regex]::Matches($card, '<td class="num mono">(\d+)</td>') | ForEach-Object { $_.Groups[1].Value }) -join ","
+    $cardFlags = @([regex]::Matches($card, '<span class="flag[^"]*">(.*?)</span>') | ForEach-Object { $_.Groups[1].Value })
+    Write-TestResult -Succeeded (($cardFlags -join "|") -ceq $note -and $cardRows -eq $memoryRows) -Message "${Label}: ${id}'s card says exactly '$note' and lists row $memoryRows ($($cardFlags -join ' | '); rows $cardRows)"
+
+    # The workbook: the card's Excel pointer, the Findings sheet's rows and
+    # links, the Finding column
+    $xlsx = Join-Path $Folder "timeline.xlsx"
+    if (-not (Test-Path -LiteralPath $xlsx)) {
+        Write-Host "SKIP: ${Label}: timeline.xlsx was not created (ImportExcel missing and not installable here); workbook checks skipped" -ForegroundColor Yellow
+        return
+    }
+    $book = Read-TestWorkbook -Path $xlsx
+    if (-not $book) {
+        Write-Host "SKIP: ${Label}: ImportExcel cannot be loaded in this PowerShell; workbook checks skipped" -ForegroundColor Yellow
+        return
+    }
+    Write-TestResult -Succeeded ($memoryModel.Workbook.Available -and $card.Contains('href="./timeline.xlsx"') -and $card.Contains("filter the &quot;Finding&quot; column of the &quot;Timeline&quot; sheet for $id.")) -Message "${Label}: ${id}'s card points at the workbook and at its id in the Finding column"
+    $sheetRows = @($book.FindingsRows | Where-Object { $_.Finding -eq $id })
+    $sheetSummary = @($sheetRows | Where-Object { $_.RowType -eq "Summary" })
+    $sheetEvidence = @($sheetRows | Where-Object { $_.RowType -ne "Summary" })
+    $badLinks = @($sheetRows | Where-Object {
+        $target = $book.TimelineRows | Where-Object Row -eq ([int]$_.Row)
+        $_.Link -ne "'Timeline'!A$($_.Row)" -or -not $target -or $target.Timestamp -ne $_.Time -or $target.Source -ne "Memory-CommandLine"
+    })
+    Write-TestResult -Succeeded ($sheetSummary.Count -eq 1 -and $sheetSummary[0].Description.EndsWith("; $note") -and (@($sheetEvidence | ForEach-Object { $_.Row }) -join ",") -eq $memoryRows -and
+        $badLinks.Count -eq 0) -Message "${Label}: the Findings sheet ends ${id}'s summary row with '$note', and its rows link to Timeline row $memoryRows ($($sheetRows.Count) rows, $($badLinks.Count) wrong links)"
+    $tagged = @($book.TimelineRows | Where-Object { @($_.Finding -split ', ') -contains $id } | ForEach-Object { $_.Row }) -join ","
+    Write-TestResult -Succeeded ($tagged -eq $memoryRows) -Message "${Label}: the Timeline sheet's Finding column tags $id on row $memoryRows only ($tagged)"
 }
 
 # Report folders the builder writes under its own reports\ (for its log)
@@ -318,6 +392,71 @@ try {
         Write-TestResult -Succeeded ($rebuiltModel.Workbook.Available -and $rebuiltWorkbook.Sheets[0] -eq "Findings" -and @($rebuiltWorkbook.Sheets | Where-Object { $_ -eq "Findings" }).Count -eq 1 -and
             @($rebuiltWorkbook.Headers | Where-Object { $_ -eq "Finding" }).Count -eq 1) -Message "-ReportOnly replaces the Findings sheet and the Finding column (no duplicates)"
         Write-TestResult -Succeeded ((@($rebuiltWorkbook.TimelineRows | ForEach-Object { $_.Finding }) -join "|") -eq ($firstFindingColumn -join "|")) -Message "-ReportOnly writes the same Finding column"
+    }
+
+    # --- 2b. A lead seen only in the memory dump: a copy of the builder (with
+    # report\ beside it, in this test's folder) whose Find-VolatilityExe gives
+    # a stub that prints canned Volatility 3 output, run with -MemoryDumpPath
+    # on a synthetic x64 crash dump header captured during the collection.
+    # fixture-stage.exe runs from C:\Users\Public only in the dump (a
+    # memory-only EXEC-STAGING lead); fixture-invoice.exe is also in the
+    # BAM rows (a mixed lead). Then -ReportOnly updates the workbook ---
+    $memBuilderDir = Join-Path $workDir "memory-builder"
+    $volDir = Join-Path $memBuilderDir "vol"
+    New-Item -ItemType Directory -Path $volDir | Out-Null
+    Copy-Item -LiteralPath (Join-Path $builderDir "report") -Destination (Join-Path $memBuilderDir "report") -Recurse
+    $volStub = Join-Path $volDir "vol-canned.cmd"
+    [System.IO.File]::WriteAllText($volStub, "@echo off`r`nif not exist `"%~dp0%5.json`" (`r`n  echo No output for %5 1>&2`r`n  exit /b 1`r`n)`r`ntype `"%~dp0%5.json`"`r`n")
+    $cannedOutput = @{
+        "windows.pslist"  = '[ { "PID": 4321, "PPID": 3000, "ImageFileName": "fixture-stage.", "CreateTime": "2026-03-02T11:30:00+00:00", "Threads": 3, "SessionId": 1, "__children": [] } ]'
+        "windows.netscan" = '[ { "Proto": "TCPv4", "LocalAddr": "10.0.0.5", "LocalPort": 49700, "ForeignAddr": "203.0.113.7", "ForeignPort": 443, "State": "ESTABLISHED", "PID": 4321, "Owner": "fixture-stage.", "Created": "2026-03-02T11:31:00+00:00", "__children": [] } ]'
+        "windows.cmdline" = '[ { "PID": 4321, "Process": "fixture-stage.exe", "Args": "\"C:\\Users\\Public\\fixture-stage.exe\" -connect 203.0.113.7", "__children": [] }, { "PID": 4400, "Process": "fixture-invoice.exe", "Args": "C:\\Users\\alice\\Downloads\\fixture-invoice.exe /quiet", "__children": [] } ]'
+        "windows.svcscan" = '[ { "PID": 900, "Start": "SERVICE_AUTO_START", "State": "SERVICE_RUNNING", "Name": "Dhcp", "Display": "DHCP Client", "Binary": "C:\\Windows\\system32\\svchost.exe -k LocalServiceNetworkRestricted -p", "__children": [] } ]'
+    }
+    foreach ($plugin in $cannedOutput.Keys) { [System.IO.File]::WriteAllText((Join-Path $volDir "$plugin.json"), $cannedOutput[$plugin]) }
+    # The collection started at 12:00 UTC; the dump was captured at 12:03
+    $dumpPath = Join-Path $workDir "memory.dmp"
+    $dumpBytes = New-Object byte[] 0x2000
+    [Array]::Copy([System.Text.Encoding]::ASCII.GetBytes("PAGEDU64"), 0, $dumpBytes, 0, 8)
+    [Array]::Copy([BitConverter]::GetBytes([uint32]0x8664), 0, $dumpBytes, 0x30, 4)
+    $captureUtc = [datetime]::new(2026, 3, 2, 12, 3, 0, [System.DateTimeKind]::Utc)
+    [Array]::Copy([BitConverter]::GetBytes([long]$captureUtc.ToFileTimeUtc()), 0, $dumpBytes, 0xFA8, 8)
+    [System.IO.File]::WriteAllBytes($dumpPath, $dumpBytes)
+    [System.IO.File]::SetLastWriteTimeUtc($dumpPath, $captureUtc.AddMinutes(2))
+    $volAnchor = "function Find-VolatilityExe {"
+    $memBuilderText = [System.IO.File]::ReadAllText($builder)
+    $volAnchorFound = $memBuilderText.IndexOf($volAnchor) -ge 0 -and $memBuilderText.IndexOf($volAnchor) -eq $memBuilderText.LastIndexOf($volAnchor)
+    # Preconditions of the memory checks print only when they fail
+    if (-not $volAnchorFound) { Write-TestResult -Succeeded $false -Message "the builder has no single Find-VolatilityExe to stub for the memory run" }
+    else {
+        $memBuilder = Join-Path $memBuilderDir "timeline-builder.ps1"
+        [System.IO.File]::WriteAllText($memBuilder, $memBuilderText.Replace($volAnchor, "$volAnchor`r`n    return '" + $volStub.Replace("'", "''") + "'"))
+        $memRunDir = Join-Path $workDir "memory-run"
+        New-Item -ItemType Directory -Path $memRunDir | Out-Null
+        $savedBuilder = $builder
+        try {
+            $builder = $memBuilder
+            Write-Host "Running the builder copy with the memory dump ..."
+            $memRun = Invoke-TimelineBuilder -Arguments @("-InputPath", $collection, "-Sources", "Persistence,PowerShellHistory,Memory", "-MemoryDumpPath", $dumpPath,
+                "-OutputFile", (Join-Path $memRunDir "timeline.csv"), "-Viewer", "None")
+        }
+        finally { $builder = $savedBuilder }
+        $memRows = @()
+        if (Test-Path -LiteralPath (Join-Path $memRunDir "timeline.csv")) { $memRows = @(Import-Csv -LiteralPath (Join-Path $memRunDir "timeline.csv")) }
+        $memWarnings = @($memRun.Output | Where-Object { $_ -match 'WARNING:' -and $_ -match 'produced no output|failed|Volatility|memory|report|finding|rule|workbook|PDF' -and -not ($_ -match 'PDF not created' -and -not $edge) })
+        if ($memRun.ExitCode -ne 0 -or @($memRows | Where-Object { $_.Source -eq "Memory-CommandLine" }).Count -ne 2 -or $memWarnings.Count -gt 0) {
+            Write-TestResult -Succeeded $false -Message "the memory run did not exit with 0 and add the dump's rows without a memory or report warning (exit code $($memRun.ExitCode)) $($memWarnings -join ' / ')"
+            $memRun.Output | Select-Object -Last 30 | ForEach-Object { Write-Host "  | $_" }
+        }
+        Test-MemoryOnlyLead -Folder $memRunDir -Label "memory run"
+        # -ReportOnly (the builder under test) updates the workbook: the same note and pointers
+        $memRebuild = Invoke-TimelineBuilder -Arguments @("-ReportOnly", $memRunDir, "-Viewer", "None")
+        $workbookUpdated = (-not (Test-Path -LiteralPath (Join-Path $memRunDir "timeline.xlsx"))) -or @($memRebuild.Output | Where-Object { $_ -match 'Workbook updated: Findings sheet and Finding column' }).Count -eq 1
+        if ($memRebuild.ExitCode -ne 0 -or $memRebuild.Errors.Count -gt 0 -or -not $workbookUpdated) {
+            Write-TestResult -Succeeded $false -Message "-ReportOnly on the memory run did not exit with 0 and update its workbook (exit code $($memRebuild.ExitCode)) $($memRebuild.Errors -join ' / ')"
+            $memRebuild.Output | Select-Object -Last 30 | ForEach-Object { Write-Host "  | $_" }
+        }
+        Test-MemoryOnlyLead -Folder $memRunDir -Label "memory run, -ReportOnly"
     }
 
     # --- 3. -ReportOnly with another rules file, workbook left alone ---

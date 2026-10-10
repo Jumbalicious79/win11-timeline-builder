@@ -94,6 +94,8 @@ namespace TimelineReport
         // Every row is a Snapshot row (state when the evidence was collected or
         // a memory dump captured): its time is when it was seen, not an event
         public bool SnapshotOnly;
+        // Every row comes from the memory dump (a Memory-* source)
+        public bool MemoryOnly;
         // The only times are dates a task's author wrote (Engine.Summarize)
         public bool AuthorTimesOnly;
         // A roll-up group (Engine.Fold): how many groups it stands for, and their keys
@@ -854,6 +856,14 @@ namespace TimelineReport
             return details != null && details.IndexOf(AuthorSuppliedTimeMark, StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
+        // A source the builder's Memory parser writes (Volatility 3 on the
+        // memory dump): Memory-Processes, Memory-Network, Memory-CommandLine,
+        // Memory-Services
+        public static bool IsMemorySource(string source)
+        {
+            return source != null && source.StartsWith("Memory-", StringComparison.OrdinalIgnoreCase);
+        }
+
         // All rows (rule rows and escalation rows, ascending), the first and
         // last time, and the evidence rows: escalation rows first (they are
         // why the severity was raised), then the earliest rule rows. A row
@@ -861,7 +871,8 @@ namespace TimelineReport
         // when the group has a row with a time Windows recorded (a forged old
         // date would otherwise date the whole lead); when it has none, those
         // dates are the times and AuthorTimesOnly is set. SnapshotOnly: every
-        // row is a Snapshot row.
+        // row is a Snapshot row. MemoryOnly: every row is from a Memory-*
+        // source (the memory dump), whatever its event type.
         public static void Summarize(RowTable t, GroupResult g, int maxEvidence)
         {
             List<int> all = new List<int>(g.Rows.Count + g.EscalationRows.Count);
@@ -872,7 +883,10 @@ namespace TimelineReport
             g.RowNumbers = new int[g.AllRows.Length];
             for (int n = 0; n < g.AllRows.Length; n++) g.RowNumbers[n] = g.AllRows[n] + 2;
             int snapshotType = Array.IndexOf(t.EventTypes, "Snapshot");
+            bool[] memorySource = new bool[t.Sources.Length];
+            for (int s = 0; s < memorySource.Length; s++) memorySource[s] = IsMemorySource(t.Sources[s]);
             bool snapshotOnly = all.Count > 0;
+            bool memoryOnly = all.Count > 0;
             long first = -1;
             long last = -1;
             long authorFirst = -1;
@@ -880,6 +894,7 @@ namespace TimelineReport
             foreach (int r in all)
             {
                 if (t.EventTypeId[r] != snapshotType) snapshotOnly = false;
+                if (!memorySource[t.SourceId[r]]) memoryOnly = false;
                 long tk = t.Ticks[r];
                 if (tk < 0) continue;
                 if (IsAuthorSuppliedTime(t.Details[r]))
@@ -900,6 +915,7 @@ namespace TimelineReport
             g.FirstTicks = first;
             g.LastTicks = last;
             g.SnapshotOnly = snapshotOnly;
+            g.MemoryOnly = memoryOnly;
             if (maxEvidence < 1) maxEvidence = 1;
             if (all.Count <= maxEvidence)
             {
@@ -1455,6 +1471,11 @@ namespace TimelineReport
 # Match timeout of every rule pattern (set it before Import-ReportRules). A
 # rule is stopped after [TimelineReport.Engine]::MaxRegexTimeouts timeouts.
 $script:ReportEngineRegexTimeout = [TimeSpan]::FromSeconds(2)
+
+# The note of a lead seen only in the memory dump (every row from a Memory-*
+# source): a finding's MemoryOnlyNote, findings.csv's summary line and the
+# workbook's Findings sheet. The report's card shows the same words.
+$script:ReportMemoryOnlyNote = "Captured in the memory dump"
 
 # Message of an invalid-rules-file error: names the file, the rule and the field
 function Format-ReportEngineRuleError {
@@ -2023,10 +2044,15 @@ function Invoke-ReportRules {
             }
             # Every row from the collection start on: maybe the collector's
             # own activity. When every row is a Snapshot row (the state seen
-            # when the evidence was collected or a memory dump captured, such
-            # as a process in the dump), its time is when it was seen, not
-            # when it happened: CapturedDuringCollection instead.
+            # when the evidence was collected, such as a task listed then),
+            # its time is when it was seen, not when it happened:
+            # CapturedDuringCollection instead. A lead whose rows all come
+            # from the memory dump (Memory-* sources, whatever their event
+            # type) is MemoryOnly and says just that ($script:ReportMemoryOnlyNote),
+            # not CapturedDuringCollection. DuringCollection stays: it comes
+            # from a time Windows recorded (a process's creation time in the dump).
             $fromCollection = ($startTicks -ge 0 -and $group.FirstTicks -ge $startTicks)
+            $memoryOnly = [bool]$group.MemoryOnly
             $findings.Add([PSCustomObject]@{
                 Id                       = ""
                 RuleId                   = $rule.Id
@@ -2050,7 +2076,9 @@ function Invoke-ReportRules {
                 EscalationCount          = $group.EscalationRows.Count
                 RowNumbers               = $group.RowNumbers
                 DuringCollection         = ($fromCollection -and -not $group.SnapshotOnly)
-                CapturedDuringCollection = ($fromCollection -and $group.SnapshotOnly)
+                CapturedDuringCollection = ($fromCollection -and $group.SnapshotOnly -and -not $memoryOnly)
+                MemoryOnly               = $memoryOnly
+                MemoryOnlyNote           = $(if ($memoryOnly) { $script:ReportMemoryOnlyNote } else { "" })
                 # A lead whose only times are a task author's dates is not
                 # dated by activity either (left out of the activity window)
                 ActivityTime             = ([bool]$rule.ActivityTime -and -not $group.AuthorTimesOnly)
@@ -2139,6 +2167,7 @@ function Export-ReportFindingsCsv {
             if ($finding.Escalated) { $summary += "; escalated by $($finding.EscalationCount) related row(s)" }
             if ($finding.EvidenceTruncated) { $summary += "; first $(@($finding.Evidence).Count) rows listed" }
             if ($finding.AllowlistedCount) { $summary += "; $($finding.AllowlistedCount) allowlisted row(s) not counted" }
+            if ($finding.MemoryOnly) { $summary += "; $script:ReportMemoryOnlyNote" }
             $lead = @($finding.Id, $finding.Severity, $finding.RuleId, $finding.Title, $finding.Category)
             $writer.WriteLine([TimelineReport.CsvText]::Line([object[]]($lead + @("", $first, "", $summary))))
             foreach ($row in $finding.Evidence) {

@@ -648,7 +648,9 @@ they find as leads to review. Next to the timeline:
                      Microsoft Edge from report.html)
   report.html        The same report as one offline HTML file: no scripts,
                      no external resources, charts drawn inline
-  findings.csv       Per finding a summary line (RowNumber empty), then one
+  findings.csv       Per finding a summary line (RowNumber empty; its
+                     Description ends with "Captured in the memory dump"
+                     for a lead seen only in the memory dump), then one
                      line per evidence row: FindingId, Severity, RuleId,
                      Title, Category, RowNumber, Timestamp, Source,
                      Description. UTF-8 with BOM, so Excel opens it directly;
@@ -750,14 +752,22 @@ once more.
                            threat name, a program file name, ...)
     flags                  "Escalated": a related event soon after raised
                            the severity (that row is among the evidence);
-                           rows set aside by the allowlist; "Every row is
-                           from during the collection" (maybe the collector
-                           itself: its first event time is at or after the
-                           collection start); "Seen only in Snapshot rows
-                           from during the collection" instead when every
-                           row is a Snapshot row -- a process in the memory
-                           dump, whose time is the capture time, may have
-                           started earlier, so check that it is not the
+                           rows set aside by the allowlist; "Captured in
+                           the memory dump" when every row of the lead
+                           comes from the memory dump (Memory-Processes,
+                           Memory-Network, Memory-CommandLine,
+                           Memory-Services): it keeps its severity and is a
+                           lead like any other; "Every row is from during
+                           the collection" (maybe the collector itself: its
+                           first event time is at or after the collection
+                           start; a memory-dump lead gets it too when the
+                           dump records a process or connection started
+                           then); "Seen only in Snapshot rows from during
+                           the collection" instead when every row is a
+                           Snapshot row and not every row is from the
+                           memory dump -- the state when it was collected
+                           (a task or service listed then), so it may have
+                           started earlier: check that it is not the
                            collector or its memory tool; "Folds N similar
                            groups" (see maxFindings below); "Dated by file
                            times", or "Dated only by a scheduled task's
@@ -783,11 +793,32 @@ once more.
   timeline.csv counted the same way -- the row Excel shows when it opens
   the CSV -- and the report labels them "CSV row".
 
+### Leads seen only in the memory dump
+
+  A lead whose rows all come from the memory dump -- the Memory-Processes,
+  Memory-Network, Memory-CommandLine and Memory-Services rows the Memory
+  parser reads with Volatility 3, whatever their event type -- says
+  exactly that: "Captured in the memory dump". Its rows are the state when
+  the dump was taken (stamped with the dump's capture time) unless the dump
+  records a time of its own, such as a process's creation time. The note
+  is the same everywhere:
+    report.pdf / report.html   a note on the lead's card
+    Findings sheet             in the lead's summary row (its Description)
+    findings.csv               at the end of the lead's summary line
+    report-model.json          "MemoryOnly": true and "MemoryOnlyNote":
+                               "Captured in the memory dump" on the finding
+  Such a lead is still a lead with its severity and its evidence rows: the
+  card's row numbers, findings.csv's RowNumber, the Findings sheet's links
+  and the Timeline sheet's Finding column point at its Memory-* rows like
+  any other lead's, also after -ReportOnly. A lead that also has rows from
+  another source (Prefetch, BAM, an event log) does not get the note.
+
 ### The workbook: Findings sheet and Finding column
 
   timeline.xlsx opens on its first sheet, "Findings": for each finding a
   bold summary row in the severity's color (count, first and last time,
-  group, escalation, how many rows are listed), then one row per evidence
+  group, escalation, how many rows are listed, and notes such as
+  "Captured in the memory dump"), then one row per evidence
   row -- finding id, severity, row type (Summary, Evidence or Escalation),
   Timeline row, time, title, description, source, event type, user,
   category and rule. Each "Timeline row" cell is a link: click it to jump
@@ -2702,8 +2733,14 @@ parsing is skipped, and the timeline CSV can be opened manually.
   collector account as the User column does, and says when the builder
   run ended incomplete (its log lines, its end banners, or the counts the
   builder passes) without repeating it in the notes. A lead seen only in
-  Snapshot rows from during the collection (a process in the memory dump)
-  must be CapturedDuringCollection, not DuringCollection; a task's
+  Snapshot rows from during the collection (a task listed then) must be
+  CapturedDuringCollection, not DuringCollection; a lead whose rows all
+  come from the memory dump must be MemoryOnly, never
+  CapturedDuringCollection (DuringCollection when the dump shows its
+  process started after the collection start), with "Captured in the
+  memory dump" in MemoryOnlyNote, report-model.json and its findings.csv
+  summary line, and its evidence lines must give its rows' numbers; a lead
+  with rows from other sources too must not be MemoryOnly. A task's
   author-supplied registration date must not set a lead's first and last
   time when the lead has a time Windows recorded, and a lead with only
   such dates must be left out of the flagged-activity window.
@@ -2730,7 +2767,10 @@ parsing is skipped, and the timeline CSV can be opened manually.
   output, the charts and the appendix, a mounted image's unknown or
   SYSTEM-hive computer name, the "Timeline incomplete" block of an
   incomplete run, and the card notes of a lead from during the collection,
-  one seen only in Snapshot rows then, and one dated only by an
+  one seen only in Snapshot rows then, one seen only in the memory dump
+  (exactly "Captured in the memory dump", with no Snapshot note or
+  collector hint; with the during-collection note too when the dump shows
+  the process started then), and one dated only by an
   author-supplied task date (also in the summary's activity window); then
   prints PDFs with Edge (skipped
   without Edge) and checks
@@ -2746,7 +2786,15 @@ parsing is skipped, and the timeline CSV can be opened manually.
   first sheet is Findings, every row links to its Timeline row, and the
   Finding column tags exactly the rows of each finding. Then -ReportOnly
   (the same findings, no duplicate sheet or column, and no error output,
-  also in Windows PowerShell), -ReportOnly with -ReportRules and -NoExcel
+  also in Windows PowerShell); a lead seen only in the memory dump, from a
+  copy of the builder (in the test's folder) whose Volatility 3 is a stub
+  with canned output, run with -MemoryDumpPath on a synthetic dump header:
+  "Captured in the memory dump" in report-model.json (MemoryOnly),
+  findings.csv, its card and its Findings-sheet summary row, and the card's
+  row numbers, findings.csv's RowNumber, the Findings sheet's links and
+  the Finding column all on its Memory-CommandLine row, also after a
+  -ReportOnly that updates the workbook (a lead that also has a BAM row is
+  not memory-only); -ReportOnly with -ReportRules and -NoExcel
   (the workbook is called stale; -WorkDir and -MemoryDumpPath are ignored
   with one warning), a missing rules file, -NoReport, -ReportOnly in a
   folder named "case [1]" and with report.pdf held open by another
