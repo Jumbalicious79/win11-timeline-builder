@@ -812,6 +812,11 @@ function Add-ReportHtmlFinding {
     if ([bool](Get-ReportHtmlField $Finding "MemoryOnly")) {
         $flags.Add('<span class="flag">Captured in the memory dump</span>')
     }
+    # An older (or unrecognized) collection could not tell the collector's own
+    # processes apart: a memory-only lead from during the collection may be it
+    if ([bool](Get-ReportHtmlField $Finding "CollectorSuspect")) {
+        $flags.Add('<span class="flag">This process was seen only in the memory dump during the collection, and this collection does not record the collector&#39;s own process IDs: check that it is not the triage collector, its launcher or the memory capture tool</span>')
+    }
     if ([bool](Get-ReportHtmlField $Finding "DuringCollection")) {
         $flags.Add('<span class="flag">Every row is from during the collection: this may be the collector&#39;s own activity</span>')
     }
@@ -988,6 +993,14 @@ function Add-ReportHtmlSummary {
         $bulk = Get-ReportHtmlBulkSpan -Activity $Context.Activity
         if ($bulk) { $spanText += "; 99% of the rows fall between " + $bulk.First + " and " + $bulk.Last }
         $facts.Add(@("Time span covered", $spanText.Trim()))
+    }
+    # The collector's own processes in the memory dump, left unflagged
+    $collectorCoverage = Get-ReportHtmlField $Context.Coverage "CollectorProcesses"
+    $collectorSummary = ConvertTo-ReportHtmlText (Get-ReportHtmlField $collectorCoverage "Summary")
+    if ([bool](Get-ReportHtmlField $collectorCoverage "Recorded") -and $collectorSummary) {
+        # Built first: in @("a", "b" + "c") the comma binds before the plus
+        $collectorFact = $collectorSummary + " &ndash; listed under Evidence coverage"
+        $facts.Add(@("Collector processes", $collectorFact))
     }
     if ([bool](Get-ReportHtmlField $collection "SecretsIncluded")) {
         $facts.Add(@("Sensitive material", "This collection includes credential material (made with -IncludeSecrets). Store and share it as sensitive."))
@@ -1259,6 +1272,47 @@ function Add-ReportHtmlCoverage {
         }
     }
     else { $null = $Builder.AppendLine('<p class="empty">The collector logged no errors or warnings.</p>') }
+
+    # The collector's own processes in the memory dump, left out of the rules.
+    # Shown only when the collection recorded its process ids and the timeline
+    # has memory rows (a Summary is then set); older models have no field.
+    $collectorCoverage = Get-ReportHtmlField $coverage "CollectorProcesses"
+    $collectorSummary = ConvertTo-ReportHtmlText (Get-ReportHtmlField $collectorCoverage "Summary")
+    if ([bool](Get-ReportHtmlField $collectorCoverage "Recorded") -and $collectorSummary) {
+        $null = $Builder.AppendLine('<h3>The collector&#39;s own processes (not flagged)</h3>')
+        $null = $Builder.AppendLine('<p>' + $collectorSummary + '. They are recognized by the process ID, name and start time recorded in collection_info.json, and the processes they started during the collection; their rows stay in the timeline but the rules do not check them. Memory network and service rows of these processes are kept and checked.</p>')
+        $processes = Get-ReportHtmlList $collectorCoverage "Processes"
+        if ($processes.Count -gt 0) {
+            $null = $Builder.AppendLine('<table><colgroup><col style="width:12%"><col style="width:8%"><col style="width:9%"><col style="width:17%"><col style="width:17%"><col style="width:17%"><col style="width:20%"></colgroup>')
+            $null = $Builder.AppendLine('<thead><tr><th>' + $Context.RowHeading + 's</th><th class="num">PID</th><th class="num">Parent PID</th><th>Name</th><th>Started (UTC)</th><th>Recognized as</th><th>Command line</th></tr></thead><tbody>')
+            foreach ($proc in @($processes | Select-Object -First 50)) {
+                $rowNumbers = @(Get-ReportHtmlList $proc "RowNumbers" | ForEach-Object { [string]([long](ConvertTo-ReportHtmlNumber $_)) })
+                $null = $Builder.AppendLine('<tr><td class="mono">' + (ConvertTo-ReportHtmlText (($rowNumbers | Select-Object -First 10) -join ", ") -MaxLength 120) +
+                    '</td><td class="num">' + (Format-ReportHtmlNumber (Get-ReportHtmlField $proc "Pid")) +
+                    '</td><td class="num">' + (Format-ReportHtmlNumber (Get-ReportHtmlField $proc "ParentPid")) +
+                    '</td><td>' + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $proc "Name") -MaxLength 120) +
+                    '</td><td class="mono">' + (Format-ReportHtmlTime (Get-ReportHtmlField $proc "CreateTimeUtc") "yyyy-MM-dd HH:mm:ss") +
+                    '</td><td>' + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $proc "How") -MaxLength 120) +
+                    '</td><td class="mono">' + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $proc "CommandLine") -MaxLength 200) + '</td></tr>')
+            }
+            $null = $Builder.AppendLine('</tbody></table>')
+            if ($processes.Count -gt 50) { $null = $Builder.AppendLine('<p class="small muted">The first 50 of ' + $processes.Count + ' are listed.</p>') }
+        }
+        $collectorNotes = New-Object System.Collections.Generic.List[string]
+        foreach ($mismatch in (Get-ReportHtmlList $collectorCoverage "Mismatched")) {
+            $collectorNotes.Add("The collector recorded PID " + (Format-ReportHtmlNumber (Get-ReportHtmlField $mismatch "Pid")) + " (" + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $mismatch "Name")) +
+                ") but the memory dump has " + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $mismatch "DumpName")) + " with that id: " + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $mismatch "Reason")) + ", so it was not left out.")
+        }
+        foreach ($missing in (Get-ReportHtmlList $collectorCoverage "NotInDump")) {
+            $collectorNotes.Add("The collector recorded PID " + (Format-ReportHtmlNumber (Get-ReportHtmlField $missing "Pid")) + " (" + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $missing "Name")) + "), which the memory dump does not have.")
+        }
+        if ($collectorNotes.Count -gt 0) {
+            $null = $Builder.AppendLine('<ul class="plain small">')
+            foreach ($note in $collectorNotes) { $null = $Builder.AppendLine('<li>' + $note + '</li>') }
+            $null = $Builder.AppendLine('</ul>')
+        }
+    }
+
     $noteList = Get-ReportHtmlList $coverage "Notes"
     $notes = @($noteList | ForEach-Object { ConvertTo-ReportHtmlText $_ } | Where-Object { $_ })
     if ($notes.Count -gt 0) {

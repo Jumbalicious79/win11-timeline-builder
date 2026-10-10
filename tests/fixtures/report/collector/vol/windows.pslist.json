@@ -1,0 +1,10 @@
+[
+  { "PID": 9120, "PPID": 8840, "ImageFileName": "powershell.exe", "CreateTime": "2026-03-02T11:58:00+00:00", "Threads": 12, "SessionId": 1, "__children": [] },
+  { "PID": 8840, "PPID": 8000, "ImageFileName": "cmd.exe", "CreateTime": "2026-03-02T11:57:55+00:00", "Threads": 1, "SessionId": 1, "__children": [] },
+  { "PID": 8848, "PPID": 8840, "ImageFileName": "conhost.exe", "CreateTime": "2026-03-02T11:57:56+00:00", "Threads": 3, "SessionId": 1, "__children": [] },
+  { "PID": 10232, "PPID": 9120, "ImageFileName": "DumpIt.exe", "CreateTime": "2026-03-02T12:03:00+00:00", "Threads": 2, "SessionId": 1, "__children": [] },
+  { "PID": 10300, "PPID": 10232, "ImageFileName": "conhost.exe", "CreateTime": "2026-03-02T12:03:00+00:00", "Threads": 2, "SessionId": 1, "__children": [] },
+  { "PID": 9501, "PPID": 9120, "ImageFileName": "csc.exe", "CreateTime": "2026-03-02T12:00:30+00:00", "Threads": 1, "SessionId": 1, "__children": [] },
+  { "PID": 6000, "PPID": 5000, "ImageFileName": "wscript.exe", "CreateTime": "2026-03-02T12:01:00+00:00", "Threads": 4, "SessionId": 1, "__children": [] },
+  { "PID": 7000, "PPID": 5000, "ImageFileName": "powershell.exe", "CreateTime": "2026-03-02T12:02:00+00:00", "Threads": 5, "SessionId": 1, "__children": [] }
+]

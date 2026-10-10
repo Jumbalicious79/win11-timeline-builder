@@ -785,6 +785,147 @@ try {
     })
     Write-TestResult -Succeeded ($special.Contains('"Text": "caf\u00e9 \u003cb\u003e\u0026\u2603\t"') -and $special.Contains('"When": "2026-01-02T03:04:05.006Z"') -and $special.Contains('"Empty": []') -and $special -match '"List": \[\s+1,\s+null,\s+true,\s+2\.5\s+\]' -and $special -match '"Map": \{\s+"a": "x"\s+\}') -Message "JSON writer: \u escapes for non-ASCII and < > &, ISO dates, arrays, nulls, dictionaries"
 
+    # =========================================================
+    # Per-branch capture key, the match-capture fallback, and the
+    # row-description fallback; import accepts capture with a key only in an
+    # anyOf entry and rejects capture with no key source anywhere
+    # =========================================================
+    $capRulesPath = Join-Path $workDir "capture-rules.json"
+    New-TestTextFile $capRulesPath ('{ "schemaVersion": 1, "rules": [ ' +
+        '{ "id": "CAP", "title": "{{group}}", "category": "Other", "severity": "Medium", "why": "w", "groupBy": "capture", "match": { "source": "^S$" }, "anyOf": [ { "description": "^plain" }, { "details": "^tag=(?<key>\\w+)" } ] }, ' +
+        '{ "id": "CAP2", "title": "{{group}}", "category": "Other", "severity": "Medium", "why": "w", "groupBy": "capture", "match": { "source": "^T$", "description": "^cmd (?<key>\\w+)" }, "anyOf": [ { "details": "^opt" } ] } ] }')
+    $capRows = @(
+        @{ Timestamp = "2026-01-01 00:00:01.000"; Source = "S"; EventType = "E"; Description = "plain row one"; User = ""; Details = "" },
+        @{ Timestamp = "2026-01-01 00:00:02.000"; Source = "S"; EventType = "E"; Description = "whatever"; User = ""; Details = "tag=alpha extra" },
+        @{ Timestamp = "2026-01-01 00:00:03.000"; Source = "T"; EventType = "E"; Description = "cmd zulu now"; User = ""; Details = "opt stuff" }
+    )
+    $capFindings = @(Invoke-ReportRules -Rows $capRows -Rules (Import-ReportRules -Path $capRulesPath))
+    $capByRow = @{}
+    foreach ($f in $capFindings) { foreach ($rn in $f.RowNumbers) { $capByRow["$($f.RuleId)|$rn"] = $f.GroupKey } }
+    Assert-Equal $capByRow["CAP|2"] "plain row one" -Message "capture: an anyOf branch without a key, and match without a capture, falls back to the row Description"
+    Assert-Equal $capByRow["CAP|3"] "alpha" -Message "capture: the matched anyOf branch's (?<key>) group is used (Details)"
+    Assert-Equal $capByRow["CAP2|4"] "zulu" -Message "capture: an anyOf branch without a key falls back to match.description's (?<key>)"
+    $capReject = Join-Path $workDir "capture-reject.json"
+    New-TestTextFile $capReject '{ "schemaVersion": 1, "rules": [ { "id": "NOKEY", "title": "t", "category": "Other", "severity": "Medium", "why": "w", "groupBy": "capture", "match": { "source": "^S$" }, "anyOf": [ { "description": "^x" } ] } ] }'
+    $message = ""
+    try { $null = Import-ReportRules -Path $capReject } catch { $message = $_.Exception.Message }
+    Write-TestResult -Succeeded ($message -match 'capture' -and $message -match 'NOKEY') -Message "import rejects groupBy capture when no match or anyOf entry has a key ($message)"
+
+    # =========================================================
+    # The collector's own processes in the memory dump (Find-ReportCollectorRows)
+    # =========================================================
+    function New-TestProc { param([string]$Time, [string]$Name, [int]$ProcId, [int]$Ppid, [switch]$Snapshot)
+        return @{ Timestamp = $Time; Source = "Memory-Processes"; EventType = $(if ($Snapshot) { "Snapshot" } else { "ProcessCreation" }); Description = "Process in memory: $Name (PID: $ProcId, PPID: $Ppid)"; User = ""; Details = "Threads=3 SessionId=1"; Artifact = "MemoryDump"; RawPath = "" } }
+    function New-TestCmd { param([string]$Name, [int]$ProcId, [string]$CmdLine)
+        return @{ Timestamp = "2026-05-15 12:03:30.000"; Source = "Memory-CommandLine"; EventType = "Snapshot"; Description = "Process command line: $Name (PID: $ProcId)"; User = ""; Details = "Args=$CmdLine"; Artifact = "MemoryDump"; RawPath = "" } }
+    $collStart = "2026-05-15T12:03:00.5000000Z"
+    $colRows = @(
+        (New-TestProc "2026-05-15 12:02:58.000" "powershell.exe" 9120 8840),
+        (New-TestProc "2026-05-15 12:02:55.000" "cmd.exe" 8840 8000),
+        (New-TestProc "2026-05-15 12:02:56.000" "conhost.exe" 8848 8840),
+        (New-TestProc "2026-05-15 12:03:30.000" "DumpIt.exe" 10232 9120),
+        (New-TestProc "2026-05-15 12:03:05.000" "csc.exe" 9500 9120),
+        (New-TestProc "2026-05-15 12:03:06.000" "cvtres.exe" 9600 9500),
+        (New-TestProc "2026-05-15 12:02:59.000" "conhost.exe" 9700 9120),
+        (New-TestProc "2026-05-15 12:03:10.000" "powershell.exe" 1234 5000),
+        (New-TestProc "2026-05-15 12:03:11.000" "evil.exe" 8840 5000 -Snapshot),
+        (New-TestCmd "powershell.exe" 9120 "powershell.exe -File C:\col\triage-collector.ps1"),
+        (New-TestCmd "DumpIt.exe" 10232 "DumpIt.exe /q"),
+        (New-TestCmd "powershell.exe" 1234 "powershell.exe -enc AAAA"),
+        @{ Timestamp = "2026-05-15 12:03:30.000"; Source = "Memory-Network"; EventType = "Snapshot"; Description = "Memory network: TCPv4 10.0.0.5:5 -> 1.2.3.4:443 (ESTABLISHED)"; User = ""; Details = "PID=9120 Process=powershell.exe"; Artifact = "MemoryDump"; RawPath = "" },
+        @{ Timestamp = "2026-05-15 12:03:30.000"; Source = "Memory-Services"; EventType = "Snapshot"; Description = "Service in memory: X (X)"; User = ""; Details = "State=RUNNING PID=9120"; Artifact = "MemoryDump"; RawPath = "" }
+    )
+    $colRecorded = @(
+        [PSCustomObject]@{ Role = "Collector"; Pid = 9120; Name = "powershell.exe"; StartUtc = "2026-05-15T12:02:58.1234567Z"; ParentPid = 8840 },
+        [PSCustomObject]@{ Role = "Launcher"; Pid = 8840; Name = "cmd.exe"; StartUtc = "2026-05-15T12:02:55.7654321Z"; ParentPid = 8000 },
+        [PSCustomObject]@{ Role = "Console"; Pid = 8848; Name = "conhost.exe"; StartUtc = "2026-05-15T12:02:56.9000000Z"; ParentPid = 8840 },
+        [PSCustomObject]@{ Role = "MemoryCapture"; Pid = 10232; Name = "DumpIt.exe"; StartUtc = "2026-05-15T12:03:30.2000000Z"; ParentPid = 9120 }
+    )
+    $colInfo = [PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $collStart; CollectorProcesses = $colRecorded }
+    $col = Find-ReportCollectorRows -Rows $colRows -CollectionInfo $colInfo
+    Assert-Equal "$($col.Recorded)|$($col.HasMemoryRows)|$($col.Count)" "True|True|6" -Message "collector: recorded, has memory rows, 6 processes (tree + closure)"
+    Assert-Equal (@($col.Processes | ForEach-Object { $_.Pid } | Sort-Object) -join ",") "8840,8848,9120,9500,9600,10232" -Message "collector: excluded set = collector, launcher, console, capture tool, and the children they started"
+    Assert-Equal $col.Summary "Collector's own processes in the memory dump: 6 (not flagged)" -Message "collector: Summary text"
+    $csc = @($col.Processes | Where-Object { $_.Pid -eq 9500 })[0]
+    Assert-Equal $csc.How "started by PID 9120 during the collection" -Message "collector: a child started during the collection (closure) is in, with its How"
+    Write-TestResult -Succeeded (-not (@($col.Processes | ForEach-Object { $_.Pid }) -contains 9700)) -Message "collector: a child created before the collection start is not in the closure"
+    Write-TestResult -Succeeded (-not (@($col.Processes | ForEach-Object { $_.Pid }) -contains 1234)) -Message "collector: an impostor process named powershell.exe with another PID is NOT excluded"
+    $colExSources = @(); for ($i = 0; $i -lt $col.Excluded.Length; $i++) { if ($col.Excluded[$i]) { $colExSources += $colRows[$i].Source } }
+    Write-TestResult -Succeeded (-not ($colExSources -contains "Memory-Network") -and -not ($colExSources -contains "Memory-Services")) -Message "collector: Memory-Network and Memory-Services rows are never excluded"
+    $colImpostorExcluded = $false; for ($i = 0; $i -lt $col.Excluded.Length; $i++) { if ($col.Excluded[$i] -and $colRows[$i].Description -like "*PID: 1234*") { $colImpostorExcluded = $true } }
+    Write-TestResult -Succeeded (-not $colImpostorExcluded) -Message "collector: the impostor's Memory-Processes and Memory-CommandLine rows are not excluded"
+    $colDecoyExcluded = $false; for ($i = 0; $i -lt $col.Excluded.Length; $i++) { if ($col.Excluded[$i] -and $colRows[$i].Description -like "*evil.exe*") { $colDecoyExcluded = $true } }
+    Write-TestResult -Succeeded (-not $colDecoyExcluded) -Message "collector: a decoy row that reused an excluded PID (other name) is not excluded"
+    # 14-char truncated name, and the whole-second time match
+    $truncRows = @( (New-TestProc "2026-05-15 12:02:58.000" "LongProcessNam" 4000 3000) )
+    $truncInfo = [PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $collStart; CollectorProcesses = @([PSCustomObject]@{ Role = "Collector"; Pid = 4000; Name = "LongProcessName.exe"; StartUtc = "2026-05-15T12:02:58.9000000Z"; ParentPid = 3000 }) }
+    $truncCol = Find-ReportCollectorRows -Rows $truncRows -CollectionInfo $truncInfo
+    Assert-Equal (@($truncCol.Processes).Count) 1 -Message "collector: a Volatility 14-char name (LongProcessNam) matches the full recorded name"
+    foreach ($pair in @(@("2026-05-15 12:00:02.000", 1), @("2026-05-15 12:00:03.000", 0), @("2026-05-15 12:00:01.000", 0))) {
+        $tRows = @( (New-TestProc $pair[0] "powershell.exe" 5 4) )
+        $tInfo = [PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = "2026-05-15T12:00:00Z"; CollectorProcesses = @([PSCustomObject]@{ Role = "Collector"; Pid = 5; Name = "powershell.exe"; StartUtc = "2026-05-15T12:00:02.9999999Z"; ParentPid = 4 }) }
+        $tCol = Find-ReportCollectorRows -Rows $tRows -CollectionInfo $tInfo
+        Assert-Equal (@($tCol.Processes).Count) $pair[1] -Message "collector: whole-second match, dump $($pair[0]) vs recorded :02.9999999 -> $($pair[1]) process(es)"
+    }
+    # StartUtc as a [datetime]; a reused PID (name differs) -> Mismatched, not excluded
+    $dtInfo = [PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $collStart; CollectorProcesses = @([PSCustomObject]@{ Role = "Collector"; Pid = 9120; Name = "powershell.exe"; StartUtc = [datetime]::new(2026, 5, 15, 12, 2, 58, [System.DateTimeKind]::Utc); ParentPid = 8840 }) }
+    $dtCol = Find-ReportCollectorRows -Rows $colRows -CollectionInfo $dtInfo
+    Assert-Equal (@($dtCol.Processes | Where-Object { $_.Pid -eq 9120 }).Count) 1 -Message "collector: StartUtc as a [datetime] is read"
+    $reuse = Find-ReportCollectorRows -Rows $colRows -CollectionInfo ([PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $collStart; CollectorProcesses = @([PSCustomObject]@{ Role = "Collector"; Pid = 7777; Name = "powershell.exe"; StartUtc = "2026-05-15T12:02:58.1Z"; ParentPid = 8840 }) })
+    Assert-Equal "$(@($reuse.Processes).Count)|$(@($reuse.NotInDump).Count)" "0|1" -Message "collector: the anchor (Collector) not in the dump leaves nothing out; it is reported as not-in-dump"
+    # MountedImage: not applied; an older collection (no field): not recorded
+    $imgCol = Find-ReportCollectorRows -Rows $colRows -CollectionInfo ([PSCustomObject]@{ Mode = "MountedImage"; CollectionStartUtc = $collStart; CollectorProcesses = $colRecorded })
+    Assert-Equal "$($imgCol.Recorded)|$(@($imgCol.Processes).Count)" "False|0" -Message "collector: not applied to a mounted image"
+    $oldCol = Find-ReportCollectorRows -Rows $colRows -CollectionInfo ([PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $collStart })
+    Assert-Equal "$($oldCol.Recorded)|$(@($oldCol.Processes).Count)" "False|0" -Message "collector: an older collection with no CollectorProcesses field recognizes nothing"
+    # An injected Child whose real parent is not the collector -> Mismatched
+    $inj = Find-ReportCollectorRows -Rows $colRows -CollectionInfo ([PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $collStart; CollectorProcesses = @($colRecorded + @([PSCustomObject]@{ Role = "Child"; Pid = 1234; Name = "powershell.exe"; StartUtc = "2026-05-15T12:03:10Z"; ParentPid = 9120 })) })
+    Write-TestResult -Succeeded (-not (@($inj.Processes | ForEach-Object { $_.Pid }) -contains 1234) -and @($inj.Mismatched | Where-Object { $_.Pid -eq 1234 }).Count -eq 1) -Message "collector: an injected Child PID whose parent in the dump is not the collector is Mismatched, not excluded"
+
+    # =========================================================
+    # Evaluate skips the collector rows; escalation skips them too; the rules
+    # leave them unflagged while a non-collector lead in the dump is unchanged
+    # =========================================================
+    $skipRulesPath = Join-Path $workDir "skip-rules.json"
+    New-TestTextFile $skipRulesPath '{ "schemaVersion": 1, "rules": [ { "id": "ANYPROC", "title": "Seen {{group}}", "category": "Execution", "severity": "High", "why": "w", "groupBy": "capture", "match": { "source": "^Memory-CommandLine$", "description": "^Process command line: (?<key>[^ ]+) " } } ] }'
+    $skipRules = Import-ReportRules -Path $skipRulesPath
+    $skipNoCollector = @(Invoke-ReportRules -Rows $colRows -Rules $skipRules -CollectionInfo ([PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $collStart }))
+    $skipWithCollector = @(Invoke-ReportRules -Rows $colRows -Rules $skipRules -CollectionInfo $colInfo -CollectorRows $col)
+    $skipKeysNo = @($skipNoCollector | ForEach-Object { $_.GroupKey } | Sort-Object)
+    $skipKeysYes = @($skipWithCollector | ForEach-Object { $_.GroupKey } | Sort-Object)
+    Write-TestResult -Succeeded (($skipKeysNo -contains "powershell.exe") -and ($skipKeysNo -contains "DumpIt.exe")) -Message "without the collector record, the rule flags the collector's own command-line rows"
+    Write-TestResult -Succeeded (-not ($skipKeysYes -contains "DumpIt.exe")) -Message "with the collector record, the capture tool's command-line row is skipped by the rules"
+    Write-TestResult -Succeeded (@($skipWithCollector | Where-Object { $_.GroupKey -eq "powershell.exe" }).Count -ge 1) -Message "the impostor powershell.exe row (not the collector's) is still flagged"
+    # CollectorSuspect: a memory-only lead from during the collection is flagged
+    # as possibly the collector when the collection did not record/recognize
+    # its IDs (older collection), but not when it did (the impostor is a lead)
+    $impNo = @($skipNoCollector | Where-Object { $_.GroupKey -eq "powershell.exe" })[0]
+    $impYes = @($skipWithCollector | Where-Object { $_.GroupKey -eq "powershell.exe" })[0]
+    Write-TestResult -Succeeded ([bool]$impNo.CollectorSuspect) -Message "an older collection (no recorded IDs): a memory-only lead during the collection is flagged CollectorSuspect"
+    Write-TestResult -Succeeded (-not [bool]$impYes.CollectorSuspect) -Message "a recognized collection: a flagged impostor lead is not marked CollectorSuspect"
+
+    # =========================================================
+    # The model's Coverage.CollectorProcesses, the Notes/Method lines, the
+    # findings.csv collector block, and the older-collection note
+    # =========================================================
+    $colModel = New-ReportModel -Rows $colRows -Findings $skipWithCollector -CollectionInfo $colInfo -CollectorRows $col
+    $cp = $colModel.Coverage.CollectorProcesses
+    Assert-Equal "$($cp.Recorded)|$($cp.Count)|$($cp.Summary)" "True|6|Collector's own processes in the memory dump: 6 (not flagged)" -Message "model Coverage.CollectorProcesses: recorded, count and summary"
+    Write-TestResult -Succeeded (-not ($cp.PSObject.Properties.Name -contains "Excluded")) -Message "model Coverage.CollectorProcesses has no Excluded mask"
+    Write-TestResult -Succeeded (@($colModel.Coverage.Notes | Where-Object { $_ -match "Collector's own processes in the memory dump: 6 \(not flagged\)" }).Count -eq 1) -Message "model Notes carries the collector summary"
+    Write-TestResult -Succeeded (@($colModel.Method | Where-Object { $_ -match "recognized by the process ID, name and start time recorded in collection_info.json" }).Count -eq 1) -Message "model Method describes the collector exclusion"
+    $colCsv = Join-Path $workDir "collector-findings.csv"
+    Export-ReportFindingsCsv -Findings $skipWithCollector -Path $colCsv -CollectorRows $col
+    $colCsvLines = @(Import-Csv -LiteralPath $colCsv)
+    $colBlock = @($colCsvLines | Where-Object { $_.FindingId -eq "Collector" })
+    $colBlockSummary = @($colBlock | Where-Object { -not $_.RowNumber })
+    Write-TestResult -Succeeded ($colBlockSummary.Count -eq 1 -and $colBlockSummary[0].Severity -eq "Not flagged" -and $colBlockSummary[0].Description -match "not checked by the rules" -and @($colBlock | Where-Object { $_.RowNumber }).Count -eq $col.RowCount) -Message "findings.csv has the Collector block: a 'Not flagged' summary and one line per left-out row"
+    # The older-collection note when memory rows exist but nothing is recorded
+    $oldModel = New-ReportModel -Rows $colRows -Findings $skipNoCollector -CollectionInfo ([PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $collStart }) -CollectorRows $oldCol
+    Write-TestResult -Succeeded (@($oldModel.Coverage.Notes | Where-Object { $_ -match "does not record the collector's own process IDs" }).Count -eq 1 -and -not $oldModel.Coverage.CollectorProcesses.Recorded) -Message "model: an older collection (memory rows, no record) gets the older-collector note"
+    # "Captured in the memory dump" still applies to a non-excluded memory lead
+    Write-TestResult -Succeeded (@($skipWithCollector | Where-Object { $_.GroupKey -eq "powershell.exe" -and $_.MemoryOnly }).Count -ge 1) -Message "a non-collector memory-only lead keeps MemoryOnly (Captured in the memory dump)"
+
     if ($script:failures -gt 0) {
         Write-Host "FAIL: $($script:failures) of $($script:checks) check(s) failed" -ForegroundColor Red
         exit 1

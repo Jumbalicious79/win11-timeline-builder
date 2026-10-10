@@ -296,8 +296,33 @@ try {
     $startedFlags = @([regex]::Matches($memoryStarted, '<span class="flag[^"]*">(.*?)</span>') | ForEach-Object { $_.Groups[1].Value })
     Write-TestResult -Succeeded (($startedFlags -join "|") -ceq "Captured in the memory dump|Every row is from during the collection: this may be the collector&#39;s own activity") -Message "a memory-only lead whose process started during the collection (a creation time in the dump) gets both notes ($($startedFlags -join ' | '))"
     $finding.DuringCollection = $false
+    # CollectorSuspect: an older collection's memory-only lead gets a card note
+    $finding.CollectorSuspect = $true
+    Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath
+    $suspectHtml = [System.IO.File]::ReadAllText($memoryHtmlPath)
+    Write-TestResult -Succeeded ($suspectHtml.Contains("this collection does not record the collector&#39;s own process IDs: check that it is not the triage collector, its launcher or the memory capture tool")) -Message "a memory-only lead from an older collection is flagged CollectorSuspect on its card"
+    $finding.CollectorSuspect = $false
     $finding.MemoryOnly = $false
     $finding.MemoryOnlyNote = ""
+
+    # The collector's own processes in the memory dump: a key fact in the
+    # summary and a subsection in Evidence coverage. A model without the field
+    # (model-minimal) renders fine and shows neither.
+    $memoryModel.Coverage.CollectorProcesses = [ordered]@{
+        Recorded = $true; Count = 2; RowCount = 3
+        Summary  = "Collector's own processes in the memory dump: 2 (not flagged)"
+        Processes = @(
+            [ordered]@{ Pid = 9120; ParentPid = 8840; Name = "powershell.exe"; CreateTimeUtc = $collectionStart; Role = "Collector"; How = "recorded by the collector: collector"; CommandLine = "powershell.exe -File x"; RowNumbers = @(5, 6) },
+            [ordered]@{ Pid = 10232; ParentPid = 9120; Name = "DumpIt.exe"; CreateTimeUtc = $collectionStart; Role = "MemoryCapture"; How = "started by PID 9120 during the collection"; CommandLine = "DumpIt.exe /q"; RowNumbers = @(7) })
+        NotInDump = @()
+        Mismatched = @([ordered]@{ Pid = 4242; Name = "cmd.exe"; Reason = "a reused id"; DumpName = "other.exe" })
+    }
+    Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath -NoFileHashes
+    $collectorHtml = [System.IO.File]::ReadAllText($memoryHtmlPath)
+    Write-TestResult -Succeeded ($collectorHtml.Contains("<th>Collector processes</th>") -and $collectorHtml.Contains("Collector&#39;s own processes in the memory dump: 2 (not flagged) &ndash; listed under Evidence coverage")) -Message "the summary's key facts gives the collector-processes summary"
+    Write-TestResult -Succeeded ($collectorHtml.Contains("The collector&#39;s own processes (not flagged)") -and $collectorHtml.Contains(">DumpIt.exe</td>") -and $collectorHtml.Contains("started by PID 9120 during the collection") -and $collectorHtml.Contains("a reused id")) -Message "Evidence coverage has the collector subsection with the process table and the mismatch note"
+    Write-TestResult -Succeeded (-not $minimal.Contains("The collector&#39;s own processes (not flagged)") -and -not $minimal.Contains("<th>Collector processes</th>")) -Message "a model without Coverage.CollectorProcesses renders no collector key fact or subsection"
+    $memoryModel.Coverage.CollectorProcesses = $null
 
     # --- Hostile and edge values: bidi controls, a long unbroken title, more
     # evidence than a card prints, a lead dated by file times, a folded lead,

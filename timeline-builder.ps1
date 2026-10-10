@@ -945,6 +945,11 @@ function Get-TimelineReportCollectionInfo {
         CollectionStartUtc       = $null
         SecretsIncluded          = $false
         ThunderbirdIndexIncluded = $false
+        # The collector's own process IDs in the memory dump (live collections
+        # only; older collections lack this field). The report leaves exactly
+        # these processes, and those they start during the collection,
+        # unflagged in the memory dump.
+        CollectorProcesses       = $null
     }
     if ($InfoJsonPath -and (Test-Path -LiteralPath $InfoJsonPath -PathType Leaf)) {
         try {
@@ -957,6 +962,7 @@ function Get-TimelineReportCollectionInfo {
             foreach ($name in @("SecretsIncluded", "ThunderbirdIndexIncluded")) {
                 if ($json.PSObject.Properties[$name]) { $info[$name] = [bool]$json.$name }
             }
+            if ($json.PSObject.Properties["CollectorProcesses"] -and $null -ne $json.CollectorProcesses) { $info.CollectorProcesses = $json.CollectorProcesses }
         }
         catch { Log-Warning "  Could not read $InfoJsonPath for the report: $($_.Exception.Message)" }
     }
@@ -1039,9 +1045,31 @@ function Invoke-TimelineReportRules {
         $rules = Import-ReportRules -Path $RulesPath
         $statistics = @{}
         $ruleWarnings = $null
-        $findings = @(Invoke-ReportRules -Rows $Rows -Rules $rules -CollectionInfo $CollectionInfo -Statistics $statistics -WarningVariable ruleWarnings -WarningAction SilentlyContinue)
+        # The collector's own processes in the memory dump, recognized by the
+        # IDs collection_info.json records, are left out of the rules
+        $collector = Find-ReportCollectorRows -Rows $Rows -CollectionInfo $CollectionInfo
+        $findings = @(Invoke-ReportRules -Rows $Rows -Rules $rules -CollectionInfo $CollectionInfo -Statistics $statistics -CollectorRows $collector -WarningVariable ruleWarnings -WarningAction SilentlyContinue)
         $timer.Stop()
         foreach ($warning in @($ruleWarnings)) { Log-Warning "  $warning" }
+        if ($collector.Recorded -and $collector.HasMemoryRows -and [int]$collector.Count -gt 0) {
+            $roleList = @($collector.Processes | ForEach-Object { "$($_.Name) (PID $($_.Pid))" }) -join ", "
+            Log "  $($collector.Summary): $roleList; $([int]$collector.RowCount) row(s) left out of the rules"
+        }
+        elseif ($collector.Recorded -and $collector.HasMemoryRows) {
+            Log "  Collector's own processes recorded in collection_info.json, but none were recognized in the memory dump (see below)."
+        }
+        foreach ($mismatch in @($collector.Mismatched)) {
+            $recordedTime = if ($mismatch.RecordedStartUtc) { $mismatch.RecordedStartUtc.ToString("yyyy-MM-dd HH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture) } else { "unknown time" }
+            $dumpTime = if ($mismatch.DumpCreateTimeUtc) { $mismatch.DumpCreateTimeUtc.ToString("yyyy-MM-dd HH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture) } else { "no recorded time" }
+            Log-Warning "  The collector recorded PID $($mismatch.Pid) ($($mismatch.Name), started $recordedTime) but the memory dump has $($mismatch.DumpName) ($dumpTime) with that PID: not left out ($($mismatch.Reason))."
+        }
+        foreach ($missing in @($collector.NotInDump)) {
+            Log "  The collector recorded PID $($missing.Pid) ($($missing.Name), $($missing.Role)) but the memory dump has no process with that PID."
+        }
+        $memoryPresent = @($Rows | Where-Object { "$($_.Source)" -like "Memory-*" }).Count -gt 0
+        if ($memoryPresent -and -not $collector.Recorded) {
+            Log "  This collection does not record the collector's own process IDs (older triage collector): its own processes in the memory dump are checked by the rules like any other."
+        }
         $high = @($findings | Where-Object { $_.Severity -eq "High" }).Count
         $medium = @($findings | Where-Object { $_.Severity -eq "Medium" }).Count
         $info = $findings.Count - $high - $medium
@@ -1058,6 +1086,7 @@ function Invoke-TimelineReportRules {
             Rules           = $rules
             Findings        = [object[]]$findings
             Statistics      = $statistics
+            CollectorRows   = $collector
             High            = $high
             Medium          = $medium
             Info            = $info
@@ -1113,12 +1142,19 @@ function Set-TimelineReportRowLink {
 # matching row, to filter on. A Findings sheet and Finding column from an
 # earlier run (-ReportOnly) are replaced. Throws on failure.
 function Add-TimelineReportWorkbookSheets {
-    param($Package, [object[]]$Findings)
+    param($Package, [object[]]$Findings, $CollectorRows)
     $invariant = [System.Globalization.CultureInfo]::InvariantCulture
     $workbook = $Package.Workbook
     $timeline = $workbook.Worksheets["Timeline"]
     if (-not $timeline -or -not $timeline.Dimension) { throw "the workbook has no Timeline sheet" }
     $lastRow = $timeline.Dimension.End.Row
+    # Timeline row numbers of the collector's own memory-dump rows (left out of
+    # the rules): the Finding column tags them "Collector (not flagged)"
+    $collectorMarker = "Collector (not flagged)"
+    $collectorRowNumbers = @()
+    if ($null -ne $CollectorRows -and [int]$CollectorRows.Count -gt 0) {
+        $collectorRowNumbers = @($CollectorRows.Rows | ForEach-Object { [int]$_.RowNumber })
+    }
     $severityOf = @{}
     foreach ($finding in $Findings) { $severityOf[[string]$finding.Id] = [string]$finding.Severity }
     $severityRank = @{ High = 3; Medium = 2; Info = 1 }
@@ -1153,6 +1189,11 @@ function Add-TimelineReportWorkbookSheets {
             $cell.Style.Fill.BackgroundColor.SetColor((ConvertTo-TimelineReportColor $script:reportSeverityColors[$top][0]))
             $cell.Style.Font.Color.SetColor((ConvertTo-TimelineReportColor $script:reportSeverityColors[$top][1]))
         }
+    }
+    # The collector's own rows are not in any finding: tag them, no color
+    foreach ($collectorRowNumber in $collectorRowNumbers) {
+        if ($collectorRowNumber -lt 2 -or $collectorRowNumber -gt $lastRow) { continue }
+        $timeline.Cells[$collectorRowNumber, $findingColumn].Value = $collectorMarker
     }
     # Widen the AutoFilter to the new column
     $timeline.Cells[1, 1, [Math]::Max(2, $lastRow), $findingColumn].AutoFilter = $true
@@ -1227,6 +1268,31 @@ function Add-TimelineReportWorkbookSheets {
         $sheet.Cells[2, 6].Value = "The report rules found nothing in this timeline."
         $row++
     }
+
+    # The collector's own processes in the memory dump: a gray summary row,
+    # then one "Not flagged" row per left-out row, linked to the Timeline row
+    if ($null -ne $CollectorRows -and [int]$CollectorRows.Count -gt 0) {
+        $collectorColor = "D9D9D9"
+        $summaryText = "Recognized by process ID, name and start time (collection_info.json); rows stay on the Timeline sheet and are not checked by the rules"
+        $values = @("Collector", "", "Summary", $null, "", $CollectorRows.Summary, $summaryText, "", "", "", "", "")
+        for ($c = 0; $c -lt $values.Count; $c++) {
+            if ($c -ne 3) { $sheet.Cells[$row, ($c + 1)].Value = ConvertTo-TimelineReportCellText ([string]$values[$c]) }
+        }
+        $summaryRange = $sheet.Cells[$row, 1, $row, $headers.Count]
+        $summaryRange.Style.Font.Bold = $true
+        $summaryRange.Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+        $summaryRange.Style.Fill.BackgroundColor.SetColor((ConvertTo-TimelineReportColor $collectorColor))
+        $row++
+        foreach ($item in $CollectorRows.Rows) {
+            $values = @("Collector", "Not flagged", "Not flagged", $null, $item.Timestamp, $CollectorRows.Summary, $item.Description, $item.Source, $item.EventType, $item.User, "", "")
+            for ($c = 0; $c -lt $values.Count; $c++) {
+                if ($c -ne 3) { $sheet.Cells[$row, ($c + 1)].Value = ConvertTo-TimelineReportCellText ([string]$values[$c]) }
+            }
+            Set-TimelineReportRowLink -Cell $sheet.Cells[$row, 4] -RowNumber ([int]$item.RowNumber)
+            $row++
+        }
+    }
+
     $sheet.Cells[1, 1, ($row - 1), $headers.Count].AutoFilter = $true
     $sheet.View.FreezePanes(2, 1)
 
@@ -1245,7 +1311,7 @@ function Add-TimelineReportWorkbookSheets {
 # -ReportOnly: adds the findings to an existing workbook (it must hold the
 # same rows as timeline.csv). $true when the workbook was updated.
 function Update-TimelineReportWorkbook {
-    param([string]$Path, [object[]]$Findings, [int]$RowCount)
+    param([string]$Path, [object[]]$Findings, [int]$RowCount, $CollectorRows)
     $staleNote = "$(Split-Path $Path -Leaf) keeps the Findings sheet and Finding column of the earlier report (if it has them): their finding ids do not match this report."
     if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
         Log-Warning "  ImportExcel is not installed, so the workbook's findings are not updated (Install-Module -Name ImportExcel -Scope CurrentUser). $staleNote"
@@ -1263,7 +1329,7 @@ function Update-TimelineReportWorkbook {
         if (-not $timeline -or -not $timeline.Dimension) { throw "it has no Timeline sheet" }
         $sheetRows = $timeline.Dimension.End.Row - 1
         if ($sheetRows -ne $RowCount) { throw "its Timeline sheet has $sheetRows rows but the timeline CSV has $RowCount" }
-        Add-TimelineReportWorkbookSheets -Package $package -Findings $Findings
+        Add-TimelineReportWorkbookSheets -Package $package -Findings $Findings -CollectorRows $CollectorRows
         Close-ExcelPackage $package
         $package = $null
         Log-Success "  Workbook updated: Findings sheet and Finding column."
@@ -1307,13 +1373,15 @@ function Complete-TimelineReport {
     $findingsCsv = Join-Path $folder "findings.csv"
     $htmlPath = Join-Path $folder "report.html"
     $pdfPath = Join-Path $folder "report.pdf"
+    $collectorRows = $null
+    if ($State.PSObject.Properties["CollectorRows"]) { $collectorRows = $State.CollectorRows }
     try {
-        Export-ReportFindingsCsv -Findings $State.Findings -Path $findingsCsv
+        Export-ReportFindingsCsv -Findings $State.Findings -Path $findingsCsv -CollectorRows $collectorRows
         $modelWarnings = $null
         $model = New-ReportModel -Rows $Rows -Findings $State.Findings -CollectionInfo $CollectionInfo -CollectorLogPath $CollectorLogPath `
             -BuilderLogPath $BuilderLogPath -TimelinePath $timelineFull -WorkbookPath $workbookFull -WorkbookAvailable:$WorkbookAvailable `
             -Rules $State.Rules -RuleStatistics $State.Statistics -FindingsCsvPath $findingsCsv -MftDays $MftDays -CollectionPath $CollectionPath `
-            -MissingInputFiles $MissingInputFiles -UnexpectedErrors $UnexpectedErrors -WarningVariable modelWarnings -WarningAction SilentlyContinue
+            -MissingInputFiles $MissingInputFiles -UnexpectedErrors $UnexpectedErrors -CollectorRows $collectorRows -WarningVariable modelWarnings -WarningAction SilentlyContinue
         foreach ($warning in @($modelWarnings)) { Log-Warning "  $warning" }
         Export-ReportModelJson -Model $model -Path (Join-Path $folder "report-model.json")
         Export-ReportHtml -Model $model -Path $htmlPath
@@ -1608,7 +1676,7 @@ function Invoke-TimelineReportOnly {
             Log ""
             Log "--- Adding the Findings to the Excel Workbook ---"
             if ($NoExcel) { Log-Warning "  -NoExcel: the workbook is left as it is, so the report does not link to it. Its Findings sheet and Finding column (if any) are from an earlier report and do not match this report's finding ids." }
-            else { $workbookReady = Update-TimelineReportWorkbook -Path $xlsxFile -Findings $reportState.Findings -RowCount $reportRows.Count }
+            else { $workbookReady = Update-TimelineReportWorkbook -Path $xlsxFile -Findings $reportState.Findings -RowCount $reportRows.Count -CollectorRows $reportState.CollectorRows }
         }
         else {
             Log "  No workbook next to the timeline: the report gives timeline.csv row numbers."
@@ -18623,7 +18691,7 @@ if (-not $skipExcel -and (Get-Module -ListAvailable -Name ImportExcel)) {
         # evidence rows, and a "Finding" column on the Timeline sheet
         if ($reportState) {
             try {
-                Add-TimelineReportWorkbookSheets -Package $excelPkg -Findings $reportState.Findings
+                Add-TimelineReportWorkbookSheets -Package $excelPkg -Findings $reportState.Findings -CollectorRows $reportState.CollectorRows
                 $reportState.WorkbookUpdated = $true
                 Log-Success "  Findings sheet and Finding column added ($(@($reportState.Findings).Count) finding(s))."
             }

@@ -655,7 +655,10 @@ they find as leads to review. Next to the timeline:
                      Title, Category, RowNumber, Timestamp, Source,
                      Description. UTF-8 with BOM, so Excel opens it directly;
                      a value starting with = + - or @ gets a leading ' so
-                     Excel never runs it as a formula
+                     Excel never runs it as a formula. When a memory dump
+                     recorded the collector's own process IDs, a last
+                     "Collector" block (FindingId "Collector", Severity "Not
+                     flagged") lists the rows left out of the rules
   report-model.json  Everything the report shows, as data (for scripts)
   timeline.xlsx      Gets a first sheet "Findings" and a "Finding" column
                      (see below)
@@ -813,6 +816,66 @@ once more.
   any other lead's, also after -ReportOnly. A lead that also has rows from
   another source (Prefetch, BAM, an event log) does not get the note.
 
+### The collector's own processes in the memory dump
+
+  When a memory dump is analyzed, the triage collector's own processes --
+  its PowerShell, the launcher cmd window, their console, the memory capture
+  tool (DumpIt), and the processes they started during the collection --
+  appear in the dump like any other process, and some run from a download
+  folder (the collector and its .bat are often launched from Downloads).
+  Without help, the rules would flag them (EXEC-STAGING, and DumpIt as a
+  program run from Downloads).
+
+  A current triage collector records its own process IDs in
+  collection_info.json (the CollectorProcesses field: each process's role,
+  PID, name and start time; see the collector's README). The report
+  recognizes exactly those processes in the memory dump -- by PID, with the
+  name and start time checked against PID reuse, never by name alone -- and
+  the processes they started during the collection (the pslist parent chain,
+  created at or after the collection start). Their rows stay in the timeline
+  and in the coverage counts, but the rules do not check them, so they are
+  not flagged. This is recognition by ID, not by name: a lead cannot hide by
+  naming itself triage-collector.ps1 or DumpIt.exe, because a process with
+  one of those names but a PID the collector did not record is checked by
+  the rules like any other (and flagged if a rule matches).
+
+  The report says what it left out, so nothing disappears silently:
+    Key facts         "Collector processes: N (not flagged)"
+    Evidence coverage a subsection "The collector's own processes (not
+                      flagged)" listing each one (rows, PID, parent PID,
+                      name, start time, how it was recognized, command line),
+                      and a note for any recorded process the dump has under
+                      the same PID with a different name or time (a reused
+                      PID: not left out) or that the dump does not have
+    findings.csv      a "Collector" block (FindingId "Collector", Severity
+                      "Not flagged"): a summary line, then one line per
+                      left-out row
+    report-model.json Coverage.CollectorProcesses
+    workbook          a gray "Collector" summary row on the Findings sheet,
+                      and "Collector (not flagged)" in the Timeline sheet's
+                      Finding column on each left-out row
+  The collector is anchored on its own PowerShell process: if that is not
+  matched in the dump, nothing is left out. Memory network and service rows
+  (Memory-Network, Memory-Services) of these processes are always kept and
+  checked -- no rule reads them, and a stale socket can belong to an earlier
+  process that reused the PID. Volatility 3's pslist reports a process's
+  create time cut to the whole second, so the recorded 100-ns start time is
+  matched against its own second. A typical double-click records about four
+  processes (PowerShell, cmd, conhost, DumpIt) plus any short-lived children
+  still listed by pslist (csc.exe/cvtres.exe from Add-Type, systeminfo.exe);
+  with Windows Terminal as the default terminal a console may be handed off
+  and show up as "not in the dump", which is normal.
+
+  Collections made by an older triage collector do not record these IDs:
+  their own processes in the memory dump are checked by the rules like any
+  other and can show up as leads (the collector's launcher .bat and
+  triage-collector.ps1 run from Downloads, and DumpIt). The report says so
+  (a note in Evidence coverage), such memory-only leads carry the "Captured
+  in the memory dump" note, and a memory-only lead seen only during the
+  collection is flagged on its card as possibly the collector ("check that
+  it is not the triage collector, its launcher or the memory capture tool"),
+  since this collection cannot tell them apart.
+
 ### The workbook: Findings sheet and Finding column
 
   timeline.xlsx opens on its first sheet, "Findings": for each finding a
@@ -825,10 +888,17 @@ once more.
   to that row of the Timeline sheet. The header is frozen and every column
   has a filter.
 
+  When a memory dump recorded the collector's own process IDs, a gray
+  "Collector" summary row follows the findings (Row type "Summary",
+  Severity "Not flagged"), then one "Not flagged" row per left-out row,
+  each linked to its Timeline row.
+
   The "Timeline" sheet gets a last column, "Finding", with the ids of every
   finding the row belongs to ("F001, F004"), colored by the most severe
   one. Filter it on an id to see all rows of that finding, also those
-  beyond the report's evidence limit. Info findings are tagged too.
+  beyond the report's evidence limit. Info findings are tagged too. A row of
+  the collector's own processes in the memory dump is tagged "Collector
+  (not flagged)" (no color): it is deliberately left out of the rules.
   timeline.csv does not get this column; its columns never change.
 
 ### The PDF, Edge and the workbook link
@@ -947,9 +1017,15 @@ once more.
   anyOf (optional): the match AND at least one of these match objects.
   groupBy: "rule" (one finding for all rows; the default), "description",
   "user", "source", "eventType", "detail:<Key>" (a Key=Value of Details;
-  "detail:K1,K2" takes the first that is set) or "capture" (the group
-  (?<key>...) of match.description, or of match.details). {{group}} in the
-  title or why is replaced by the group's value.
+  "detail:K1,K2" takes the first that is set) or "capture". "capture" takes
+  the (?<key>...) group of match.description (or match.details); when the
+  anyOf entry that matched the row has its own (?<key>...) in its details
+  (then its description), that one is used instead, so a rule can key each
+  branch differently (EXEC-STAGING keys a program-in-folder row by the
+  program name, and a script-host command line by the script file name). If
+  neither the matched branch nor match has a key, the row's whole
+  Description is the key. {{group}} in the title or why is replaced by the
+  group's value.
   threshold (optional): a group becomes a finding only when at least
   "count" rows fall within "windowMinutes".
   escalate (optional): a row matching escalate.match up to withinMinutes
@@ -996,6 +1072,20 @@ once more.
     - tests\Test-ReportRules.ps1 checks report\report-rules.json against
       tests\fixtures\report\rules\cases.csv (a matching and a near-miss row
       for every rule); add cases there when you change a rule.
+
+  Memory command lines where a script host runs a script, HTA or DLL from a
+  staging folder (Downloads, Users\Public, PerfLogs, the Recycle Bin) are
+  flagged by EXEC-STAGING (Medium), and from an Outlook attachment folder
+  (Content.Outlook, Olk\Attachments) by INITIAL-EMAIL-RUN (High), keyed by
+  the script or DLL file name (not the host). The hosts recognized are
+  wscript/cscript, mshta, powershell/pwsh (-File or a .ps1 after a call or
+  dot-source), cmd (/c or /k with a .bat/.cmd), rundll32 (the DLL before the
+  comma) and regsvr32. An editor or viewer that only opens such a file is
+  not a run (the matched program must be the script host). These rules read
+  the path literally and do not resolve it, so they do not catch a short
+  (8.3) name (\DOWNLO~1\), an environment-variable form (%USERPROFILE%\...),
+  forward slashes (C:/Users/Public/...) or a caret-split cmd path; a run
+  from one of those forms is not flagged.
 
   Where the shipped rules differ from the rule plan, on purpose:
     - EXEC-STAGING leaves out Temp folders (the plan's R13 lists them):
@@ -1048,7 +1138,11 @@ once more.
       SPF, DKIM and DMARC; mailbox and sign-in logs are kept by the mail
       service (for example Microsoft 365).
     - Analysis tools run on the collected computer leave their own traces
-      in later collections.
+      in later collections. When the collection recorded the collector's own
+      process IDs, its processes in the memory dump are recognized and left
+      unflagged (see "The collector's own processes in the memory dump"); an
+      older collection that did not record them can show the collector, its
+      launcher .bat and the memory capture tool as leads.
   Plus, when they apply: a timeline that ended incomplete (exit code 2:
   input files that disappeared during the run, or unexpected errors;
   listed right after the first limit above), credential material in the
@@ -2743,7 +2837,20 @@ parsing is skipped, and the timeline CSV can be opened manually.
   with rows from other sources too must not be MemoryOnly. A task's
   author-supplied registration date must not set a lead's first and last
   time when the lead has a time Windows recorded, and a lead with only
-  such dates must be left out of the flagged-activity window.
+  such dates must be left out of the flagged-activity window. It also checks
+  the per-anyOf-branch capture key (and the fall-backs to match's capture
+  and the row Description), that groupBy "capture" is rejected when no
+  branch or match has a key, and Find-ReportCollectorRows: the collector's
+  tree recognized by PID, name and start time (Volatility's whole-second
+  create time matched against the recorded 100-ns time), a 14-character
+  Volatility name, the descendant closure (a child started during the
+  collection is in, one started before is out), an impostor with the same
+  name but another PID and a reused-PID decoy not left out, the anchor
+  (nothing left out when the collector's own process is not matched), memory
+  network/service rows never left out, that a mounted image and an older
+  collection recognize nothing, the Evaluate skip, and the model's
+  Coverage.CollectorProcesses, Notes, Method and findings.csv "Collector"
+  block.
 
   tests\Test-ReportRules.ps1 -- loads report\report-rules.json with the
   engine and checks it against tests\fixtures\report\rules\cases.csv: rows
@@ -2756,8 +2863,16 @@ parsing is skipped, and the timeline CSV can be opened manually.
   <group>: a hit whose finding must be grouped under that value. Every
   enabled rule needs a hit and a near-miss case. The rules file must load
   without an error, and no compiled condition may be empty (it would match
-  every row) or keep a {{list:...}} placeholder. -RulesPath and -CasesPath
-  check other files, -EnginePath another engine.
+  every row) or keep a {{list:...}} placeholder. The cases include the
+  script-host branches of EXEC-STAGING and INITIAL-EMAIL-RUN (KEY rows for a
+  script, HTA or DLL run by wscript/cscript, mshta, powershell, cmd,
+  rundll32 or regsvr32 from a staging or attachment folder, including the
+  collector's own triage-collector.ps1 and Run-TriageCollector.bat), the
+  near-misses that must not fire (an editor or viewer opening the file,
+  Get-Content, -File under Documents/Temp, a script outside the folder, the
+  rundll32/regsvr32 handlers, a .txt, \MyDownloadsX\), and the
+  INITIAL-EMAIL-RUN / INITIAL-EMAIL-ATTACH exclusivity. -RulesPath and
+  -CasesPath check other files, -EnginePath another engine.
 
   tests\Test-ReportRender.ps1 -- renders report.html from the synthetic
   models in tests\fixtures\report\render\ and from in-memory models and
@@ -2771,7 +2886,11 @@ parsing is skipped, and the timeline CSV can be opened manually.
   (exactly "Captured in the memory dump", with no Snapshot note or
   collector hint; with the during-collection note too when the dump shows
   the process started then), and one dated only by an
-  author-supplied task date (also in the summary's activity window); then
+  author-supplied task date (also in the summary's activity window). It
+  checks the collector key fact and the "The collector's own processes (not
+  flagged)" subsection of Evidence coverage (the process table and a
+  mismatch note), and that a model without Coverage.CollectorProcesses
+  renders neither. Then it
   prints PDFs with Edge (skipped
   without Edge) and checks
   the page size, the relative ./timeline.xlsx link, that no local path is
@@ -2794,7 +2913,17 @@ parsing is skipped, and the timeline CSV can be opened manually.
   row numbers, findings.csv's RowNumber, the Findings sheet's links and
   the Finding column all on its Memory-CommandLine row, also after a
   -ReportOnly that updates the workbook (a lead that also has a BAM row is
-  not memory-only); -ReportOnly with -ReportRules and -NoExcel
+  not memory-only); a collector-fixture run (tests\fixtures\report\collector\,
+  the stub Volatility's canned output) whose collection_info.json records
+  the collector's process IDs -- the collector's 6 processes in the dump are
+  not flagged and are listed (model, report.html, findings.csv "Collector"
+  block, Findings sheet and the "Collector (not flagged)" Finding column),
+  while an attacker wscript (invoice.vbs) and a same-name process with
+  another PID (triage-collector.ps1) are flagged, the impostor on its own
+  row; the same after -ReportOnly; and a copy with CollectorProcesses
+  removed (an older collector) where the collector's own run is flagged
+  again and the older-collector note appears; -ReportOnly with -ReportRules
+  and -NoExcel
   (the workbook is called stale; -WorkDir and -MemoryDumpPath are ignored
   with one warning), a missing rules file, -NoReport, -ReportOnly in a
   folder named "case [1]" and with report.pdf held open by another
