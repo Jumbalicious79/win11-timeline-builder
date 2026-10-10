@@ -255,6 +255,8 @@ function Test-CollectorFixture {
     Write-TestResult -Succeeded ($blockSummary.Count -eq 1 -and $blockSummary[0].Severity -eq "Not flagged" -and @($block | Where-Object { $_.RowNumber }).Count -eq [int]$cp.RowCount) -Message "${Label}: findings.csv has the Collector block (summary + $([int]$cp.RowCount) row line(s))"
     $html = [System.IO.File]::ReadAllText((Join-Path $Folder "report.html"))
     Write-TestResult -Succeeded ($html.Contains("Collector&#39;s own processes in the memory dump: 6 (not flagged)") -and $html.Contains("The collector&#39;s own processes (not flagged)")) -Message "${Label}: report.html shows the collector summary and the Evidence-coverage subsection"
+    $tableWrong = @($cp.Processes | Where-Object { -not $html.Contains('<tr><td class="mono">' + (@($_.RowNumbers) -join ", ") + '</td><td class="num">' + $_.Pid + '</td><td class="num">' + $_.ParentPid + '</td>') })
+    Write-TestResult -Succeeded (@($cp.Processes).Count -eq 6 -and $tableWrong.Count -eq 0) -Message "${Label}: report.html's collector table gives each process's timeline rows and its plain PID and parent PID ($($tableWrong.Count) wrong)"
     $xlsx = Join-Path $Folder "timeline.xlsx"
     if (-not (Test-Path -LiteralPath $xlsx)) {
         Write-Host "SKIP: ${Label}: timeline.xlsx not created; workbook checks skipped" -ForegroundColor Yellow
@@ -266,7 +268,8 @@ function Test-CollectorFixture {
         return
     }
     $sheetBlock = @($book.FindingsRows | Where-Object { $_.Finding -eq "Collector" })
-    Write-TestResult -Succeeded (@($sheetBlock | Where-Object { $_.RowType -eq "Summary" }).Count -eq 1 -and @($sheetBlock | Where-Object { $_.RowType -ne "Summary" }).Count -eq [int]$cp.RowCount) -Message "${Label}: the Findings sheet has the Collector summary row and its left-out rows"
+    Write-TestResult -Succeeded (@($sheetBlock | Where-Object { $_.RowType -eq "Summary" }).Count -eq 1 -and @($sheetBlock | Where-Object { $_.RowType -ne "Summary" }).Count -eq [int]$cp.RowCount -and
+        @($sheetBlock | Where-Object { $_.Severity -ne "Not flagged" }).Count -eq 0) -Message "${Label}: the Findings sheet has the Collector summary row and its left-out rows, all 'Not flagged' (as in findings.csv)"
     $tagged = @($book.TimelineRows | Where-Object { $_.Finding -eq "Collector (not flagged)" } | ForEach-Object { [int]$_.Row } | Sort-Object -Unique)
     $tagWrong = @($tagged | Where-Object { $colRowNums -notcontains $_ }) + @($colRowNums | Where-Object { $tagged -notcontains $_ })
     Write-TestResult -Succeeded ($tagWrong.Count -eq 0) -Message "${Label}: the Timeline sheet's Finding column tags the collector rows 'Collector (not flagged)' ($($tagged.Count) of $($colRowNums.Count))"

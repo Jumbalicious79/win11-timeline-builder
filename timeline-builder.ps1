@@ -1056,7 +1056,7 @@ function Invoke-TimelineReportRules {
             Log "  $($collector.Summary): $roleList; $([int]$collector.RowCount) row(s) left out of the rules"
         }
         elseif ($collector.Recorded -and $collector.HasMemoryRows) {
-            Log "  Collector's own processes recorded in collection_info.json, but none were recognized in the memory dump (see below)."
+            Log "  Collector's own processes recorded in collection_info.json, but none were recognized in the memory dump (see below): nothing is left out, and a lead seen only in the memory dump during the collection is marked on its card as possibly the collector."
         }
         foreach ($mismatch in @($collector.Mismatched)) {
             $recordedTime = if ($mismatch.RecordedStartUtc) { $mismatch.RecordedStartUtc.ToString("yyyy-MM-dd HH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture) } else { "unknown time" }
@@ -1274,7 +1274,7 @@ function Add-TimelineReportWorkbookSheets {
     if ($null -ne $CollectorRows -and [int]$CollectorRows.Count -gt 0) {
         $collectorColor = "D9D9D9"
         $summaryText = "Recognized by process ID, name and start time (collection_info.json); rows stay on the Timeline sheet and are not checked by the rules"
-        $values = @("Collector", "", "Summary", $null, "", $CollectorRows.Summary, $summaryText, "", "", "", "", "")
+        $values = @("Collector", "Not flagged", "Summary", $null, "", $CollectorRows.Summary, $summaryText, "", "", "", "", "")
         for ($c = 0; $c -lt $values.Count; $c++) {
             if ($c -ne 3) { $sheet.Cells[$row, ($c + 1)].Value = ConvertTo-TimelineReportCellText ([string]$values[$c]) }
         }

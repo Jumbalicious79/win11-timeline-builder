@@ -300,7 +300,7 @@ try {
     $finding.CollectorSuspect = $true
     Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath
     $suspectHtml = [System.IO.File]::ReadAllText($memoryHtmlPath)
-    Write-TestResult -Succeeded ($suspectHtml.Contains("this collection does not record the collector&#39;s own process IDs: check that it is not the triage collector, its launcher or the memory capture tool")) -Message "a memory-only lead from an older collection is flagged CollectorSuspect on its card"
+    Write-TestResult -Succeeded ($suspectHtml.Contains("this collection does not record the collector&#39;s own process IDs (or they were not recognized in the memory dump): check that it is not the triage collector, its launcher or the memory capture tool")) -Message "a memory-only lead from an older (or unrecognized) collection is flagged CollectorSuspect on its card"
     $finding.CollectorSuspect = $false
     $finding.MemoryOnly = $false
     $finding.MemoryOnlyNote = ""
@@ -311,17 +311,33 @@ try {
     $memoryModel.Coverage.CollectorProcesses = [ordered]@{
         Recorded = $true; Count = 2; RowCount = 3
         Summary  = "Collector's own processes in the memory dump: 2 (not flagged)"
+        # RowNumbers as the engine gives them ([int[]]) and as report-model.json
+        # gives them back (object[])
         Processes = @(
-            [ordered]@{ Pid = 9120; ParentPid = 8840; Name = "powershell.exe"; CreateTimeUtc = $collectionStart; Role = "Collector"; How = "recorded by the collector: collector"; CommandLine = "powershell.exe -File x"; RowNumbers = @(5, 6) },
-            [ordered]@{ Pid = 10232; ParentPid = 9120; Name = "DumpIt.exe"; CreateTimeUtc = $collectionStart; Role = "MemoryCapture"; How = "started by PID 9120 during the collection"; CommandLine = "DumpIt.exe /q"; RowNumbers = @(7) })
+            [ordered]@{ Pid = 19120; ParentPid = 18840; Name = "powershell.exe"; CreateTimeUtc = $collectionStart; Role = "Collector"; How = "recorded by the collector: collector"; CommandLine = "powershell.exe -File x"; RowNumbers = [int[]]@(5, 6) },
+            [ordered]@{ Pid = 10232; ParentPid = 19120; Name = "DumpIt.exe"; CreateTimeUtc = $collectionStart; Role = "MemoryCapture"; How = "started by PID 19120 during the collection"; CommandLine = "DumpIt.exe /q"; RowNumbers = @(7) })
         NotInDump = @()
-        Mismatched = @([ordered]@{ Pid = 4242; Name = "cmd.exe"; Reason = "a reused id"; DumpName = "other.exe" })
+        Mismatched = @([ordered]@{ Pid = 14242; Name = "cmd.exe"; Reason = "a reused id"; DumpName = "other.exe" })
     }
     Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath -NoFileHashes
     $collectorHtml = [System.IO.File]::ReadAllText($memoryHtmlPath)
     Write-TestResult -Succeeded ($collectorHtml.Contains("<th>Collector processes</th>") -and $collectorHtml.Contains("Collector&#39;s own processes in the memory dump: 2 (not flagged) &ndash; listed under Evidence coverage")) -Message "the summary's key facts gives the collector-processes summary"
-    Write-TestResult -Succeeded ($collectorHtml.Contains("The collector&#39;s own processes (not flagged)") -and $collectorHtml.Contains(">DumpIt.exe</td>") -and $collectorHtml.Contains("started by PID 9120 during the collection") -and $collectorHtml.Contains("a reused id")) -Message "Evidence coverage has the collector subsection with the process table and the mismatch note"
+    Write-TestResult -Succeeded ($collectorHtml.Contains("The collector&#39;s own processes (not flagged)") -and $collectorHtml.Contains(">DumpIt.exe</td>") -and $collectorHtml.Contains("started by PID 19120 during the collection") -and $collectorHtml.Contains("a reused id")) -Message "Evidence coverage has the collector subsection with the process table and the mismatch note"
+    Write-TestResult -Succeeded ($collectorHtml.Contains('<tr><td class="mono">5, 6</td><td class="num">19120</td><td class="num">18840</td>') -and $collectorHtml.Contains('<tr><td class="mono">7</td><td class="num">10232</td><td class="num">19120</td>') -and
+        $collectorHtml.Contains("The collector recorded PID 14242 (") -and -not $collectorHtml.Contains("19,120")) -Message "the collector table gives each process's rows (5, 6 and 7) and plain process IDs, as the timeline writes them"
     Write-TestResult -Succeeded (-not $minimal.Contains("The collector&#39;s own processes (not flagged)") -and -not $minimal.Contains("<th>Collector processes</th>")) -Message "a model without Coverage.CollectorProcesses renders no collector key fact or subsection"
+    # Recorded but none recognized (the collector's PowerShell not in the dump)
+    $memoryModel.Coverage.CollectorProcesses = [ordered]@{
+        Recorded = $true; Count = 0; RowCount = 0
+        Summary  = "Collector's own processes in the memory dump: none recognized (nothing left out)"
+        Processes = @()
+        NotInDump = @([ordered]@{ Pid = 19120; Name = "powershell.exe"; Role = "Collector" })
+        Mismatched = @()
+    }
+    Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath -NoFileHashes
+    $unrecognizedHtml = [System.IO.File]::ReadAllText($memoryHtmlPath)
+    Write-TestResult -Succeeded ($unrecognizedHtml.Contains("none recognized (nothing left out) &ndash; listed under Evidence coverage") -and $unrecognizedHtml.Contains("but its PowerShell process was not matched in the memory dump") -and
+        -not $unrecognizedHtml.Contains("their rows stay in the timeline but the rules do not check them") -and $unrecognizedHtml.Contains("The collector recorded PID 19120 (powershell.exe), which the memory dump does not have.")) -Message "a collection whose recorded processes were not recognized says nothing was left out, with the not-in-dump note"
     $memoryModel.Coverage.CollectorProcesses = $null
 
     # --- Hostile and edge values: bidi controls, a long unbroken title, more

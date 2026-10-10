@@ -855,16 +855,20 @@ once more.
                       and "Collector (not flagged)" in the Timeline sheet's
                       Finding column on each left-out row
   The collector is anchored on its own PowerShell process: if that is not
-  matched in the dump, nothing is left out. Memory network and service rows
-  (Memory-Network, Memory-Services) of these processes are always kept and
-  checked -- no rule reads them, and a stale socket can belong to an earlier
-  process that reused the PID. Volatility 3's pslist reports a process's
-  create time cut to the whole second, so the recorded 100-ns start time is
-  matched against its own second. A typical double-click records about four
-  processes (PowerShell, cmd, conhost, DumpIt) plus any short-lived children
-  still listed by pslist (csc.exe/cvtres.exe from Add-Type, systeminfo.exe);
-  with Windows Terminal as the default terminal a console may be handed off
-  and show up as "not in the dump", which is normal.
+  matched in the dump, nothing is left out ("none recognized (nothing left
+  out)"), and the report treats the collection like one from an older
+  collector (below): a memory-only lead seen during the collection is
+  flagged on its card as possibly the collector. Memory network and service
+  rows (Memory-Network, Memory-Services) of these processes are always kept
+  and checked -- no rule reads them, and a stale socket can belong to an
+  earlier process that reused the PID. Volatility 3's pslist reports a
+  process's create time cut to the whole second, so the recorded 100-ns start
+  time is matched against its own second. A typical double-click records
+  about four processes (PowerShell, cmd, conhost, DumpIt) plus any
+  short-lived children still listed by pslist (csc.exe/cvtres.exe from
+  Add-Type, systeminfo.exe); with Windows Terminal as the default terminal a
+  console may be handed off and show up as "not in the dump", which is
+  normal.
 
   Collections made by an older triage collector do not record these IDs:
   their own processes in the memory dump are checked by the rules like any
@@ -874,7 +878,8 @@ once more.
   in the memory dump" note, and a memory-only lead seen only during the
   collection is flagged on its card as possibly the collector ("check that
   it is not the triage collector, its launcher or the memory capture tool"),
-  since this collection cannot tell them apart.
+  since this collection cannot tell them apart. The same holds for a current
+  collection whose recorded processes were not recognized in the dump.
 
 ### The workbook: Findings sheet and Finding column
 
@@ -2848,9 +2853,12 @@ parsing is skipped, and the timeline CSV can be opened manually.
   name but another PID and a reused-PID decoy not left out, the anchor
   (nothing left out when the collector's own process is not matched), memory
   network/service rows never left out, that a mounted image and an older
-  collection recognize nothing, the Evaluate skip, and the model's
-  Coverage.CollectorProcesses, Notes, Method and findings.csv "Collector"
-  block.
+  collection recognize nothing, the Evaluate skip, the CollectorSuspect card
+  flag (an older collection, and a recorded one whose collector was not
+  recognized: "none recognized (nothing left out)" and its own note), and
+  the model's Coverage.CollectorProcesses, Notes, Method and findings.csv
+  "Collector" block (its summary counts the left-out rows and the processes
+  apart).
 
   tests\Test-ReportRules.ps1 -- loads report\report-rules.json with the
   engine and checks it against tests\fixtures\report\rules\cases.csv: rows
@@ -2888,9 +2896,10 @@ parsing is skipped, and the timeline CSV can be opened manually.
   the process started then), and one dated only by an
   author-supplied task date (also in the summary's activity window). It
   checks the collector key fact and the "The collector's own processes (not
-  flagged)" subsection of Evidence coverage (the process table and a
-  mismatch note), and that a model without Coverage.CollectorProcesses
-  renders neither. Then it
+  flagged)" subsection of Evidence coverage (the process table with each
+  process's rows and plain process IDs, a mismatch note, and the text for a
+  collection whose recorded processes were not recognized), and that a
+  model without Coverage.CollectorProcesses renders neither. Then it
   prints PDFs with Edge (skipped
   without Edge) and checks
   the page size, the relative ./timeline.xlsx link, that no local path is
@@ -2916,8 +2925,9 @@ parsing is skipped, and the timeline CSV can be opened manually.
   not memory-only); a collector-fixture run (tests\fixtures\report\collector\,
   the stub Volatility's canned output) whose collection_info.json records
   the collector's process IDs -- the collector's 6 processes in the dump are
-  not flagged and are listed (model, report.html, findings.csv "Collector"
-  block, Findings sheet and the "Collector (not flagged)" Finding column),
+  not flagged and are listed (model, report.html with each process's rows
+  and PIDs, findings.csv "Collector" block, Findings sheet and the
+  "Collector (not flagged)" Finding column),
   while an attacker wscript (invoice.vbs) and a same-name process with
   another PID (triage-collector.ps1) are flagged, the impostor on its own
   row; the same after -ReportOnly; and a copy with CollectorProcesses

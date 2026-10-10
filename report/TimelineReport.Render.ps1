@@ -815,7 +815,7 @@ function Add-ReportHtmlFinding {
     # An older (or unrecognized) collection could not tell the collector's own
     # processes apart: a memory-only lead from during the collection may be it
     if ([bool](Get-ReportHtmlField $Finding "CollectorSuspect")) {
-        $flags.Add('<span class="flag">This process was seen only in the memory dump during the collection, and this collection does not record the collector&#39;s own process IDs: check that it is not the triage collector, its launcher or the memory capture tool</span>')
+        $flags.Add('<span class="flag">This process was seen only in the memory dump during the collection, and this collection does not record the collector&#39;s own process IDs (or they were not recognized in the memory dump): check that it is not the triage collector, its launcher or the memory capture tool</span>')
     }
     if ([bool](Get-ReportHtmlField $Finding "DuringCollection")) {
         $flags.Add('<span class="flag">Every row is from during the collection: this may be the collector&#39;s own activity</span>')
@@ -1279,17 +1279,26 @@ function Add-ReportHtmlCoverage {
     $collectorCoverage = Get-ReportHtmlField $coverage "CollectorProcesses"
     $collectorSummary = ConvertTo-ReportHtmlText (Get-ReportHtmlField $collectorCoverage "Summary")
     if ([bool](Get-ReportHtmlField $collectorCoverage "Recorded") -and $collectorSummary) {
-        $null = $Builder.AppendLine('<h3>The collector&#39;s own processes (not flagged)</h3>')
-        $null = $Builder.AppendLine('<p>' + $collectorSummary + '. They are recognized by the process ID, name and start time recorded in collection_info.json, and the processes they started during the collection; their rows stay in the timeline but the rules do not check them. Memory network and service rows of these processes are kept and checked.</p>')
         $processes = Get-ReportHtmlList $collectorCoverage "Processes"
+        $null = $Builder.AppendLine('<h3>The collector&#39;s own processes (not flagged)</h3>')
+        if ($processes.Count -gt 0) {
+            $null = $Builder.AppendLine('<p>' + $collectorSummary + '. They are recognized by the process ID, name and start time recorded in collection_info.json, and the processes they started during the collection; their rows stay in the timeline but the rules do not check them. Memory network and service rows of these processes are kept and checked.</p>')
+        }
+        else {
+            $null = $Builder.AppendLine('<p>' + $collectorSummary + '. The collector recorded its own process IDs in collection_info.json, but its PowerShell process was not matched in the memory dump (see below), so the rules check its processes like any other, and a lead seen only in the memory dump during the collection is marked on its card as possibly the collector.</p>')
+        }
         if ($processes.Count -gt 0) {
             $null = $Builder.AppendLine('<table><colgroup><col style="width:12%"><col style="width:8%"><col style="width:9%"><col style="width:17%"><col style="width:17%"><col style="width:17%"><col style="width:20%"></colgroup>')
             $null = $Builder.AppendLine('<thead><tr><th>' + $Context.RowHeading + 's</th><th class="num">PID</th><th class="num">Parent PID</th><th>Name</th><th>Started (UTC)</th><th>Recognized as</th><th>Command line</th></tr></thead><tbody>')
             foreach ($proc in @($processes | Select-Object -First 50)) {
-                $rowNumbers = @(Get-ReportHtmlList $proc "RowNumbers" | ForEach-Object { [string]([long](ConvertTo-ReportHtmlNumber $_)) })
+                # Get-ReportHtmlList returns its array as one pipeline object:
+                # loop over it, do not pipe it
+                $rowNumbers = @(foreach ($rowNumber in (Get-ReportHtmlList $proc "RowNumbers")) { [string]([long](ConvertTo-ReportHtmlNumber $rowNumber)) })
+                # Process IDs as the timeline and the log write them (no
+                # thousands separator), so they can be searched for there
                 $null = $Builder.AppendLine('<tr><td class="mono">' + (ConvertTo-ReportHtmlText (($rowNumbers | Select-Object -First 10) -join ", ") -MaxLength 120) +
-                    '</td><td class="num">' + (Format-ReportHtmlNumber (Get-ReportHtmlField $proc "Pid")) +
-                    '</td><td class="num">' + (Format-ReportHtmlNumber (Get-ReportHtmlField $proc "ParentPid")) +
+                    '</td><td class="num">' + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $proc "Pid")) +
+                    '</td><td class="num">' + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $proc "ParentPid")) +
                     '</td><td>' + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $proc "Name") -MaxLength 120) +
                     '</td><td class="mono">' + (Format-ReportHtmlTime (Get-ReportHtmlField $proc "CreateTimeUtc") "yyyy-MM-dd HH:mm:ss") +
                     '</td><td>' + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $proc "How") -MaxLength 120) +
@@ -1300,11 +1309,11 @@ function Add-ReportHtmlCoverage {
         }
         $collectorNotes = New-Object System.Collections.Generic.List[string]
         foreach ($mismatch in (Get-ReportHtmlList $collectorCoverage "Mismatched")) {
-            $collectorNotes.Add("The collector recorded PID " + (Format-ReportHtmlNumber (Get-ReportHtmlField $mismatch "Pid")) + " (" + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $mismatch "Name")) +
+            $collectorNotes.Add("The collector recorded PID " + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $mismatch "Pid")) + " (" + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $mismatch "Name")) +
                 ") but the memory dump has " + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $mismatch "DumpName")) + " with that id: " + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $mismatch "Reason")) + ", so it was not left out.")
         }
         foreach ($missing in (Get-ReportHtmlList $collectorCoverage "NotInDump")) {
-            $collectorNotes.Add("The collector recorded PID " + (Format-ReportHtmlNumber (Get-ReportHtmlField $missing "Pid")) + " (" + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $missing "Name")) + "), which the memory dump does not have.")
+            $collectorNotes.Add("The collector recorded PID " + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $missing "Pid")) + " (" + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $missing "Name")) + "), which the memory dump does not have.")
         }
         if ($collectorNotes.Count -gt 0) {
             $null = $Builder.AppendLine('<ul class="plain small">')

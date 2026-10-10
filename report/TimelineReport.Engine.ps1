@@ -2565,7 +2565,10 @@ function Find-ReportCollectorRows {
     $count = @($processes).Count
     $summary = ""
     if ($result.Recorded -and $result.HasMemoryRows) {
-        $summary = "Collector's own processes in the memory dump: $count (not flagged)"
+        # None recognized: the collector's own PowerShell process (the anchor)
+        # was not matched in the dump, so nothing is left out
+        if ($count -gt 0) { $summary = "Collector's own processes in the memory dump: $count (not flagged)" }
+        else { $summary = "Collector's own processes in the memory dump: none recognized (nothing left out)" }
     }
     return [PSCustomObject]@{
         Recorded      = [bool]$result.Recorded
@@ -2627,7 +2630,9 @@ function Invoke-ReportRules {
     # processes are left out, and a same-name impostor is positively a lead.
     $mode = [string](Get-ReportEngineInfoValue $CollectionInfo @("Mode"))
     $live = (-not $mode -or $mode -eq "Live")
-    $collectorRecognized = ($null -ne $CollectorRows -and [bool]$CollectorRows.Recorded -and [bool]$CollectorRows.HasMemoryRows)
+    # Recognized: recorded, and the collector's own PowerShell process (the
+    # anchor) matched in the dump, so at least one process was left out
+    $collectorRecognized = ($null -ne $CollectorRows -and [bool]$CollectorRows.Recorded -and [bool]$CollectorRows.HasMemoryRows -and [int]$CollectorRows.Count -gt 0)
     # Command-line rows of a process that started around the collection start:
     # only computed when the collector's IDs were not recorded/recognized
     $suspectRows = $null
@@ -2826,7 +2831,7 @@ function Export-ReportFindingsCsv {
         # summary line, then one line per left-out row, with the reason.
         if ($null -ne $CollectorRows -and [int]$CollectorRows.Count -gt 0) {
             $collectorLead = @("Collector", "Not flagged", "", $CollectorRows.Summary, "")
-            $collectorDescription = "Summary: $($CollectorRows.Count) row(s) of the collector's own processes, recognized by process ID, name and start time; not checked by the rules"
+            $collectorDescription = "Summary: $($CollectorRows.RowCount) row(s) of $($CollectorRows.Count) collector process(es), recognized by process ID, name and start time; not checked by the rules"
             $writer.WriteLine([TimelineReport.CsvText]::Line([object[]]($collectorLead + @("", "", "", $collectorDescription))))
             foreach ($row in $CollectorRows.Rows) {
                 $writer.WriteLine([TimelineReport.CsvText]::Line([object[]]($collectorLead + @($row.RowNumber, $row.Timestamp, $row.Source, $row.Description))))
@@ -3285,8 +3290,11 @@ function New-ReportModel {
     # The collector's own processes in the memory dump, left out of the rules
     $memoryRowsPresent = @($stats.Sources | Where-Object { $_.Source -like "Memory-*" }).Count -gt 0
     $collectorRecorded = ($null -ne $CollectorRows -and [bool]$CollectorRows.Recorded -and [bool]$CollectorRows.HasMemoryRows)
-    if ($collectorRecorded -and $CollectorRows.Summary) {
+    if ($collectorRecorded -and $CollectorRows.Summary -and [int]$CollectorRows.Count -gt 0) {
         $notes.Add("$($CollectorRows.Summary). These rows stay in the timeline and in coverage counts; they are listed under ""The collector's own processes (not flagged)"" in Evidence coverage.")
+    }
+    elseif ($collectorRecorded -and $CollectorRows.Summary) {
+        $notes.Add("The collector recorded its own process IDs in collection_info.json, but its PowerShell process was not matched in the memory dump, so nothing was left out: its processes are checked by the rules like any other, and a lead seen only in the memory dump during the collection is marked on its card as possibly the collector (see ""The collector's own processes (not flagged)"" in Evidence coverage).")
     }
     elseif ($live -and $memoryRowsPresent -and ($null -eq $CollectorRows -or -not [bool]$CollectorRows.Recorded)) {
         $notes.Add("This collection does not record the collector's own process IDs (made by an older triage collector): its own processes in the memory dump are checked by the rules like any other and can show up as leads.")

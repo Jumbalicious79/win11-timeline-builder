@@ -820,18 +820,18 @@ try {
         return @{ Timestamp = "2026-05-15 12:03:30.000"; Source = "Memory-CommandLine"; EventType = "Snapshot"; Description = "Process command line: $Name (PID: $ProcId)"; User = ""; Details = "Args=$CmdLine"; Artifact = "MemoryDump"; RawPath = "" } }
     $collStart = "2026-05-15T12:03:00.5000000Z"
     $colRows = @(
-        (New-TestProc "2026-05-15 12:02:58.000" "powershell.exe" 9120 8840),
-        (New-TestProc "2026-05-15 12:02:55.000" "cmd.exe" 8840 8000),
-        (New-TestProc "2026-05-15 12:02:56.000" "conhost.exe" 8848 8840),
-        (New-TestProc "2026-05-15 12:03:30.000" "DumpIt.exe" 10232 9120),
-        (New-TestProc "2026-05-15 12:03:05.000" "csc.exe" 9500 9120),
-        (New-TestProc "2026-05-15 12:03:06.000" "cvtres.exe" 9600 9500),
-        (New-TestProc "2026-05-15 12:02:59.000" "conhost.exe" 9700 9120),
-        (New-TestProc "2026-05-15 12:03:10.000" "powershell.exe" 1234 5000),
-        (New-TestProc "2026-05-15 12:03:11.000" "evil.exe" 8840 5000 -Snapshot),
-        (New-TestCmd "powershell.exe" 9120 "powershell.exe -File C:\col\triage-collector.ps1"),
-        (New-TestCmd "DumpIt.exe" 10232 "DumpIt.exe /q"),
-        (New-TestCmd "powershell.exe" 1234 "powershell.exe -enc AAAA"),
+        (New-TestProc -Time "2026-05-15 12:02:58.000" -Name "powershell.exe" -ProcId 9120 -Ppid 8840),
+        (New-TestProc -Time "2026-05-15 12:02:55.000" -Name "cmd.exe" -ProcId 8840 -Ppid 8000),
+        (New-TestProc -Time "2026-05-15 12:02:56.000" -Name "conhost.exe" -ProcId 8848 -Ppid 8840),
+        (New-TestProc -Time "2026-05-15 12:03:30.000" -Name "DumpIt.exe" -ProcId 10232 -Ppid 9120),
+        (New-TestProc -Time "2026-05-15 12:03:05.000" -Name "csc.exe" -ProcId 9500 -Ppid 9120),
+        (New-TestProc -Time "2026-05-15 12:03:06.000" -Name "cvtres.exe" -ProcId 9600 -Ppid 9500),
+        (New-TestProc -Time "2026-05-15 12:02:59.000" -Name "conhost.exe" -ProcId 9700 -Ppid 9120),
+        (New-TestProc -Time "2026-05-15 12:03:10.000" -Name "powershell.exe" -ProcId 1234 -Ppid 5000),
+        (New-TestProc -Time "2026-05-15 12:03:11.000" -Name "evil.exe" -ProcId 8840 -Ppid 5000 -Snapshot),
+        (New-TestCmd -Name "powershell.exe" -ProcId 9120 -CmdLine "powershell.exe -File C:\col\triage-collector.ps1"),
+        (New-TestCmd -Name "DumpIt.exe" -ProcId 10232 -CmdLine "DumpIt.exe /q"),
+        (New-TestCmd -Name "powershell.exe" -ProcId 1234 -CmdLine "powershell.exe -enc AAAA"),
         @{ Timestamp = "2026-05-15 12:03:30.000"; Source = "Memory-Network"; EventType = "Snapshot"; Description = "Memory network: TCPv4 10.0.0.5:5 -> 1.2.3.4:443 (ESTABLISHED)"; User = ""; Details = "PID=9120 Process=powershell.exe"; Artifact = "MemoryDump"; RawPath = "" },
         @{ Timestamp = "2026-05-15 12:03:30.000"; Source = "Memory-Services"; EventType = "Snapshot"; Description = "Service in memory: X (X)"; User = ""; Details = "State=RUNNING PID=9120"; Artifact = "MemoryDump"; RawPath = "" }
     )
@@ -857,12 +857,12 @@ try {
     $colDecoyExcluded = $false; for ($i = 0; $i -lt $col.Excluded.Length; $i++) { if ($col.Excluded[$i] -and $colRows[$i].Description -like "*evil.exe*") { $colDecoyExcluded = $true } }
     Write-TestResult -Succeeded (-not $colDecoyExcluded) -Message "collector: a decoy row that reused an excluded PID (other name) is not excluded"
     # 14-char truncated name, and the whole-second time match
-    $truncRows = @( (New-TestProc "2026-05-15 12:02:58.000" "LongProcessNam" 4000 3000) )
+    $truncRows = @( (New-TestProc -Time "2026-05-15 12:02:58.000" -Name "LongProcessNam" -ProcId 4000 -Ppid 3000) )
     $truncInfo = [PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $collStart; CollectorProcesses = @([PSCustomObject]@{ Role = "Collector"; Pid = 4000; Name = "LongProcessName.exe"; StartUtc = "2026-05-15T12:02:58.9000000Z"; ParentPid = 3000 }) }
     $truncCol = Find-ReportCollectorRows -Rows $truncRows -CollectionInfo $truncInfo
     Assert-Equal (@($truncCol.Processes).Count) 1 -Message "collector: a Volatility 14-char name (LongProcessNam) matches the full recorded name"
     foreach ($pair in @(@("2026-05-15 12:00:02.000", 1), @("2026-05-15 12:00:03.000", 0), @("2026-05-15 12:00:01.000", 0))) {
-        $tRows = @( (New-TestProc $pair[0] "powershell.exe" 5 4) )
+        $tRows = @( (New-TestProc -Time $pair[0] -Name "powershell.exe" -ProcId 5 -Ppid 4) )
         $tInfo = [PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = "2026-05-15T12:00:00Z"; CollectorProcesses = @([PSCustomObject]@{ Role = "Collector"; Pid = 5; Name = "powershell.exe"; StartUtc = "2026-05-15T12:00:02.9999999Z"; ParentPid = 4 }) }
         $tCol = Find-ReportCollectorRows -Rows $tRows -CollectionInfo $tInfo
         Assert-Equal (@($tCol.Processes).Count) $pair[1] -Message "collector: whole-second match, dump $($pair[0]) vs recorded :02.9999999 -> $($pair[1]) process(es)"
@@ -903,6 +903,16 @@ try {
     $impYes = @($skipWithCollector | Where-Object { $_.GroupKey -eq "powershell.exe" })[0]
     Write-TestResult -Succeeded ([bool]$impNo.CollectorSuspect) -Message "an older collection (no recorded IDs): a memory-only lead during the collection is flagged CollectorSuspect"
     Write-TestResult -Succeeded (-not [bool]$impYes.CollectorSuspect) -Message "a recognized collection: a flagged impostor lead is not marked CollectorSuspect"
+    # Recorded but not recognized (the collector's PowerShell is not in the
+    # dump): nothing is left out, and the memory-only leads from during the
+    # collection -- the collector's own capture tool among them -- are marked
+    # CollectorSuspect as in an older collection
+    $reuseInfo = [PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $collStart; CollectorProcesses = @([PSCustomObject]@{ Role = "Collector"; Pid = 7777; Name = "powershell.exe"; StartUtc = "2026-05-15T12:02:58.1Z"; ParentPid = 8840 }) }
+    Assert-Equal "$($reuse.Recorded)|$($reuse.HasMemoryRows)|$($reuse.Count)|$($reuse.Summary)" "True|True|0|Collector's own processes in the memory dump: none recognized (nothing left out)" -Message "collector: recorded but none recognized: Summary says nothing was left out"
+    $skipUnrecognized = @(Invoke-ReportRules -Rows $colRows -Rules $skipRules -CollectionInfo $reuseInfo -CollectorRows $reuse)
+    $unrecDumpIt = @($skipUnrecognized | Where-Object { $_.GroupKey -eq "DumpIt.exe" })
+    $unrecImpostor = @($skipUnrecognized | Where-Object { $_.GroupKey -eq "powershell.exe" })
+    Write-TestResult -Succeeded ($unrecDumpIt.Count -eq 1 -and [bool]$unrecDumpIt[0].CollectorSuspect -and $unrecImpostor.Count -eq 1 -and [bool]$unrecImpostor[0].CollectorSuspect) -Message "recorded but not recognized: the memory-only leads from during the collection (the capture tool, powershell.exe) are flagged CollectorSuspect"
 
     # =========================================================
     # The model's Coverage.CollectorProcesses, the Notes/Method lines, the
@@ -920,6 +930,10 @@ try {
     $colBlock = @($colCsvLines | Where-Object { $_.FindingId -eq "Collector" })
     $colBlockSummary = @($colBlock | Where-Object { -not $_.RowNumber })
     Write-TestResult -Succeeded ($colBlockSummary.Count -eq 1 -and $colBlockSummary[0].Severity -eq "Not flagged" -and $colBlockSummary[0].Description -match "not checked by the rules" -and @($colBlock | Where-Object { $_.RowNumber }).Count -eq $col.RowCount) -Message "findings.csv has the Collector block: a 'Not flagged' summary and one line per left-out row"
+    Write-TestResult -Succeeded ($col.RowCount -ne $col.Count -and $colBlockSummary.Count -eq 1 -and $colBlockSummary[0].Description.StartsWith("Summary: $($col.RowCount) row(s) of $($col.Count) collector process(es),")) -Message "findings.csv's Collector summary counts the left-out rows and the processes apart ($(if ($colBlockSummary.Count -eq 1) { $colBlockSummary[0].Description }))"
+    $unrecModel = New-ReportModel -Rows $colRows -Findings $skipUnrecognized -CollectionInfo $reuseInfo -CollectorRows $reuse
+    Write-TestResult -Succeeded (@($unrecModel.Coverage.Notes | Where-Object { $_ -match "but its PowerShell process was not matched in the memory dump, so nothing was left out" }).Count -eq 1 -and
+        @($unrecModel.Coverage.Notes | Where-Object { $_ -match "These rows stay in the timeline" -or $_ -match "older triage collector" }).Count -eq 0) -Message "model: recorded but not recognized gets its own note (nothing left out), not the left-out or older-collector note"
     # The older-collection note when memory rows exist but nothing is recorded
     $oldModel = New-ReportModel -Rows $colRows -Findings $skipNoCollector -CollectionInfo ([PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $collStart }) -CollectorRows $oldCol
     Write-TestResult -Succeeded (@($oldModel.Coverage.Notes | Where-Object { $_ -match "does not record the collector's own process IDs" }).Count -eq 1 -and -not $oldModel.Coverage.CollectorProcesses.Recorded) -Message "model: an older collection (memory rows, no record) gets the older-collector note"
