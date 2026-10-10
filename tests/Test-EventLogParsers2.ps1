@@ -849,7 +849,7 @@ function Invoke-TestBuilder {
     try {
         Write-Host "Running the builder ($powershellExe) on $Collection ..."
         $output = @(& $powershellExe -NoProfile -ExecutionPolicy Bypass -File $builder -InputPath $Collection -Sources "EventLogs" `
-                -OutputFile $timelineCsv -NoExcel -Viewer None 2>&1 | ForEach-Object { "$_" })
+                -OutputFile $timelineCsv -NoExcel -NoReport -Viewer None 2>&1 | ForEach-Object { "$_" })
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $timelineCsv)) {
             $output | ForEach-Object { Write-Host "  | $_" }
             Write-TestResult -Name "${Label}: builder run" -Passed $false -Message "the builder exited with code $LASTEXITCODE or wrote no timeline"

@@ -2,7 +2,9 @@
 
 A pure PowerShell script that builds a unified, chronological CSV timeline from
 Windows forensic artifacts. Designed as a lightweight alternative to
-log2timeline/plaso, focused specifically on Windows 11 artifacts.
+log2timeline/plaso, focused specifically on Windows 11 artifacts. Each run
+also writes a findings report (PDF and HTML): leads to review, found by
+rules in the timeline, with a plain-English summary page first.
 
 Designed to be used with win11-triage-collector, which collects the forensic
 artifacts this script parses. The timeline builder is a pure parser -- it
@@ -28,10 +30,14 @@ Required directory structure:
     win11-timeline-builder\       <-- this repo
       timeline-builder.ps1
       Run-TimelineBuilder.bat
+      report\                     <-- findings report rules and renderer
+                                      (needed for report.pdf)
       reports\                    <-- timelines save here
       tools\                      <-- auto-downloaded on first run
         sqlite3\                  <-- browser history parser
         TimelineExplorer\         <-- forensic CSV viewer
+
+  (Copy each repository folder whole; the lists show the main parts.)
 
 To set up:
 
@@ -40,6 +46,13 @@ To set up:
 
 Or download both repos and extract them into the same parent folder. The parent
 folder can be anywhere -- your desktop, a USB drive, a network share, etc.
+GitHub's "Download ZIP" names the folders win11-triage-collector-master and
+win11-timeline-builder-master: rename them to win11-triage-collector and
+win11-timeline-builder. (Browse mode also finds one win11-triage-collector-*
+folder with a reports\ folder in it, but the exact name is what it looks for
+first.) The path of the builder's folder must not have [ ], * or ? in it
+(PowerShell reads them as wildcards): from such a folder the builder stops at
+the start with an error that says so (exit code 1).
 
 If you pass -InputPath directly, the sibling requirement does not apply. But
 for the zero-config double-click workflow (browse mode), both directories must
@@ -54,7 +67,9 @@ no dependencies, no command-line knowledge needed.
 
   1. COLLECT: Run triage-collector on the target system
   2. ANALYZE: Run timeline-builder on the collection (this tool)
-  3. REVIEW: Timeline Explorer auto-opens with the timeline loaded
+  3. REVIEW: choose a viewer from the menu: the color-coded Excel workbook,
+     Timeline Explorer (downloaded on first use), both, or Open report (the
+     findings report PDF)
 
 ### Live System (Dirty Forensics)
 
@@ -65,7 +80,8 @@ For incident response, triage, or non-legal investigations:
   3. Double-click Run-TriageCollector.bat (collects to reports\ on the USB)
   4. Unplug the USB, take it to your analysis workstation
   5. Double-click Run-TimelineBuilder.bat -- it auto-finds the triage zips
-  6. Pick a collection, timeline builds, Timeline Explorer opens automatically
+  6. Pick a collection; the timeline and the findings report are built, then
+     choose a viewer: Excel, Timeline Explorer, Both, Open report or None
 
 ### Forensic Image (Clean Forensics)
 
@@ -97,9 +113,12 @@ Both tools are designed to live side-by-side on a USB drive:
     win11-timeline-builder\
       timeline-builder.ps1
       Run-TimelineBuilder.bat
+      report\                     <-- findings report rules and renderer
       tools\                      <-- auto-downloaded: sqlite3, Timeline Explorer
         volatility3\              <-- optional: vol.exe for memory analysis
       reports\                    <-- timelines save here
+
+  Copy both repository folders whole (the list shows the main parts).
 
 The timeline builder auto-discovers triage collections from the sibling
 directory. sqlite3.exe and Timeline Explorer are auto-downloaded on first run
@@ -117,14 +136,24 @@ themselves are never committed.
   Run-TimelineBuilder.bat
 
   No arguments needed. The script automatically:
-    1. Finds triage collection .zip files from sibling triage-collector\reports\
+    1. Finds triage collection .zip files in the sibling
+       win11-triage-collector\reports\ folder, and collection folders there
+       (made with the collector's "nozip"; shown as "folder, not zipped")
     2. Lists them with size and date, newest first
-    3. You pick a number
-    4. Extracts it into a work folder in %LOCALAPPDATA%\TimelineBuilder,
-       not %TEMP% (deleted after; see "Work folder" below)
-    5. Builds the timeline (~2 minutes for ~36,000 events)
+    3. You pick a number (an invalid answer is asked again; 0 cancels)
+    4. Extracts a zip into a work folder in %LOCALAPPDATA%\TimelineBuilder,
+       not %TEMP% (deleted after; see "Work folder" below); a folder is
+       read where it is
+    5. Builds the timeline: about 5 minutes for a 100 MB collection with
+       the $MFT and the USN journal (~300,000 events), most of it adding the
+       USN journal and writing the Excel file, which the console announces
     6. Generates a color-coded Excel file (rows colored by EventType)
-    7. Asks how you want to view: Excel (colored), Timeline Explorer, Both, None
+    7. Writes the findings report: report.pdf, report.html and findings.csv
+       -- leads to review, each linked to its rows in the Excel file (see
+       "Findings Report")
+    8. Asks how you want to view: Excel (colored), Timeline Explorer, Both,
+       Open report, None (the numbers change when there is no Excel file or
+       no report; a number that is not listed is asked again)
 
   You can also pass a collection folder or a collection .zip directly (or
   drop either on the .bat), optionally followed by a comma-separated
@@ -136,11 +165,49 @@ themselves are never committed.
 
   The launcher asks for Administrator rights (UAC) and restarts itself
   elevated with the same arguments. Paths with spaces, apostrophes, & or !
-  are fine, and a relative path is turned into a full path first (the
-  elevated window starts in C:\Windows\System32).
+  are fine when typed in quotes, and a relative path is turned into a full
+  path first (the elevated window starts in C:\Windows\System32).
 
-  While the builder runs, QuickEdit is off in its console window, so a
-  click in the window cannot pause the run. (With QuickEdit on, a click
+  Drag and drop: drop ONE collection .zip or folder on the .bat. Explorer
+  quotes a dropped path only when it has a space in it, so a path with
+  & , = ; or ^ but no space (C:\Cases\R&D\...) arrives cut up, and
+  dropping it is unreliable: rename that folder first, or run the .bat
+  from a command prompt with the path in quotes. The .bat catches most
+  cut-up paths before asking for Administrator rights: it says the path
+  was not found, or that the path arrived cut up (the pieces joined again
+  are an existing path, the rest is a path ending in .zip, .dmp or .raw,
+  or there is a third piece). It cannot catch a path cut at & whose first
+  piece is an existing folder (C:\Cases\R for C:\Cases\R&D\...): that
+  folder would be read. Dropping two items (two zips, or a zip and its
+  memory dump) is refused with "Drop one collection at a time": the second
+  path would otherwise be read as the keyword list. (So is a second
+  argument that is the full path of an existing file or folder, or a
+  .zip, .dmp or .raw file or a collection folder.) The keyword list is one
+  argument: put it in one pair of quotes ("mimikatz,psexec"); a third
+  argument is refused.
+
+  If you click No when Windows asks for Administrator rights, the .bat
+  says "Could not elevate" and waits for a key (exit code 1).
+
+  A collection folder is read where it is, so its files' full paths must
+  stay under 260 characters: Windows PowerShell (which the .bat uses)
+  cannot open longer paths with Windows' default settings. When a folder
+  holds such files, the run stops at the start (exit code 1) and names
+  them (or, when even the files right in the folder cannot be opened,
+  says that the folder's own path is too long and how long it is): copy
+  the collection to a short path such as C:\Cases\<name>, or
+  drop the collection .zip instead (a zip is extracted into a short work
+  folder, and over-long names are shortened).
+
+  At the end the .bat repeats the outcome when the builder did not finish
+  cleanly ("Result: ... exit code 1" or "... exit code 2") and waits for a
+  key. Started from a window that is already elevated (Administrator), it
+  then returns the builder's exit code (0, 1 or 2; see "Incomplete
+  timeline (exit code 2)") to whatever started it; otherwise it hands the
+  run to a new elevated window and ends at once.
+
+  While the builder runs (also with -ReportOnly), QuickEdit is off in its
+  console window, so a click in the window cannot pause the run. (With QuickEdit on, a click
   starts a text selection, and every write to the window -- and with it
   the whole run, log file included -- waits until the selection ends.)
   The console's mouse input is turned off with it, so the mouse wheel
@@ -161,7 +228,13 @@ themselves are never committed.
   #15). When the manifest lists a dump the builder cannot find or use, it
   says what to do: connect the drive, or copy the dump next to the zip
   under the name it gives (<zip name>_memory_dump.dmp or .raw), then run
-  the .bat again.
+  the .bat again. A dump from a Windows ARM64 computer is never offered:
+  Volatility 3 cannot analyze ARM64 memory (open the dump in WinDbg), and
+  for an ARM64 collection (its systeminfo.txt says so) the builder does not
+  ask for the dump to be copied. A dump that is found (or listed) but not
+  analyzed -- ARM64, answered 2 at the prompt, no vol.exe, not found -- is
+  named in the findings report's Evidence coverage notes, with the reason,
+  and in its "What this report can't tell you" box.
 
 ### PowerShell (Admin)
 
@@ -173,6 +246,12 @@ themselves are never committed.
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -Sources "EventLogs,Prefetch,Registry"
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -Keywords "mimikatz,psexec,powershell -enc"
   powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -MaxUsnEntries 200000
+  powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -InputPath "D:\Cases\Case001\Collection" -NoReport
+
+  Rebuild only the findings report of an existing timeline (no parsing, no
+  Administrator rights needed), for example after editing the rules:
+  powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -ReportOnly ".\reports\timeline_2026-04-08_09-43-57"
+  powershell -ExecutionPolicy Bypass -NoProfile -File timeline-builder.ps1 -ReportOnly ".\reports\timeline_2026-04-08_09-43-57" -ReportRules "D:\my-rules.json" -Viewer Report
 
   With -File, PowerShell passes a list such as "a","b" or a,b to the script as
   one string ("a,b"). The script splits -Sources and -Keywords on commas
@@ -188,12 +267,31 @@ themselves are never committed.
 
 ## Parameters
 
-  -Browse         Auto-find triage zips in sibling triage-collector\reports\
-                  and present a numbered menu to select one. No InputPath needed.
+  -Browse         Auto-find triage zips (and collection folders with a
+                  collection_info.json, from the collector's "nozip") in
+                  the sibling win11-triage-collector\reports\ folder (or,
+                  when that name is not there, in the one
+                  win11-triage-collector-* sibling with a reports\ folder,
+                  e.g. after GitHub's Download ZIP) and present a numbered
+                  menu to select one. No InputPath needed. Without such a
+                  folder, or with no collection in it, it stops with exit
+                  code 1 and says what it looked for.
   -InputPath      Path to a triage collection directory, a collection .zip
                   (extracted into the work folder, as in browse mode; a
                   memory dump next to it is found too), or any directory
-                  containing supported artifacts.
+                  containing supported artifacts. A collection directory
+                  whose path has [ ], * or ? in it is refused (exit code
+                  1): PowerShell reads them as wildcards, so its files
+                  would not be found. Rename it, or pass the .zip: when a
+                  zip's one top folder has them in its name ("Case [1]"
+                  zipped with Explorer), its extracted copy in the work
+                  folder is renamed ("Case _1_") and read as usual. A
+                  directory holding files whose full paths have 260 or
+                  more characters is refused too in Windows PowerShell
+                  5.1 (exit code 1, the files named): it cannot open
+                  them. Copy the collection to a shorter path, or pass the
+                  .zip. Any other file (a .7z, a memory dump) is refused
+                  with "Input path is a file" (exit code 1).
   -OutputFile     Output CSV path. Defaults to reports\timeline_<timestamp>\timeline.csv
   -StartDate      Only include events after this date (UTC).
   -EndDate        Only include events before this date (UTC).
@@ -218,9 +316,40 @@ themselves are never committed.
                   unlimited. The USN journal is usually the largest source;
                   see "Known Limitations" for the Excel row limit.
   -Viewer         Viewer to open at the end without the menu: Excel,
-                  TimelineExplorer, Both or None (for scripts and automation).
+                  TimelineExplorer, Both, Report (the findings report:
+                  report.pdf, or report.html when no PDF was made) or None
+                  (for scripts and automation).
   -NoExcel        CSV only: don't generate timeline.xlsx (ImportExcel is then
-                  not needed).
+                  not needed). The findings report is still written; its row
+                  numbers are then rows of timeline.csv. With -ReportOnly:
+                  leave an existing timeline.xlsx as it is.
+  -NoReport       Don't write the findings report (report.pdf, report.html,
+                  findings.csv, report-model.json) and don't add the Findings
+                  sheet and Finding column to timeline.xlsx. The timeline
+                  itself is the same either way. Not with -ReportOnly.
+  -ReportOnly     Rebuild only the findings report from an existing timeline:
+                  the path of a timeline.csv, or of a reports\timeline_*
+                  folder that holds one. Nothing is parsed, the collection
+                  is not needed, and no Administrator rights are needed.
+                  Rewrites report.pdf, report.html, findings.csv and
+                  report-model.json next to the timeline and, when
+                  timeline.xlsx is there with the same rows, replaces its
+                  Findings sheet and Finding column (close it in Excel
+                  first). Logs to report_log.txt in that folder. -Viewer,
+                  -NoExcel and -ReportRules apply; the parsing parameters
+                  (-Sources, -StartDate, -EndDate, -Keywords, -MftDays,
+                  -MaxUsnEntries, -OutputFile, -WorkDir, -MemoryDumpPath)
+                  are ignored with a warning.
+                  Cannot be combined with -InputPath, -Browse or -NoReport.
+                  Exit code 1 when no report could be made, or when an
+                  error stopped the rebuild (an unexpected error in one of
+                  its steps is logged, that step skipped, and the report
+                  still made, as in a full run).
+  -ReportRules    Rules file for the findings report (default:
+                  report\report-rules.json next to the script). See "Report
+                  rules file". A missing or invalid file is logged as a
+                  warning and the run finishes without a report (with
+                  -ReportOnly it is an error).
   -MftDays        $MFT file-system events: only times within this many days
                   before the collection are added. Default 7; 0 = all. A
                   full $MFT can produce millions of rows, and one Windows
@@ -233,7 +362,9 @@ themselves are never committed.
                   another local drive when the system drive is low on
                   space, and never a temp folder. A network share or mapped
                   network drive is refused (reg load cannot load hives
-                  from there).
+                  from there). For a .zip input, a work folder whose path
+                  has [ ], * or ? in it is refused at the start (exit code
+                  1): the parsers would not find the extracted files.
   -MemoryDumpPath The collection's memory dump file (a DumpIt .dmp or a
                   .raw image), for a dump the builder does not find or does
                   not use by itself: one moved to another folder after the
@@ -306,11 +437,30 @@ The script creates a timestamped report folder next to the script:
     reports\
       timeline_2026-04-08_09-43-57\
         timeline_builder_log.txt     -- Full processing log
-        timeline.csv                 -- The unified timeline (~12 MB, ~36K events)
-        timeline.xlsx                -- Color-coded Excel version (~2 MB)
+        timeline.csv                 -- The unified timeline (~110 MB for
+                                        ~300K events with the $MFT and USN
+                                        journal)
+        timeline.xlsx                -- Color-coded Excel version (~12 MB); its
+                                        first sheet "Findings" links to the
+                                        rows of each finding
+        report.pdf                   -- Findings report (printed by Microsoft Edge)
+        report.html                  -- The same report as one offline HTML file
+        findings.csv                 -- The findings with their row numbers
+        report-model.json            -- Everything the report shows, as data
+        collection_info.json         -- Copied from the collection (for -ReportOnly)
+        collection_log.txt           -- Copied from the collection (for -ReportOnly)
+        report_log.txt               -- Log of -ReportOnly runs (only after one)
+    report\
+      report-rules.json              -- The findings report's rules (data)
+      TimelineReport.Engine.ps1      -- Rules engine and report model
+      TimelineReport.Render.ps1      -- report.html and report.pdf
     tools\
       sqlite3\                       -- Auto-downloaded, cached
       TimelineExplorer\              -- Auto-downloaded on first use, cached
+
+The report files are written next to the timeline: with -OutputFile, in
+that file's folder (the builder log stays in reports\timeline_<timestamp>\).
+See "Findings Report".
 
 ### Work folder
 
@@ -332,7 +482,17 @@ The script creates a timestamped report folder next to the script:
   to the script is used. The log names the work folder. It must be on a
   local drive: reg load only loads a hive from a local file, so a network
   share (\\server\share) or a mapped network drive is not used, and with
-  such a -WorkDir the run stops at the start.
+  such a -WorkDir the run stops at the start. The run also stops at the
+  start (exit code 1, with an error naming the folder) when a zip is to be
+  extracted into a work folder whose path has [ ], * or ? in it, for
+  example -WorkDir "D:\Work [1]": the parsers find the collection's files
+  with PowerShell paths that read those characters as wildcards, so they
+  would find nothing there and the run would end without a timeline. The
+  same holds for a collection folder passed as -InputPath. A zip whose one
+  top folder has such a name (a folder "Case [1]" zipped with Explorer's
+  "Send to > Compressed folder") is fine: after the extraction that folder,
+  a copy in the work folder, is renamed with "_" for each of those
+  characters ("Case _1_"), and the log says so.
 
   Copied email attachments (Email\<user>\Outlook\SecureTemp\ and
   Email\<user>\NewOutlook\Attachments\) stay in the zip: no parser reads
@@ -381,12 +541,25 @@ The script creates a timestamped report folder next to the script:
 
   In both cases the exit code is 2 instead of 0. Exit code 1 means the run
   stopped early (input not found, a bad zip, no work folder, files gone
-  right after the extraction).
+  right after the extraction, a collection folder with paths too long to
+  open, a builder folder with [ ] * ? in its path). Run-TimelineBuilder.bat
+  repeats the outcome for 1 or 2 in one "Result:" line right before its
+  final pause, so it is on screen when the window waits, and (in an
+  already elevated window) returns the same exit code after that pause.
+
+  The findings report of such a run says so: "Timeline incomplete" comes
+  first in its Evidence coverage section, and the summary page's "What
+  this report can't tell you" box says how many input files disappeared
+  or how many unexpected errors were hit (report-model.json:
+  Coverage.TimelineCompleteness). -ReportOnly on that timeline later
+  reads the same from the run's timeline_builder_log.txt.
 
 
 ## Output Format (CSV and Excel)
 
-Both timeline.csv and timeline.xlsx contain the same columns:
+Both timeline.csv and timeline.xlsx contain the same columns (the workbook
+adds a last column, Finding, for the findings report; timeline.csv never
+gets it):
 
   Timestamp     UTC-normalized datetime (yyyy-MM-dd HH:mm:ss.fff)
   Source        Which artifact produced the entry (e.g., Security.evtx, Prefetch)
@@ -492,7 +665,11 @@ Both timeline.csv and timeline.xlsx contain the same columns:
     MicrosoftAccount\..., AzureAD\..., the computer account
     (WORKGROUP\HOST$), NT SERVICE\..., NT VIRTUAL MACHINE\... and group
     names.
-  The log's "User column:" line says how many rows changed.
+  The log's "User column:" line says how many rows changed. The findings
+  report counts rows per account in these forms (Rows per user, User
+  accounts), so CORP\alice and a local alice stay two accounts; when SIDs
+  were left without a name, its Evidence coverage notes say that an
+  account can be listed under its SID.
 
   The machine and SID names are read, with no extra hive loads, only by
   the sources that open those files: ProfileList by Registry (and by
@@ -542,6 +719,443 @@ Both timeline.csv and timeline.xlsx contain the same columns:
      larger (usually because of a very large USN journal), the .xlsx is not
      generated and a warning is logged; use the CSV, or narrow the run with
      -StartDate, -EndDate, -Sources or -MaxUsnEntries.
+
+
+## Findings Report
+
+Every run ends with a findings report made from the timeline rows. Rules
+look for known signs of attacker activity -- antivirus detections and
+tampering, cleared logs, new accounts and admin-group adds, suspicious
+services, tasks and Run keys, encoded PowerShell, attacker tools, programs
+run from download folders, timestomped files, and more -- and list what
+they find as leads to review. Next to the timeline:
+
+  report.pdf         The report to read, print or send (printed by
+                     Microsoft Edge from report.html)
+  report.html        The same report as one offline HTML file: no scripts,
+                     no external resources, charts drawn inline
+  findings.csv       Per finding a summary line (RowNumber empty; its
+                     Description ends with "Captured in the memory dump"
+                     for a lead seen only in the memory dump), then one
+                     line per evidence row: FindingId, Severity, RuleId,
+                     Title, Category, RowNumber, Timestamp, Source,
+                     Description. UTF-8 with BOM, so Excel opens it directly;
+                     a value starting with = + - or @ gets a leading ' so
+                     Excel never runs it as a formula
+  report-model.json  Everything the report shows, as data (for scripts)
+  timeline.xlsx      Gets a first sheet "Findings" and a "Finding" column
+                     (see below)
+
+-NoReport turns the report off. -ReportOnly rebuilds it later from an
+existing timeline, for example after the rules were tuned. A problem with
+the report (a broken rules file, Edge missing, the workbook open in Excel)
+is logged as a warning; the timeline is never affected.
+
+On a 286,000-row timeline the rules take about 4 seconds; with the
+workbook's Findings sheet, the HTML and the PDF the report adds roughly
+half a minute to a run. When the input was a collection .zip, the report
+also records the zip's SHA-256 (Appendix D): reading a multi-gigabyte zip
+from a USB drive or a network share adds the time it takes to read it
+once more.
+
+### Two audiences, in this order
+
+  1  Summary page, written for a manager or client:
+       - the bottom line: how many High and Medium leads, and the earliest
+         and latest flagged time (in UTC and the machine's local time).
+         Leads dated by file times -- timestomp candidates and
+         Amcache/ShimCache entries, whose times can be years old or forged
+         -- are left out of that window and counted beside it, and so are
+         leads dated only by a scheduled task's author-supplied
+         registration date (the task XML's RegistrationInfo/Date, which
+         whoever wrote the task sets). A lead that also has a time Windows
+         recorded (the TaskCache "registered" or a "last run" row) is dated
+         by those times, not by the author-supplied one;
+       - key facts: computer, operating system, user accounts, when the
+         evidence was collected and how, the machine's time zone (marked
+         "assumed" when the collection does not record it), the time span
+         the timeline covers, the Excel workbook. The computer is always
+         the examined one: for a mounted-image collection its name comes
+         from the image's SYSTEM hive (collection_info.json names only the
+         computer the collector ran on); when that is not known, the
+         report says "Not known" and why, and names the collector's
+         computer only as such. User accounts are named as in the
+         timeline's User column (alice and CORP\alice are two accounts),
+         and so is the account the collector ran as: in a live collection
+         a local account HOST\examiner (or .\examiner) is examiner;
+       - the top five leads in one plain sentence each: the first lead of
+         each rule (High first), so one rule cannot fill the list, with
+         "and N similar leads" where a rule has more;
+       - a box "What this report can't tell you".
+     Then "All leads at a glance": every High and Medium lead in one table
+     with its first row numbers (the rest of the report is for the analyst).
+  2  Evidence coverage and integrity: first, when the builder run ended
+     with exit code 2, that the timeline is incomplete (see "Incomplete
+     timeline (exit code 2)"); how far back each source reaches
+     (first and last time, days before the collection), cleared logs,
+     boots and shutdowns, logging that was off (no 4688 process creation,
+     no 4104 script blocks, no Sysmon, the USN journal's span, ...),
+     collector errors and warnings (or that the collector's log is
+     missing), notes (among them a memory dump of the collection that was
+     not analyzed, and why), and the Integrity leads
+  3  Antivirus verdicts       4  Access       5  Persistence
+  6  Execution                7  Initial access       8  File system
+     (and "Other leads" when a rule uses another category)
+  9  Activity overview: events per day (and per month when the data
+     reaches back further), the busiest hours, rows per source and per user
+     (one entry per account as the User column names it; in a timeline
+     from an older builder, HOST\alice of the examined computer counts with
+     alice), with markers on the days and hours that have leads
+  A  Informational items      B  Rules used      C  Method
+  D  Files: timeline.csv, findings.csv, the workbook (and the collection
+     zip, when the input was a .zip: -InputPath, browse mode or a zip
+     dropped on Run-TimelineBuilder.bat) with their SHA-256
+
+### Conservative flagging: leads, not a verdict
+
+  Every rule has a severity:
+    High    review first: a strong sign of attacker activity in general
+    Medium  review: often benign, but worth a look
+    Info    context only: listed in Appendix A, never counted as a lead
+  Only High and Medium findings are leads. A lead is a reason to look
+  closer, not proof -- key risk indicators are reasons to look, not
+  indicators of compromise. The report never says that the computer was
+  or was not compromised, and "no leads" does not mean "clean".
+
+### Reading a finding
+
+  Each lead has a card in its category's section:
+    F003  HIGH  Title      the id (F001... numbered High first, then
+                           Medium, then Info, each by first time), the
+                           severity as a label and a color, the title
+    meta line              category, how many rows matched, first and last
+                           time (UTC), the rule id
+    why                    what it means, in plain English
+    Technical detail       what the rule matched, for the analyst
+    What to check next     how to confirm or rule it out
+    Common benign causes   the usual innocent explanations
+    References             MITRE ATT&CK techniques
+    Grouped by             the value the rows were grouped by (a user, a
+                           threat name, a program file name, ...)
+    flags                  "Escalated": a related event soon after raised
+                           the severity (that row is among the evidence);
+                           rows set aside by the allowlist; "Captured in
+                           the memory dump" when every row of the lead
+                           comes from the memory dump (Memory-Processes,
+                           Memory-Network, Memory-CommandLine,
+                           Memory-Services): it keeps its severity and is a
+                           lead like any other; "Every row is from during
+                           the collection" (maybe the collector itself: its
+                           first event time is at or after the collection
+                           start; a memory-dump lead gets it too when the
+                           dump records a process or connection started
+                           then); "Seen only in Snapshot rows from during
+                           the collection" instead when every row is a
+                           Snapshot row and not every row is from the
+                           memory dump -- the state when it was collected
+                           (a task or service listed then), so it may have
+                           started earlier: check that it is not the
+                           collector or its memory tool; "Folds N similar
+                           groups" (see maxFindings below); "Dated by file
+                           times", or "Dated only by a scheduled task's
+                           author-supplied registration date"
+    evidence rows          row number, time, source and event type,
+                           description and details, user -- at most 15 on
+                           the card: the rows that raised the severity and
+                           the earliest ("Showing 15 of the 59 rows of this
+                           lead" when there are more). findings.csv and the
+                           Findings sheet list up to the rule's limit
+                           (maxEvidence), and the Finding column tags all
+    In Excel: ...          where to find every row of the finding
+
+  Values from the examined computer are shown as text: markup is escaped,
+  and right-to-left override and other invisible formatting characters
+  (used to disguise file names, such as invoice[U+202E]fdp.exe) appear as
+  visible markers like [U+202E], in the report and on the Findings sheet.
+
+  Row numbers are rows of the "Timeline" sheet in timeline.xlsx: the header
+  is row 1, so the first event is row 2. Type one into Excel's Name Box (or
+  press Ctrl+G) to jump to it. Without a workbook (-NoExcel, a timeline over
+  Excel's 1,048,575-row limit, ImportExcel missing) they are rows of
+  timeline.csv counted the same way -- the row Excel shows when it opens
+  the CSV -- and the report labels them "CSV row".
+
+### Leads seen only in the memory dump
+
+  A lead whose rows all come from the memory dump -- the Memory-Processes,
+  Memory-Network, Memory-CommandLine and Memory-Services rows the Memory
+  parser reads with Volatility 3, whatever their event type -- says
+  exactly that: "Captured in the memory dump". Its rows are the state when
+  the dump was taken (stamped with the dump's capture time) unless the dump
+  records a time of its own, such as a process's creation time. The note
+  is the same everywhere:
+    report.pdf / report.html   a note on the lead's card
+    Findings sheet             in the lead's summary row (its Description)
+    findings.csv               at the end of the lead's summary line
+    report-model.json          "MemoryOnly": true and "MemoryOnlyNote":
+                               "Captured in the memory dump" on the finding
+  Such a lead is still a lead with its severity and its evidence rows: the
+  card's row numbers, findings.csv's RowNumber, the Findings sheet's links
+  and the Timeline sheet's Finding column point at its Memory-* rows like
+  any other lead's, also after -ReportOnly. A lead that also has rows from
+  another source (Prefetch, BAM, an event log) does not get the note.
+
+### The workbook: Findings sheet and Finding column
+
+  timeline.xlsx opens on its first sheet, "Findings": for each finding a
+  bold summary row in the severity's color (count, first and last time,
+  group, escalation, how many rows are listed, and notes such as
+  "Captured in the memory dump"), then one row per evidence
+  row -- finding id, severity, row type (Summary, Evidence or Escalation),
+  Timeline row, time, title, description, source, event type, user,
+  category and rule. Each "Timeline row" cell is a link: click it to jump
+  to that row of the Timeline sheet. The header is frozen and every column
+  has a filter.
+
+  The "Timeline" sheet gets a last column, "Finding", with the ids of every
+  finding the row belongs to ("F001, F004"), colored by the most severe
+  one. Filter it on an id to see all rows of that finding, also those
+  beyond the report's evidence limit. Info findings are tagged too.
+  timeline.csv does not get this column; its columns never change.
+
+### The PDF, Edge and the workbook link
+
+  report.pdf is report.html printed by Microsoft Edge in headless mode
+  (msedge --headless=new --print-to-pdf) with a temporary profile folder
+  that is deleted afterwards. Edge comes with Windows 10 and 11; the builder
+  looks in Program Files (x86), Program Files, %LOCALAPPDATA% and the App
+  Paths registry keys. The paper is Letter, or A4 when Windows' region uses
+  the metric system. The footer has page numbers and the computer's name;
+  the PDF has bookmarks, and the ids on the summary page and in the index
+  link to the cards.
+
+  Without Edge -- or when it fails or needs more than 3 minutes (plus 12
+  seconds per MB of HTML) -- a warning is logged and the run goes on:
+  report.html is complete, and any browser can print it to PDF. A
+  report.pdf from an earlier run is removed first. When it cannot be
+  removed because a PDF viewer has it open, the new PDF is written as
+  report_<date>_<time>.pdf and a warning says that report.pdf is out of
+  date.
+
+  The report links to the workbook with a relative link (./timeline.xlsx),
+  not with a full path: the PDF holds no local path (or user name), and the
+  link keeps working when the whole folder is moved, copied or zipped. Keep
+  report.pdf and timeline.xlsx in the same folder: a PDF viewer resolves
+  the link against the PDF's own folder (some viewers ask before they open
+  a file, and a viewer in a browser may refuse local files). The link
+  opens the workbook, not a particular row: use the row numbers printed
+  with the evidence, or the Findings sheet, whose cells link to the rows.
+
+### Rebuilding the report: -ReportOnly
+
+  -ReportOnly <timeline folder or timeline.csv> reads the timeline, runs
+  the rules and rewrites report.pdf, report.html, findings.csv and
+  report-model.json in that folder. When timeline.xlsx is there with the
+  same number of rows, its Findings sheet and Finding column are replaced
+  (close it in Excel first; with -NoExcel it is left alone and the report
+  does not link to it). When the workbook is not updated -- -NoExcel,
+  ImportExcel missing, the file open in Excel, a different row count -- it
+  keeps the Findings sheet and Finding column of the earlier report, whose
+  finding ids no longer match: the log and the report's caveats say so.
+  Nothing is parsed, the collection is not needed, and no Administrator
+  rights are needed. It logs to report_log.txt in the folder. On a
+  286,000-row timeline it takes about 35 seconds, 20 of them for the
+  workbook; QuickEdit is off in its console window meanwhile, as in a full
+  run. -WorkDir and -MemoryDumpPath (and the other parsing parameters) are
+  ignored with a warning.
+
+  The collection facts (computer name, collector user, collection time,
+  mode and time zone) come from the collection_info.json and
+  collection_log.txt that every run copies next to the timeline. Their
+  computer name is the examined computer only for a live collection; for a
+  mounted image the report takes it from the original run's
+  timeline_builder_log.txt ("Examined computer name (SYSTEM hive): ...",
+  logged when a parser read the image's SYSTEM hive), else from the
+  timeline's SystemInfo row, else it says the name is not known. For a
+  timeline folder made before the report existed, the collection time, mode
+  and time zone are read from its timeline_builder_log.txt and the computer
+  name from the timeline's SystemInfo row. When the original run had to
+  assume the time zone (an older collection or a mounted image without it),
+  the report marks the zone as assumed. When the original run ended with
+  exit code 2, its log says so, and so does the rebuilt report.
+
+### Report rules file
+
+  The rules are data: report\report-rules.json, or another file given with
+  -ReportRules. Keyword lists (attacker tools, LOLBins, staging folders,
+  download cradles, ...) live only in this file: Defender's AMSI blocks
+  PowerShell code that contains such names, so never move them into a .ps1
+  file, and edit the JSON in a text editor, not through PowerShell commands
+  that contain the words. Keep the file ASCII. The engine expands
+  {{list:<name>}} and compiles every pattern in its C# helper, so the list
+  values are never the argument of a PowerShell method call (PowerShell 7
+  passes those to AMSI, which can block one). It fails closed: a pattern
+  that cannot be expanded or compiled -- an unknown or empty list, an
+  invalid regular expression, a call that antivirus blocked -- is an
+  "Invalid report rules file" error naming the rule and field (no report
+  is made; the timeline is not affected), never a condition that matches
+  every row.
+
+    {
+      "schemaVersion": 1,
+      "lists": { "stagingExec": ["\\Downloads\\", "\\Users\\Public\\"] },
+      "rules": [ {
+        "id": "EXEC-STAGING",                  unique, shown in the report
+        "title": "A program ran from a user folder: {{group}}",
+        "category": "Execution",               Integrity, Antivirus, Access,
+                                               Persistence, Execution,
+                                               InitialAccess, FileSystem, Other
+        "severity": "Medium",                  High, Medium or Info
+        "match": { "source": "^(Prefetch|BAM|Registry-UserAssist)$" },
+        "anyOf": [ { "description": "{{list:stagingExec}}" } ],
+        "groupBy": "description",              one finding per value
+        "threshold": { "count": 10, "windowMinutes": 5 },
+        "escalate": { "severity": "High", "withinMinutes": 60,
+                      "sameKey": "user", "match": { ... } },
+        "why": "...", "technical": "...", "nextSteps": "...",
+        "falsePositives": "...", "references": ["MITRE ATT&CK T1204.002"],
+        "maxEvidence": 40,                     evidence rows listed (25)
+        "maxFindings": 5,                      separate leads at most (20)
+        "activityTime": false,                 times are file times (true)
+        "enabled": true                        false turns the rule off
+      } ],
+      "allowlist": [ { "ruleId": "AV-EXCLUSION", "match": { ... },
+                       "reason": "why these rows are benign" } ]
+    }
+
+  match: every condition given must hold. Conditions are case-insensitive
+  .NET regular expressions on the timeline columns: source, eventType,
+  description, details and user, and notSource, notEventType,
+  notDescription, notDetails and notUser, which must NOT match.
+  "duringCollection": true (or false) matches only rows at or after (before)
+  the collection start. {{list:<name>}} in a pattern stands for any entry of
+  that list, as literal text. In JSON a backslash is written twice: the
+  regex \. is "\\." and a literal backslash \\ is "\\\\".
+  anyOf (optional): the match AND at least one of these match objects.
+  groupBy: "rule" (one finding for all rows; the default), "description",
+  "user", "source", "eventType", "detail:<Key>" (a Key=Value of Details;
+  "detail:K1,K2" takes the first that is set) or "capture" (the group
+  (?<key>...) of match.description, or of match.details). {{group}} in the
+  title or why is replaced by the group's value.
+  threshold (optional): a group becomes a finding only when at least
+  "count" rows fall within "windowMinutes".
+  escalate (optional): a row matching escalate.match up to withinMinutes
+  after one of the finding's rows, with the same sameKey value ("user",
+  "source", "description", "eventType", "detail:<Key>" or "none"), raises
+  the finding to escalate.severity and is added to its evidence.
+  maxEvidence (default 25): the evidence rows findings.csv and the
+  Findings sheet list per finding (the card prints at most 15 of them).
+  maxFindings (default 20; 0 = no limit): at most this many separate leads
+  from the rule. When there are more groups (one per attacking address of
+  a password-spraying run, say), the escalated ones and those with the most
+  rows stay separate and the rest fold into one lead that lists them;
+  every row still gets its id in the Finding column.
+  activityTime false: the rule's row times are file times (which can be
+  years old or forged), so its leads are left out of the summary's
+  flagged-activity window and their cards say so. For every rule, a row
+  whose Details say its time is "author-supplied, not recorded by Windows"
+  (a task XML registration date) does not set a lead's first and last time
+  when the lead has a row with another time; a lead with only such rows
+  keeps their dates but is treated like activityTime false.
+  Members whose names start with "_", and "comment" and "notes", are
+  comments. Any other unknown member, a bad regular expression or an
+  unknown list stops the report with an error that names the rule and the
+  field; the timeline is not affected. Each pattern match may take at most
+  2 seconds; a rule whose patterns time out 3 times (a pattern that
+  backtracks badly) is stopped with a warning and reports nothing, so a
+  bad custom rule cannot hang the run.
+
+  Tuning:
+    - Known-benign activity: add an allowlist entry (a ruleId, or "*" for
+      every rule, a match object and a reason). Allowlisted rows are counted
+      on the finding and in the log but never flagged. The collector's own
+      temporary Defender exclusion of its output folder
+      (TriageCollection_<date>_<time>) is allowlisted this way when it is
+      added or removed (Defender Operational 5007, MPLog, and the
+      registry row the builder labels); an exclusion of such a folder that
+      is still in effect after a collection is listed.
+    - A rule you don't want: "enabled": false.
+    - A noisy rule: narrow its match, add a threshold, group it differently
+      or lower its severity. Keep your copy of the file outside the
+      repository and pass it with -ReportRules, so an update does not
+      overwrite it.
+    - Check the effect with -ReportOnly: it needs no new collection.
+    - tests\Test-ReportRules.ps1 checks report\report-rules.json against
+      tests\fixtures\report\rules\cases.csv (a matching and a near-miss row
+      for every rule); add cases there when you change a rule.
+
+  Where the shipped rules differ from the rule plan, on purpose:
+    - EXEC-STAGING leaves out Temp folders (the plan's R13 lists them):
+      installers unpack and run from Temp all the time. Downloads,
+      Users\Public, PerfLogs and the Recycle Bin are flagged.
+    - ACCESS-RDP-RECONNECT (4778) is Info, not Medium (P5): reconnecting
+      to one's own session is everyday use.
+    - ACCESS-PASSWORD-RESET (4724) is Info, not Medium (P3): creating an
+      account also logs a reset for it, so every new account would be a
+      second lead.
+    - AV-ASR-BLOCK is Medium, as P7 says; Defender's own detections of
+      the same activity are High.
+    - Microsoft Defender reported as off by Security Center is Medium
+      (AV-DEFENDER-PRODUCT-OFF): Windows reports it off whenever another
+      antivirus takes over. Defender's own real-time protection switch-off
+      (5001) stays High (AV-RTP-OFF).
+    - Browser extensions: High only for --load-extension (CommandLine);
+      unpacked, local-policy and registry installs are Medium; enterprise
+      store installs by policy (ExternalPolicyDownload) are not flagged.
+    - EXEC-PS-DOWNLOAD is High only when the download is also run
+      (Invoke-Expression, as the plan's "cradle plus IEX"); a download alone
+      is EXEC-PS-DOWNLOAD-FILE (Medium).
+    - Not expressible with the current rule engine, so not flagged: a
+      task deleted soon after it was created (R7), a timestomped file that
+      also ran (R14 High), a security service stop "near a finding" (R15:
+      crashes and disabling are flagged, routine stops for updates are
+      not), deleted .evtx/.pf files (P17), and downloads from file-sharing
+      hosts (R11).
+
+### What the report can't tell you
+
+  The summary page lists these limits; they apply to every lead:
+    - Leads are reasons to look, not a verdict on whether the computer was
+      compromised or is clean.
+    - Useful logging is off by default (process command lines 4688, task
+      and remote-session events 4698-4702 and 4778/4779, full PowerShell
+      script logging, file-share access 5140/5145): a missing event proves
+      nothing.
+    - Domain sign-ins are logged on the domain controller (Kerberos and
+      NTLM events 4768, 4769, 4776), not on the computer.
+    - Logs roll over: each reaches back only to its first event.
+    - All times are UTC; a wrong clock or altered file times (timestomping)
+      can put events out of order.
+    - ShimCache and Amcache show that a file existed, not that it ran;
+      Prefetch shows that a program ran, not what it did.
+    - Private browsing leaves no history and clearing history is not
+      logged; App-Bound-encrypted cookies need the live computer; Chrome's
+      own DNS lookups are not in the Windows DNS cache.
+    - Email headers can be forged, and a compromised real mailbox passes
+      SPF, DKIM and DMARC; mailbox and sign-in logs are kept by the mail
+      service (for example Microsoft 365).
+    - Analysis tools run on the collected computer leave their own traces
+      in later collections.
+  Plus, when they apply: a timeline that ended incomplete (exit code 2:
+  input files that disappeared during the run, or unexpected errors;
+  listed right after the first limit above), credential material in the
+  collection (-IncludeSecrets), the -MftDays window, dropped USN entries,
+  a -StartDate/-EndDate range, collector errors, an unknown or assumed
+  time zone, an unknown collection time, a mounted-image collection
+  (running programs and connections then come only from a memory dump, if
+  one was analyzed) and an examined computer whose name is not known, no
+  workbook (or one that still holds an earlier report's findings).
+
+  And about the report itself:
+    - The rules only know the patterns in the rules file. Everything else
+      is still in the timeline, but not in the report.
+    - Severity says how strongly a pattern is linked to attacker activity
+      in general, not that it happened here. Medium leads are often benign
+      (installers run from Downloads, admin tools, test activity).
+    - Each card shows at most the rule's maxEvidence rows; the workbook's
+      Finding column tags them all.
+    - A timeline narrowed with -Sources, -StartDate/-EndDate, -MftDays or
+      -MaxUsnEntries gives a narrower report.
 
 
 ## What Each Parser Extracts (19 Parsers)
@@ -1141,7 +1755,13 @@ same (also for a collection whose manifest lists no dump) and adds
 -MemoryDumpPath.
 Requires vol.exe in tools\volatility3\ (see tools\volatility3\README.txt).
 Windows ARM64 dumps are detected from the dump header and skipped:
-Volatility 3 analyzes Intel x86/x64 Windows memory only (use WinDbg).
+Volatility 3 analyzes Intel x86/x64 Windows memory only (use WinDbg). When
+no dump is found for a collection whose systeminfo.txt says ARM64, the
+offer step says so instead of asking for the dump to be copied next to
+the zip. A dump of the collection that is found or listed but not
+analyzed (ARM64, answered 2 at the prompt, no vol.exe, not found) gets a
+log line "Memory dump not analyzed: <dump> (<size>): <reason>", which the
+findings report shows in its Evidence coverage notes and as a caveat.
   - windows.pslist: Running processes with creation timestamps, PIDs, parent
     PIDs (ProcessCreation at the creation time)
   - windows.netscan: Network connections with protocol, addresses, ports,
@@ -1335,11 +1955,21 @@ After the timeline builds, the script presents a viewer menu:
   [2] Timeline Explorer -- powerful forensic CSV viewer (no colors,
       requires manual conditional formatting setup per session)
   [3] Both -- open Excel (colored) and Timeline Explorer side by side
-  [4] None -- just save the files, don't open anything
+  [4] Open report -- the findings report (PDF): leads to review,
+      each with its timeline rows (plain-English summary first)
+  [5] None -- just save the files, don't open anything
 
-Both output files are always generated regardless of viewer choice:
+Options that do not apply are left out and the rest renumbered: Excel and
+Both without a workbook, Open report without a report (-NoReport, or a
+report that could not be written). Open report opens report.pdf, or
+report.html when no PDF was made. -Viewer Excel|TimelineExplorer|Both|
+Report|None skips the menu.
+
+The output files are always generated regardless of viewer choice:
   - timeline.csv   -- plain CSV for any tool (Timeline Explorer, SIEM, etc.)
   - timeline.xlsx  -- color-coded Excel with rows pre-formatted by EventType
+  - report.pdf, report.html, findings.csv -- the findings report (see
+    "Findings Report")
 
 
 ### Option 1: Excel (recommended for most users)
@@ -1431,30 +2061,41 @@ Timeline Explorer at the same time.
      Or: Run-TimelineBuilder.bat "path\to\collection" "mimikatz,psexec"
 
   3. REVIEW summary in the console output
-     Total events, date range, per-source breakdown, keyword-flagged count
+     Total events, date range, per-source breakdown, keyword-flagged count,
+     and the findings report's High/Medium/Info counts
 
-  4. CHOOSE a viewer when prompted
+  4. READ the findings report (report.pdf)
+     The summary page says how many leads there are and where to start;
+     each lead lists its evidence rows. In Excel, the Findings sheet links
+     to those rows, and the Finding column of the Timeline sheet filters
+     every row of a lead. Leads are reasons to look, not a verdict.
+
+  5. CHOOSE a viewer when prompted
      Excel: pre-colored rows, ready to analyze immediately
      Timeline Explorer: powerful forensic CSV viewer (manual color setup)
      Both: side by side for maximum flexibility
+     Open report: the findings report
 
-  5. TRIAGE in your chosen viewer
+  6. TRIAGE in your chosen viewer
+     Filter the Finding column for a lead's id to see all of its rows
      Filter EventType to SecurityAlert for AV detections and tampering
      Filter Flagged column to TRUE for keyword hits
      Sort by Timestamp for chronological review
      Group by EventType for category analysis (hide Snapshot rows to see
      only real events)
 
-  6. INVESTIGATE
+  7. INVESTIGATE
      Pivot on timestamps: what else happened +/- 5 minutes?
      Pivot on users: what else did this account do?
      Pivot on processes: where else does this executable appear?
      Check Browser entries for downloads preceding suspicious execution
 
-  7. REFINE if needed
+  8. REFINE if needed
      Re-run with -StartDate/-EndDate to zoom into a timeframe
      Re-run with additional -Keywords based on findings
      Re-run with -Sources to focus on specific artifact types
+     Tune the report's rules (allowlist known-benign activity) and rebuild
+     the report alone with -ReportOnly
 
 
 ## Known Limitations and Expected Warnings
@@ -1504,10 +2145,11 @@ Timeline Explorer at the same time.
     the work folder on every exit), it skips the rest of the step, so the
     run says so. Please report it with the log line.
 
-  - Console window -- QuickEdit is off while the builder runs (see Quick
-    Start), so a click no longer pauses it, but a selection made with the
-    window menu (Edit > Mark) still does, until Enter or Esc ends it. The
-    builder changes the mode only when its input is a console with
+  - Console window -- QuickEdit is off while the builder runs, -ReportOnly
+    included (see Quick Start), so a click no longer pauses it, but a
+    selection made with the window menu (Edit > Mark) still does, until
+    Enter or Esc ends it. The builder changes the mode only when its input
+    is a console with
     QuickEdit on: with input redirected (a script piping into it, CI) or
     QuickEdit already off, nothing is changed and the log has no QuickEdit
     line. The console's mode is put back at every end of the run (also an
@@ -1696,13 +2338,31 @@ Timeline Explorer at the same time.
     no results on Windows 11 Build 26200+ due to kernel structure changes.
     This is a Volatility compatibility issue, not a script bug.
 
+  - Findings report warnings -- the timeline is always kept; only the report
+    part named in the warning is missing:
+      "Rules file not found" / "The report rules failed: ..." -- a missing
+      -ReportRules file, or a rules file with an error (the message names
+      the rule and field): no report. Fix the file and run -ReportOnly.
+      "PDF not created: ..." -- Microsoft Edge is missing, failed or timed
+      out: report.html is complete; print it to PDF from a browser.
+      "Could not update the workbook: ..." (-ReportOnly) -- timeline.xlsx is
+      open in Excel, ImportExcel is missing, or the workbook does not have
+      the timeline's rows: the report then gives timeline.csv row numbers.
+      "Report rule X: N regular expression match(es) timed out" -- a
+      rule's pattern took over 2 seconds on a row; that row is not flagged.
+
+  - Findings report limits -- see "What the report can't tell you" under
+    "Findings Report". In short: leads are reasons to look, not a verdict;
+    the rules only know the patterns in the rules file; Medium leads are
+    often benign; and a missing event proves nothing.
+
 
 ## Limitations vs. Full Tools (plaso/log2timeline)
 
   Feature          | timeline-builder.ps1           | log2timeline/plaso
   -----------------+--------------------------------+----------------------------
   Setup            | Zero dependencies (pure PS)    | Requires Python + plaso
-  Speed            | Fast (1-2 minutes)             | Slow (hours for full parse)
+  Speed            | Fast (about 5 minutes)         | Slow (hours for full parse)
   Event logs       | Targeted high-value event IDs  | All event IDs
   Prefetch         | Name, run count, run times     | Full binary parsing
   Registry         | Key artifacts (MRU, BAM, etc.) | Hundreds of plugins
@@ -1711,7 +2371,8 @@ Timeline Explorer at the same time.
   USN Journal      | Parsed from text export        | Full $UsnJrnl binary parse
   $MFT             | SI/FN, deleted, windowed, MotW | Full $MFT parsing
   Shellbags        | Folder names + key times       | Full shellbag parsing
-  Output formats   | CSV + color-coded XLSX         | CSV, JSON, XLSX, and more
+  Output formats   | CSV + color-coded XLSX +       | CSV, JSON, XLSX, and more
+                   | findings report (PDF/HTML)     |
   Parsers          | 19 parsers (18 + memory opt-in) | 100+ parsers
 
   When to use this: Quick triage, initial timeline, no-install environments,
@@ -1725,7 +2386,10 @@ Timeline Explorer at the same time.
 
   - Windows 10 or Windows 11
   - PowerShell 5.1 or later
-  - Administrator privileges (the .bat launcher handles elevation)
+  - Administrator privileges (the .bat launcher handles elevation); not for
+    -ReportOnly
+  - Microsoft Edge (part of Windows 10 and 11) for report.pdf; without it
+    the findings report is written as report.html only
   - Internet connection on first run (to install ImportExcel module and
     auto-download sqlite3.exe; Timeline Explorer downloaded on first use
     if selected). After first run, cached copies are used offline.
@@ -1775,7 +2439,8 @@ installation or configuration is needed.
   License:    Free for use (see Eric Zimmerman's tools page)
   Cached at:  tools\TimelineExplorer\
   Size:       ~86 MB (zip)
-  Used by:    Auto-launched after timeline export
+  Used by:    Opened when chosen from the viewer menu (Timeline Explorer or
+              Both), or with -Viewer TimelineExplorer / Both
   Requires:   .NET 9 Runtime (Timeline Explorer will prompt to install if missing)
 
 Both zips are downloaded to %TEMP%, extracted, and the zip is deleted. If
@@ -1877,7 +2542,9 @@ parsing is skipped, and the timeline CSV can be opened manually.
   synthetic rows: the computer name of collection_info.json must strip
   HOST\ only for a live collection, not for a mounted image, and the log
   lines are checked. The computer name and ProfileList are read from this
-  machine's own SYSTEM and SOFTWARE keys (read only). Part 1 needs no
+  machine's own SYSTEM and SOFTWARE keys (read only); the first SYSTEM
+  hive's computer name is kept once for the findings report (the examined
+  computer of a mounted image). Part 1 needs no
   admin and always runs. Part 2 generates real events (audit policy, a
   temporary local user and group membership, scheduled task, service and
   classic event log), exports the logs with wevtutil, runs the builder on
@@ -2005,14 +2672,35 @@ parsing is skipped, and the timeline CSV can be opened manually.
   fit), the manifest lookups, the list of input files, the free-space and
   temp-folder checks, the refusal of a network work folder, the clean-up
   of work folders left by killed runs, the SRUM database copy (made in the
-  work folder; a missing transaction log reported) and the end-of-run
-  banners; it needs no admin. Part 2 runs the builder on a synthetic
+  work folder; a missing transaction log reported), the end-of-run
+  banners and the files of a collection folder whose paths have 260 or
+  more characters (named in Windows PowerShell 5.1, none in PowerShell 7,
+  never a memory dump or email attachment copy); it needs no admin. Part
+  2 runs the builder on a synthetic
   collection zip dated 2025 with two setupapi logs: both must be parsed,
   the free space must be checked, the work folder must be outside %TEMP%
   and removed afterwards, and an input file deleted during the run (by a
-  test hook) must give exit code 2 and the MISSING INPUT FILE(S) banner.
-  A zip with a copied email attachment must give exit code 0 and the
-  attachment's rows without extracting it. Part 2 needs admin like the
+  test hook) must give exit code 2 and the MISSING INPUT FILE(S) banner;
+  that run keeps its findings report (in a folder of its own; the other
+  runs use -NoReport), which must say the timeline is incomplete, list the
+  zip's SHA-256 and have collection_info.json copied next to it. A zip with
+  a copied email attachment must give exit code 0 and the attachment's
+  rows without extracting it, and a -WorkDir with [ ] in its path must
+  stop the run at the start (exit code 1). A zip "Case [1].zip" whose top
+  folder is "Case [1]" must give exit code 0 and both devices: its
+  extracted copy is renamed "Case _1_" (Part 1 checks the rename and that
+  the input-file list follows it). The kept report must say "incomplete"
+  twice only (the caveat and Evidence coverage). A collection folder with
+  a path of 260+ characters in it must stop the run at the start in
+  Windows PowerShell 5.1 (exit code 1, the file named) and give a
+  timeline in PowerShell 7, and so must a collection folder whose own
+  path has 250 characters (in 5.1 the error says the folder's path is too
+  long, with its length, instead of counting a few names); a .7z and a
+  memory dump named "Case [2]..."
+  must give "Input path is a file" (exit code 1), not the wildcard error;
+  the builder copied into a folder "inst [1]" must stop at the start with
+  an error about its folder; a folder of zips must end with no entries
+  and a hint to drop one .zip. Part 2 needs admin like the
   builder (or -BuilderPath with a copy without the admin check); it
   changes nothing on the system.
 
@@ -2065,7 +2753,19 @@ parsing is skipped, and the timeline CSV can be opened manually.
   analyzed (connect its drive, or copy it to the path named next to the
   zip or folder); only the parser, run with -Sources ...,Memory from
   PowerShell, names -MemoryDumpPath, and the offer step says nothing for a
-  collection whose manifest lists no dump. Then it
+  collection whose manifest lists no dump. The offer step also logs the
+  "Memory dump not analyzed" line the findings report reads; for a
+  collection from a Windows ARM64 computer (its systeminfo.txt) it gives
+  no copy advice and names WinDbg; the dump of a zip whose top folder was
+  renamed is named after the folder's original name. It runs the offer
+  itself (the builder's block for a run without Memory in -Sources, as
+  from the .bat) on a zip with its dump next to it: an ARM64 dump is not
+  offered, no vol.exe, answer 2, the end of redirected input (as 2), an
+  invalid answer and then 1 (asked again); each dump that is not analyzed
+  gets the "Memory dump not analyzed" line, which the findings report's
+  own log reader must read back, with the size the prompt shows (bytes,
+  or GB with two decimals), and WinDbg is named once. The Memory parser
+  gives that line too (ARM64, no vol.exe). Then it
   reads synthetic dump headers: the architecture and the capture time
   (64-bit SystemTime used; zero, before 1980, more than a day after the
   last write, cut off, 32-bit and raw fall back to the last-write time;
@@ -2123,8 +2823,126 @@ parsing is skipped, and the timeline CSV can be opened manually.
   comes back (skipped when the child gets no console of its own). In the
   builder's syntax tree it checks that QuickEdit is turned off first in
   the main body, before its first long step and every exit, with the log
-  line, and put back last in its finally block. The console the test runs
-  in is never changed. No admin needed.
+  line, and put back last in its finally block, and the same for
+  -ReportOnly in its function Invoke-TimelineReportOnly (which returns its
+  exit code instead of calling exit, so its finally block runs). The
+  console the test runs in is never changed. No admin needed.
+
+  Four scripts test the findings report (CI runs them after the parser
+  tests, in both PowerShell versions). The first three need no admin and do
+  not run the builder:
+
+  tests\Test-ReportEngine.ps1 -- the rules engine and report model
+  (report\TimelineReport.Engine.ps1) on synthetic rows and rules in
+  tests\fixtures\report\engine\: every match condition, lists, grouping,
+  threshold windows, escalation, the allowlist, numbering, evidence limits,
+  maxFindings roll-ups, activityTime, the stop of a rule whose pattern
+  keeps timing out, row numbers, invalid rules files (each error names the
+  rule and field), the report model, findings.csv and the timeline CSV
+  reader. Lists are expanded in the C# helper, also when one is used
+  several times (a synthetic list of harmless words), and the expansion
+  fails closed: a stand-in for a blocked call, one that gives no regex or
+  an empty one, or an error inside it must give a rules-file error, and
+  the shipped report-rules.json must import with no error and no empty
+  condition. The model keeps accounts apart as the User column names them
+  (an older timeline's HOST\alice counts with alice), marks unnamed
+  service SIDs as not people, counts ShimCache file times as file rows,
+  names a mounted image's examined computer (SYSTEM hive, or "not known"
+  with the collector host kept apart), names a live collection's local
+  collector account as the User column does, and says when the builder
+  run ended incomplete (its log lines, its end banners, or the counts the
+  builder passes) without repeating it in the notes, and names a memory
+  dump the builder did not analyze (its "Memory dump not analyzed" log
+  line) in the notes, with a caveat that does not say the dump exists
+  (it may not have been found). A lead seen only in
+  Snapshot rows from during the collection (a task listed then) must be
+  CapturedDuringCollection, not DuringCollection; a lead whose rows all
+  come from the memory dump must be MemoryOnly, never
+  CapturedDuringCollection (DuringCollection when the dump shows its
+  process started after the collection start), with "Captured in the
+  memory dump" in MemoryOnlyNote, report-model.json and its findings.csv
+  summary line, and its evidence lines must give its rows' numbers; a lead
+  with rows from other sources too must not be MemoryOnly. A task's
+  author-supplied registration date must not set a lead's first and last
+  time when the lead has a time Windows recorded, and a lead with only
+  such dates must be left out of the flagged-activity window.
+
+  tests\Test-ReportRules.ps1 -- loads report\report-rules.json with the
+  engine and checks it against tests\fixtures\report\rules\cases.csv: rows
+  in timeline format, in the shapes the parsers write now (memory command
+  lines as Snapshot rows, author-supplied task dates, task actions written
+  with environment variables (%TEMP%, %PUBLIC%, ...), Security 4698/4702
+  Command/Arguments rows, ShimCache FileLastModified rows, the User
+  column's forms), each tagged with the
+  rules it must (HIT) or must not (MISS) trigger, or with KEY <rule>
+  <group>: a hit whose finding must be grouped under that value. Every
+  enabled rule needs a hit and a near-miss case. The rules file must load
+  without an error, and no compiled condition may be empty (it would match
+  every row) or keep a {{list:...}} placeholder. -RulesPath and -CasesPath
+  check other files, -EnginePath another engine.
+
+  tests\Test-ReportRender.ps1 -- renders report.html from the synthetic
+  models in tests\fixtures\report\render\ and from in-memory models and
+  checks the sections and their order, the summary page, escaping (also of
+  right-to-left override characters), long unbroken values, the card's
+  evidence limit, the offline page (no scripts or external loads), ASCII
+  output, the charts and the appendix, a mounted image's unknown or
+  SYSTEM-hive computer name, the "Timeline incomplete" block of an
+  incomplete run, and the card notes of a lead from during the collection,
+  one seen only in Snapshot rows then, one seen only in the memory dump
+  (exactly "Captured in the memory dump", with no Snapshot note or
+  collector hint; with the during-collection note too when the dump shows
+  the process started then), and one dated only by an
+  author-supplied task date (also in the summary's activity window); then
+  prints PDFs with Edge (skipped
+  without Edge) and checks
+  the page size, the relative ./timeline.xlsx link, that no local path is
+  in the PDF and that Edge's temporary profile is removed.
+
+  tests\Test-ReportBuilder.ps1 -- runs the builder on the synthetic
+  collection in tests\fixtures\report\builder\collection\ (Defender
+  detections, Run keys, BAM) and checks findings.csv (the expected rule ids
+  and severities, row numbers that point at the right timeline rows),
+  report-model.json, report.html, report.pdf (skipped without Edge), the
+  copied collection_info.json and collection_log.txt, and the workbook: the
+  first sheet is Findings, every row links to its Timeline row, and the
+  Finding column tags exactly the rows of each finding. Then -ReportOnly
+  (the same findings, no duplicate sheet or column, and no error output,
+  also in Windows PowerShell); a lead seen only in the memory dump, from a
+  copy of the builder (in the test's folder) whose Volatility 3 is a stub
+  with canned output, run with -MemoryDumpPath on a synthetic dump header:
+  "Captured in the memory dump" in report-model.json (MemoryOnly),
+  findings.csv, its card and its Findings-sheet summary row, and the card's
+  row numbers, findings.csv's RowNumber, the Findings sheet's links and
+  the Finding column all on its Memory-CommandLine row, also after a
+  -ReportOnly that updates the workbook (a lead that also has a BAM row is
+  not memory-only); -ReportOnly with -ReportRules and -NoExcel
+  (the workbook is called stale; -WorkDir and -MemoryDumpPath are ignored
+  with one warning), a missing rules file, -NoReport, -ReportOnly in a
+  folder named "case [1]" and with report.pdf held open by another
+  program, -ReportOnly on a mounted-image timeline whose run ended with
+  exit code 2 (the examined computer from the run's log, the incomplete
+  timeline in the report), -ReportOnly without a timeline, and a copy of
+  the builder (in the test's folder) with an injected error: an
+  unexpected error in the rebuild is logged and the report still made
+  (exit code 0), and a rebuild that stops before it gives its exit code,
+  or an error thrown out of it, exits with 1, not 0. Before the
+  runs it checks what the report takes from collection_info.json (the
+  builder's Get-TimelineReportCollectionInfo): a mounted image's computer
+  name is the collector host, not the examined computer. It needs admin
+  like the builder, or -BuilderPath with
+  a copy without the admin check that has the report\ folder beside it.
+  Like a user run, the builder installs ImportExcel from the PowerShell
+  Gallery when it is missing; if it cannot, the workbook checks are SKIPPED.
+
+    powershell -ExecutionPolicy Bypass -File tests\Test-ReportEngine.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-ReportRules.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-ReportRender.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-ReportBuilder.ps1
+
+  The parser tests above run the builder with -NoReport: the report has
+  its own tests, and a parser test must not fail because Edge is missing
+  or slow on a machine.
 
   Run them from an elevated PowerShell; -AllowSystemChanges lets the event
   log, registry and SRUM tests change this machine:
@@ -2181,6 +2999,10 @@ parsing is skipped, and the timeline CSV can be opened manually.
 
   WScript.Shell COM    Reads LNK shortcut files to extract target paths,
                        arguments, and working directories for Recent Files.
+
+  msedge.exe           Microsoft Edge in headless mode prints report.html
+                       to report.pdf (a temporary profile folder in %TEMP%,
+                       deleted afterwards; no network access is needed).
 
   PowerShell cmdlets   Import-Csv, Export-Csv, Expand-Archive,
                        Invoke-WebRequest, ConvertFrom-Json.
@@ -2266,9 +3088,18 @@ Temporary actions (all cleaned up automatically, also after an error or Ctrl+C):
   - Writes Volatility 3's JSON output (Memory parser) into the work folder
     -- deleted after each plugin
   - Downloads zip files to %TEMP% (first run) -- deleted after extraction
+  - Gives Microsoft Edge a temporary profile folder,
+    %TEMP%\timeline-report-edge-<id>, to print report.pdf -- deleted after
+    printing
   - Turns QuickEdit and mouse input off in its console window, so a click
     cannot pause the run (see Quick Start) -- the console's own mode is
     put back at the end
+
+The findings report writes only next to the timeline (report.*,
+findings.csv, report-model.json, copies of collection_info.json and
+collection_log.txt) and adds the Findings sheet and Finding column to that
+folder's timeline.xlsx. -ReportOnly rewrites those files in the folder it is
+given and logs to report_log.txt there.
 
 Event log entries (not removed):
   - Only when the in-process recovery of a SRUM database fails, or a copy

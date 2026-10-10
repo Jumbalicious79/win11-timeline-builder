@@ -452,7 +452,7 @@ try {
     $previous = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     $builderOutput = @(& $powershellExe -NoProfile -ExecutionPolicy Bypass -File $builder -InputPath $collection -Sources "AntiVirus" `
-        -OutputFile $timelineCsv -NoExcel -Viewer None 2>&1 | ForEach-Object { "$_" })
+        -OutputFile $timelineCsv -NoExcel -NoReport -Viewer None 2>&1 | ForEach-Object { "$_" })
     $ErrorActionPreference = $previous
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $timelineCsv)) {
         $builderOutput | ForEach-Object { Write-Host "  | $_" }

@@ -1,0 +1,14 @@
+{
+  "SchemaVersion": 1,
+  "ComputerName": "WS01",
+  "CollectorUser": "CORP\\examiner",
+  "Mode": "Live",
+  "TargetDrive": "C",
+  "TargetRoot": "C:\\",
+  "CollectionStartUtc": "2026-03-10T12:00:00.0000000Z",
+  "CollectorTimeZoneId": "Pacific Standard Time",
+  "CollectorCulture": "en-US",
+  "TargetTimeZoneId": "Pacific Standard Time",
+  "SecretsIncluded": true,
+  "ThunderbirdIndexIncluded": false
+}

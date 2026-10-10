@@ -1,0 +1,159 @@
+{
+  "schemaVersion": 1,
+  "_comment": "Synthetic rules for tests\\Test-ReportEngine.ps1 (one or more rules per engine feature). Not the real report rules.",
+  "lists": {
+    "tools": ["alphatool", "betatool", "gamma.tool"]
+  },
+  "rules": [
+    {
+      "id": "T-AV",
+      "title": "Antivirus detection",
+      "category": "Antivirus",
+      "severity": "High",
+      "match": { "source": "^Defender$", "eventType": "^SecurityAlert$", "description": "^detection:", "notDescription": "TESTFILE" },
+      "groupBy": "description",
+      "why": "The antivirus flagged a file.",
+      "technical": "Defender detection rows, test files excluded.",
+      "nextSteps": "Check the file and where it came from.",
+      "falsePositives": "Antivirus test files.",
+      "references": ["MITRE ATT&CK T1204"]
+    },
+    {
+      "id": "T-TOOL",
+      "title": "Listed tool executed",
+      "category": "Execution",
+      "severity": "Medium",
+      "match": { "source": "^(Prefetch|BAM)$", "description": "\\b{{list:tools}}\\.exe" },
+      "groupBy": "description",
+      "why": "A program from the tool list ran."
+    },
+    {
+      "id": "T-SVC",
+      "title": "Suspicious service: {{group}}",
+      "category": "Persistence",
+      "severity": "High",
+      "match": { "description": "^New service installed" },
+      "anyOf": [
+        { "details": "ImagePath=[^|]*\\\\Temp\\\\" },
+        { "details": "ImagePath=cmd /c" }
+      ],
+      "groupBy": "detail:ServiceName",
+      "why": "A service runs from a temporary folder or a command line."
+    },
+    {
+      "id": "T-EXCL",
+      "title": "Defender exclusion",
+      "category": "Antivirus",
+      "severity": "Medium",
+      "match": { "source": "^Defender$", "description": "^Defender exclusion added" },
+      "why": "The antivirus was told to skip a folder."
+    },
+    {
+      "id": "T-BURST",
+      "title": "Failed logon burst",
+      "category": "Access",
+      "severity": "Medium",
+      "match": { "source": "^Security\\.evtx$", "description": "^Failed logon attempt" },
+      "groupBy": "detail:Source",
+      "threshold": { "count": 5, "windowMinutes": 5 },
+      "escalate": {
+        "severity": "High",
+        "withinMinutes": 10,
+        "sameKey": "detail:IpAddress,Source",
+        "match": { "source": "^Security\\.evtx$", "description": "^Successful logon" }
+      },
+      "maxEvidence": 4,
+      "why": "Someone tried many passwords in a short time."
+    },
+    {
+      "id": "T-ACCOUNT",
+      "title": "Account created",
+      "category": "Access",
+      "severity": "Medium",
+      "match": { "source": "^Security\\.evtx$", "description": "^User account created" },
+      "groupBy": "description",
+      "escalate": {
+        "severity": "High",
+        "withinMinutes": 30,
+        "sameKey": "user",
+        "match": { "description": "^Member added to security-enabled local group: Administrators" }
+      },
+      "why": "A new account was created."
+    },
+    {
+      "id": "T-EXPLICIT",
+      "title": "Explicit credentials",
+      "category": "Access",
+      "severity": "Info",
+      "match": { "description": "^Logon using explicit credentials", "user": "\\\\", "notUser": "^NT AUTHORITY\\\\" },
+      "groupBy": "user",
+      "why": "An account used another account's password."
+    },
+    {
+      "id": "T-LOGONTYPE",
+      "title": "Logon type {{group}}",
+      "category": "Access",
+      "severity": "Info",
+      "match": { "source": "^Security\\.evtx$", "description": "^Successful logon" },
+      "groupBy": "detail:LogonType",
+      "why": "Successful logons, by logon type."
+    },
+    {
+      "id": "T-PS",
+      "title": "PowerShell module logging",
+      "category": "Execution",
+      "severity": "Medium",
+      "match": { "source": "PowerShell", "description": "module logging" },
+      "groupBy": "source",
+      "why": "PowerShell ran a logged command."
+    },
+    {
+      "id": "T-RENAME",
+      "title": "Mass rename to .{{group}}",
+      "category": "FileSystem",
+      "severity": "High",
+      "match": { "source": "^UsnJournal$", "description": "^USN renamed to: .*\\.(?<key>[a-z0-9]{2,8})$" },
+      "groupBy": "capture",
+      "threshold": { "count": 4, "windowMinutes": 1 },
+      "why": "Many files were renamed at once."
+    },
+    {
+      "id": "T-USN-DEL",
+      "title": "Files deleted",
+      "category": "FileSystem",
+      "severity": "Info",
+      "match": { "source": "^UsnJournal$", "description": "^USN deleted:", "notDetails": "Rename" },
+      "maxEvidence": 3,
+      "why": "Files were deleted."
+    },
+    {
+      "id": "T-FORMULA",
+      "title": "Formula-looking name",
+      "category": "Other",
+      "severity": "Info",
+      "match": { "description": "^=" },
+      "why": "A name that a spreadsheet would read as a formula."
+    },
+    {
+      "id": "T-DISABLED",
+      "title": "Disabled rule",
+      "category": "Other",
+      "severity": "High",
+      "enabled": false,
+      "match": { "source": "." },
+      "why": "This rule is turned off and never runs."
+    },
+    {
+      "id": "T-NOTSOURCE",
+      "title": "Logon outside the Security log",
+      "category": "Access",
+      "severity": "Info",
+      "match": { "eventType": "^Logon$", "notSource": "^Security\\.evtx$" },
+      "why": "Logon rows from other logs."
+    }
+  ],
+  "allowlist": [
+    { "ruleId": "T-EXCL", "match": { "details": "Exclusion=C:\\\\Collector\\\\" }, "reason": "The collector's own exclusion." },
+    { "ruleId": "*", "match": { "details": "CollectorRun=1", "duringCollection": true }, "reason": "The collector's own activity." }
+  ]
+}

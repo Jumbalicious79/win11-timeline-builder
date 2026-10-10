@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "_comment": "A one-rule file for tests\\Test-ReportBuilder.ps1 (-ReportRules): every Run key change in the fixture collection is one Medium finding.",
+  "lists": {},
+  "rules": [
+    {
+      "id": "FIXTURE-RUNKEY",
+      "title": "A Run key was written",
+      "category": "Persistence",
+      "severity": "Medium",
+      "match": { "source": "^Persistence-RunKeys$", "eventType": "^PersistenceChange$" },
+      "groupBy": "rule",
+      "why": "A program was set to start automatically at logon.",
+      "technical": "Run/RunOnce key last-write times from run_keys.csv.",
+      "nextSteps": "Check the command of each Run value.",
+      "falsePositives": "Software installs write Run keys.",
+      "references": ["MITRE ATT&CK T1547.001"]
+    }
+  ],
+  "allowlist": []
+}

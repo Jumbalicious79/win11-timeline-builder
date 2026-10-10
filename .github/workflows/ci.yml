@@ -110,6 +110,30 @@ jobs:
         if: ${{ !cancelled() }}
         run: ./tests/Test-SrumParsers.ps1
 
+      # Findings report: the rules engine, report-rules.json against its
+      # cases, and the HTML/PDF renderer (Edge headless). No admin, no
+      # builder run.
+      - name: Run report engine test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-ReportEngine.ps1
+
+      - name: Run report rules test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-ReportRules.ps1
+
+      - name: Run report renderer test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-ReportRender.ps1
+
+      # The builder end to end on tests\fixtures\report\builder: report.html,
+      # report.pdf, findings.csv, the workbook's Findings sheet and Finding
+      # column, -ReportOnly, -ReportRules and -NoReport. The builder installs
+      # ImportExcel from the PowerShell Gallery if the runner lacks it, as it
+      # does for a user; without it the workbook checks are skipped.
+      - name: Run findings report builder test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-ReportBuilder.ps1
+
       - name: Run zip input test
         if: ${{ !cancelled() }}
         run: ./tests/Test-ZipInput.ps1

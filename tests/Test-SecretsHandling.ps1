@@ -80,7 +80,7 @@ function Invoke-TimelineBuilder {
     # One comma-joined string: powershell.exe -File would otherwise treat the
     # second source as a positional argument (the builder splits on commas)
     $output = & $powershellExe -NoProfile -ExecutionPolicy Bypass -File $builder `
-        -InputPath $CollectionPath -Sources "Browser,FileSystem,ScheduledTasks,SRUM,AntiVirus" -OutputFile $OutputFile -NoExcel -Viewer None 2>&1
+        -InputPath $CollectionPath -Sources "Browser,FileSystem,ScheduledTasks,SRUM,AntiVirus" -OutputFile $OutputFile -NoExcel -NoReport -Viewer None 2>&1
     return , @($output | ForEach-Object { "$_" })
 }
 

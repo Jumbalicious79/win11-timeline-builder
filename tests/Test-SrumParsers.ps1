@@ -89,7 +89,7 @@ function Invoke-TimelineBuilder {
     param([string]$CollectionPath, [string]$OutputFile)
     $ErrorActionPreference = "Continue"
     $output = & $powershellExe -NoProfile -ExecutionPolicy Bypass -File $builder `
-        -InputPath $CollectionPath -Sources "SRUM" -OutputFile $OutputFile -NoExcel -Viewer None 2>&1
+        -InputPath $CollectionPath -Sources "SRUM" -OutputFile $OutputFile -NoExcel -NoReport -Viewer None 2>&1
     $lines = @($output | ForEach-Object { "$_" })
     foreach ($line in $lines) {
         if ($line -cmatch '\] Work folder: (.+)$') { $script:builderWorkFolders.Add($Matches[1].Trim()) }

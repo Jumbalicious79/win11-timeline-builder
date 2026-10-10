@@ -73,7 +73,7 @@ function Invoke-TimelineBuilder {
     param([string]$CollectionPath, [string]$OutputFile, [string]$Sources)
     $ErrorActionPreference = "Continue"
     $output = & $powershellExe -NoProfile -ExecutionPolicy Bypass -File $builder `
-        -InputPath $CollectionPath -Sources $Sources -OutputFile $OutputFile -NoExcel -Viewer None 2>&1
+        -InputPath $CollectionPath -Sources $Sources -OutputFile $OutputFile -NoExcel -NoReport -Viewer None 2>&1
     return , @($output | ForEach-Object { "$_" })
 }
 
@@ -529,7 +529,7 @@ PRAGMA writable_schema = OFF;
     Write-Host "Running the builder again with a relative -InputPath ..."
     $ErrorActionPreference = "Continue"
     $relativeOutput = @(& $powershellExe -NoProfile -ExecutionPolicy Bypass -Command ("Set-Location -LiteralPath '$workDir'; & '$builder' -InputPath '.\collection' " +
-        "-Sources Email,RecentFiles,FileSystem -OutputFile '$relativeCsv' -NoExcel -Viewer None") 2>&1 | ForEach-Object { "$_" })
+        "-Sources Email,RecentFiles,FileSystem -OutputFile '$relativeCsv' -NoExcel -NoReport -Viewer None") 2>&1 | ForEach-Object { "$_" })
     $ErrorActionPreference = "Stop"
     if (Test-Path -LiteralPath $relativeCsv) {
         $relativeRows = @(Import-Csv -LiteralPath $relativeCsv)

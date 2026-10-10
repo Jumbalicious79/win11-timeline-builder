@@ -82,7 +82,7 @@ function Invoke-TimelineBuilder {
     param([string]$CollectionPath, [string]$Sources, [string]$OutputFile)
     $ErrorActionPreference = "Continue"
     $output = & $powershellExe -NoProfile -ExecutionPolicy Bypass -File $builder `
-        -InputPath $CollectionPath -Sources $Sources -OutputFile $OutputFile -NoExcel -Viewer None 2>&1
+        -InputPath $CollectionPath -Sources $Sources -OutputFile $OutputFile -NoExcel -NoReport -Viewer None 2>&1
     return [PSCustomObject]@{ ExitCode = $LASTEXITCODE; Lines = @($output | ForEach-Object { "$_" }) }
 }
 

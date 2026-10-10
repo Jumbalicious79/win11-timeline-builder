@@ -22,7 +22,10 @@
 #    its own;
 #  - in the builder's syntax tree, that QuickEdit is turned off at the
 #    start of the main body, before its first long step, with the log
-#    line, and put back last in the main body's finally block.
+#    line, and put back last in the main body's finally block; and that
+#    -ReportOnly (which ends before the main body) does the same in its
+#    own function, Invoke-TimelineReportOnly, which returns its exit code
+#    instead of calling exit.
 # Only Get-ConsoleModeWithoutQuickEdit is loaded here (from the builder's
 # AST), so the script itself and its Administrator check do not run, and
 # the console of this test is never changed: no admin rights needed.
@@ -363,6 +366,31 @@ try {
             Write-TestResult -Name "Restore-ConsoleMode: after the hives and the work folder (a click cannot pause the clean-up)" -Passed ($cleanupInFinally.Count -eq 2) -Message "$($cleanupInFinally.Count) of Dismount-RunHives / Remove-RunWorkFolder in the try block before it"
         }
     }
+
+    # --- -ReportOnly: runs before the main body, in a function of its own,
+    # with QuickEdit off too ---------------------------------------------------
+    $reportOnlyFunction = Get-BuilderFunction "Invoke-TimelineReportOnly"
+    if ($reportOnlyFunction) {
+        $statements = @($reportOnlyFunction.Body.EndBlock.Statements)
+        $firstText = if ($statements.Count -gt 0) { $statements[0].Extent.Text } else { "" }
+        Assert-Equal -Name "-ReportOnly: QuickEdit turned off first in Invoke-TimelineReportOnly" -Expected '$consoleMode = Disable-ConsoleQuickEdit' -Actual $firstText
+        $restTry = if ($statements.Count -eq 2) { $statements[1] } else { $null }
+        $restoreTexts = @()
+        if ($restTry -is [System.Management.Automation.Language.TryStatementAst] -and $restTry.Finally) {
+            $restoreTexts = @($restTry.Finally.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq "Restore-ConsoleMode" }, $true) | ForEach-Object { $_.Extent.Text })
+        }
+        Assert-Equal -Name "-ReportOnly: everything else in a try block whose finally puts the console mode back" -Expected 'Restore-ConsoleMode $consoleMode' -Actual ($restoreTexts -join " | ")
+        $reportOnlyLogLines = @($reportOnlyFunction.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq "Log" -and $node.CommandElements.Count -gt 1 -and
+                    $node.CommandElements[1] -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $node.CommandElements[1].Value -eq $expectedLogLine
+                }, $true))
+        Assert-Equal -Name "-ReportOnly: the agreed log line when the mode was changed" -Expected 1 -Actual $reportOnlyLogLines.Count
+        Assert-Equal -Name "-ReportOnly: no exit inside Invoke-TimelineReportOnly (it returns the exit code, so the finally block runs)" -Expected 0 -Actual @($reportOnlyFunction.FindAll({ param($node) $node -is [System.Management.Automation.Language.ExitStatementAst] }, $true)).Count
+        $reportOnlyCalls = @(Find-MainFlowCommand -Name "Invoke-TimelineReportOnly")
+        Assert-Equal -Name "-ReportOnly: Invoke-TimelineReportOnly called once, before the main body" -Expected "1 True" -Actual "$($reportOnlyCalls.Count) $($reportOnlyCalls.Count -eq 1 -and $reportOnlyCalls[0].Extent.StartOffset -lt $mainTry.Extent.StartOffset)"
+    }
+    else { Write-TestResult -Name "-ReportOnly: Invoke-TimelineReportOnly is in the builder" -Passed $false }
 
     # --- The helpers themselves ---------------------------------------------
     $disableFunction = Get-BuilderFunction "Disable-ConsoleQuickEdit"
