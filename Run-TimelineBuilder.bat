@@ -10,9 +10,12 @@
 ::
 :: Drag and drop: drop ONE collection .zip or folder on this file. Explorer
 :: quotes a dropped path only when it has a space in it, so a path with
-:: & , = ; or ^ but no space arrives cut up (this file then says the path was
-:: not found): rename that folder, or run this file from a command prompt
-:: with the path in quotes.
+:: & , = ; or ^ but no space arrives cut up, and dropping it is unreliable:
+:: rename that folder first, or run this file from a command prompt with the
+:: path in quotes. This file catches most cut-up paths (it says the path was
+:: not found, or arrived cut up), but not one cut at & whose first piece is
+:: an existing folder (C:\Cases\R for C:\Cases\R&D\...): that folder is read.
+:: The keyword list goes in one pair of quotes after the path.
 ::
 :: Exit code (when started from a window that is already elevated; otherwise
 :: this file hands the run to a new elevated window and ends at once): the
@@ -43,13 +46,26 @@ if not exist "%TB_INPUT%" goto :nopath
 :: second one would be read as the keywords. A dropped path is a full path;
 :: keywords are not the full path of an existing file or folder.
 if not defined TB_KEYWORDS goto :checked
-if not exist "%TB_KEYWORDS%" goto :checked
+if not exist "%TB_KEYWORDS%" goto :notitem
 if /i "%~f2"=="%TB_KEYWORDS%" goto :twoitems
 if /i "%~x2"==".zip" goto :twoitems
 if /i "%~x2"==".dmp" goto :twoitems
 if /i "%~x2"==".raw" goto :twoitems
 if exist "%TB_KEYWORDS%\collection_info.json" goto :twoitems
 if exist "%TB_KEYWORDS%\collection_manifest.csv" goto :twoitems
+:notitem
+:: A dropped path with ; , or = and no space is cut there. When the piece
+:: before the cut exists, the rest would be read as the keywords: the two
+:: pieces joined again are an existing path, the rest is a path ending in
+:: .zip, .dmp or .raw, or there is a third piece (keywords are one argument).
+if exist "%TB_INPUT%;%TB_KEYWORDS%" goto :cutpath
+if exist "%TB_INPUT%,%TB_KEYWORDS%" goto :cutpath
+if exist "%TB_INPUT%=%TB_KEYWORDS%" goto :cutpath
+if not "%~3"=="" goto :cutpath
+if "%TB_KEYWORDS:\=%"=="%TB_KEYWORDS%" goto :checked
+if /i "%~x2"==".zip" goto :cutpath
+if /i "%~x2"==".dmp" goto :cutpath
+if /i "%~x2"==".raw" goto :cutpath
 :checked
 
 net session >nul 2>&1
@@ -59,9 +75,13 @@ if %errorlevel% equ 0 goto :run
 :: PowerShell reads the values from the environment (so spaces and ' in paths
 :: need no escaping) and starts cmd.exe /s /c with the .bat path and each
 :: argument in its own pair of quotes, all wrapped in one more pair of quotes.
+:: No at the UAC prompt: the message stays on screen until a key is pressed.
 echo Requesting Administrator privileges...
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$q = [char]34; $a = '/s /c ' + $q + $q + $env:TB_BAT + $q; if ($env:TB_INPUT) { $a += ' ' + $q + $env:TB_INPUT + $q }; if ($env:TB_KEYWORDS) { $a += ' ' + $q + $env:TB_KEYWORDS + $q }; $a += $q; Start-Process -FilePath cmd.exe -ArgumentList $a -Verb RunAs"
-exit /b
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$q = [char]34; $a = '/s /c ' + $q + $q + $env:TB_BAT + $q; if ($env:TB_INPUT) { $a += ' ' + $q + $env:TB_INPUT + $q }; if ($env:TB_KEYWORDS) { $a += ' ' + $q + $env:TB_KEYWORDS + $q }; $a += $q; try { Start-Process -FilePath cmd.exe -ArgumentList $a -Verb RunAs -ErrorAction Stop } catch { Write-Host ('Could not elevate: ' + $_.Exception.Message) -ForegroundColor Red; exit 1 }"
+if not errorlevel 1 exit /b 0
+echo The timeline builder needs Administrator rights: run this file again and click Yes when Windows asks.
+pause
+exit /b 1
 
 :nopath
 echo.
@@ -84,6 +104,23 @@ echo ERROR: Drop one collection at a time. More than one path was given:
 echo   "%TB_INPUT%"
 echo   "%TB_KEYWORDS%"
 echo (The second one would have been read as the keyword list.)
+echo.
+pause
+exit /b 1
+
+:cutpath
+echo.
+echo ERROR: The path arrived cut up, or more than one item was given:
+echo   "%TB_INPUT%"
+echo   "%TB_KEYWORDS%"
+if not "%~3"=="" echo   "%~3" ...
+echo.
+echo A path dropped on this file arrives cut up when it has ^& , = ; or ^^ in it
+echo but no space. Rename that folder, or run this file from a command prompt
+echo with the path in quotes:
+echo   Run-TimelineBuilder.bat "C:\Cases\R&D\TriageCollection.zip"
+echo Keywords go in one pair of quotes after the path:
+echo   Run-TimelineBuilder.bat "C:\Cases\TriageCollection.zip" "mimikatz,psexec"
 echo.
 pause
 exit /b 1

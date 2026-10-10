@@ -2675,7 +2675,8 @@ function New-ReportModel {
         $caveats.Add("The oldest USN journal entries were dropped (-MaxUsnEntries): older file changes are not in the timeline.")
     }
     if ($builderLog.MemoryDumpNotAnalyzed) {
-        $caveats.Add("A memory dump of this collection exists but was not analyzed (see Evidence coverage): the programs, network connections and command lines in memory are not in this report.")
+        # (not "exists": the reason can be that it was not found)
+        $caveats.Add("A memory dump of this collection was not analyzed (see Evidence coverage): the programs, network connections and command lines in memory are not in this report.")
     }
     if ($builderLog.StartDate -or $builderLog.EndDate) {
         $range = @(@($builderLog.StartDate, $builderLog.EndDate) | Where-Object { $_ }) -join " to "

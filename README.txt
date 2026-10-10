@@ -170,20 +170,32 @@ themselves are never committed.
 
   Drag and drop: drop ONE collection .zip or folder on the .bat. Explorer
   quotes a dropped path only when it has a space in it, so a path with
-  & , = ; or ^ but no space (C:\Cases\R&D\...) arrives cut up: the .bat
-  then says the path was not found, before asking for Administrator
-  rights. Rename that folder, or run the .bat from a command prompt with
-  the path in quotes. Dropping two items (two zips, or a zip and its
+  & , = ; or ^ but no space (C:\Cases\R&D\...) arrives cut up, and
+  dropping it is unreliable: rename that folder first, or run the .bat
+  from a command prompt with the path in quotes. The .bat catches most
+  cut-up paths before asking for Administrator rights: it says the path
+  was not found, or that the path arrived cut up (the pieces joined again
+  are an existing path, the rest is a path ending in .zip, .dmp or .raw,
+  or there is a third piece). It cannot catch a path cut at & whose first
+  piece is an existing folder (C:\Cases\R for C:\Cases\R&D\...): that
+  folder would be read. Dropping two items (two zips, or a zip and its
   memory dump) is refused with "Drop one collection at a time": the second
   path would otherwise be read as the keyword list. (So is a second
   argument that is the full path of an existing file or folder, or a
-  .zip, .dmp or .raw file or a collection folder.)
+  .zip, .dmp or .raw file or a collection folder.) The keyword list is one
+  argument: put it in one pair of quotes ("mimikatz,psexec"); a third
+  argument is refused.
+
+  If you click No when Windows asks for Administrator rights, the .bat
+  says "Could not elevate" and waits for a key (exit code 1).
 
   A collection folder is read where it is, so its files' full paths must
   stay under 260 characters: Windows PowerShell (which the .bat uses)
   cannot open longer paths with Windows' default settings. When a folder
   holds such files, the run stops at the start (exit code 1) and names
-  them: copy the collection to a short path such as C:\Cases\<name>, or
+  them (or, when even the files right in the folder cannot be opened,
+  says that the folder's own path is too long and how long it is): copy
+  the collection to a short path such as C:\Cases\<name>, or
   drop the collection .zip instead (a zip is extracted into a short work
   folder, and over-long names are shortened).
 
@@ -2681,7 +2693,10 @@ parsing is skipped, and the timeline CSV can be opened manually.
   twice only (the caveat and Evidence coverage). A collection folder with
   a path of 260+ characters in it must stop the run at the start in
   Windows PowerShell 5.1 (exit code 1, the file named) and give a
-  timeline in PowerShell 7; a .7z and a memory dump named "Case [2]..."
+  timeline in PowerShell 7, and so must a collection folder whose own
+  path has 250 characters (in 5.1 the error says the folder's path is too
+  long, with its length, instead of counting a few names); a .7z and a
+  memory dump named "Case [2]..."
   must give "Input path is a file" (exit code 1), not the wildcard error;
   the builder copied into a folder "inst [1]" must stop at the start with
   an error about its folder; a folder of zips must end with no entries
@@ -2742,7 +2757,15 @@ parsing is skipped, and the timeline CSV can be opened manually.
   "Memory dump not analyzed" line the findings report reads; for a
   collection from a Windows ARM64 computer (its systeminfo.txt) it gives
   no copy advice and names WinDbg; the dump of a zip whose top folder was
-  renamed is named after the folder's original name. Then it
+  renamed is named after the folder's original name. It runs the offer
+  itself (the builder's block for a run without Memory in -Sources, as
+  from the .bat) on a zip with its dump next to it: an ARM64 dump is not
+  offered, no vol.exe, answer 2, the end of redirected input (as 2), an
+  invalid answer and then 1 (asked again); each dump that is not analyzed
+  gets the "Memory dump not analyzed" line, which the findings report's
+  own log reader must read back, with the size the prompt shows (bytes,
+  or GB with two decimals), and WinDbg is named once. The Memory parser
+  gives that line too (ARM64, no vol.exe). Then it
   reads synthetic dump headers: the architecture and the capture time
   (64-bit SystemTime used; zero, before 1980, more than a day after the
   last write, cut off, 32-bit and raw fall back to the last-write time;
@@ -2830,7 +2853,8 @@ parsing is skipped, and the timeline CSV can be opened manually.
   run ended incomplete (its log lines, its end banners, or the counts the
   builder passes) without repeating it in the notes, and names a memory
   dump the builder did not analyze (its "Memory dump not analyzed" log
-  line) in the notes, with a caveat. A lead seen only in
+  line) in the notes, with a caveat that does not say the dump exists
+  (it may not have been found). A lead seen only in
   Snapshot rows from during the collection (a task listed then) must be
   CapturedDuringCollection, not DuringCollection; a lead whose rows all
   come from the memory dump must be MemoryOnly, never

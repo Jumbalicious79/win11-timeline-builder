@@ -769,12 +769,20 @@ try {
     # skipped at its prompt, no Volatility 3, or not found) ---
     $memoryLog = Join-Path $workDir "memory_builder_log.txt"
     New-TestTextFile $memoryLog ("[2026-02-02 01:00:00] === Windows 11 Forensic Timeline Builder Started ===`r`n" +
-        "[2026-02-02 01:00:05] Memory dump detected: C:\x\T_memory_dump.dmp (Windows ARM64).`r`n" +
-        "[2026-02-02 01:00:05]   Memory dump not analyzed: T_memory_dump.dmp (8.0 GB): a Windows ARM64 dump, which Volatility 3 cannot analyze; examine it in WinDbg.`r`n")
+        "[2026-02-02 01:00:05] Memory dump detected: C:\x\T_memory_dump.dmp (Windows ARM64), not offered for analysis.`r`n" +
+        "[2026-02-02 01:00:05]   Memory dump not analyzed: T_memory_dump.dmp (7.99 GB): a Windows ARM64 dump, which Volatility 3 cannot analyze; examine it in WinDbg.`r`n")
     $memoryModel = New-ReportModel -Rows $userRows -BuilderLogPath $memoryLog
-    $memoryNotes = @($memoryModel.Coverage.Notes | Where-Object { $_ -eq "A memory dump of this collection was not analyzed: T_memory_dump.dmp (8.0 GB): a Windows ARM64 dump, which Volatility 3 cannot analyze; examine it in WinDbg." })
-    $memoryCaveats = @($memoryModel.Caveats | Where-Object { $_.StartsWith("A memory dump of this collection exists but was not analyzed") })
+    $memoryNotes = @($memoryModel.Coverage.Notes | Where-Object { $_ -eq "A memory dump of this collection was not analyzed: T_memory_dump.dmp (7.99 GB): a Windows ARM64 dump, which Volatility 3 cannot analyze; examine it in WinDbg." })
+    $memoryCaveat = "A memory dump of this collection was not analyzed (see Evidence coverage): the programs, network connections and command lines in memory are not in this report."
+    $memoryCaveats = @($memoryModel.Caveats | Where-Object { $_ -eq $memoryCaveat })
     Assert-Equal "$($memoryNotes.Count)|$($memoryCaveats.Count)" "1|1" -Message "a memory dump not analyzed: named in Coverage.Notes with the reason, and a caveat"
+    # A dump the manifest lists but that was not found: the same caveat,
+    # which does not say that the dump exists
+    $missingDumpLog = Join-Path $workDir "memory_missing_builder_log.txt"
+    New-TestTextFile $missingDumpLog ("[2026-02-02 01:00:00] === Windows 11 Forensic Timeline Builder Started ===`r`n" +
+        "[2026-02-02 01:00:05]   Memory dump not analyzed: collection_manifest.csv lists one (7.99 GB), but it was not found (or not usable) next to the collection or where the collector saved it.`r`n")
+    $missingDumpModel = New-ReportModel -Rows $userRows -BuilderLogPath $missingDumpLog
+    Assert-Equal "$(@($missingDumpModel.Caveats | Where-Object { $_ -eq $memoryCaveat }).Count)|$(@($missingDumpModel.Caveats | Where-Object { $_ -match 'dump of this collection exists' }).Count)" "1|0" -Message "a listed memory dump not found: the caveat does not say that it exists"
     Assert-Equal "$(@($model.Coverage.Notes | Where-Object { $_ -match 'memory dump of this collection' }).Count)|$(@($model.Caveats | Where-Object { $_ -match 'memory dump of this collection' }).Count)" "0|0" -Message "no such log line: no memory-dump note or caveat"
 
     # =========================================================

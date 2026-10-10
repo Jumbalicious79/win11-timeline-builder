@@ -56,6 +56,11 @@
 #   - a collection folder holding a file whose path has 260 or more
 #     characters: in Windows PowerShell 5.1 the run stops at the start
 #     (exit code 1) and names it; PowerShell 7 builds the timeline;
+#   - a collection folder whose own path has 250 characters (even the files
+#     right in it have 260+): in Windows PowerShell 5.1 the run stops at
+#     the start (exit code 1) and says the folder's path is too long, with
+#     its length, instead of counting a few names; PowerShell 7 builds the
+#     timeline;
 #   - a .7z and a memory dump with [ ] in their names: "Input path is a
 #     file" (exit code 1; for the dump, a hint to give its collection), not
 #     the folder-wildcard error;
@@ -792,6 +797,37 @@ try {
         Assert-Equal -Name "run F: the error says so and names the file" -Expected "1 1" -Actual "$(@($runF.Lines -match 'ERROR: 1 file\(s\) or folder\(s\) of the collection have paths of 260 or more characters').Count) $(@($runF.Lines | Where-Object { $_.EndsWith($longRunEvtx) }).Count)"
     }
 
+    # --- Run F2: a collection folder whose own path has 250 characters: even
+    # the files right in it (collection_manifest.csv, ...) have paths of 260+
+    # characters. Windows PowerShell 5.1 stops at the start (exit code 1)
+    # and says that the folder's path is too long, not a count of a few
+    # top-level names (the manifest cannot be read, and Get-ChildItem does
+    # not go into the folders, so the rest cannot be counted) ------------
+    $longRootBase = Join-Path (Get-LongPath $testRoot) "longroot"
+    $longRootColl = $longRootBase + "\" + ("c" * (250 - $longRootBase.Length - 1))
+    $longRootFiles = [ordered]@{
+        "collection_info.json"    = $collectionInfo
+        "collection_manifest.csv" = (New-TestManifest -RelativePaths @("USB\setupapi.dev.log"))
+        "USB\setupapi.dev.log"    = (New-SetupApiText -Instance $deviceA -LocalTime "2025/01/02 10:00:00.000")
+    }
+    foreach ($rel in $longRootFiles.Keys) {
+        $file = Get-ExtendedLengthPath ($longRootColl + '\' + $rel)
+        [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($file))
+        [System.IO.File]::WriteAllText($file, [string]$longRootFiles[$rel])
+    }
+    $csvF2 = Join-Path $testRoot "timeline-f2.csv"
+    Write-Host "Running the builder on a collection folder whose own path has $($longRootColl.Length) characters ..."
+    $runF2 = Invoke-ZipRun -OutputFile $csvF2 -Zip $longRootColl
+    if ($PSVersionTable.PSEdition -eq "Core") {
+        if ($runF2.ExitCode -ne 0) { $runF2.Lines | ForEach-Object { Write-Host "  | $_" } }
+        Assert-Equal -Name "run F2 (PowerShell 7): a collection folder of 250 characters is read, exit code 0, the timeline written" -Expected "0 True" -Actual "$($runF2.ExitCode) $(Test-Path -LiteralPath $csvF2)"
+    }
+    else {
+        if ($runF2.ExitCode -ne 1) { $runF2.Lines | ForEach-Object { Write-Host "  | $_" } }
+        Assert-Equal -Name "run F2: a collection folder of 250 characters stops the run at the start (exit code 1, no timeline)" -Expected "1 False" -Actual "$($runF2.ExitCode) $(Test-Path -LiteralPath $csvF2)"
+        Assert-Equal -Name "run F2: the error says the folder's path is too long (with its length), no count of a few names" -Expected "1 0" -Actual "$(@($runF2.Lines -match "ERROR: The collection folder's path has 250 characters, too long for Windows PowerShell: even files or folders right in it cannot be opened").Count) $(@($runF2.Lines -match 'file\(s\) or folder\(s\) of the collection have paths of 260').Count)"
+    }
+
     # --- Run G: a file that is not a collection zip, with [ ] in its name:
     # "Input path is a file" (not the folder-wildcard error) -------------
     $otherDir = Join-Path $testRoot "other"
@@ -831,7 +867,7 @@ catch {
 finally {
     # Paths of 260+ characters first (Windows PowerShell's Remove-Item
     # cannot delete them)
-    foreach ($longFolder in @((Join-Path $testRoot "long"), (Join-Path $testRoot "longrun"))) {
+    foreach ($longFolder in @((Join-Path $testRoot "long"), (Join-Path $testRoot "longrun"), (Join-Path $testRoot "longroot"))) {
         $extendedFolder = '\\?\' + [System.IO.Path]::GetFullPath($longFolder)
         try { if ([System.IO.Directory]::Exists($extendedFolder)) { [System.IO.Directory]::Delete($extendedFolder, $true) } }
         catch { Write-Host "Could not remove ${longFolder}: $($_.Exception.Message)" }

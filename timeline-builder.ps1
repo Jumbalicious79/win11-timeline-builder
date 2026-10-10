@@ -1910,9 +1910,19 @@ else {
     $unreadable = @(Get-UnreadableLongPaths -Folder $InputPath)
     if ($unreadable.Count -gt 0) {
         $folderLength = (Get-LongPath $InputPath).Length
-        Log-Error "$($unreadable.Count) file(s) or folder(s) of the collection have paths of 260 or more characters, which Windows PowerShell cannot open (the collection folder's own path has $folderLength characters), so they would be missing from the timeline:"
-        $unreadable | Select-Object -First 5 | ForEach-Object { Log "    $_" }
-        if ($unreadable.Count -gt 5) { Log "    ... and $($unreadable.Count - 5) more" }
+        # Files or folders right in the collection folder: its own path is
+        # too long. Much of the collection is unreadable then, and cannot be
+        # counted (collection_manifest.csv may be one of them, and
+        # Get-ChildItem does not go into such folders), so no count is given.
+        $topLevel = @($unreadable | Where-Object { $_.TrimEnd('\') -notmatch '\\' })
+        if ($topLevel.Count -gt 0) {
+            Log-Error "The collection folder's path has $folderLength characters, too long for Windows PowerShell: even files or folders right in it cannot be opened (such as $($topLevel[0])), so much of the collection would be missing from the timeline: $InputPath"
+        }
+        else {
+            Log-Error "$($unreadable.Count) file(s) or folder(s) of the collection have paths of 260 or more characters, which Windows PowerShell cannot open (the collection folder's own path has $folderLength characters), so they would be missing from the timeline:"
+            $unreadable | Select-Object -First 5 | ForEach-Object { Log "    $_" }
+            if ($unreadable.Count -gt 5) { Log "    ... and $($unreadable.Count - 5) more" }
+        }
         Log "  Copy the collection to a folder with a short path (such as C:\Cases\<name>) and run the builder on that copy, or drop the collection .zip on Run-TimelineBuilder.bat instead: a .zip is extracted into a short work folder."
         exit 1
     }
@@ -16808,7 +16818,7 @@ function Write-NoMemoryDumpToOffer {
     if (Test-CollectionArm64) {
         # Copying the dump next to the zip would not help: it is not offered
         Log "No memory dump to offer: $($notFound.Note)."
-        Log "  The collection is from a Windows ARM64 computer, and Volatility 3 cannot analyze Windows ARM64 memory, so the dump is not needed here: open it in WinDbg to examine it."
+        Log "  The collection is from a Windows ARM64 computer, so the dump does not need to be copied here."
         Write-MemoryDumpNotAnalyzed "collection_manifest.csv lists one$($sizeText): a Windows ARM64 dump (the collection's systeminfo.txt says ARM64), which Volatility 3 cannot analyze; examine it in WinDbg."
     }
     else {
@@ -16819,14 +16829,15 @@ function Write-NoMemoryDumpToOffer {
     Log ""
 }
 
-# " (8 GB)" for a size in bytes (a number, or the text of a manifest's
-# SizeBytes; under 100 MB in bytes), "" when there is none
+# " (7.99 GB)" for a size in bytes (a number, or the text of a manifest's
+# SizeBytes; under 100 MB in bytes), "" when there is none. Two decimals,
+# as the memory prompt and the collector's summary show the size.
 function Get-MemoryDumpSizeText {
     param([string]$Bytes)
     $size = [long]0
     if (-not [long]::TryParse("$Bytes", [System.Globalization.NumberStyles]::None, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$size) -or $size -le 0) { return "" }
     if ($size -lt 100MB) { return " ($size bytes)" }
-    return " ($(([math]::Round($size / 1GB, 1)).ToString([System.Globalization.CultureInfo]::InvariantCulture)) GB)"
+    return " ($(([math]::Round($size / 1GB, 2)).ToString([System.Globalization.CultureInfo]::InvariantCulture)) GB)"
 }
 
 # The line the findings report reads from the log (TimelineReport.Engine.ps1,
@@ -17124,7 +17135,6 @@ function Parse-Memory {
     $dumpText = "$([System.IO.Path]::GetFileName($dumpPath))$(Get-MemoryDumpSizeText -Bytes (Get-Item -LiteralPath $dumpPath -Force).Length)"
     if ($dumpArch -eq "ARM64") {
         Log-Warning "  This is a Windows ARM64 memory dump. Volatility 3 cannot analyze Windows ARM64 memory, so memory analysis is skipped."
-        Log "  The .dmp file is a Microsoft crash dump: open it in WinDbg to examine it manually."
         Write-MemoryDumpNotAnalyzed "${dumpText}: a Windows ARM64 dump, which Volatility 3 cannot analyze; examine it in WinDbg."
         Log "  Memory parsing complete."
         Log ""
@@ -18397,16 +18407,18 @@ if ($Sources -notcontains "Memory") {
     }
     # A dump that is found but not analyzed is named in the log line the
     # findings report reads (Write-MemoryDumpNotAnalyzed), with why
+    # (and the memory prompt shows the same size)
     $detectedDumpText = ""
+    $detectedDumpSize = ""
     if ($detectedDump) {
-        $detectedDumpText = "$([System.IO.Path]::GetFileName($detectedDump))$(Get-MemoryDumpSizeText -Bytes (Get-Item -LiteralPath $detectedDump -Force).Length)"
+        $detectedDumpSize = Get-MemoryDumpSizeText -Bytes (Get-Item -LiteralPath $detectedDump -Force).Length
+        $detectedDumpText = "$([System.IO.Path]::GetFileName($detectedDump))$detectedDumpSize"
     }
     if ($detectedDump -and (Get-MemoryDumpInfo -Path $detectedDump).Architecture -eq "ARM64") {
         # Volatility 3 cannot analyze Windows ARM64 memory: don't offer it
+        # (the next line says why, and names WinDbg)
         Log ""
-        Log "Memory dump detected: $(Get-MemoryDumpDisplayName $detectedDump) (Windows ARM64)."
-        Log "  Volatility 3 cannot analyze Windows ARM64 memory, so it is not offered."
-        Log "  Open the .dmp file in WinDbg to examine it manually."
+        Log "Memory dump detected: $(Get-MemoryDumpDisplayName $detectedDump) (Windows ARM64), not offered for analysis."
         Write-MemoryDumpNotAnalyzed "${detectedDumpText}: a Windows ARM64 dump, which Volatility 3 cannot analyze; examine it in WinDbg."
         Log ""
         $detectedDump = $null
@@ -18417,13 +18429,12 @@ if ($Sources -notcontains "Memory") {
         $volAvailable = [bool](Find-VolatilityExe)
 
         if ($volAvailable) {
-            $dumpSizeGB = [math]::Round((Get-Item -LiteralPath $detectedDump).Length / 1GB, 2)
             Write-Host ""
             Write-Host "========================================" -ForegroundColor Cyan
             Write-Host "  Memory Dump Detected" -ForegroundColor Cyan
             Write-Host "========================================" -ForegroundColor Cyan
             Write-Host ""
-            Write-Host "  Found: $(Get-MemoryDumpDisplayName $detectedDump) ($dumpSizeGB GB)" -ForegroundColor Green
+            Write-Host "  Found: $(Get-MemoryDumpDisplayName $detectedDump)$detectedDumpSize" -ForegroundColor Green
             if ($script:memoryDumpListedPath) {
                 Write-Host "  (where the collector saved it, on a drive with another letter now:" -ForegroundColor Green
                 Write-Host "   collection_manifest.csv lists $($script:memoryDumpListedPath))" -ForegroundColor Green
