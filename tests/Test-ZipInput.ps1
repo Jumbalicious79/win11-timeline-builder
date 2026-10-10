@@ -61,6 +61,8 @@
 #     the start (exit code 1) and says the folder's path is too long, with
 #     its length, instead of counting a few names; PowerShell 7 builds the
 #     timeline;
+#     (both long-path cases expect the PowerShell 7 result in 5.1 too when
+#     Windows long paths are enabled, as on the GitHub runners);
 #   - a .7z and a memory dump with [ ] in their names: "Input path is a
 #     file" (exit code 1; for the dump, a hint to give its collection), not
 #     the folder-wildcard error;
@@ -381,9 +383,13 @@ try {
         (New-TestManifest -RelativePaths @($longEvtx, $longLnk, $longDump, $longAttachment, "USB\setupapi.dev.log")))
     Set-Variable -Name InputPath -Value $longColl -Scope Script
     $script:collectionManifest = $null
+    # Long paths work in PowerShell 7, and in Windows PowerShell 5.1 too when
+    # Windows long paths are enabled (LongPathsEnabled = 1, as on the GitHub
+    # runners): then nothing is unreadable and nothing is refused
+    $script:longPathsWork = [System.IO.File]::Exists($longColl + '\' + $longEvtx)
     $unreadable = @(Get-UnreadableLongPaths -Folder $longColl)
-    if ($PSVersionTable.PSEdition -eq "Core") {
-        Assert-Equal -Name "paths of 260+ characters: PowerShell 7 opens them, nothing named" -Expected "" -Actual ($unreadable -join ", ")
+    if ($script:longPathsWork) {
+        Assert-Equal -Name "paths of 260+ characters: long paths work here (PowerShell 7 or LongPathsEnabled), nothing named" -Expected "" -Actual ($unreadable -join ", ")
     }
     else {
         $named = "$($unreadable -contains $longEvtx) $($unreadable -contains $longLnk) $(@($unreadable | Where-Object { $_ -like 'Memory\*' -or $_ -like 'Email\*' -or $_ -like 'USB\*' }).Count)"
@@ -787,9 +793,9 @@ try {
     $csvF = Join-Path $testRoot "timeline-f.csv"
     Write-Host "Running the builder on a collection folder with a $($longRunColl.Length + 1 + $longRunEvtx.Length)-character path in it ..."
     $runF = Invoke-ZipRun -OutputFile $csvF -Zip $longRunColl
-    if ($PSVersionTable.PSEdition -eq "Core") {
+    if ($script:longPathsWork) {
         if ($runF.ExitCode -ne 0) { $runF.Lines | ForEach-Object { Write-Host "  | $_" } }
-        Assert-Equal -Name "run F (PowerShell 7): a path of 260+ characters is read, exit code 0, the timeline written" -Expected "0 True" -Actual "$($runF.ExitCode) $(Test-Path -LiteralPath $csvF)"
+        Assert-Equal -Name "run F (long paths work here): a path of 260+ characters is read, exit code 0, the timeline written" -Expected "0 True" -Actual "$($runF.ExitCode) $(Test-Path -LiteralPath $csvF)"
     }
     else {
         if ($runF.ExitCode -ne 1) { $runF.Lines | ForEach-Object { Write-Host "  | $_" } }
@@ -818,9 +824,9 @@ try {
     $csvF2 = Join-Path $testRoot "timeline-f2.csv"
     Write-Host "Running the builder on a collection folder whose own path has $($longRootColl.Length) characters ..."
     $runF2 = Invoke-ZipRun -OutputFile $csvF2 -Zip $longRootColl
-    if ($PSVersionTable.PSEdition -eq "Core") {
+    if ($script:longPathsWork) {
         if ($runF2.ExitCode -ne 0) { $runF2.Lines | ForEach-Object { Write-Host "  | $_" } }
-        Assert-Equal -Name "run F2 (PowerShell 7): a collection folder of 250 characters is read, exit code 0, the timeline written" -Expected "0 True" -Actual "$($runF2.ExitCode) $(Test-Path -LiteralPath $csvF2)"
+        Assert-Equal -Name "run F2 (long paths work here): a collection folder of 250 characters is read, exit code 0, the timeline written" -Expected "0 True" -Actual "$($runF2.ExitCode) $(Test-Path -LiteralPath $csvF2)"
     }
     else {
         if ($runF2.ExitCode -ne 1) { $runF2.Lines | ForEach-Object { Write-Host "  | $_" } }
