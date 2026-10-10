@@ -23,8 +23,9 @@
 #     (accounts as the User column names them, unnamed service SIDs, file
 #     times), caveats (assumed time zone, stale workbook, mounted image), the
 #     examined computer of a mounted image, an incomplete builder run (exit
-#     code 2), top findings (one per rule first), the lead window, rule
-#     titles, file hashes;
+#     code 2), a memory dump the builder did not analyze (its log line in
+#     Coverage.Notes and a caveat), top findings (one per rule first), the
+#     lead window, rule titles, file hashes;
 #   - findings.csv, report-model.json and Import-TimelineCsvForReport
 #     (fields with line breaks, quotes and commas).
 # Needs no Administrator rights and does not run the builder.
@@ -763,6 +764,18 @@ try {
     $passed = (New-ReportModel -Rows $userRows -MissingInputFiles 5 -UnexpectedErrors 0).Coverage.TimelineCompleteness
     Assert-Equal "$($passed.Incomplete)|$($passed.MissingInputFiles)|$($passed.UnexpectedErrors)|$(@($passed.Lines).Count)" "True|5|0|1" -Message "the builder's own counts (-MissingInputFiles) without a log"
     Assert-Equal "$($model.Coverage.TimelineCompleteness.Incomplete)|$(@($model.Caveats | Where-Object { $_ -match 'incomplete' }).Count)" "False|0" -Message "a complete run: no incomplete caveat"
+
+    # --- A memory dump the builder found but did not analyze (Windows ARM64,
+    # skipped at its prompt, no Volatility 3, or not found) ---
+    $memoryLog = Join-Path $workDir "memory_builder_log.txt"
+    New-TestTextFile $memoryLog ("[2026-02-02 01:00:00] === Windows 11 Forensic Timeline Builder Started ===`r`n" +
+        "[2026-02-02 01:00:05] Memory dump detected: C:\x\T_memory_dump.dmp (Windows ARM64).`r`n" +
+        "[2026-02-02 01:00:05]   Memory dump not analyzed: T_memory_dump.dmp (8.0 GB): a Windows ARM64 dump, which Volatility 3 cannot analyze; examine it in WinDbg.`r`n")
+    $memoryModel = New-ReportModel -Rows $userRows -BuilderLogPath $memoryLog
+    $memoryNotes = @($memoryModel.Coverage.Notes | Where-Object { $_ -eq "A memory dump of this collection was not analyzed: T_memory_dump.dmp (8.0 GB): a Windows ARM64 dump, which Volatility 3 cannot analyze; examine it in WinDbg." })
+    $memoryCaveats = @($memoryModel.Caveats | Where-Object { $_.StartsWith("A memory dump of this collection exists but was not analyzed") })
+    Assert-Equal "$($memoryNotes.Count)|$($memoryCaveats.Count)" "1|1" -Message "a memory dump not analyzed: named in Coverage.Notes with the reason, and a caveat"
+    Assert-Equal "$(@($model.Coverage.Notes | Where-Object { $_ -match 'memory dump of this collection' }).Count)|$(@($model.Caveats | Where-Object { $_ -match 'memory dump of this collection' }).Count)" "0|0" -Message "no such log line: no memory-dump note or caveat"
 
     # =========================================================
     # report-model.json

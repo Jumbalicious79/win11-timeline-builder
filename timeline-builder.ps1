@@ -101,6 +101,23 @@ param(
     [string]$MemoryDumpPath
 )
 
+# --- The builder's own folder: no [ ] * ? in its path ---
+# The timeline, the workbook and the report are written under reports\ next
+# to the script, and tools\ and report\ are read from there, with commands
+# that read [ ], * and ? as wildcards (Export-Csv, ImportExcel): from such a
+# folder the run would end without a timeline.csv. Checked first, for every
+# mode.
+if ([System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters($PSScriptRoot)) {
+    Write-Host ""
+    Write-Host "ERROR: The path of the builder's folder has [ ], * or ? in it, which PowerShell" -ForegroundColor Red
+    Write-Host "  reads as wildcards, so the timeline could not be written there:" -ForegroundColor Red
+    Write-Host "  $PSScriptRoot" -ForegroundColor Yellow
+    Write-Host "  Move or rename the folder (keep win11-triage-collector next to it), for" -ForegroundColor Yellow
+    Write-Host "  example to C:\Tools\win11-timeline-builder, and start it again." -ForegroundColor Yellow
+    Write-Host ""
+    exit 1
+}
+
 # --- Require Administrator (not for -ReportOnly: it only reads a timeline) ---
 $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
@@ -626,6 +643,8 @@ function Get-WildcardSafeFolder {
     if (-not ($name -match '[\[\]*?`]')) { return $Folder }
     $safeFolder = Join-Path (Split-Path $Folder -Parent) ($name -replace '[\[\]*?`]', '_')
     [System.IO.Directory]::Move($Folder, $safeFolder)
+    # The name the collector gave the folder (and so the memory dump next to the zip)
+    $script:collectionFolderOriginalName = $name
     $oldPrefix = $Folder + '\'
     $newPrefix = $safeFolder + '\'
     for ($i = 0; $i -lt $script:inputFiles.Count; $i++) {
@@ -708,6 +727,62 @@ function Add-ManifestInputFiles {
     Log "Input files: $($script:inputFiles.Count) of the $listed file(s) listed in $($manifest.Path) are present."
 }
 
+# The \\?\ form of a full path, which Windows opens whatever its length
+# (\\?\C:\..., \\?\UNC\server\share\...)
+function Get-ExtendedLengthPath {
+    param([string]$Path)
+    if ($Path.StartsWith('\\?\')) { return $Path }
+    if ($Path.StartsWith('\\')) { return '\\?\UNC\' + $Path.Substring(2) }
+    return '\\?\' + $Path
+}
+
+# Files and folders of a collection folder that this PowerShell cannot open
+# because their paths have 260 or more characters. Windows PowerShell 5.1,
+# with long paths off (the Windows default), does not open such a file
+# (Get-WinEvent says it does not exist, a file read that a part of the
+# path was not found) and Get-ChildItem does not go into such a folder;
+# the parsers would leave them out without an error. PowerShell 7 opens
+# them, so nothing is returned there. Checked: the files
+# collection_manifest.csv lists (seen through their \\?\ path), and the
+# files and folders Get-ChildItem finds. Memory dumps and copied email
+# attachments are left out (no parser reads them). Returns their paths
+# relative to $Folder; a folder ends with "\".
+function Get-UnreadableLongPaths {
+    param([string]$Folder)
+    $root = Get-LongPath $Folder
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $result = New-Object System.Collections.Generic.List[string]
+    $addPath = {
+        param([string]$Full, [bool]$IsFolder)
+        $rel = $Full
+        if ($Full.StartsWith($root + '\', [System.StringComparison]::OrdinalIgnoreCase)) { $rel = $Full.Substring($root.Length + 1) }
+        if ($rel -match '^Memory\\[^\\]+\.(?:dmp|raw)$' -or (Test-EmailAttachmentCopy ($rel + '\'))) { return }
+        if ($IsFolder) { $rel = $rel.TrimEnd('\') + '\' }
+        if ($seen.Add($Full)) { $result.Add($rel) }
+    }
+    $manifest = Get-CollectionManifest
+    if ($manifest.Path) {
+        # Long form, as Get-ChildItem below gives it (a temp path can be in
+        # 8.3 form, C:\Users\RUNNER~1\...), so a file both find counts once
+        $manifestRoot = Get-LongPath $manifest.Folder
+        foreach ($rel in $manifest.RelativePaths) {
+            $full = $manifestRoot + '\' + $rel
+            if ($full.Length -lt 260 -or [System.IO.File]::Exists($full)) { continue }
+            if ([System.IO.File]::Exists((Get-ExtendedLengthPath $full))) { & $addPath $full $false }
+        }
+    }
+    $walkErrors = $null
+    foreach ($file in @(Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue -ErrorVariable walkErrors)) {
+        if ($file.FullName.Length -ge 260 -and -not [System.IO.File]::Exists($file.FullName)) { & $addPath $file.FullName $false }
+    }
+    # A folder Get-ChildItem could not go into: its path is the error's target
+    foreach ($walkError in @($walkErrors)) {
+        $target = "$($walkError.TargetObject)"
+        if ($target.Length -ge 248 -and [System.IO.Directory]::Exists((Get-ExtendedLengthPath $target))) { & $addPath $target $true }
+    }
+    return $result.ToArray()
+}
+
 # Input files of this run that no longer exist
 function Get-MissingInputFiles {
     return @($script:inputFiles | Where-Object { -not [System.IO.File]::Exists($_) })
@@ -774,33 +849,51 @@ function Write-RunEndBanner {
 # Browse mode: auto-find triage collections from sibling project
 # =============================================================
 if ($Browse) {
-    # Look for sibling triage-collector/reports directory
+    # Look for the sibling win11-triage-collector\reports folder. GitHub's
+    # "Download ZIP" extracts it as win11-triage-collector-master (or
+    # -main): when the exact name is not there, one such sibling with a
+    # reports\ folder is used.
     $toolsRoot = Split-Path $PSScriptRoot -Parent
     $triageReportsDir = Join-Path $toolsRoot "win11-triage-collector\reports"
+    if (-not (Test-Path -LiteralPath $triageReportsDir -PathType Container)) {
+        $collectorSiblings = @(Get-ChildItem -LiteralPath $toolsRoot -Directory -Filter "win11-triage-collector*" -ErrorAction SilentlyContinue |
+            Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "reports") -PathType Container })
+        if ($collectorSiblings.Count -eq 1) { $triageReportsDir = Join-Path $collectorSiblings[0].FullName "reports" }
+    }
 
-    if (-not (Test-Path $triageReportsDir)) {
+    # No pause before exit 1 here: Run-TimelineBuilder.bat pauses at its end
+    if (-not (Test-Path -LiteralPath $triageReportsDir -PathType Container)) {
         Write-Host ""
         Write-Host "ERROR: Triage collector reports directory not found:" -ForegroundColor Red
         Write-Host "  $triageReportsDir" -ForegroundColor Yellow
         Write-Host ""
-        Write-Host "Run the triage collector first, or provide a path manually:" -ForegroundColor Cyan
-        Write-Host "  Run-TimelineBuilder.bat ""C:\path\to\collection""" -ForegroundColor Cyan
+        Write-Host "Browse mode lists the collections in the reports\ folder of a folder named" -ForegroundColor Cyan
+        Write-Host "win11-triage-collector next to $(Split-Path $PSScriptRoot -Leaf). Rename the collector's folder" -ForegroundColor Cyan
+        Write-Host "if it has another name (GitHub's Download ZIP adds -master), run the triage" -ForegroundColor Cyan
+        Write-Host "collector first, or drop a collection .zip or folder on Run-TimelineBuilder.bat:" -ForegroundColor Cyan
+        Write-Host "  Run-TimelineBuilder.bat ""C:\path\to\collection.zip""" -ForegroundColor Cyan
         Write-Host ""
-        pause
         exit 1
     }
 
-    # Find all .zip files in the reports directory
-    $zipFiles = Get-ChildItem -Path $triageReportsDir -Filter "*.zip" -File | Sort-Object LastWriteTime -Descending
+    # Collection zips, and collection folders (the collector's "nozip": a
+    # folder with collection_info.json), except a folder whose zip is there
+    # as well
+    $collections = @(Get-ChildItem -LiteralPath $triageReportsDir -Filter "*.zip" -File -ErrorAction SilentlyContinue)
+    $collections += @(Get-ChildItem -LiteralPath $triageReportsDir -Directory -ErrorAction SilentlyContinue | Where-Object {
+            (Test-Path -LiteralPath (Join-Path $_.FullName "collection_info.json") -PathType Leaf) -and
+            -not (Test-Path -LiteralPath "$($_.FullName).zip" -PathType Leaf)
+        })
+    $collections = @($collections | Sort-Object LastWriteTime -Descending)
 
-    if ($zipFiles.Count -eq 0) {
+    if ($collections.Count -eq 0) {
         Write-Host ""
-        Write-Host "ERROR: No triage collection .zip files found in:" -ForegroundColor Red
+        Write-Host "ERROR: No triage collection .zip files or collection folders found in:" -ForegroundColor Red
         Write-Host "  $triageReportsDir" -ForegroundColor Yellow
         Write-Host ""
-        Write-Host "Run the triage collector first to generate a collection." -ForegroundColor Cyan
+        Write-Host "Run the triage collector first to generate a collection, or drop a collection" -ForegroundColor Cyan
+        Write-Host "kept elsewhere on Run-TimelineBuilder.bat." -ForegroundColor Cyan
         Write-Host ""
-        pause
         exit 1
     }
 
@@ -810,11 +903,16 @@ if ($Browse) {
     Write-Host "========================================" -ForegroundColor Cyan
     Write-Host ""
 
-    for ($i = 0; $i -lt $zipFiles.Count; $i++) {
-        $z = $zipFiles[$i]
-        $sizeMB = [math]::Round($z.Length / 1MB, 1)
-        $dateStr = $z.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")
-        Write-Host "  [$($i + 1)] $($z.Name)  ($sizeMB MB, $dateStr)" -ForegroundColor White
+    for ($i = 0; $i -lt $collections.Count; $i++) {
+        $c = $collections[$i]
+        $dateStr = $c.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")
+        if ($c.PSIsContainer) {
+            Write-Host "  [$($i + 1)] $($c.Name)  (folder, not zipped, $dateStr)" -ForegroundColor White
+        }
+        else {
+            $sizeMB = [math]::Round($c.Length / 1MB, 1)
+            Write-Host "  [$($i + 1)] $($c.Name)  ($sizeMB MB, $dateStr)" -ForegroundColor White
+        }
     }
 
     Write-Host ""
@@ -822,25 +920,27 @@ if ($Browse) {
     Write-Host ""
 
     do {
-        $selection = Read-Host "Select a collection (1-$($zipFiles.Count))"
-        if ($selection -eq "0") {
+        $selection = Read-Host "Select a collection (1-$($collections.Count))"
+        # $null: the end of redirected input, as Cancel
+        if ($selection -eq "0" -or $null -eq $selection) {
             Write-Host "Cancelled." -ForegroundColor Yellow
             exit 0
         }
         $selIndex = 0
-        $valid = [int]::TryParse($selection, [ref]$selIndex) -and $selIndex -ge 1 -and $selIndex -le $zipFiles.Count
+        $valid = [int]::TryParse($selection, [ref]$selIndex) -and $selIndex -ge 1 -and $selIndex -le $collections.Count
         if (-not $valid) {
-            Write-Host "Invalid selection. Enter 1-$($zipFiles.Count) or 0 to cancel." -ForegroundColor Red
+            Write-Host "Invalid selection. Enter 1-$($collections.Count) or 0 to cancel." -ForegroundColor Red
         }
     } while (-not $valid)
 
-    $selectedZip = $zipFiles[$selIndex - 1]
-    $script:selectedZipPath = $selectedZip.FullName
+    $selectedCollection = $collections[$selIndex - 1]
     Write-Host ""
-    Write-Host "Selected: $($selectedZip.Name)" -ForegroundColor Green
+    Write-Host "Selected: $($selectedCollection.Name)" -ForegroundColor Green
 
-    # Extracted into this run's work folder once the log is set up (below)
-    $InputPath = $selectedZip.FullName
+    # A zip is extracted into this run's work folder once the log is set up
+    # (below); a folder is read where it is, as when dropped on the .bat
+    if (-not $selectedCollection.PSIsContainer) { $script:selectedZipPath = $selectedCollection.FullName }
+    $InputPath = $selectedCollection.FullName
     Write-Host ""
 } elseif ($InputPath -and (Test-Path -LiteralPath $InputPath -PathType Leaf) -and [System.IO.Path]::GetExtension($InputPath) -eq ".zip") {
     # A collection zip passed as -InputPath is extracted like a browse-mode
@@ -1476,10 +1576,16 @@ function Invoke-TimelineViewer {
         Write-Host "  [$noneOptionNum] None -- just save the files, don't open anything" -ForegroundColor DarkGray
         Write-Host ""
 
+        # The number of options changes (no Excel without a workbook, no
+        # Open report without a report), so a wrong number says so. At the
+        # end of redirected input (Read-Host returns $null) nothing is opened.
         $maxOption = $menuOptions.Count
         do {
             $viewerChoice = Read-Host "Select a viewer (1-$maxOption)"
-        } while (-not ($menuOptions.Key -contains $viewerChoice))
+            if ($null -eq $viewerChoice) { $viewerChoice = "$noneOptionNum" }
+            $validViewer = $menuOptions.Key -contains $viewerChoice
+            if (-not $validViewer) { Write-Host "Invalid selection. Enter 1-$maxOption." -ForegroundColor Red }
+        } while (-not $validViewer)
 
         $selectedAction = ($menuOptions | Where-Object { $_.Key -eq $viewerChoice }).Action
         Log "  Viewer selection: $($($menuOptions | Where-Object { $_.Key -eq $viewerChoice }).Label)"
@@ -1713,7 +1819,23 @@ if ($tempFolder) {
 }
 
 if (-not (Test-Path -LiteralPath $InputPath)) {
-    Log-Error "Input path does not exist: $InputPath"
+    # Windows PowerShell 5.1 does not see a folder whose path has 260 or
+    # more characters
+    $inputFullPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($InputPath)
+    if ($inputFullPath.Length -ge 248 -and [System.IO.Directory]::Exists((Get-ExtendedLengthPath $inputFullPath))) {
+        Log-Error "The collection folder's path has $($inputFullPath.Length) characters, too long for Windows PowerShell to open: $InputPath. Copy the collection to a folder with a short path (such as C:\Cases\<name>), or drop the collection .zip on Run-TimelineBuilder.bat instead."
+    }
+    else { Log-Error "Input path does not exist: $InputPath" }
+    exit 1
+}
+
+# A file that is not a collection zip (before the wildcard check below, which
+# is about folders). A memory dump is found next to its collection.
+if (-not $script:selectedZipPath -and (Test-Path -LiteralPath $InputPath -PathType Leaf)) {
+    Log-Error "Input path is a file, not a collection folder or .zip: $InputPath"
+    if ($InputPath -match '\.(?:dmp|raw)$') {
+        Log "  A memory dump is not read on its own: give its collection (the .zip or the folder) instead. The builder finds the dump next to it as <collection>_memory_dump$([System.IO.Path]::GetExtension($InputPath).ToLowerInvariant())."
+    }
     exit 1
 }
 
@@ -1730,7 +1852,7 @@ if ([System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters($
         Log-Error "The work folder's path has [ ], * or ? in it, which PowerShell reads as wildcards, so the collection extracted there could not be read: $($script:runWorkDir). Pass -WorkDir with a folder whose path has none of them."
     }
     else {
-        Log-Error "The collection folder's path has [ ], * or ? in it, which PowerShell reads as wildcards, so its files could not be read: $InputPath. Rename the folder (or a folder above it), copy the collection to a path without them, or pass the collection .zip as -InputPath."
+        Log-Error "The collection folder's path has [ ], * or ? in it, which PowerShell reads as wildcards, so its files could not be read: $InputPath. Rename the folder (or a folder above it), copy the collection to a path without them, or drop the collection .zip on Run-TimelineBuilder.bat (or pass it as -InputPath)."
     }
     exit 1
 }
@@ -1778,14 +1900,21 @@ if ($script:selectedZipPath) {
         else { Log-Warning "Test hook ignored (not a file in the work folder): $hookFile" }
     }
 }
-elseif (Test-Path -LiteralPath $InputPath -PathType Leaf) {
-    Log-Error "Input path is a file, not a collection folder or .zip: $InputPath"
-    exit 1
-}
 else {
     $tempFolder = Get-ContainingTempFolder $InputPath
     if ($tempFolder) {
-        Log-Warning "The input folder is inside a temp folder ($tempFolder). Windows Storage Sense deletes files older than 7 days there when disk space is low, also during a run. Copy the collection elsewhere, or pass the collection .zip as -InputPath."
+        Log-Warning "The input folder is inside a temp folder ($tempFolder). Windows Storage Sense deletes files older than 7 days there when disk space is low, also during a run. Copy the collection elsewhere, or drop the collection .zip on Run-TimelineBuilder.bat (or pass it as -InputPath)."
+    }
+    # Files Windows PowerShell 5.1 cannot open (paths of 260+ characters)
+    # would be missing from the timeline without an error: stop instead
+    $unreadable = @(Get-UnreadableLongPaths -Folder $InputPath)
+    if ($unreadable.Count -gt 0) {
+        $folderLength = (Get-LongPath $InputPath).Length
+        Log-Error "$($unreadable.Count) file(s) or folder(s) of the collection have paths of 260 or more characters, which Windows PowerShell cannot open (the collection folder's own path has $folderLength characters), so they would be missing from the timeline:"
+        $unreadable | Select-Object -First 5 | ForEach-Object { Log "    $_" }
+        if ($unreadable.Count -gt 5) { Log "    ... and $($unreadable.Count - 5) more" }
+        Log "  Copy the collection to a folder with a short path (such as C:\Cases\<name>) and run the builder on that copy, or drop the collection .zip on Run-TimelineBuilder.bat instead: a .zip is extracted into a short work folder."
+        exit 1
     }
     Add-ManifestInputFiles
 }
@@ -12339,6 +12468,11 @@ function Parse-UsnJournal {
         }
 
         $readSeconds = [Math]::Round($stopwatch.Elapsed.TotalSeconds, 1)
+        Log "  Read $total USN row(s) in $readSeconds s (skipped $skipped noisy close events, $unparsed unparsed line(s), $outOfRange outside the date filter)."
+        # Adding the rows takes far longer than reading them (about 1-2
+        # minutes for 350,000 rows), and nothing is printed meanwhile
+        if ($kept.Count -gt 0) { Log "  Adding $($kept.Count) USN entries to the timeline (about 1-2 minutes for 350,000 entries)..." }
+        $addTimer = [System.Diagnostics.Stopwatch]::StartNew()
         $minTs = $null
         $maxTs = $null
         foreach ($item in $kept) {
@@ -12361,9 +12495,8 @@ function Parse-UsnJournal {
                 -Artifact "UsnJournal" -RawPath $usnFile.FullName
         }
 
-        Log "  Read $total USN row(s) in $readSeconds s (skipped $skipped noisy close events, $unparsed unparsed line(s), $outOfRange outside the date filter)."
         if ($kept.Count -gt 0) {
-            Log "  Kept $($kept.Count) USN entries from $($minTs.ToString('yyyy-MM-dd HH:mm:ss')) to $($maxTs.ToString('yyyy-MM-dd HH:mm:ss')) UTC."
+            Log "  Kept $($kept.Count) USN entries from $($minTs.ToString('yyyy-MM-dd HH:mm:ss')) to $($maxTs.ToString('yyyy-MM-dd HH:mm:ss')) UTC (added in $([Math]::Round($addTimer.Elapsed.TotalSeconds, 1)) s; the USN step took $([Math]::Round($stopwatch.Elapsed.TotalSeconds, 1)) s)."
         }
         if ($dropped -gt 0) {
             Log-Warning "  Dropped the $dropped oldest USN entries (limit $MaxUsnEntries). Use -MaxUsnEntries 0 to keep all."
@@ -16644,7 +16777,11 @@ function Get-MemoryDumpNotFoundText {
         }
         "Missing" {
             if ($Listed.InCollection) {
-                "collection_manifest.csv lists one in the collection ($($Listed.RelativePath)), which the collector moves next to the zip as $([System.IO.Path]::GetFileName((Get-CollectionRootFolder)))_memory_dump$($Listed.Extension) when it zips the collection"
+                # The collector names it after the collection folder: as the
+                # collector named it, not as renamed after a zip's extraction
+                $collectionName = $script:collectionFolderOriginalName
+                if (-not $collectionName) { $collectionName = [System.IO.Path]::GetFileName((Get-CollectionRootFolder)) }
+                "collection_manifest.csv lists one in the collection ($($Listed.RelativePath)), which the collector moves next to the zip as ${collectionName}_memory_dump$($Listed.Extension) when it zips the collection"
             }
             else {
                 $otherDrives = ""
@@ -16666,10 +16803,52 @@ function Write-NoMemoryDumpToOffer {
     $listed = Get-ManifestMemoryDump
     if ($listed.Status -eq "None") { return }
     $notFound = Get-MemoryDumpNotFoundText -Listed $listed
+    $sizeText = Get-MemoryDumpSizeText -Bytes $listed.SizeBytes
     Log ""
-    Log "No memory dump to offer: $($notFound.Note)."
-    Log "  To have it analyzed, $($notFound.Remedy), then run the builder again."
+    if (Test-CollectionArm64) {
+        # Copying the dump next to the zip would not help: it is not offered
+        Log "No memory dump to offer: $($notFound.Note)."
+        Log "  The collection is from a Windows ARM64 computer, and Volatility 3 cannot analyze Windows ARM64 memory, so the dump is not needed here: open it in WinDbg to examine it."
+        Write-MemoryDumpNotAnalyzed "collection_manifest.csv lists one$($sizeText): a Windows ARM64 dump (the collection's systeminfo.txt says ARM64), which Volatility 3 cannot analyze; examine it in WinDbg."
+    }
+    else {
+        Log "No memory dump to offer: $($notFound.Note)."
+        Log "  To have it analyzed, $($notFound.Remedy), then run the builder again."
+        Write-MemoryDumpNotAnalyzed "collection_manifest.csv lists one$($sizeText), but it was not found (or not usable) next to the collection or where the collector saved it."
+    }
     Log ""
+}
+
+# " (8 GB)" for a size in bytes (a number, or the text of a manifest's
+# SizeBytes; under 100 MB in bytes), "" when there is none
+function Get-MemoryDumpSizeText {
+    param([string]$Bytes)
+    $size = [long]0
+    if (-not [long]::TryParse("$Bytes", [System.Globalization.NumberStyles]::None, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$size) -or $size -le 0) { return "" }
+    if ($size -lt 100MB) { return " ($size bytes)" }
+    return " ($(([math]::Round($size / 1GB, 1)).ToString([System.Globalization.CultureInfo]::InvariantCulture)) GB)"
+}
+
+# The line the findings report reads from the log (TimelineReport.Engine.ps1,
+# Read-ReportEngineBuilderLog) when a memory dump of the collection exists
+# but this run did not analyze it: "Memory dump not analyzed: <what and why>"
+function Write-MemoryDumpNotAnalyzed {
+    param([string]$Text)
+    Log "  Memory dump not analyzed: $Text"
+}
+
+# $true when the collection comes from a Windows ARM64 computer: its
+# systeminfo.txt (live collections, the only ones with a memory dump) says
+# "System Type: ARM64-based PC".
+function Test-CollectionArm64 {
+    foreach ($file in @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("systeminfo.txt"))) {
+        try {
+            $values = ConvertFrom-SystemInfoText -Lines (Get-Content -LiteralPath $file.FullName -ErrorAction Stop)
+            if ("$($values['System Type'])" -match 'ARM64') { return $true }
+        }
+        catch { Write-Verbose "Could not read $($file.FullName): $($_.Exception.Message)" }
+    }
+    return $false
 }
 
 # A memory dump as the user is shown it: "<path in the collection> in the
@@ -16912,7 +17091,7 @@ function Find-VolatilityExe {
         (Join-Path $PSScriptRoot "vol.exe")
     )
     foreach ($loc in $volLocations) {
-        if (Test-Path $loc) { return $loc }
+        if (Test-Path -LiteralPath $loc -PathType Leaf) { return $loc }
     }
     return $null
 }
@@ -16942,9 +17121,11 @@ function Parse-Memory {
     Log "  Dump time: $($dumpInfo.CaptureTimeUtc.ToString('yyyy-MM-dd HH:mm:ss.fff', [System.Globalization.CultureInfo]::InvariantCulture)) UTC ($($dumpInfo.TimeSource))"
 
     # Volatility 3's Windows support is for Intel x86/x64 memory only
+    $dumpText = "$([System.IO.Path]::GetFileName($dumpPath))$(Get-MemoryDumpSizeText -Bytes (Get-Item -LiteralPath $dumpPath -Force).Length)"
     if ($dumpArch -eq "ARM64") {
         Log-Warning "  This is a Windows ARM64 memory dump. Volatility 3 cannot analyze Windows ARM64 memory, so memory analysis is skipped."
         Log "  The .dmp file is a Microsoft crash dump: open it in WinDbg to examine it manually."
+        Write-MemoryDumpNotAnalyzed "${dumpText}: a Windows ARM64 dump, which Volatility 3 cannot analyze; examine it in WinDbg."
         Log "  Memory parsing complete."
         Log ""
         return
@@ -16963,6 +17144,7 @@ function Parse-Memory {
         Log "    2. Place vol.exe in: $(Join-Path $PSScriptRoot 'tools\volatility3\vol.exe')"
         Log ""
         Log "  Skipping memory analysis."
+        Write-MemoryDumpNotAnalyzed "${dumpText}: Volatility 3 (vol.exe) is not in the builder's tools\volatility3\ folder."
         Log "  Memory parsing complete."
         Log ""
         return
@@ -18213,27 +18395,26 @@ if ($Sources -notcontains "Memory") {
         # lists, and how to have it analyzed
         Write-NoMemoryDumpToOffer
     }
-    elseif ((Get-MemoryDumpInfo -Path $detectedDump).Architecture -eq "ARM64") {
+    # A dump that is found but not analyzed is named in the log line the
+    # findings report reads (Write-MemoryDumpNotAnalyzed), with why
+    $detectedDumpText = ""
+    if ($detectedDump) {
+        $detectedDumpText = "$([System.IO.Path]::GetFileName($detectedDump))$(Get-MemoryDumpSizeText -Bytes (Get-Item -LiteralPath $detectedDump -Force).Length)"
+    }
+    if ($detectedDump -and (Get-MemoryDumpInfo -Path $detectedDump).Architecture -eq "ARM64") {
         # Volatility 3 cannot analyze Windows ARM64 memory: don't offer it
         Log ""
         Log "Memory dump detected: $(Get-MemoryDumpDisplayName $detectedDump) (Windows ARM64)."
         Log "  Volatility 3 cannot analyze Windows ARM64 memory, so it is not offered."
         Log "  Open the .dmp file in WinDbg to examine it manually."
+        Write-MemoryDumpNotAnalyzed "${detectedDumpText}: a Windows ARM64 dump, which Volatility 3 cannot analyze; examine it in WinDbg."
         Log ""
         $detectedDump = $null
     }
 
     # If dump found, check if Volatility 3 is available
     if ($detectedDump) {
-        $volAvailable = $false
-        $volLocations = @(
-            (Join-Path $PSScriptRoot "tools\volatility3\vol.exe"),
-            (Join-Path $PSScriptRoot "tools\volatility3\volatility3.exe"),
-            (Join-Path $PSScriptRoot "tools\vol.exe")
-        )
-        foreach ($loc in $volLocations) {
-            if (Test-Path $loc) { $volAvailable = $true; break }
-        }
+        $volAvailable = [bool](Find-VolatilityExe)
 
         if ($volAvailable) {
             $dumpSizeGB = [math]::Round((Get-Item -LiteralPath $detectedDump).Length / 1GB, 2)
@@ -18259,8 +18440,10 @@ if ($Sources -notcontains "Memory") {
             Write-Host "  [2] No  -- skip, build timeline from disk artifacts only" -ForegroundColor White
             Write-Host ""
 
+            # $null: the end of redirected input, as No
             do {
                 $memChoice = Read-Host "Include memory analysis? (1-2)"
+                if ($null -eq $memChoice) { $memChoice = "2" }
             } while ($memChoice -notin @("1", "2"))
 
             if ($memChoice -eq "1") {
@@ -18269,15 +18452,17 @@ if ($Sources -notcontains "Memory") {
                 Write-Host "Memory analysis enabled." -ForegroundColor Cyan
                 Write-Host ""
             } else {
-                Write-Host ""
-                Write-Host "Memory analysis skipped." -ForegroundColor DarkGray
-                Write-Host ""
+                Log ""
+                Log "Memory analysis skipped (answer 2 at the memory prompt)."
+                Write-MemoryDumpNotAnalyzed "${detectedDumpText}: skipped at the memory prompt (run the builder again and answer 1 to analyze it)."
+                Log ""
             }
         } else {
             Log ""
             Log "Memory dump detected ($(Get-MemoryDumpDisplayName $detectedDump)) but Volatility 3 not found in tools\ directory."
             Log "  To enable memory analysis, place vol.exe in: $(Join-Path $PSScriptRoot 'tools\volatility3\')"
             Log "  Download from: https://github.com/volatilityfoundation/volatility3/releases"
+            Write-MemoryDumpNotAnalyzed "${detectedDumpText}: Volatility 3 (vol.exe) is not in the builder's tools\volatility3\ folder."
             Log ""
         }
     }
@@ -18339,7 +18524,12 @@ $entryCount = $script:timelineEntries.Count
 Log "  Raw entries collected: $entryCount"
 
 if ($entryCount -eq 0) {
-    Log-Warning "No timeline entries were collected. Check input path and selected sources."
+    Log-Warning "No timeline entries were collected. Check the input path (and -Sources, if given)."
+    # A folder such as the collector's reports\ holds collection zips, not a collection
+    if (-not $script:selectedZipPath -and (Test-Path -LiteralPath $InputPath -PathType Container) -and
+        @(Get-ChildItem -LiteralPath $InputPath -Filter "*.zip" -File -ErrorAction SilentlyContinue).Count -gt 0) {
+        Log "  This folder holds .zip file(s), not a collection: drop one collection .zip on Run-TimelineBuilder.bat, or double-click Run-TimelineBuilder.bat to pick one from the collector's reports\ folder."
+    }
     if (Write-RunEndBanner -NoOutput) { exit 2 }
     exit 0
 }
@@ -18436,8 +18626,8 @@ if ($Keywords -and $Keywords.Count -gt 0) {
 Log "--- Exporting Timeline ---"
 Log "  Output file: $OutputFile"
 
-$sorted | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
-$fileSizeMB = [math]::Round((Get-Item $OutputFile).Length / 1MB, 2)
+$sorted | Export-Csv -LiteralPath $OutputFile -NoTypeInformation -Encoding UTF8
+$fileSizeMB = [math]::Round((Get-Item -LiteralPath $OutputFile).Length / 1MB, 2)
 Log-Success "  Timeline exported: $OutputFile ($fileSizeMB MB)"
 
 # =============================================================
@@ -18535,7 +18725,9 @@ if (-not $skipExcel -and (Get-Module -ListAvailable -Name ImportExcel)) {
         # EventTypes whose rows are also set in bold so they stand out
         $boldTypes = @("SecurityAlert")
 
-        Log "  Exporting to Excel with conditional formatting..."
+        # Nothing is printed while the cells are cleaned and the workbook is
+        # written: say how long that takes for a large timeline
+        Log "  Exporting $($sorted.Count) rows to Excel with conditional formatting (about 2 minutes for 300,000 rows)..."
 
         # Second-pass sanitization for Excel compatibility:
         # 1. Remove XML-invalid characters (same rule as Add-TimelineEntry)
@@ -18556,6 +18748,7 @@ if (-not $skipExcel -and (Get-Module -ListAvailable -Name ImportExcel)) {
         }
 
         # Export CSV data to Excel
+        Log "  Writing $(Split-Path $xlsxFile -Leaf)..."
         $sorted | Export-Excel -Path $xlsxFile -WorksheetName "Timeline" `
             -AutoSize -AutoFilter -FreezeTopRow -BoldTopRow -ErrorAction Stop
 
@@ -18640,7 +18833,7 @@ if (-not $skipExcel -and (Get-Module -ListAvailable -Name ImportExcel)) {
         # This is a known ImportExcel/EPPlus library issue -- the file data is intact.
         # Excel repairs minor XML formatting differences and opens normally.
 
-        $xlsxSizeMB = [math]::Round((Get-Item $xlsxFile).Length / 1MB, 2)
+        $xlsxSizeMB = [math]::Round((Get-Item -LiteralPath $xlsxFile).Length / 1MB, 2)
         Log-Success "  Excel timeline: $xlsxFile ($xlsxSizeMB MB)"
         $xlsxGenerated = $true
 

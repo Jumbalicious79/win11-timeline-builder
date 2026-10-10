@@ -2260,6 +2260,9 @@ function Read-ReportEngineBuilderLog {
     $info = [PSCustomObject]@{
         Available = $false; Sources = ""; StartDate = ""; EndDate = ""; MftDays = $null; UsnDropped = $false; ProblemLines = @()
         MissingInputFiles = 0; UnexpectedErrors = 0; UnnamedSids = 0; ExaminedComputerName = ""
+        # A memory dump of the collection that the run did not analyze: what
+        # and why ("" when there is none, or it was analyzed)
+        MemoryDumpNotAnalyzed = ""
     }
     $text = Read-ReportEngineLogText $Path
     if ($null -eq $text) { return $info }
@@ -2283,6 +2286,7 @@ function Read-ReportEngineBuilderLog {
         elseif ($line -match 'Timeline Builder (?:Completed|Finished) WITH (\d+) UNEXPECTED ERROR\(S\)') { $errorBanner = [Math]::Max($errorBanner, [int]$Matches[1]) }
         elseif ($line -match '^\[[^\]]*\]\s+User column: (\d+) SID\(s\) not named') { $info.UnnamedSids = [int]$Matches[1] }
         elseif (-not $info.ExaminedComputerName -and $line -match '^\[[^\]]*\]\s+Examined computer name \(SYSTEM hive\): (.+?)\s*$') { $info.ExaminedComputerName = $Matches[1] }
+        elseif (-not $info.MemoryDumpNotAnalyzed -and $line -match '^\[[^\]]*\]\s+Memory dump not analyzed: (.+?)\s*$') { $info.MemoryDumpNotAnalyzed = $Matches[1] }
     }
     $info.ProblemLines = $problems.ToArray()
     $info.MissingInputFiles = [Math]::Max($missingLogged, $missingBanner)
@@ -2618,6 +2622,13 @@ function New-ReportModel {
     if ($builderLog.UnnamedSids -gt 0) {
         $notes.Add("$($builderLog.UnnamedSids) account SID(s) in the User column have no name (the SOFTWARE hive's ProfileList and bam_entries.csv were not read in this run, or do not list them): Rows per user can list such an account under its SID, apart from its name.")
     }
+    # The builder logs "Memory dump not analyzed: <what and why>" for a dump
+    # of the collection that it found (or that collection_manifest.csv
+    # lists) but did not analyze: Windows ARM64, skipped at its prompt, no
+    # Volatility 3, or not found
+    if ($builderLog.MemoryDumpNotAnalyzed) {
+        $notes.Add("A memory dump of this collection was not analyzed: $($builderLog.MemoryDumpNotAnalyzed)")
+    }
 
     # --- Caveats: what this report can't tell you ---
     $caveats = New-Object System.Collections.Generic.List[string]
@@ -2662,6 +2673,9 @@ function New-ReportModel {
     }
     if ($builderLog.UsnDropped) {
         $caveats.Add("The oldest USN journal entries were dropped (-MaxUsnEntries): older file changes are not in the timeline.")
+    }
+    if ($builderLog.MemoryDumpNotAnalyzed) {
+        $caveats.Add("A memory dump of this collection exists but was not analyzed (see Evidence coverage): the programs, network connections and command lines in memory are not in this report.")
     }
     if ($builderLog.StartDate -or $builderLog.EndDate) {
         $range = @(@($builderLog.StartDate, $builderLog.EndDate) | Where-Object { $_ }) -join " to "

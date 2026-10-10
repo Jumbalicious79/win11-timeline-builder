@@ -288,7 +288,10 @@ function Get-ReportHtmlWorkbookHref {
     return ConvertTo-ReportHtmlText -Value ("./" + [System.Uri]::EscapeDataString($name))
 }
 
-# SHA-256 of a file next to the report (or at a full path), or $null
+# SHA-256 of a file next to the report (or at a full path), or $null. Hashed
+# with .NET, not Get-FileHash: Windows PowerShell started from PowerShell 7
+# (through cmd.exe) can load PowerShell 7's Utility module, which has no
+# Get-FileHash for it.
 function Get-ReportHtmlFileHash {
     param([string]$Directory, [string]$File)
     if (-not $File) { return $null }
@@ -297,7 +300,15 @@ function Get-ReportHtmlFileHash {
     $candidates += (Join-Path $Directory ([System.IO.Path]::GetFileName($File)))
     foreach ($candidate in $candidates) {
         if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-            try { return (Get-FileHash -LiteralPath $candidate -Algorithm SHA256 -ErrorAction Stop).Hash }
+            try {
+                $stream = New-Object System.IO.FileStream($candidate, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                $sha = [System.Security.Cryptography.SHA256]::Create()
+                try { return ([System.BitConverter]::ToString($sha.ComputeHash($stream))).Replace("-", "") }
+                finally {
+                    $sha.Dispose()
+                    $stream.Dispose()
+                }
+            }
             catch { Write-Verbose "Could not hash ${candidate}: $($_.Exception.Message)" }
         }
     }

@@ -30,10 +30,14 @@ Required directory structure:
     win11-timeline-builder\       <-- this repo
       timeline-builder.ps1
       Run-TimelineBuilder.bat
+      report\                     <-- findings report rules and renderer
+                                      (needed for report.pdf)
       reports\                    <-- timelines save here
       tools\                      <-- auto-downloaded on first run
         sqlite3\                  <-- browser history parser
         TimelineExplorer\         <-- forensic CSV viewer
+
+  (Copy each repository folder whole; the lists show the main parts.)
 
 To set up:
 
@@ -42,6 +46,13 @@ To set up:
 
 Or download both repos and extract them into the same parent folder. The parent
 folder can be anywhere -- your desktop, a USB drive, a network share, etc.
+GitHub's "Download ZIP" names the folders win11-triage-collector-master and
+win11-timeline-builder-master: rename them to win11-triage-collector and
+win11-timeline-builder. (Browse mode also finds one win11-triage-collector-*
+folder with a reports\ folder in it, but the exact name is what it looks for
+first.) The path of the builder's folder must not have [ ], * or ? in it
+(PowerShell reads them as wildcards): from such a folder the builder stops at
+the start with an error that says so (exit code 1).
 
 If you pass -InputPath directly, the sibling requirement does not apply. But
 for the zero-config double-click workflow (browse mode), both directories must
@@ -56,7 +67,9 @@ no dependencies, no command-line knowledge needed.
 
   1. COLLECT: Run triage-collector on the target system
   2. ANALYZE: Run timeline-builder on the collection (this tool)
-  3. REVIEW: Timeline Explorer auto-opens with the timeline loaded
+  3. REVIEW: choose a viewer from the menu: the color-coded Excel workbook,
+     Timeline Explorer (downloaded on first use), both, or Open report (the
+     findings report PDF)
 
 ### Live System (Dirty Forensics)
 
@@ -67,7 +80,8 @@ For incident response, triage, or non-legal investigations:
   3. Double-click Run-TriageCollector.bat (collects to reports\ on the USB)
   4. Unplug the USB, take it to your analysis workstation
   5. Double-click Run-TimelineBuilder.bat -- it auto-finds the triage zips
-  6. Pick a collection, timeline builds, Timeline Explorer opens automatically
+  6. Pick a collection; the timeline and the findings report are built, then
+     choose a viewer: Excel, Timeline Explorer, Both, Open report or None
 
 ### Forensic Image (Clean Forensics)
 
@@ -99,9 +113,12 @@ Both tools are designed to live side-by-side on a USB drive:
     win11-timeline-builder\
       timeline-builder.ps1
       Run-TimelineBuilder.bat
+      report\                     <-- findings report rules and renderer
       tools\                      <-- auto-downloaded: sqlite3, Timeline Explorer
         volatility3\              <-- optional: vol.exe for memory analysis
       reports\                    <-- timelines save here
+
+  Copy both repository folders whole (the list shows the main parts).
 
 The timeline builder auto-discovers triage collections from the sibling
 directory. sqlite3.exe and Timeline Explorer are auto-downloaded on first run
@@ -119,18 +136,24 @@ themselves are never committed.
   Run-TimelineBuilder.bat
 
   No arguments needed. The script automatically:
-    1. Finds triage collection .zip files from sibling triage-collector\reports\
+    1. Finds triage collection .zip files in the sibling
+       win11-triage-collector\reports\ folder, and collection folders there
+       (made with the collector's "nozip"; shown as "folder, not zipped")
     2. Lists them with size and date, newest first
-    3. You pick a number
-    4. Extracts it into a work folder in %LOCALAPPDATA%\TimelineBuilder,
-       not %TEMP% (deleted after; see "Work folder" below)
-    5. Builds the timeline (~2 minutes for ~36,000 events)
+    3. You pick a number (an invalid answer is asked again; 0 cancels)
+    4. Extracts a zip into a work folder in %LOCALAPPDATA%\TimelineBuilder,
+       not %TEMP% (deleted after; see "Work folder" below); a folder is
+       read where it is
+    5. Builds the timeline: about 5 minutes for a 100 MB collection with
+       the $MFT and the USN journal (~300,000 events), most of it adding the
+       USN journal and writing the Excel file, which the console announces
     6. Generates a color-coded Excel file (rows colored by EventType)
     7. Writes the findings report: report.pdf, report.html and findings.csv
        -- leads to review, each linked to its rows in the Excel file (see
        "Findings Report")
     8. Asks how you want to view: Excel (colored), Timeline Explorer, Both,
-       Open report, None
+       Open report, None (the numbers change when there is no Excel file or
+       no report; a number that is not listed is asked again)
 
   You can also pass a collection folder or a collection .zip directly (or
   drop either on the .bat), optionally followed by a comma-separated
@@ -142,8 +165,34 @@ themselves are never committed.
 
   The launcher asks for Administrator rights (UAC) and restarts itself
   elevated with the same arguments. Paths with spaces, apostrophes, & or !
-  are fine, and a relative path is turned into a full path first (the
-  elevated window starts in C:\Windows\System32).
+  are fine when typed in quotes, and a relative path is turned into a full
+  path first (the elevated window starts in C:\Windows\System32).
+
+  Drag and drop: drop ONE collection .zip or folder on the .bat. Explorer
+  quotes a dropped path only when it has a space in it, so a path with
+  & , = ; or ^ but no space (C:\Cases\R&D\...) arrives cut up: the .bat
+  then says the path was not found, before asking for Administrator
+  rights. Rename that folder, or run the .bat from a command prompt with
+  the path in quotes. Dropping two items (two zips, or a zip and its
+  memory dump) is refused with "Drop one collection at a time": the second
+  path would otherwise be read as the keyword list. (So is a second
+  argument that is the full path of an existing file or folder, or a
+  .zip, .dmp or .raw file or a collection folder.)
+
+  A collection folder is read where it is, so its files' full paths must
+  stay under 260 characters: Windows PowerShell (which the .bat uses)
+  cannot open longer paths with Windows' default settings. When a folder
+  holds such files, the run stops at the start (exit code 1) and names
+  them: copy the collection to a short path such as C:\Cases\<name>, or
+  drop the collection .zip instead (a zip is extracted into a short work
+  folder, and over-long names are shortened).
+
+  At the end the .bat repeats the outcome when the builder did not finish
+  cleanly ("Result: ... exit code 1" or "... exit code 2") and waits for a
+  key. Started from a window that is already elevated (Administrator), it
+  then returns the builder's exit code (0, 1 or 2; see "Incomplete
+  timeline (exit code 2)") to whatever started it; otherwise it hands the
+  run to a new elevated window and ends at once.
 
   While the builder runs (also with -ReportOnly), QuickEdit is off in its
   console window, so a click in the window cannot pause the run. (With QuickEdit on, a click
@@ -167,7 +216,13 @@ themselves are never committed.
   #15). When the manifest lists a dump the builder cannot find or use, it
   says what to do: connect the drive, or copy the dump next to the zip
   under the name it gives (<zip name>_memory_dump.dmp or .raw), then run
-  the .bat again.
+  the .bat again. A dump from a Windows ARM64 computer is never offered:
+  Volatility 3 cannot analyze ARM64 memory (open the dump in WinDbg), and
+  for an ARM64 collection (its systeminfo.txt says so) the builder does not
+  ask for the dump to be copied. A dump that is found (or listed) but not
+  analyzed -- ARM64, answered 2 at the prompt, no vol.exe, not found -- is
+  named in the findings report's Evidence coverage notes, with the reason,
+  and in its "What this report can't tell you" box.
 
 ### PowerShell (Admin)
 
@@ -200,8 +255,15 @@ themselves are never committed.
 
 ## Parameters
 
-  -Browse         Auto-find triage zips in sibling triage-collector\reports\
-                  and present a numbered menu to select one. No InputPath needed.
+  -Browse         Auto-find triage zips (and collection folders with a
+                  collection_info.json, from the collector's "nozip") in
+                  the sibling win11-triage-collector\reports\ folder (or,
+                  when that name is not there, in the one
+                  win11-triage-collector-* sibling with a reports\ folder,
+                  e.g. after GitHub's Download ZIP) and present a numbered
+                  menu to select one. No InputPath needed. Without such a
+                  folder, or with no collection in it, it stops with exit
+                  code 1 and says what it looked for.
   -InputPath      Path to a triage collection directory, a collection .zip
                   (extracted into the work folder, as in browse mode; a
                   memory dump next to it is found too), or any directory
@@ -211,7 +273,13 @@ themselves are never committed.
                   would not be found. Rename it, or pass the .zip: when a
                   zip's one top folder has them in its name ("Case [1]"
                   zipped with Explorer), its extracted copy in the work
-                  folder is renamed ("Case _1_") and read as usual.
+                  folder is renamed ("Case _1_") and read as usual. A
+                  directory holding files whose full paths have 260 or
+                  more characters is refused too in Windows PowerShell
+                  5.1 (exit code 1, the files named): it cannot open
+                  them. Copy the collection to a shorter path, or pass the
+                  .zip. Any other file (a .7z, a memory dump) is refused
+                  with "Input path is a file" (exit code 1).
   -OutputFile     Output CSV path. Defaults to reports\timeline_<timestamp>\timeline.csv
   -StartDate      Only include events after this date (UTC).
   -EndDate        Only include events before this date (UTC).
@@ -357,8 +425,10 @@ The script creates a timestamped report folder next to the script:
     reports\
       timeline_2026-04-08_09-43-57\
         timeline_builder_log.txt     -- Full processing log
-        timeline.csv                 -- The unified timeline (~12 MB, ~36K events)
-        timeline.xlsx                -- Color-coded Excel version (~2 MB); its
+        timeline.csv                 -- The unified timeline (~110 MB for
+                                        ~300K events with the $MFT and USN
+                                        journal)
+        timeline.xlsx                -- Color-coded Excel version (~12 MB); its
                                         first sheet "Findings" links to the
                                         rows of each finding
         report.pdf                   -- Findings report (printed by Microsoft Edge)
@@ -459,7 +529,11 @@ See "Findings Report".
 
   In both cases the exit code is 2 instead of 0. Exit code 1 means the run
   stopped early (input not found, a bad zip, no work folder, files gone
-  right after the extraction).
+  right after the extraction, a collection folder with paths too long to
+  open, a builder folder with [ ] * ? in its path). Run-TimelineBuilder.bat
+  repeats the outcome for 1 or 2 in one "Result:" line right before its
+  final pause, so it is on screen when the window waits, and (in an
+  already elevated window) returns the same exit code after that pause.
 
   The findings report of such a run says so: "Timeline incomplete" comes
   first in its Evidence coverage section, and the summary page's "What
@@ -710,7 +784,8 @@ once more.
      boots and shutdowns, logging that was off (no 4688 process creation,
      no 4104 script blocks, no Sysmon, the USN journal's span, ...),
      collector errors and warnings (or that the collector's log is
-     missing), and the Integrity leads
+     missing), notes (among them a memory dump of the collection that was
+     not analyzed, and why), and the Integrity leads
   3  Antivirus verdicts       4  Access       5  Persistence
   6  Execution                7  Initial access       8  File system
      (and "Other leads" when a rule uses another category)
@@ -1668,7 +1743,13 @@ same (also for a collection whose manifest lists no dump) and adds
 -MemoryDumpPath.
 Requires vol.exe in tools\volatility3\ (see tools\volatility3\README.txt).
 Windows ARM64 dumps are detected from the dump header and skipped:
-Volatility 3 analyzes Intel x86/x64 Windows memory only (use WinDbg).
+Volatility 3 analyzes Intel x86/x64 Windows memory only (use WinDbg). When
+no dump is found for a collection whose systeminfo.txt says ARM64, the
+offer step says so instead of asking for the dump to be copied next to
+the zip. A dump of the collection that is found or listed but not
+analyzed (ARM64, answered 2 at the prompt, no vol.exe, not found) gets a
+log line "Memory dump not analyzed: <dump> (<size>): <reason>", which the
+findings report shows in its Evidence coverage notes and as a caveat.
   - windows.pslist: Running processes with creation timestamps, PIDs, parent
     PIDs (ProcessCreation at the creation time)
   - windows.netscan: Network connections with protocol, addresses, ports,
@@ -2269,7 +2350,7 @@ Timeline Explorer at the same time.
   Feature          | timeline-builder.ps1           | log2timeline/plaso
   -----------------+--------------------------------+----------------------------
   Setup            | Zero dependencies (pure PS)    | Requires Python + plaso
-  Speed            | Fast (1-2 minutes)             | Slow (hours for full parse)
+  Speed            | Fast (about 5 minutes)         | Slow (hours for full parse)
   Event logs       | Targeted high-value event IDs  | All event IDs
   Prefetch         | Name, run count, run times     | Full binary parsing
   Registry         | Key artifacts (MRU, BAM, etc.) | Hundreds of plugins
@@ -2346,7 +2427,8 @@ installation or configuration is needed.
   License:    Free for use (see Eric Zimmerman's tools page)
   Cached at:  tools\TimelineExplorer\
   Size:       ~86 MB (zip)
-  Used by:    Auto-launched after timeline export
+  Used by:    Opened when chosen from the viewer menu (Timeline Explorer or
+              Both), or with -Viewer TimelineExplorer / Both
   Requires:   .NET 9 Runtime (Timeline Explorer will prompt to install if missing)
 
 Both zips are downloaded to %TEMP%, extracted, and the zip is deleted. If
@@ -2578,8 +2660,11 @@ parsing is skipped, and the timeline CSV can be opened manually.
   fit), the manifest lookups, the list of input files, the free-space and
   temp-folder checks, the refusal of a network work folder, the clean-up
   of work folders left by killed runs, the SRUM database copy (made in the
-  work folder; a missing transaction log reported) and the end-of-run
-  banners; it needs no admin. Part 2 runs the builder on a synthetic
+  work folder; a missing transaction log reported), the end-of-run
+  banners and the files of a collection folder whose paths have 260 or
+  more characters (named in Windows PowerShell 5.1, none in PowerShell 7,
+  never a memory dump or email attachment copy); it needs no admin. Part
+  2 runs the builder on a synthetic
   collection zip dated 2025 with two setupapi logs: both must be parsed,
   the free space must be checked, the work folder must be outside %TEMP%
   and removed afterwards, and an input file deleted during the run (by a
@@ -2593,7 +2678,14 @@ parsing is skipped, and the timeline CSV can be opened manually.
   folder is "Case [1]" must give exit code 0 and both devices: its
   extracted copy is renamed "Case _1_" (Part 1 checks the rename and that
   the input-file list follows it). The kept report must say "incomplete"
-  twice only (the caveat and Evidence coverage). Part 2 needs admin like the
+  twice only (the caveat and Evidence coverage). A collection folder with
+  a path of 260+ characters in it must stop the run at the start in
+  Windows PowerShell 5.1 (exit code 1, the file named) and give a
+  timeline in PowerShell 7; a .7z and a memory dump named "Case [2]..."
+  must give "Input path is a file" (exit code 1), not the wildcard error;
+  the builder copied into a folder "inst [1]" must stop at the start with
+  an error about its folder; a folder of zips must end with no entries
+  and a hint to drop one .zip. Part 2 needs admin like the
   builder (or -BuilderPath with a copy without the admin check); it
   changes nothing on the system.
 
@@ -2646,7 +2738,11 @@ parsing is skipped, and the timeline CSV can be opened manually.
   analyzed (connect its drive, or copy it to the path named next to the
   zip or folder); only the parser, run with -Sources ...,Memory from
   PowerShell, names -MemoryDumpPath, and the offer step says nothing for a
-  collection whose manifest lists no dump. Then it
+  collection whose manifest lists no dump. The offer step also logs the
+  "Memory dump not analyzed" line the findings report reads; for a
+  collection from a Windows ARM64 computer (its systeminfo.txt) it gives
+  no copy advice and names WinDbg; the dump of a zip whose top folder was
+  renamed is named after the folder's original name. Then it
   reads synthetic dump headers: the architecture and the capture time
   (64-bit SystemTime used; zero, before 1980, more than a day after the
   last write, cut off, 32-bit and raw fall back to the last-write time;
@@ -2732,7 +2828,9 @@ parsing is skipped, and the timeline CSV can be opened manually.
   with the collector host kept apart), names a live collection's local
   collector account as the User column does, and says when the builder
   run ended incomplete (its log lines, its end banners, or the counts the
-  builder passes) without repeating it in the notes. A lead seen only in
+  builder passes) without repeating it in the notes, and names a memory
+  dump the builder did not analyze (its "Memory dump not analyzed" log
+  line) in the notes, with a caveat. A lead seen only in
   Snapshot rows from during the collection (a task listed then) must be
   CapturedDuringCollection, not DuringCollection; a lead whose rows all
   come from the memory dump must be MemoryOnly, never

@@ -115,8 +115,8 @@ try {
     Write-Host "Testing which rows the summary counts ..."
     $countCalls = @(Find-MainFlowCommand -Name "Get-ArtifactRowCounts")
     Assert-Equal -Name "summary: Get-ArtifactRowCounts is called once" -Expected 1 -Actual $countCalls.Count
-    $csvExports = @(Find-MainFlowCommand -Name "Export-Csv" | Where-Object { $_.Extent.Text -match '-Path \$OutputFile\b' })
-    Assert-Equal -Name "CSV export: one Export-Csv -Path `$OutputFile" -Expected 1 -Actual $csvExports.Count
+    $csvExports = @(Find-MainFlowCommand -Name "Export-Csv" | Where-Object { $_.Extent.Text -match '-(?:Literal)?Path \$OutputFile\b' })
+    Assert-Equal -Name "CSV export: one Export-Csv -LiteralPath `$OutputFile" -Expected 1 -Actual $csvExports.Count
     if ($countCalls.Count -eq 1 -and $csvExports.Count -eq 1) {
         # The variable passed to the count, and the one piped to Export-Csv
         $countedVariable = @($countCalls[0].CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.VariableExpressionAst] } |

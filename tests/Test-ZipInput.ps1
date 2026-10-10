@@ -21,8 +21,11 @@
 #   and relative paths too), the end-of-run hive list, the clean-up of
 #   work folders left by earlier runs, the SRUM database copy (made in the
 #   work folder's scratch folder, a missing transaction log reported), the
-#   refusal of a network work folder and the end-of-run banners (missing
-#   input files, unexpected errors).
+#   refusal of a network work folder, the end-of-run banners (missing
+#   input files, unexpected errors) and the files of a collection folder
+#   whose paths have 260 or more characters (named in Windows PowerShell
+#   5.1, which cannot open them; none in PowerShell 7; memory dumps and
+#   email attachment copies never).
 # Part 2 -- builder runs: a synthetic collection zip whose entries are dated
 #   2025, with two setupapi logs (USBSTOR devices) under "/" and "\" entry
 #   names and a manifest, passed as -InputPath (-Sources USB):
@@ -49,7 +52,17 @@
 #   - a zip "Case [1].zip" whose top folder is "Case [1]": its extracted
 #     copy is renamed "Case _1_", exit code 0, both logs parsed, every
 #     input file found; run B's report says "incomplete" only twice (the
-#     caveat and Evidence coverage).
+#     caveat and Evidence coverage);
+#   - a collection folder holding a file whose path has 260 or more
+#     characters: in Windows PowerShell 5.1 the run stops at the start
+#     (exit code 1) and names it; PowerShell 7 builds the timeline;
+#   - a .7z and a memory dump with [ ] in their names: "Input path is a
+#     file" (exit code 1; for the dump, a hint to give its collection), not
+#     the folder-wildcard error;
+#   - the builder copied into a folder named "inst [1]": it stops at the
+#     start (exit code 1) with an error about its folder, writing nothing;
+#   - a folder that holds collection zips: no entries, exit code 0, and a
+#     hint to drop one .zip on Run-TimelineBuilder.bat.
 #   Needs Administrator rights, like the builder itself (GitHub Actions
 #   Windows runners are elevated). For a local run without them, pass
 #   -BuilderPath with a copy of the builder that has no admin check, kept
@@ -340,6 +353,40 @@ try {
     $logNames = @(Get-Content -LiteralPath $logFile | Select-Object -Skip $logBefore | Where-Object { $_ -match 'Browser\\file\d\d\.db$' })
     Assert-Equal -Name "25 missing files: all 25 names in the log file" -Expected 25 -Actual $logNames.Count
     Assert-Equal -Name "25 missing files: 20 names and a count on the console" -Expected "20 1" -Actual "$(@($console -match 'Browser\\file\d\d\.db$').Count) $(@($console -match '\.\.\. and 5 more \(all listed in the log file\)$').Count)"
+
+    # --- Paths of 260 or more characters in a collection folder -----------
+    # A collection folder is read where it is. Windows PowerShell 5.1 (long
+    # paths off, the Windows default) cannot open such a file and does not go
+    # into such a folder, so the parsers would leave them out without an
+    # error: Get-UnreadableLongPaths names them and the run is refused.
+    # PowerShell 7 opens them, so nothing is named there. Memory dumps and
+    # copied email attachments do not count (no parser reads them).
+    $longColl = Join-Path (Get-LongPath $testRoot) "long\Coll"
+    $pad = 275 - $longColl.Length
+    $longEvtx = "EventLogs\" + ("e" * ($pad - 15)) + ".evtx"
+    $longLnk = "UserActivity\alice\" + ("u" * [Math]::Max(10, 232 - $longColl.Length - 19)) + "\" + ("v" * 40) + "\a.lnk"
+    $longDump = "Memory\" + ("m" * ($pad - 11)) + ".dmp"
+    $longAttachment = "Email\alice\NewOutlook\Attachments\" + ("a" * ($pad - 40)) + ".pdf"
+    foreach ($rel in @($longEvtx, $longLnk, $longDump, $longAttachment, "USB\setupapi.dev.log")) {
+        $file = Get-ExtendedLengthPath ($longColl + '\' + $rel)
+        [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($file))
+        [System.IO.File]::WriteAllText($file, "x")
+    }
+    [System.IO.File]::WriteAllText((Join-Path $longColl "collection_manifest.csv"),
+        (New-TestManifest -RelativePaths @($longEvtx, $longLnk, $longDump, $longAttachment, "USB\setupapi.dev.log")))
+    Set-Variable -Name InputPath -Value $longColl -Scope Script
+    $script:collectionManifest = $null
+    $unreadable = @(Get-UnreadableLongPaths -Folder $longColl)
+    if ($PSVersionTable.PSEdition -eq "Core") {
+        Assert-Equal -Name "paths of 260+ characters: PowerShell 7 opens them, nothing named" -Expected "" -Actual ($unreadable -join ", ")
+    }
+    else {
+        $named = "$($unreadable -contains $longEvtx) $($unreadable -contains $longLnk) $(@($unreadable | Where-Object { $_ -like 'Memory\*' -or $_ -like 'Email\*' -or $_ -like 'USB\*' }).Count)"
+        Assert-Equal -Name "paths of 260+ characters: the event log and the file in a deep folder named (no dump, attachment or short path)" -Expected "True True 0" -Actual $named
+    }
+    $script:collectionManifest = $null
+    # Windows PowerShell's Remove-Item cannot delete such paths: .NET with \\?\
+    [System.IO.Directory]::Delete((Get-ExtendedLengthPath (Split-Path $longColl -Parent)), $true)
 
     # --- SetupAPI logs the manifest lists (USB parser) --------------------
     # Logs shortened on extraction, named the way Expand-CollectionZip does
@@ -713,11 +760,82 @@ try {
         "2024-03-01 10:00:00.000 Outlook attachment in temp folder: invoice.docm (alice) | 2024-03-02 11:00:00.000 Outlook attachment in temp folder modified: invoice.docm (alice)") -Actual ($mailRows -join " | ")
     $reportLeftovers = @(@("findings.csv", "report.html", "report-model.json") | Where-Object { Test-Path -LiteralPath (Join-Path $testRoot $_) })
     Assert-Equal -Name "runs A and C (-NoReport): no report next to their timelines" -Expected "" -Actual ($reportLeftovers -join ", ")
+
+    # --- Run F: a collection folder with a file whose path has 260 or more
+    # characters. Windows PowerShell 5.1 cannot open it: the run stops at the
+    # start with exit code 1 and names it (it would otherwise be left out of
+    # a timeline that ends "Completed Successfully"). PowerShell 7 opens it
+    # and builds the timeline --------------------------------------------
+    $longRunColl = Join-Path (Get-LongPath $testRoot) "longrun\$collName"
+    $longRunEvtx = "EventLogs\" + ("e" * (270 - $longRunColl.Length - 15)) + ".evtx"
+    $longRunFiles = [ordered]@{
+        "collection_info.json"    = $collectionInfo
+        "collection_manifest.csv" = (New-TestManifest -RelativePaths @("USB\setupapi.dev.log", $longRunEvtx))
+        "USB\setupapi.dev.log"    = (New-SetupApiText -Instance $deviceA -LocalTime "2025/01/02 10:00:00.000")
+        $longRunEvtx              = "not read here (-Sources USB)"
+    }
+    foreach ($rel in $longRunFiles.Keys) {
+        $file = Get-ExtendedLengthPath ($longRunColl + '\' + $rel)
+        [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($file))
+        [System.IO.File]::WriteAllText($file, [string]$longRunFiles[$rel])
+    }
+    $csvF = Join-Path $testRoot "timeline-f.csv"
+    Write-Host "Running the builder on a collection folder with a $($longRunColl.Length + 1 + $longRunEvtx.Length)-character path in it ..."
+    $runF = Invoke-ZipRun -OutputFile $csvF -Zip $longRunColl
+    if ($PSVersionTable.PSEdition -eq "Core") {
+        if ($runF.ExitCode -ne 0) { $runF.Lines | ForEach-Object { Write-Host "  | $_" } }
+        Assert-Equal -Name "run F (PowerShell 7): a path of 260+ characters is read, exit code 0, the timeline written" -Expected "0 True" -Actual "$($runF.ExitCode) $(Test-Path -LiteralPath $csvF)"
+    }
+    else {
+        if ($runF.ExitCode -ne 1) { $runF.Lines | ForEach-Object { Write-Host "  | $_" } }
+        Assert-Equal -Name "run F: a path of 260+ characters stops the run at the start (exit code 1, no timeline)" -Expected "1 False" -Actual "$($runF.ExitCode) $(Test-Path -LiteralPath $csvF)"
+        Assert-Equal -Name "run F: the error says so and names the file" -Expected "1 1" -Actual "$(@($runF.Lines -match 'ERROR: 1 file\(s\) or folder\(s\) of the collection have paths of 260 or more characters').Count) $(@($runF.Lines | Where-Object { $_.EndsWith($longRunEvtx) }).Count)"
+    }
+
+    # --- Run G: a file that is not a collection zip, with [ ] in its name:
+    # "Input path is a file" (not the folder-wildcard error) -------------
+    $otherDir = Join-Path $testRoot "other"
+    [void][System.IO.Directory]::CreateDirectory($otherDir)
+    $sevenZip = Join-Path $otherDir "Case [2].7z"
+    [System.IO.File]::WriteAllText($sevenZip, "not a zip")
+    $runG = Invoke-ZipRun -OutputFile (Join-Path $testRoot "timeline-g.csv") -Zip $sevenZip
+    Assert-Equal -Name "run G: a .7z named 'Case [2].7z': exit code 1, 'Input path is a file', no wildcard error" -Expected "1 1 0" -Actual "$($runG.ExitCode) $(@($runG.Lines -match 'ERROR: Input path is a file, not a collection folder or \.zip: ').Count) $(@($runG.Lines -match 'wildcards').Count)"
+    $dumpFile = Join-Path $otherDir "Case [2]_memory_dump.dmp"
+    [System.IO.File]::WriteAllText($dumpFile, "not a dump")
+    $runG2 = Invoke-ZipRun -OutputFile (Join-Path $testRoot "timeline-g2.csv") -Zip $dumpFile
+    Assert-Equal -Name "run G: a memory dump given on its own: exit code 1, 'Input path is a file' and a hint to give its collection" -Expected "1 1 1" -Actual "$($runG2.ExitCode) $(@($runG2.Lines -match 'ERROR: Input path is a file').Count) $(@($runG2.Lines -match 'A memory dump is not read on its own: give its collection').Count)"
+
+    # --- Run H: the builder in a folder whose path has [ ]: it stops at the
+    # start (exit code 1) with an error that says so, before anything is
+    # written (Export-Csv and ImportExcel would read the brackets as
+    # wildcards and write no timeline.csv) --------------------------------
+    $bracketBuilderDir = Join-Path $testRoot "inst [1]"
+    [void][System.IO.Directory]::CreateDirectory($bracketBuilderDir)
+    $bracketBuilder = Join-Path $bracketBuilderDir "timeline-builder.ps1"
+    Copy-Item -LiteralPath $builder -Destination $bracketBuilder
+    $outputH = @(& $powershellExe -NoProfile -ExecutionPolicy Bypass -File $bracketBuilder -InputPath $zipPath -Sources USB -NoExcel -NoReport -Viewer None 2>&1 | ForEach-Object { "$_" })
+    $exitH = $LASTEXITCODE
+    Assert-Equal -Name "run H: builder in a folder with [ ]: exit code 1, the error, no reports\ folder" -Expected "1 1 False" -Actual "$exitH $(@($outputH -match "ERROR: The path of the builder's folder has \[ \], \* or \? in it").Count) $([System.IO.Directory]::Exists((Join-Path $bracketBuilderDir 'reports')))"
+
+    # --- Run I: a folder that holds collection zips, not a collection: no
+    # entries, and a hint to give one of the zips ---------------------------
+    $zipsOnly = Join-Path $testRoot "zips-only"
+    [void][System.IO.Directory]::CreateDirectory($zipsOnly)
+    Copy-Item -LiteralPath $zipPath -Destination $zipsOnly
+    $runI = Invoke-ZipRun -OutputFile (Join-Path $testRoot "timeline-i.csv") -Zip $zipsOnly
+    Assert-Equal -Name "run I: a folder of zips: exit code 0, no entries, the hint to drop one .zip" -Expected "0 1 1" -Actual "$($runI.ExitCode) $(@($runI.Lines -match 'No timeline entries were collected\. Check the input path \(and -Sources, if given\)\.').Count) $(@($runI.Lines -match 'This folder holds \.zip file\(s\), not a collection: drop one collection \.zip on Run-TimelineBuilder\.bat').Count)"
 }
 catch {
     Write-TestResult -Name "test run" -Passed $false -Message "$($_.Exception.Message) ($($_.InvocationInfo.PositionMessage))"
 }
 finally {
+    # Paths of 260+ characters first (Windows PowerShell's Remove-Item
+    # cannot delete them)
+    foreach ($longFolder in @((Join-Path $testRoot "long"), (Join-Path $testRoot "longrun"))) {
+        $extendedFolder = '\\?\' + [System.IO.Path]::GetFullPath($longFolder)
+        try { if ([System.IO.Directory]::Exists($extendedFolder)) { [System.IO.Directory]::Delete($extendedFolder, $true) } }
+        catch { Write-Host "Could not remove ${longFolder}: $($_.Exception.Message)" }
+    }
     Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
     # The builder also writes a report folder (log) under reports\; remove the ones from this run
     if ($reportsDir) {

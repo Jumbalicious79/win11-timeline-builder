@@ -36,7 +36,11 @@
 # Run-TimelineBuilder.bat sees) and Parse-Memory say what the manifest
 # lists and how to have the dump analyzed: copy it next to the zip or the
 # collection folder under its name, or connect the drive it was saved to;
-# only Parse-Memory (-Sources ...,Memory) also names -MemoryDumpPath.
+# only Parse-Memory (-Sources ...,Memory) also names -MemoryDumpPath. The
+# offer step also logs the "Memory dump not analyzed" line the findings
+# report reads; for a collection from a Windows ARM64 computer
+# (systeminfo.txt) it gives no copy advice and names WinDbg; the dump of a
+# renamed collection folder is named after the folder's original name.
 # Then the dump header (Get-MemoryDumpInfo) on synthetic headers: the
 # architecture and the capture time (DUMP_HEADER64.SystemTime; zero,
 # implausible, 32-bit and raw fall back to the file's last-write time),
@@ -185,6 +189,7 @@ function Set-TestRunState {
     $script:memoryDumpNotices = $null
     $script:memoryDumpFromManifest = $false
     $script:memoryDumpListedPath = ""
+    $script:collectionFolderOriginalName = $null
     # Find-ArtifactFiles skips the email attachment copies (relative to the
     # collection root) and the Secrets\ folder, which the builder looks up
     # once per run
@@ -703,9 +708,9 @@ try {
     $noDumpCases = @(
         @{ Name = "no dump row"; Collection = (Join-Path $reports $nameC); Note = "collection_manifest.csv lists none (the collector saved no complete dump)"; Remedy = "copy the dump to $(Join-Path $reports "${nameC}_memory_dump.dmp")$anyType" },
         @{ Name = "no collection_manifest.csv"; Collection = (Join-Path $reports $nameP); Note = "there is no collection_manifest.csv that says where the collector saved one"; Remedy = "copy the dump to $(Join-Path $reports "${nameP}_memory_dump.dmp")$anyType" },
-        @{ Name = "the listed dump is gone"; Collection = (Join-Path $reports $nameX); Note = "the collector saved it to $goneX (collection_manifest.csv), and it is not there now, nor at that path on another drive"; Remedy = "connect the drive the collector saved it to, or copy the dump to $(Join-Path $reports "${nameX}_memory_dump.dmp") (collection_manifest.csv lists 16 bytes)" },
-        @{ Name = "the dump row in the collection, no dump next to it"; Collection = (Join-Path $reports $nameY); Note = "collection_manifest.csv lists one in the collection (Memory\memory_dump.dmp), which the collector moves next to the zip as ${nameY}_memory_dump.dmp when it zips the collection"; Remedy = "copy the dump to $(Join-Path $reports "${nameY}_memory_dump.dmp") (collection_manifest.csv lists 16 bytes)" },
-        @{ Name = "the listed dump has another size"; Collection = (Join-Path $reports $nameS); Note = "collection_manifest.csv lists one at $driveS, which was not used (see the warning above)"; Remedy = "copy the dump to $(Join-Path $reports "${nameS}_memory_dump.dmp") (collection_manifest.csv lists 34359738368 bytes)" }
+        @{ Name = "the listed dump is gone"; Collection = (Join-Path $reports $nameX); Note = "the collector saved it to $goneX (collection_manifest.csv), and it is not there now, nor at that path on another drive"; Remedy = "connect the drive the collector saved it to, or copy the dump to $(Join-Path $reports "${nameX}_memory_dump.dmp") (collection_manifest.csv lists 16 bytes)"; Size = " (16 bytes)" },
+        @{ Name = "the dump row in the collection, no dump next to it"; Collection = (Join-Path $reports $nameY); Note = "collection_manifest.csv lists one in the collection (Memory\memory_dump.dmp), which the collector moves next to the zip as ${nameY}_memory_dump.dmp when it zips the collection"; Remedy = "copy the dump to $(Join-Path $reports "${nameY}_memory_dump.dmp") (collection_manifest.csv lists 16 bytes)"; Size = " (16 bytes)" },
+        @{ Name = "the listed dump has another size"; Collection = (Join-Path $reports $nameS); Note = "collection_manifest.csv lists one at $driveS, which was not used (see the warning above)"; Remedy = "copy the dump to $(Join-Path $reports "${nameS}_memory_dump.dmp") (collection_manifest.csv lists 34359738368 bytes)"; Size = " (32 GB)" }
     )
     foreach ($case in $noDumpCases) {
         Set-TestRunState -Collection $case.Collection
@@ -715,10 +720,33 @@ try {
         Set-TestRunState -Collection $case.Collection
         Write-NoMemoryDumpToOffer
         $log = (Get-TestLog) -replace '(?m)^\[[0-9: -]+\] ', ''
-        $expected = "No memory dump to offer: $($case.Note).`r`n  To have it analyzed, $($case.Remedy), then run the builder again."
+        # The last line is the one the findings report reads (Coverage.Notes)
+        $expected = "No memory dump to offer: $($case.Note).`r`n  To have it analyzed, $($case.Remedy), then run the builder again.`r`n  Memory dump not analyzed: collection_manifest.csv lists one$($case.Size), but it was not found (or not usable) next to the collection or where the collector saved it."
         if ($case.Name -like "no *") { $expected = "" }
-        Assert-Equal -Name "offer step without a dump, $($case.Name): $(if ($expected) { 'what the manifest lists and how to have the dump analyzed' } else { 'nothing logged' })" -Expected "$expected|False" -Actual "$($log.Trim())|$($log.Contains('-MemoryDumpPath'))"
+        Assert-Equal -Name "offer step without a dump, $($case.Name): $(if ($expected) { 'what the manifest lists, how to have the dump analyzed, and the line for the report' } else { 'nothing logged' })" -Expected "$expected|False" -Actual "$($log.Trim())|$($log.Contains('-MemoryDumpPath'))"
     }
+    # A collection from a Windows ARM64 computer (systeminfo.txt): copying
+    # the dump would not help (Volatility 3 cannot analyze ARM64 memory), so
+    # there is no copy advice, and WinDbg is named
+    $nameArm = "TriageCollection_2025-06-19_07-45"
+    $collectionArm = Join-Path $reports $nameArm
+    New-TestManifestCollection -Path $collectionArm -CollectedAt "$origReports\$nameArm" -DumpDest "$origReports\$nameArm\Memory\memory_dump.dmp" -DumpRel "Memory\memory_dump.dmp" -DumpSize "8583323648"
+    [void][System.IO.Directory]::CreateDirectory((Join-Path $collectionArm "SystemInfo"))
+    [System.IO.File]::WriteAllText((Join-Path $collectionArm "SystemInfo\systeminfo.txt"), "`r`nHost Name:                 WS01`r`nOS Name:                   Microsoft Windows 11 Pro`r`nSystem Type:               ARM64-based PC`r`n")
+    Set-TestRunState -Collection $collectionArm
+    Write-NoMemoryDumpToOffer
+    $log = ((Get-TestLog) -replace '(?m)^\[[0-9: -]+\] ', '').Trim()
+    $expected = "No memory dump to offer: collection_manifest.csv lists one in the collection (Memory\memory_dump.dmp), which the collector moves next to the zip as ${nameArm}_memory_dump.dmp when it zips the collection.`r`n" +
+        "  The collection is from a Windows ARM64 computer, and Volatility 3 cannot analyze Windows ARM64 memory, so the dump is not needed here: open it in WinDbg to examine it.`r`n" +
+        "  Memory dump not analyzed: collection_manifest.csv lists one (8 GB): a Windows ARM64 dump (the collection's systeminfo.txt says ARM64), which Volatility 3 cannot analyze; examine it in WinDbg."
+    Assert-Equal -Name "offer step without a dump, an ARM64 collection: no copy advice, WinDbg named, and the line for the report" -Expected $expected -Actual $log
+    # The extracted copy of a zip whose top folder had [ ] in its name was
+    # renamed (Get-WildcardSafeFolder): the dump is named as the collector
+    # named it, after the folder's original name
+    Set-TestRunState -Collection (Join-Path $reports $nameY)
+    $script:collectionFolderOriginalName = "Case [1]"
+    Assert-Equal -Name "no dump next to a renamed collection folder: the note names the dump after the folder's original name" -Expected "True" -Actual "$((Get-MemoryDumpNotFoundText -Listed (Get-ManifestMemoryDump)).Note.Contains('next to the zip as Case [1]_memory_dump.dmp when'))"
+    $script:collectionFolderOriginalName = $null
     # A zip: the dump goes next to it
     New-TestManifestCollection -Path $collectionQ -CollectedAt "$origReports\$nameQ" -DumpDest "$origReports\$nameQ\Memory\memory_dump.dmp" -DumpRel "Memory\memory_dump.dmp" -DumpSize "4096"
     Set-TestRunState -Collection $collectionQ -Zip $zipQ
