@@ -1,5 +1,6 @@
 [
   { "PID": 9120, "Process": "powershell.exe", "Args": "powershell.exe -ExecutionPolicy Bypass -NoProfile -File \"C:\\Users\\u\\Downloads\\TC\\triage-collector.ps1\"", "__children": [] },
+  { "PID": 8840, "Process": "cmd.exe", "Args": "cmd.exe /c \"\"C:\\Users\\u\\Downloads\\TC\\Run-TriageCollector.bat\" \"", "__children": [] },
   { "PID": 10232, "Process": "DumpIt.exe", "Args": "DumpIt.exe /q /o C:\\out\\mem.dmp", "__children": [] },
   { "PID": 6000, "Process": "wscript.exe", "Args": "wscript.exe //nologo \"C:\\Users\\u\\Downloads\\invoice.vbs\"", "__children": [] },
   { "PID": 7000, "Process": "powershell.exe", "Args": "powershell.exe -ExecutionPolicy Bypass -NoProfile -File \"C:\\Users\\u\\Downloads\\TC\\triage-collector.ps1\"", "__children": [] }

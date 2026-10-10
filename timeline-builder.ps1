@@ -950,10 +950,16 @@ function Get-TimelineReportCollectionInfo {
         # these processes, and those they start during the collection,
         # unflagged in the memory dump.
         CollectorProcesses       = $null
+        # Whether collection_info.json was read ("Read"), is not there
+        # ("Missing") or could not be read ("Unreadable"), so the report can
+        # say why the collector's own process IDs are not known
+        CollectionInfoState      = "Missing"
     }
     if ($InfoJsonPath -and (Test-Path -LiteralPath $InfoJsonPath -PathType Leaf)) {
         try {
             $json = Get-Content -LiteralPath $InfoJsonPath -Raw -ErrorAction Stop | ConvertFrom-Json
+            if ($null -eq $json) { throw "the file is empty" }
+            $info.CollectionInfoState = "Read"
             foreach ($name in @("ComputerName", "CollectorUser", "Mode", "TargetTimeZoneId")) {
                 if ($json.PSObject.Properties[$name] -and $json.$name) { $info[$name] = [string]$json.$name }
             }
@@ -964,7 +970,10 @@ function Get-TimelineReportCollectionInfo {
             }
             if ($json.PSObject.Properties["CollectorProcesses"] -and $null -ne $json.CollectorProcesses) { $info.CollectorProcesses = $json.CollectorProcesses }
         }
-        catch { Log-Warning "  Could not read $InfoJsonPath for the report: $($_.Exception.Message)" }
+        catch {
+            $info.CollectionInfoState = "Unreadable"
+            Log-Warning "  Could not read $InfoJsonPath for the report: $($_.Exception.Message)"
+        }
     }
     if ($BuilderInfo) {
         if ($BuilderInfo.Mode) { $info.Mode = [string]$BuilderInfo.Mode }
@@ -1056,19 +1065,29 @@ function Invoke-TimelineReportRules {
             Log "  $($collector.Summary): $roleList; $([int]$collector.RowCount) row(s) left out of the rules"
         }
         elseif ($collector.Recorded -and $collector.HasMemoryRows) {
-            Log "  Collector's own processes recorded in collection_info.json, but none were recognized in the memory dump (see below): nothing is left out, and a lead seen only in the memory dump during the collection is marked on its card as possibly the collector."
+            Log "  Collector's own processes recorded in collection_info.json, but its PowerShell process could not be recognized in the memory dump (see below): nothing is left out, and a lead seen only in the memory dump during the collection is marked on its card as possibly the collector."
         }
         foreach ($mismatch in @($collector.Mismatched)) {
             $recordedTime = if ($mismatch.RecordedStartUtc) { $mismatch.RecordedStartUtc.ToString("yyyy-MM-dd HH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture) } else { "unknown time" }
             $dumpTime = if ($mismatch.DumpCreateTimeUtc) { $mismatch.DumpCreateTimeUtc.ToString("yyyy-MM-dd HH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture) } else { "no recorded time" }
-            Log-Warning "  The collector recorded PID $($mismatch.Pid) ($($mismatch.Name), started $recordedTime) but the memory dump has $($mismatch.DumpName) ($dumpTime) with that PID: not left out ($($mismatch.Reason))."
+            $dumpText = if ($mismatch.DumpName) { " and the memory dump has $($mismatch.DumpName) ($dumpTime) with that PID" } else { "" }
+            Log-Warning "  collection_info.json lists PID $($mismatch.Pid) ($($mismatch.Name), $($mismatch.Role), started $recordedTime)${dumpText}: not left out ($($mismatch.Reason))."
         }
         foreach ($missing in @($collector.NotInDump)) {
             Log "  The collector recorded PID $($missing.Pid) ($($missing.Name), $($missing.Role)) but the memory dump has no process with that PID."
         }
+        if ($collector.PSObject.Properties["OutsideTree"] -and [int]$collector.OutsideTree -gt 0) {
+            Log-Warning "  collection_info.json lists $([int]$collector.OutsideTree) process(es) the collector would not have recorded that way (see above); they were not left out. Check whether collection_info.json was altered after the collection."
+        }
         $memoryPresent = @($Rows | Where-Object { "$($_.Source)" -like "Memory-*" }).Count -gt 0
-        if ($memoryPresent -and -not $collector.Recorded) {
-            Log "  This collection does not record the collector's own process IDs (older triage collector): its own processes in the memory dump are checked by the rules like any other."
+        # (A mounted image's collection has no process IDs to record: NotApplicable)
+        if ($memoryPresent -and -not $collector.Recorded -and [string]$collector.State -ne "NotApplicable") {
+            switch ([string]$collector.State) {
+                "Unreadable" { Log "  collection_info.json could not be read (see above), so the collector's own process IDs are not known: its own processes in the memory dump are checked by the rules like any other." }
+                "Missing" { Log "  collection_info.json was not available, so the collector's own process IDs are not known: its own processes in the memory dump are checked by the rules like any other." }
+                "NoUsableEntries" { Log "  collection_info.json has a CollectorProcesses field with no usable entry: the collector's own processes in the memory dump are checked by the rules like any other." }
+                default { Log "  This collection does not record the collector's own process IDs (older triage collector): its own processes in the memory dump are checked by the rules like any other." }
+            }
         }
         $high = @($findings | Where-Object { $_.Severity -eq "High" }).Count
         $medium = @($findings | Where-Object { $_.Severity -eq "Medium" }).Count

@@ -846,7 +846,8 @@ once more.
                       name, start time, how it was recognized, command line),
                       and a note for any recorded process the dump has under
                       the same PID with a different name or time (a reused
-                      PID: not left out) or that the dump does not have
+                      PID: not left out), that failed the checks below
+                      (with its reason), or that the dump does not have
     findings.csv      a "Collector" block (FindingId "Collector", Severity
                       "Not flagged"): a summary line, then one line per
                       left-out row
@@ -854,11 +855,41 @@ once more.
     workbook          a gray "Collector" summary row on the Findings sheet,
                       and "Collector (not flagged)" in the Timeline sheet's
                       Finding column on each left-out row
-  The collector is anchored on its own PowerShell process: if that is not
-  matched in the dump, nothing is left out ("none recognized (nothing left
-  out)"), and the report treats the collection like one from an older
-  collector (below): a memory-only lead seen during the collection is
-  flagged on its card as possibly the collector. Memory network and service
+  The collector is anchored on its own PowerShell process: exactly one
+  Collector entry, a powershell.exe, pwsh.exe or powershell_ise.exe started
+  no later than the collection. If there is none, more than one, or it is
+  not matched in the dump or not such a process, nothing is left out
+  ("none recognized (nothing left out)"), and the report treats the
+  collection like one from an older collector (below): a memory-only lead
+  seen during the collection is flagged on its card as possibly the
+  collector.
+
+  collection_info.json can be changed by anyone who can write the
+  collection folder, so every other entry is checked against the dump's
+  parent links the way the collector chose it, and an entry that fails is
+  never left out (and cannot vouch for another): the Launcher must be the
+  collector's parent, a cmd.exe started no later than it; a Console a
+  conhost.exe that launcher started before the collector; the
+  MemoryCapture tool a process the collector started during the
+  collection; a Child a process started during the collection by one
+  already recognized, not before it. Only these five roles are accepted.
+  An entry the collector would not have written that way (an unknown role,
+  a second collector, a collector that is not such a PowerShell process,
+  or a process outside the collector's own tree in the dump) is listed
+  with its reason, and the builder log, the Notes in Evidence coverage and
+  the key fact say: "Check whether collection_info.json was altered after
+  the collection." In the descendant closure, too, a process created
+  before the process whose ID it names as its parent is not the
+  collector's (that parent's ID was reused).
+
+  When the collection is recognized but a process near the collector
+  could not be identified exactly -- its parent (the .bat's cmd window)
+  when that was not left out, as when the collector could not read the
+  process list and recorded only itself, or a recorded process whose start
+  time does not match -- a memory-only lead on that process (the .bat run
+  from Downloads) keeps the "possibly the collector" card note.
+
+  Memory network and service
   rows (Memory-Network, Memory-Services) of these processes are always kept
   and checked -- no rule reads them, and a stale socket can belong to an
   earlier process that reused the PID. Volatility 3's pslist reports a
@@ -879,7 +910,11 @@ once more.
   collection is flagged on its card as possibly the collector ("check that
   it is not the triage collector, its launcher or the memory capture tool"),
   since this collection cannot tell them apart. The same holds for a current
-  collection whose recorded processes were not recognized in the dump.
+  collection whose recorded processes were not recognized in the dump. The
+  note in Evidence coverage gives the reason the IDs are not known:
+  collection_info.json was not available, could not be read (the builder
+  log has the error), has a CollectorProcesses field with no usable entry,
+  or has no such field (made by an older triage collector).
 
 ### The workbook: Findings sheet and Finding column
 
@@ -1086,11 +1121,17 @@ once more.
   wscript/cscript, mshta, powershell/pwsh (-File or a .ps1 after a call or
   dot-source), cmd (/c or /k with a .bat/.cmd), rundll32 (the DLL before the
   comma) and regsvr32. An editor or viewer that only opens such a file is
-  not a run (the matched program must be the script host). These rules read
-  the path literally and do not resolve it, so they do not catch a short
-  (8.3) name (\DOWNLO~1\), an environment-variable form (%USERPROFILE%\...),
-  forward slashes (C:/Users/Public/...) or a caret-split cmd path; a run
-  from one of those forms is not flagged.
+  not a run (the matched program must be the script host). For PowerShell
+  -Command, a quoted .ps1 path counts only after the call (&) or dot-source
+  (.) operator, in any statement (a quoted path that is only named, such as
+  'C:\Users\Public\x.ps1' | Remove-Item, is not a run); an unquoted .ps1 path
+  as a statement, or as the first argument without -Command, counts too.
+  These rules read the path literally and do not resolve it. A variable
+  that still shows the folder (%USERPROFILE%\Downloads\x.vbs) is matched,
+  but they do not catch a variable that hides the folder name
+  (%PUBLIC%\x.vbs), a short (8.3) name (\DOWNLO~1\), forward slashes
+  (C:/Users/Public/...) or a caret-split cmd path; a run from one of those
+  forms is not flagged.
 
   Where the shipped rules differ from the rule plan, on purpose:
     - EXEC-STAGING leaves out Temp folders (the plan's R13 lists them):
@@ -2858,7 +2899,20 @@ parsing is skipped, and the timeline CSV can be opened manually.
   recognized: "none recognized (nothing left out)" and its own note), and
   the model's Coverage.CollectorProcesses, Notes, Method and findings.csv
   "Collector" block (its summary counts the left-out rows and the processes
-  apart).
+  apart). The recorded set is checked against the collector's own tree: a
+  second Collector entry, chained Child entries outside the tree and an
+  unknown role leave nothing extra out and get the "check whether
+  collection_info.json was altered" note (OutsideTree); a Collector that is
+  not a PowerShell process or started after the collection is no anchor; a
+  Launcher that is not the collector's cmd.exe parent (explorer.exe) is
+  rejected with the processes it started; a Child of a recognized Child is
+  accepted; a process created before its recorded or closure parent is not
+  left out; with only the Collector recorded (the collector's own fallback)
+  or a launcher whose start time differs, the launcher's lead is marked
+  CollectorSuspect and other leads are not; and the reason the IDs are not
+  known (State: collection_info.json unreadable, missing, a CollectorProcesses
+  field with no usable entry -- [] or {} --, no field, a mounted image)
+  gives its own note.
 
   tests\Test-ReportRules.ps1 -- loads report\report-rules.json with the
   engine and checks it against tests\fixtures\report\rules\cases.csv: rows
@@ -2878,9 +2932,19 @@ parsing is skipped, and the timeline CSV can be opened manually.
   collector's own triage-collector.ps1 and Run-TriageCollector.bat), the
   near-misses that must not fire (an editor or viewer opening the file,
   Get-Content, -File under Documents/Temp, a script outside the folder, the
-  rundll32/regsvr32 handlers, a .txt, \MyDownloadsX\), and the
-  INITIAL-EMAIL-RUN / INITIAL-EMAIL-ATTACH exclusivity. -RulesPath and
-  -CasesPath check other files, -EnginePath another engine.
+  rundll32/regsvr32 handlers, a .txt, \MyDownloadsX\, a quoted .ps1 path
+  PowerShell only names, a ; inside an unmatched -File's arguments, a
+  variable that hides the folder), and the INITIAL-EMAIL-RUN /
+  INITIAL-EMAIL-ATTACH exclusivity for every script host (mshta with its
+  {GUID} suffix, cmd /c, rundll32, regsvr32, -Command "& '...'"). Then it
+  adds the crafted command lines of
+  tests\fixtures\report\rules\long-lines.json (about 32,000 characters each,
+  the Windows limit, built from a prefix and a repeated unit): no rule's
+  patterns may time out on them (a pattern that backtracks badly would cost
+  2 s per row, and a rule stopped 3 times reports nothing), every case row
+  must be flagged by the same rules as without them, and the run must take
+  under 30 s. -RulesPath, -CasesPath and -LongLinesPath check other files,
+  -EnginePath another engine.
 
   tests\Test-ReportRender.ps1 -- renders report.html from the synthetic
   models in tests\fixtures\report\render\ and from in-memory models and
@@ -2898,7 +2962,10 @@ parsing is skipped, and the timeline CSV can be opened manually.
   checks the collector key fact and the "The collector's own processes (not
   flagged)" subsection of Evidence coverage (the process table with each
   process's rows and plain process IDs, a mismatch note, and the text for a
-  collection whose recorded processes were not recognized), and that a
+  collection whose recorded processes were not recognized), the warning
+  paragraph, key fact and marked entries when collection_info.json lists
+  processes the collector would not have recorded (an entry without a dump
+  process reads without "the memory dump has"), and that a
   model without Coverage.CollectorProcesses renders neither. Then it
   prints PDFs with Edge (skipped
   without Edge) and checks
@@ -2927,12 +2994,16 @@ parsing is skipped, and the timeline CSV can be opened manually.
   the collector's process IDs -- the collector's 6 processes in the dump are
   not flagged and are listed (model, report.html with each process's rows
   and PIDs, findings.csv "Collector" block, Findings sheet and the
-  "Collector (not flagged)" Finding column),
+  "Collector (not flagged)" Finding column), the launcher's
+  Run-TriageCollector.bat command line among them,
   while an attacker wscript (invoice.vbs) and a same-name process with
   another PID (triage-collector.ps1) are flagged, the impostor on its own
-  row; the same after -ReportOnly; and a copy with CollectorProcesses
-  removed (an older collector) where the collector's own run is flagged
-  again and the older-collector note appears; -ReportOnly with -ReportRules
+  row; the same after -ReportOnly; a copy with CollectorProcesses
+  removed (an older collector) where the collector's own run and its .bat
+  are flagged again and the older-collector note appears; and a copy whose
+  collection_info.json also lists the attacker's process as a Child: it is
+  not left out, and the builder log, report-model.json and report.html say
+  to check whether collection_info.json was altered; -ReportOnly with -ReportRules
   and -NoExcel
   (the workbook is called stale; -WorkDir and -MemoryDumpPath are ignored
   with one warning), a missing rules file, -NoReport, -ReportOnly in a
@@ -2946,7 +3017,9 @@ parsing is skipped, and the timeline CSV can be opened manually.
   or an error thrown out of it, exits with 1, not 0. Before the
   runs it checks what the report takes from collection_info.json (the
   builder's Get-TimelineReportCollectionInfo): a mounted image's computer
-  name is the collector host, not the examined computer. It needs admin
+  name is the collector host, not the examined computer, and a truncated,
+  missing or readable collection_info.json is told apart (an empty
+  CollectorProcesses stays an empty field). It needs admin
   like the builder, or -BuilderPath with
   a copy without the admin check that has the report\ folder beside it.
   Like a user run, the builder installs ImportExcel from the PowerShell

@@ -1010,24 +1010,43 @@ namespace TimelineReport
         public List<int> RowNumbers = new List<int>();
     }
 
-    // A recorded process the dump has under the same id but with a different
-    // name or start time (or no readable time): a reused id, not left out
+    // A recorded process that was not left out: the dump has its id with a
+    // different name or start time (a reused id), or the entry did not pass
+    // the checks of the collector's own process tree (Reason says which)
     public sealed class CollectorMismatch
     {
         public CollectorRecord Record;
         public string DumpName;
         public long DumpTicks = -1;
         public string Reason;
+        // True when the collector would not have written this entry: a role
+        // it does not write, a second collector, a collector that is not a
+        // PowerShell process started before the collection, or a process
+        // outside the collector's own tree in the dump. collection_info.json
+        // may have been altered.
+        public bool OutsideTree;
     }
 
     public sealed class CollectorResult
     {
         public bool Recorded;
         public bool HasMemoryRows;
+        // The collector's own PowerShell process (the anchor) was matched
+        // and passed its checks: the collection is recognized
+        public bool Anchored;
         public bool[] Excluded;
         public List<CollectorProcess> Processes = new List<CollectorProcess>();
         public List<CollectorRecord> NotInDump = new List<CollectorRecord>();
         public List<CollectorMismatch> Mismatched = new List<CollectorMismatch>();
+        // Entries the collector would not have written (see OutsideTree)
+        public int OutsideTreeCount;
+        // In a recognized collection, processes that may be the collector's
+        // own but could not be identified exactly: the anchor's parent in the
+        // dump when it was not left out (a launcher that was not recorded,
+        // or not matched), and a recorded process that was not left out
+        // although the dump has it under the same id and name. Their
+        // memory-only leads are marked as possibly the collector.
+        public List<int> SuspectPids = new List<int>();
         public int RowCount;
     }
 
@@ -1097,10 +1116,84 @@ namespace TimelineReport
             return -1;
         }
 
+        // The roles the collector writes (Select-CollectorProcesses and the
+        // memory capture), in their spelling; null for any other
+        static readonly string[] KnownRoles = new string[] { "Collector", "Launcher", "Console", "Child", "MemoryCapture" };
+        static string KnownRole(string role)
+        {
+            if (role == null) return null;
+            foreach (string known in KnownRoles)
+            {
+                if (string.Equals(role, known, StringComparison.OrdinalIgnoreCase)) return known;
+            }
+            return null;
+        }
+
+        // Program names the collector's own processes have: its PowerShell
+        // (Windows PowerShell, PowerShell 7 or the ISE), the .bat's cmd
+        // window and that window's console host
+        static readonly string[] CollectorNames = new string[] { "powershell.exe", "pwsh.exe", "powershell_ise.exe" };
+        static bool IsOneOf(string name, string[] names)
+        {
+            foreach (string n in names)
+            {
+                if (string.Equals(name, n, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            return false;
+        }
+
+        static string RoleLabel(string role)
+        {
+            switch (role)
+            {
+                case "Collector": return "the collector";
+                case "Launcher": return "the launcher";
+                case "Console": return "the console";
+                case "MemoryCapture": return "the memory capture tool";
+                default: return "a child";
+            }
+        }
+
+        static string HowLabel(string role)
+        {
+            switch (role)
+            {
+                case "Collector": return "recorded by the collector: collector";
+                case "Launcher": return "recorded by the collector: launcher";
+                case "Console": return "recorded by the collector: console";
+                case "MemoryCapture": return "recorded by the collector: memory capture tool";
+                default: return "recorded by the collector: child";
+            }
+        }
+
+        static string PidText(int pid)
+        {
+            return pid.ToString(CultureInfo.InvariantCulture);
+        }
+
+        static void AddMismatch(CollectorResult result, CollectorRecord r, PslistRow row, string reason, bool outsideTree)
+        {
+            CollectorMismatch mm = new CollectorMismatch();
+            mm.Record = r;
+            mm.DumpName = row != null ? row.Name : "";
+            mm.DumpTicks = row != null ? row.CreateTicks : -1;
+            mm.Reason = reason;
+            mm.OutsideTree = outsideTree;
+            result.Mismatched.Add(mm);
+            if (outsideTree) result.OutsideTreeCount++;
+        }
+
+        static PslistRow FirstRow(Dictionary<int, List<PslistRow>> pslistByPid, int pid)
+        {
+            List<PslistRow> rows;
+            if (pslistByPid.TryGetValue(pid, out rows) && rows.Count > 0) return rows[0];
+            return null;
+        }
+
         public static CollectorResult Find(RowTable t, CollectorRecord[] recorded, long collectionStartTicks)
         {
             CollectorResult result = new CollectorResult();
-            result.Excluded = new bool[t.Count];
+            result.Excluded = new bool[t == null ? 0 : t.Count];
             if (t == null || t.Count == 0 || recorded == null || recorded.Length == 0) return result;
             result.Recorded = true;
 
@@ -1144,18 +1237,53 @@ namespace TimelineReport
             result.HasMemoryRows = pslist.Count > 0;
             if (pslist.Count == 0) return result;
 
-            // Match each recorded process to a pslist row by pid, name and
-            // start time; a reused id (same pid, other name or time) is a
-            // mismatch and nothing is left out for it
-            Dictionary<int, PslistRow> matchedRowByPid = new Dictionary<int, PslistRow>();
-            Dictionary<string, CollectorRecord> recordByRole = new Dictionary<string, CollectorRecord>(StringComparer.OrdinalIgnoreCase);
-            Dictionary<int, CollectorRecord> recordByPid = new Dictionary<int, CollectorRecord>();
-            List<CollectorRecord> matchedRecords = new List<CollectorRecord>();
+            // Only the roles the collector writes: an entry with any other
+            // role is reported and never left out
+            Dictionary<CollectorRecord, string> roleOf = new Dictionary<CollectorRecord, string>();
+            List<CollectorRecord> known = new List<CollectorRecord>();
+            int collectorEntries = 0;
             foreach (CollectorRecord r in recorded)
             {
                 if (r == null) continue;
-                if (!recordByRole.ContainsKey(r.Role == null ? "" : r.Role)) recordByRole[r.Role == null ? "" : r.Role] = r;
-                recordByPid[r.Pid] = r;
+                string role = KnownRole(r.Role);
+                if (role == null)
+                {
+                    AddMismatch(result, r, FirstRow(pslistByPid, r.Pid), "its role \"" + (r.Role ?? "") + "\" is not one the collector writes (Collector, Launcher, Console, Child, MemoryCapture)", true);
+                    continue;
+                }
+                roleOf[r] = role;
+                known.Add(r);
+                if (role == "Collector") collectorEntries++;
+            }
+
+            // The collector process is the anchor, and the collector records
+            // exactly one. Without it (none, or more than one), leave nothing
+            // out: a user-writable collection_info.json could otherwise name
+            // an attacker's process as the collector's
+            if (collectorEntries != 1)
+            {
+                string why = collectorEntries > 1
+                    ? "collection_info.json lists " + collectorEntries.ToString(CultureInfo.InvariantCulture) + " processes as the collector (the collector records exactly one), so its process tree could not be anchored"
+                    : "collection_info.json lists no process as the collector, so its process tree could not be anchored";
+                foreach (CollectorRecord r in known)
+                {
+                    AddMismatch(result, r, FirstRow(pslistByPid, r.Pid), why, collectorEntries == 0 || roleOf[r] == "Collector");
+                }
+                return result;
+            }
+
+            // Match each entry to a pslist row by pid, name and start time; a
+            // reused id (same pid, other name or time) is a mismatch and
+            // nothing is left out for it
+            Dictionary<CollectorRecord, PslistRow> rowOf = new Dictionary<CollectorRecord, PslistRow>();
+            List<CollectorRecord> matchedRecords = new List<CollectorRecord>();
+            // Pids the dump has under a recorded name but another start time:
+            // possibly the collector's own process (SuspectPids)
+            List<int> sameNamePids = new List<int>();
+            CollectorRecord collector = null;
+            foreach (CollectorRecord r in known)
+            {
+                if (roleOf[r] == "Collector") collector = r;
                 List<PslistRow> candidates;
                 if (!pslistByPid.TryGetValue(r.Pid, out candidates))
                 {
@@ -1163,176 +1291,247 @@ namespace TimelineReport
                     continue;
                 }
                 PslistRow hit = null;
-                PslistRow nameTimeClash = null;
+                bool sameName = false;
                 foreach (PslistRow p in candidates)
                 {
-                    if (NamesMatch(p.Name, r.Name) && TimeMatches(p.CreateTicks, r.StartTicks)) { hit = p; break; }
-                    if (nameTimeClash == null) nameTimeClash = p;
+                    if (NamesMatch(p.Name, r.Name))
+                    {
+                        sameName = true;
+                        if (TimeMatches(p.CreateTicks, r.StartTicks)) { hit = p; break; }
+                    }
                 }
                 if (hit != null)
                 {
-                    matchedRowByPid[r.Pid] = hit;
+                    rowOf[r] = hit;
                     matchedRecords.Add(r);
+                    continue;
                 }
-                else
-                {
-                    CollectorMismatch mm = new CollectorMismatch();
-                    mm.Record = r;
-                    mm.DumpName = nameTimeClash != null ? nameTimeClash.Name : "";
-                    mm.DumpTicks = nameTimeClash != null ? nameTimeClash.CreateTicks : -1;
-                    mm.Reason = "the memory dump has this process id with a different name or start time (a reused id)";
-                    result.Mismatched.Add(mm);
-                }
+                AddMismatch(result, r, candidates[0], "the memory dump has this process id with a different name or start time (a reused id)", false);
+                if (sameName && !sameNamePids.Contains(r.Pid)) sameNamePids.Add(r.Pid);
             }
 
-            // The collector process is the anchor. Without it, leave nothing
-            // out: a user-writable collection_info.json could otherwise name
-            // an attacker's process as the collector's
-            CollectorRecord collector = null;
-            if (recordByRole.ContainsKey("Collector") && matchedRowByPid.ContainsKey(recordByRole["Collector"].Pid)) collector = recordByRole["Collector"];
-            if (collector == null)
+            PslistRow collectorRow;
+            if (!rowOf.TryGetValue(collector, out collectorRow))
             {
                 // Nothing to anchor on: no exclusion, but report what was recorded
                 foreach (CollectorRecord r in matchedRecords)
                 {
-                    CollectorMismatch mm = new CollectorMismatch();
-                    mm.Record = r;
-                    PslistRow p = matchedRowByPid[r.Pid];
-                    mm.DumpName = p.Name;
-                    mm.DumpTicks = p.CreateTicks;
-                    mm.Reason = "the collector's own PowerShell process was not matched in the memory dump, so its process tree could not be anchored";
-                    result.Mismatched.Add(mm);
+                    AddMismatch(result, r, rowOf[r], "the collector's own PowerShell process was not matched in the memory dump, so its process tree could not be anchored", false);
                 }
                 return result;
             }
 
-            // Verify the recorded set against the dump's parent links, so a
-            // process injected into collection_info.json is not left out: the
-            // launcher is the collector's parent, a console is a child of the
-            // launcher, the capture tool is a child of the collector, and a
-            // child was started by the collector or the capture tool during
-            // the collection
+            // The anchor must be what the collector is (Select-CollectorProcesses
+            // in triage-collector.ps1): a PowerShell process that started no
+            // later than the collection
+            string anchorProblem = null;
+            if (!IsOneOf(collector.Name, CollectorNames)) anchorProblem = "the process recorded as the collector is not a PowerShell process (powershell.exe, pwsh.exe or powershell_ise.exe)";
+            else if (collectionStartTicks >= 0 && collectorRow.CreateTicks > collectionStartTicks) anchorProblem = "the process recorded as the collector started after the collection did";
+            if (anchorProblem != null)
+            {
+                foreach (CollectorRecord r in matchedRecords)
+                {
+                    if (r == collector) AddMismatch(result, r, collectorRow, anchorProblem + ", so its process tree could not be anchored", true);
+                    else AddMismatch(result, r, rowOf[r], "the process recorded as the collector was not accepted (" + anchorProblem + "), so its process tree could not be anchored", false);
+                }
+                return result;
+            }
+            result.Anchored = true;
+
+            // Verify the other entries against the dump's parent links, as the
+            // collector chose them: the launcher is the collector's parent, a
+            // cmd.exe started no later than it; a console is a conhost.exe the
+            // launcher started between the launcher and the collector; the
+            // capture tool was started by the collector during the collection;
+            // a child was started during the collection by a process already
+            // verified (repeated until nothing changes), never before it. An
+            // entry that fails is reported and not left out, so an entry added
+            // to collection_info.json cannot vouch for another.
             long startFloor = FloorToSecond(collectionStartTicks);
-            HashSet<int> excludedPids = new HashSet<int>();
+            bool startKnown = collectionStartTicks >= 0;
+            // Each left-out pid's own pslist row (its name and create time;
+            // a decoy that reused the id is not left out) and how it was
+            // recognized
+            Dictionary<int, PslistRow> canonical = new Dictionary<int, PslistRow>();
             Dictionary<int, string> roleByPid = new Dictionary<int, string>();
             Dictionary<int, string> howByPid = new Dictionary<int, string>();
-            // The name of the collector process behind each excluded pid, so a
-            // decoy process that reused the id (a different name on the same
-            // pid) is not left out
-            Dictionary<int, string> nameByPid = new Dictionary<int, string>();
-            int collectorPid = collector.Pid;
-            int launcherPid = -1;
-            if (recordByRole.ContainsKey("Launcher") && matchedRowByPid.ContainsKey(recordByRole["Launcher"].Pid)) launcherPid = recordByRole["Launcher"].Pid;
-            int collectorParent = matchedRowByPid[collectorPid].Ppid;
+            canonical[collector.Pid] = collectorRow;
+            roleByPid[collector.Pid] = "Collector";
+            howByPid[collector.Pid] = HowLabel("Collector");
+
+            PslistRow launcherRow = null;
+            List<CollectorRecord> pending = new List<CollectorRecord>();
             foreach (CollectorRecord r in matchedRecords)
             {
-                PslistRow p = matchedRowByPid[r.Pid];
-                string role = r.Role == null ? "" : r.Role;
-                bool ok;
-                if (string.Equals(role, "Collector", StringComparison.OrdinalIgnoreCase)) ok = true;
-                else if (string.Equals(role, "Launcher", StringComparison.OrdinalIgnoreCase)) ok = (collectorParent == r.Pid);
-                else if (string.Equals(role, "MemoryCapture", StringComparison.OrdinalIgnoreCase)) ok = (p.Ppid == collectorPid);
-                else if (string.Equals(role, "Console", StringComparison.OrdinalIgnoreCase)) ok = (p.Ppid == collectorPid || (launcherPid >= 0 && p.Ppid == launcherPid));
-                else ok = ((p.Ppid == collectorPid || (launcherPid >= 0 && p.Ppid == launcherPid) || (recordByPid.ContainsKey(p.Ppid) && matchedRowByPid.ContainsKey(p.Ppid))) &&
-                           (collectionStartTicks < 0 || (p.CreateTicks >= 0 && p.CreateTicks >= startFloor)));
-                if (ok)
+                if (r == collector) continue;
+                if (roleOf[r] != "Launcher") { pending.Add(r); continue; }
+                PslistRow p = rowOf[r];
+                if (launcherRow == null && p.Pid == collectorRow.Ppid && string.Equals(r.Name, "cmd.exe", StringComparison.OrdinalIgnoreCase) && p.CreateTicks <= collectorRow.CreateTicks)
                 {
-                    excludedPids.Add(r.Pid);
-                    roleByPid[r.Pid] = role.Length > 0 ? role : "Child";
-                    howByPid[r.Pid] = "recorded by the collector: " + (role.Length > 0 ? role.ToLowerInvariant() : "child");
-                    nameByPid[r.Pid] = p.Name;
+                    launcherRow = p;
+                    canonical[p.Pid] = p;
+                    roleByPid[p.Pid] = "Launcher";
+                    howByPid[p.Pid] = HowLabel("Launcher");
+                }
+                else if (launcherRow != null && p == launcherRow)
+                {
+                    // The same process recorded twice: already left out
                 }
                 else
                 {
-                    CollectorMismatch mm = new CollectorMismatch();
-                    mm.Record = r;
-                    mm.DumpName = p.Name;
-                    mm.DumpTicks = p.CreateTicks;
-                    mm.Reason = "this process is not in the collector's own process tree in the memory dump (its parent does not link to the collector)";
-                    result.Mismatched.Add(mm);
+                    AddMismatch(result, r, p, "it is not the collector's parent cmd.exe, started no later than the collector, in the memory dump", true);
                 }
             }
 
-            // Descendant closure: a process started by a collector process
-            // (or one already in the closure) during the collection is the
-            // collector's too
-            if (collectionStartTicks >= 0 && excludedPids.Count > 0)
+            bool changed = true;
+            while (changed && pending.Count > 0)
             {
-                bool changed = true;
-                while (changed)
+                changed = false;
+                for (int k = 0; k < pending.Count; k++)
                 {
-                    changed = false;
+                    CollectorRecord r = pending[k];
+                    PslistRow p = rowOf[r];
+                    PslistRow known2;
+                    if (canonical.TryGetValue(p.Pid, out known2) && known2 == p)
+                    {
+                        // The same process recorded twice: already left out
+                        pending.RemoveAt(k);
+                        k--;
+                        changed = true;
+                        continue;
+                    }
+                    if (canonical.ContainsKey(p.Pid)) continue;
+                    string role = roleOf[r];
+                    bool duringCollection = !startKnown || p.CreateTicks >= startFloor;
+                    bool ok;
+                    if (role == "Console")
+                    {
+                        ok = launcherRow != null && p.Ppid == launcherRow.Pid && string.Equals(r.Name, "conhost.exe", StringComparison.OrdinalIgnoreCase) &&
+                             p.CreateTicks >= launcherRow.CreateTicks && p.CreateTicks <= collectorRow.CreateTicks;
+                    }
+                    else if (role == "MemoryCapture")
+                    {
+                        ok = p.Ppid == collector.Pid && p.CreateTicks >= collectorRow.CreateTicks && duringCollection;
+                    }
+                    else
+                    {
+                        PslistRow parent;
+                        ok = p.Ppid != p.Pid && canonical.TryGetValue(p.Ppid, out parent) && p.CreateTicks >= parent.CreateTicks && duringCollection;
+                    }
+                    if (!ok) continue;
+                    canonical[p.Pid] = p;
+                    roleByPid[p.Pid] = role;
+                    howByPid[p.Pid] = HowLabel(role);
+                    pending.RemoveAt(k);
+                    k--;
+                    changed = true;
+                }
+            }
+            // The entries left are not in the collector's tree. A console
+            // whose recorded launcher was not recognized fails with it (not
+            // a sign of an edit); any other was not written by the collector
+            // as it is
+            HashSet<int> launcherPids = new HashSet<int>();
+            foreach (CollectorRecord r in known) { if (roleOf[r] == "Launcher") launcherPids.Add(r.Pid); }
+            foreach (CollectorRecord r in pending)
+            {
+                PslistRow p = rowOf[r];
+                string role = roleOf[r];
+                if (role == "Console" && launcherRow == null && launcherPids.Contains(p.Ppid))
+                {
+                    AddMismatch(result, r, p, "its parent, the launcher (PID " + PidText(p.Ppid) + "), was not recognized in the memory dump", false);
+                    if (!sameNamePids.Contains(p.Pid)) sameNamePids.Add(p.Pid);
+                }
+                else if (role == "Console")
+                {
+                    AddMismatch(result, r, p, "it is not a conhost.exe that the collector's launcher started before the collector, in the memory dump", true);
+                }
+                else if (role == "MemoryCapture")
+                {
+                    AddMismatch(result, r, p, "it is not a process the collector started during the collection, in the memory dump", true);
+                }
+                else
+                {
+                    AddMismatch(result, r, p, "its parent in the memory dump (PID " + PidText(p.Ppid) + ") is not one of the collector's processes, or it started before its parent or before the collection (it is not in the collector's own process tree)", true);
+                }
+            }
+
+            // Descendant closure: a process started by a left-out process
+            // during the collection is the collector's too. A child cannot be
+            // created before its parent: one that was is not (its parent's id
+            // was reused by a collector process), whatever the parent's role.
+            if (startKnown)
+            {
+                bool grew = true;
+                while (grew)
+                {
+                    grew = false;
                     foreach (PslistRow p in pslist)
                     {
-                        if (excludedPids.Contains(p.Pid)) continue;
+                        if (canonical.ContainsKey(p.Pid)) continue;
                         if (p.CreateTicks < 0 || p.CreateTicks < startFloor) continue;
-                        if (p.Ppid < 0 || !excludedPids.Contains(p.Ppid)) continue;
+                        if (p.Ppid < 0 || p.Ppid == p.Pid) continue;
                         PslistRow parent;
-                        if (matchedRowByPid.TryGetValue(p.Ppid, out parent) && parent.CreateTicks >= 0 && p.CreateTicks < parent.CreateTicks) continue;
-                        excludedPids.Add(p.Pid);
+                        if (!canonical.TryGetValue(p.Ppid, out parent)) continue;
+                        if (parent.CreateTicks < 0 || p.CreateTicks < parent.CreateTicks) continue;
+                        canonical[p.Pid] = p;
                         roleByPid[p.Pid] = "Child";
-                        howByPid[p.Pid] = "started by PID " + p.Ppid.ToString(CultureInfo.InvariantCulture) + " during the collection";
-                        nameByPid[p.Pid] = p.Name;
-                        changed = true;
+                        howByPid[p.Pid] = "started by PID " + PidText(p.Ppid) + " during the collection";
+                        grew = true;
                     }
                 }
             }
 
-            if (excludedPids.Count == 0) return result;
+            // In a recognized collection, a process that may be the
+            // collector's own but could not be identified exactly: the
+            // anchor's parent when it was not left out, and a recorded
+            // process with the recorded name that was not left out
+            if (collectorRow.Ppid > 0 && !canonical.ContainsKey(collectorRow.Ppid)) result.SuspectPids.Add(collectorRow.Ppid);
+            foreach (int pid in sameNamePids)
+            {
+                if (!canonical.ContainsKey(pid) && !result.SuspectPids.Contains(pid)) result.SuspectPids.Add(pid);
+            }
 
-            // Rows left out: the Memory-Processes rows of each excluded pid,
-            // and a Memory-CommandLine row whose pid is one excluded process
-            // (name matches, and the pid is on exactly one pslist row). Never
-            // the Memory-Network or Memory-Services rows: no rule reads them,
-            // and netscan can show a stale socket of an earlier process that
+            // Rows left out: the Memory-Processes row of each left-out process
+            // (its own row, not a decoy's under the same id), and a
+            // Memory-CommandLine row whose pid is one left-out process (name
+            // matches, and the pid is on exactly one pslist row). Never the
+            // Memory-Network or Memory-Services rows: no rule reads them, and
+            // netscan can show a stale socket of an earlier process that
             // reused the id.
             Dictionary<int, CollectorProcess> procByPid = new Dictionary<int, CollectorProcess>();
             foreach (PslistRow p in pslist)
             {
-                if (!excludedPids.Contains(p.Pid)) continue;
-                // Only the collector's process, not a decoy that reused its id
-                string canonical;
-                if (nameByPid.TryGetValue(p.Pid, out canonical) && !NamesMatch(p.Name, canonical)) continue;
+                PslistRow canon;
+                if (!canonical.TryGetValue(p.Pid, out canon) || canon != p) continue;
                 result.Excluded[p.Index] = true;
-                CollectorProcess proc;
-                if (!procByPid.TryGetValue(p.Pid, out proc))
-                {
-                    proc = new CollectorProcess();
-                    proc.Pid = p.Pid;
-                    proc.ParentPid = p.Ppid;
-                    proc.Name = p.Name;
-                    proc.CreateTicks = p.CreateTicks;
-                    proc.Role = roleByPid.ContainsKey(p.Pid) ? roleByPid[p.Pid] : "Child";
-                    proc.How = howByPid.ContainsKey(p.Pid) ? howByPid[p.Pid] : "";
-                    proc.CommandLine = "";
-                    procByPid[p.Pid] = proc;
-                    result.Processes.Add(proc);
-                }
-                else if (proc.CreateTicks < 0 && p.CreateTicks >= 0)
-                {
-                    proc.CreateTicks = p.CreateTicks;
-                    proc.ParentPid = p.Ppid;
-                }
+                CollectorProcess proc = new CollectorProcess();
+                proc.Pid = p.Pid;
+                proc.ParentPid = p.Ppid;
+                proc.Name = p.Name;
+                proc.CreateTicks = p.CreateTicks;
+                proc.Role = roleByPid.ContainsKey(p.Pid) ? roleByPid[p.Pid] : "Child";
+                proc.How = howByPid.ContainsKey(p.Pid) ? howByPid[p.Pid] : "";
+                proc.CommandLine = "";
                 proc.RowNumbers.Add(p.Index + 2);
+                procByPid[p.Pid] = proc;
+                result.Processes.Add(proc);
             }
             foreach (CmdRow c in cmdlines)
             {
-                if (!excludedPids.Contains(c.Pid)) continue;
+                CollectorProcess proc;
+                if (!procByPid.TryGetValue(c.Pid, out proc)) continue;
                 List<PslistRow> byPid;
                 if (!pslistByPid.TryGetValue(c.Pid, out byPid) || byPid.Count != 1) continue;
                 if (!NamesMatch(byPid[0].Name, c.Name)) continue;
                 result.Excluded[c.Index] = true;
-                CollectorProcess proc;
-                if (procByPid.TryGetValue(c.Pid, out proc))
+                if (string.IsNullOrEmpty(proc.CommandLine) && !string.IsNullOrEmpty(c.Args))
                 {
-                    if (string.IsNullOrEmpty(proc.CommandLine) && !string.IsNullOrEmpty(c.Args))
-                    {
-                        string args = c.Args;
-                        if (args.Length > 500) args = args.Substring(0, 500);
-                        proc.CommandLine = args;
-                    }
-                    proc.RowNumbers.Add(c.Index + 2);
+                    string args = c.Args;
+                    if (args.Length > 500) args = args.Substring(0, 500);
+                    proc.CommandLine = args;
                 }
+                proc.RowNumbers.Add(c.Index + 2);
             }
             int rowCount = 0;
             for (int i = 0; i < result.Excluded.Length; i++) { if (result.Excluded[i]) rowCount++; }
@@ -1352,6 +1551,14 @@ namespace TimelineReport
         // command-line rows.
         public static bool[] SuspectRows(RowTable t, long collectionStartTicks)
         {
+            return SuspectRows(t, collectionStartTicks, null);
+        }
+
+        // The same, for the given pids only (a recognized collection's
+        // CollectorResult.SuspectPids); null for every pid
+        public static bool[] SuspectRows(RowTable t, long collectionStartTicks, int[] onlyPids)
+        {
+            HashSet<int> only = onlyPids == null ? null : new HashSet<int>(onlyPids);
             bool[] suspect = new bool[t == null ? 0 : t.Count];
             if (t == null || t.Count == 0 || collectionStartTicks < 0) return suspect;
             int processSource = Array.IndexOf(t.Sources, "Memory-Processes");
@@ -1380,6 +1587,7 @@ namespace TimelineReport
                 Match m = CommandLineRow.Match(t.Description[i]);
                 if (!m.Success) continue;
                 int pid = ParseInt(m.Groups["pid"].Value);
+                if (only != null && !only.Contains(pid)) continue;
                 long create;
                 if (createByPid.TryGetValue(pid, out create) && create >= threshold) suspect[i] = true;
             }
@@ -2482,12 +2690,20 @@ Recognizes the collector's own processes in the memory dump by the process
 ids recorded in collection_info.json (CollectorProcesses), so the rules leave
 them and the processes they started during the collection unflagged.
 .DESCRIPTION
--CollectionInfo is the collection info (its CollectorProcesses array and
-Mode). Applied only for a Live collection with recorded processes and a
-timeline that has memory rows; otherwise it returns a result that excludes
-nothing (older collections behave as before). Returns Recorded, Count,
-RowCount, Summary, Processes, Rows (the left-out rows as report row objects),
-NotInDump, Mismatched, Excluded (a bool[] over the rows) and HasMemoryRows.
+-CollectionInfo is the collection info (its CollectorProcesses array, Mode,
+and the builder's CollectionInfoState: "Read", "Missing" or "Unreadable").
+Applied only for a Live collection with recorded processes and a timeline
+that has memory rows; otherwise it returns a result that excludes nothing
+(older collections behave as before). Returns State, Recorded, Anchored,
+Count, RowCount, Summary, Processes, Rows (the left-out rows as report row
+objects), NotInDump, Mismatched (each with OutsideTree), OutsideTree (how
+many entries the collector would not have written), SuspectPids, Excluded (a
+bool[] over the rows) and HasMemoryRows.
+State says why nothing may have been recognized: "NotApplicable" (not a
+live collection), "Missing" (no collection_info.json), "Unreadable" (it
+could not be read), "NotRecorded" (no CollectorProcesses field: an older
+collector), "NoUsableEntries" (the field has no entry with a process id) or
+"Recorded".
 #>
 function Find-ReportCollectorRows {
     [CmdletBinding()]
@@ -2496,15 +2712,12 @@ function Find-ReportCollectorRows {
         $CollectionInfo
     )
     $table = Get-ReportEngineRowTable -Rows $Rows
-    $empty = [PSCustomObject]@{
-        Recorded = $false; Count = 0; RowCount = 0; Summary = ""; HasMemoryRows = $false
-        Processes = [object[]]@(); Rows = [object[]]@(); NotInDump = [object[]]@(); Mismatched = [object[]]@()
-        Excluded = [bool[]]@()
-    }
     $mode = [string](Get-ReportEngineInfoValue $CollectionInfo @("Mode"))
+    $infoState = [string](Get-ReportEngineInfoValue $CollectionInfo @("CollectionInfoState"))
     # Read CollectorProcesses directly: Get-ReportEngineInfoValue is for scalar
     # values and mishandles an array (a one-element array in particular)
     $recordsValue = $null
+    $recordsPresent = $false
     if ($null -ne $CollectionInfo) {
         if ($CollectionInfo -is [System.Collections.IDictionary]) {
             if ($CollectionInfo.Contains("CollectorProcesses")) { $recordsValue = $CollectionInfo["CollectorProcesses"] }
@@ -2513,24 +2726,37 @@ function Find-ReportCollectorRows {
             $property = $CollectionInfo.PSObject.Properties["CollectorProcesses"]
             if ($property) { $recordsValue = $property.Value }
         }
+        $recordsPresent = ($null -ne $recordsValue)
     }
-    # Live only, and only when the collection recorded its own process ids
-    if (($mode -and $mode -ne "Live") -or $null -eq $recordsValue) { return $empty }
+    $state = "Recorded"
+    if ($mode -and $mode -ne "Live") { $state = "NotApplicable" }
+    elseif ($infoState -eq "Unreadable") { $state = "Unreadable" }
+    elseif ($null -eq $CollectionInfo -or $infoState -eq "Missing") { $state = "Missing" }
+    elseif (-not $recordsPresent) { $state = "NotRecorded" }
     $records = New-Object System.Collections.Generic.List[TimelineReport.CollectorRecord]
-    foreach ($item in @($recordsValue)) {
-        if ($null -eq $item) { continue }
-        $recordPid = ConvertTo-ReportEngineInt (Get-ReportEngineInfoValue $item @("Pid"))
-        if ($null -eq $recordPid) { continue }
-        $record = New-Object TimelineReport.CollectorRecord
-        $record.Pid = [int]$recordPid
-        $record.Name = [string](Get-ReportEngineInfoValue $item @("Name"))
-        $record.Role = [string](Get-ReportEngineInfoValue $item @("Role"))
-        $record.StartTicks = ConvertTo-ReportEngineUtcTicks (Get-ReportEngineInfoValue $item @("StartUtc"))
-        $parent = ConvertTo-ReportEngineInt (Get-ReportEngineInfoValue $item @("ParentPid"))
-        $record.ParentPid = if ($null -ne $parent) { [int]$parent } else { -1 }
-        $records.Add($record)
+    if ($state -eq "Recorded") {
+        foreach ($item in @($recordsValue)) {
+            if ($null -eq $item) { continue }
+            $recordPid = ConvertTo-ReportEngineInt (Get-ReportEngineInfoValue $item @("Pid"))
+            if ($null -eq $recordPid) { continue }
+            $record = New-Object TimelineReport.CollectorRecord
+            $record.Pid = [int]$recordPid
+            $record.Name = [string](Get-ReportEngineInfoValue $item @("Name"))
+            $record.Role = [string](Get-ReportEngineInfoValue $item @("Role"))
+            $record.StartTicks = ConvertTo-ReportEngineUtcTicks (Get-ReportEngineInfoValue $item @("StartUtc"))
+            $parent = ConvertTo-ReportEngineInt (Get-ReportEngineInfoValue $item @("ParentPid"))
+            $record.ParentPid = if ($null -ne $parent) { [int]$parent } else { -1 }
+            $records.Add($record)
+        }
+        if ($records.Count -eq 0) { $state = "NoUsableEntries" }
     }
-    if ($records.Count -eq 0) { return $empty }
+    if ($state -ne "Recorded") {
+        return [PSCustomObject]@{
+            State = $state; Recorded = $false; Anchored = $false; Count = 0; RowCount = 0; Summary = ""; HasMemoryRows = $false
+            Processes = [object[]]@(); Rows = [object[]]@(); NotInDump = [object[]]@(); Mismatched = [object[]]@()
+            OutsideTree = 0; SuspectPids = [int[]]@(); Excluded = [bool[]]@()
+        }
+    }
     $start = Get-ReportEngineCollectionStart $CollectionInfo
     $startTicks = if ($start) { $start.Ticks } else { [long]-1 }
     $result = [TimelineReport.CollectorRows]::Find($table, $records.ToArray(), $startTicks)
@@ -2560,18 +2786,21 @@ function Find-ReportCollectorRows {
             RecordedStartUtc = ConvertFrom-ReportEngineTicks $m.Record.StartTicks
             DumpName = $m.DumpName; DumpCreateTimeUtc = ConvertFrom-ReportEngineTicks $m.DumpTicks
             Reason = $m.Reason
+            OutsideTree = [bool]$m.OutsideTree
         }
     })
     $count = @($processes).Count
     $summary = ""
     if ($result.Recorded -and $result.HasMemoryRows) {
         # None recognized: the collector's own PowerShell process (the anchor)
-        # was not matched in the dump, so nothing is left out
+        # was not matched or not accepted, so nothing is left out
         if ($count -gt 0) { $summary = "Collector's own processes in the memory dump: $count (not flagged)" }
         else { $summary = "Collector's own processes in the memory dump: none recognized (nothing left out)" }
     }
     return [PSCustomObject]@{
+        State         = $state
         Recorded      = [bool]$result.Recorded
+        Anchored      = [bool]$result.Anchored
         HasMemoryRows = [bool]$result.HasMemoryRows
         Count         = $count
         RowCount      = $result.RowCount
@@ -2580,6 +2809,8 @@ function Find-ReportCollectorRows {
         Rows          = [object[]]$leftOutRows.ToArray()
         NotInDump     = [object[]]$notInDump
         Mismatched    = [object[]]$mismatched
+        OutsideTree   = [int]$result.OutsideTreeCount
+        SuspectPids   = [int[]]@($result.SuspectPids)
         Excluded      = [bool[]]$result.Excluded
     }
 }
@@ -2626,18 +2857,27 @@ function Invoke-ReportRules {
     # IDs were not recorded (an older collector) or could not be recognized,
     # a lead seen only in the memory dump during the collection may be the
     # collector itself: it is flagged on its card (CollectorSuspect). A
-    # collection that did record and recognize them does not need this: those
-    # processes are left out, and a same-name impostor is positively a lead.
+    # collection that did record and recognize them needs this only for the
+    # processes it could not identify exactly (SuspectPids): the others are
+    # left out, and a same-name impostor is positively a lead.
     $mode = [string](Get-ReportEngineInfoValue $CollectionInfo @("Mode"))
     $live = (-not $mode -or $mode -eq "Live")
     # Recognized: recorded, and the collector's own PowerShell process (the
     # anchor) matched in the dump, so at least one process was left out
     $collectorRecognized = ($null -ne $CollectorRows -and [bool]$CollectorRows.Recorded -and [bool]$CollectorRows.HasMemoryRows -and [int]$CollectorRows.Count -gt 0)
     # Command-line rows of a process that started around the collection start:
-    # only computed when the collector's IDs were not recorded/recognized
+    # every such process when the collector's IDs were not recorded or not
+    # recognized; in a recognized collection only the processes that may be
+    # the collector's but could not be identified exactly (SuspectPids: the
+    # collector's parent when it was not left out, for example a launcher
+    # that was not recorded because the process list could not be read)
     $suspectRows = $null
     if ($live -and -not $collectorRecognized) {
         $sr = [TimelineReport.CollectorRows]::SuspectRows($table, $startTicks)
+        if (@($sr | Where-Object { $_ }).Count -gt 0) { $suspectRows = $sr }
+    }
+    elseif ($live -and $CollectorRows.PSObject.Properties["SuspectPids"] -and @($CollectorRows.SuspectPids).Count -gt 0) {
+        $sr = [TimelineReport.CollectorRows]::SuspectRows($table, $startTicks, [int[]]@($CollectorRows.SuspectPids))
         if (@($sr | Where-Object { $_ }).Count -gt 0) { $suspectRows = $sr }
     }
 
@@ -3294,10 +3534,26 @@ function New-ReportModel {
         $notes.Add("$($CollectorRows.Summary). These rows stay in the timeline and in coverage counts; they are listed under ""The collector's own processes (not flagged)"" in Evidence coverage.")
     }
     elseif ($collectorRecorded -and $CollectorRows.Summary) {
-        $notes.Add("The collector recorded its own process IDs in collection_info.json, but its PowerShell process was not matched in the memory dump, so nothing was left out: its processes are checked by the rules like any other, and a lead seen only in the memory dump during the collection is marked on its card as possibly the collector (see ""The collector's own processes (not flagged)"" in Evidence coverage).")
+        $notes.Add("The collector recorded its own process IDs in collection_info.json, but its PowerShell process could not be recognized in the memory dump, so nothing was left out: its processes are checked by the rules like any other, and a lead seen only in the memory dump during the collection is marked on its card as possibly the collector (see ""The collector's own processes (not flagged)"" in Evidence coverage).")
     }
     elseif ($live -and $memoryRowsPresent -and ($null -eq $CollectorRows -or -not [bool]$CollectorRows.Recorded)) {
-        $notes.Add("This collection does not record the collector's own process IDs (made by an older triage collector): its own processes in the memory dump are checked by the rules like any other and can show up as leads.")
+        # Why the collector's own process IDs are not known (State from
+        # Find-ReportCollectorRows; a result without State is an older one)
+        $collectorState = if ($null -ne $CollectorRows -and $CollectorRows.PSObject.Properties["State"]) { [string]$CollectorRows.State } else { "NotRecorded" }
+        $unknownTail = "its own processes in the memory dump are checked by the rules like any other and can show up as leads."
+        switch ($collectorState) {
+            "Unreadable" { $notes.Add("collection_info.json could not be read, so the collector's own process IDs are not known: $unknownTail") }
+            "Missing" { $notes.Add("collection_info.json was not available, so the collector's own process IDs are not known: $unknownTail") }
+            "NoUsableEntries" { $notes.Add("collection_info.json has a CollectorProcesses field but no usable entry in it (none with a process ID), so nothing was left out: the collector's $unknownTail") }
+            default { $notes.Add("This collection does not record the collector's own process IDs (made by an older triage collector): $unknownTail") }
+        }
+    }
+    # Entries the collector would not have written: never left out, and a
+    # sign that the file was changed after the collection
+    $outsideTree = 0
+    if ($collectorRecorded -and $CollectorRows.PSObject.Properties["OutsideTree"]) { $outsideTree = [int]$CollectorRows.OutsideTree }
+    if ($outsideTree -gt 0) {
+        $notes.Add("collection_info.json lists $outsideTree process(es) the collector would not have recorded that way (a role it does not write, a second collector, a collector that is not a PowerShell process started before the collection, or a process outside the collector's own process tree in the memory dump). They were not left out (see ""The collector's own processes (not flagged)"" in Evidence coverage). Check whether collection_info.json was altered after the collection.")
     }
 
     # --- Caveats: what this report can't tell you ---
@@ -3315,7 +3571,10 @@ function New-ReportModel {
         "Analysis tools run on the collected computer leave their own traces in later collections."
     ) | ForEach-Object { $caveats.Add($_) }
     if ($null -eq $CollectionInfo -or -not $collectionStart) {
-        $caveats.Add("The collection's metadata (collection_info.json) was not available: the collection time is unknown.")
+        if ([string](Get-ReportEngineInfoValue $CollectionInfo @("CollectionInfoState")) -eq "Unreadable") {
+            $caveats.Add("The collection's metadata (collection_info.json) could not be read: the collection time is unknown.")
+        }
+        else { $caveats.Add("The collection's metadata (collection_info.json) was not available: the collection time is unknown.") }
     }
     if (-not $zoneId) {
         $caveats.Add("The computer's time zone is unknown: times that Windows records in local time were converted with an assumed time zone.")
@@ -3388,13 +3647,15 @@ function New-ReportModel {
     # The collector's own processes in the memory dump (no Excluded array:
     # the report shows the rows, not the mask)
     $collectorCoverage = [PSCustomObject]@{
-        Recorded   = $collectorRecorded
-        Count      = $(if ($null -ne $CollectorRows) { [int]$CollectorRows.Count } else { 0 })
-        RowCount   = $(if ($null -ne $CollectorRows) { [int]$CollectorRows.RowCount } else { 0 })
-        Summary    = $(if ($collectorRecorded) { [string]$CollectorRows.Summary } else { "" })
-        Processes  = [object[]]@(if ($null -ne $CollectorRows) { $CollectorRows.Processes } else { @() })
-        NotInDump  = [object[]]@(if ($null -ne $CollectorRows) { $CollectorRows.NotInDump } else { @() })
-        Mismatched = [object[]]@(if ($null -ne $CollectorRows) { $CollectorRows.Mismatched } else { @() })
+        Recorded    = $collectorRecorded
+        State       = $(if ($null -ne $CollectorRows -and $CollectorRows.PSObject.Properties["State"]) { [string]$CollectorRows.State } else { "" })
+        Count       = $(if ($null -ne $CollectorRows) { [int]$CollectorRows.Count } else { 0 })
+        RowCount    = $(if ($null -ne $CollectorRows) { [int]$CollectorRows.RowCount } else { 0 })
+        Summary     = $(if ($collectorRecorded) { [string]$CollectorRows.Summary } else { "" })
+        OutsideTree = $outsideTree
+        Processes   = [object[]]@(if ($null -ne $CollectorRows) { $CollectorRows.Processes } else { @() })
+        NotInDump   = [object[]]@(if ($null -ne $CollectorRows) { $CollectorRows.NotInDump } else { @() })
+        Mismatched  = [object[]]@(if ($null -ne $CollectorRows) { $CollectorRows.Mismatched } else { @() })
     }
 
     return [PSCustomObject]@{

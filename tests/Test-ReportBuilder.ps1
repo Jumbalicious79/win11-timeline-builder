@@ -229,7 +229,7 @@ function Test-MemoryOnlyLead {
 
 # Checks the collector-fixture run (section 2c): the collector's 6 processes
 # are not flagged and are listed (model, report.html, findings.csv, workbook),
-# while the attacker wscript (invoice.vbs) and the same-name impostor
+# while the attacker script (invoice.vbs) and the same-name impostor
 # (triage-collector.ps1, another PID) are flagged, the impostor on its own row.
 function Test-CollectorFixture {
     param([string]$Folder, [string]$Label)
@@ -244,7 +244,10 @@ function Test-CollectorFixture {
     Write-TestResult -Succeeded ($overlap.Count -eq 0) -Message "${Label}: no finding holds a collector row ($($overlap.Count) overlap(s))"
     $exec = @($model.Findings | Where-Object { $_.RuleId -eq "EXEC-STAGING" })
     $keys = @($exec | ForEach-Object { $_.GroupKey } | Sort-Object)
-    Write-TestResult -Succeeded (($keys -contains "invoice.vbs") -and ($keys -contains "triage-collector.ps1")) -Message "${Label}: the attacker wscript (invoice.vbs) and the same-name impostor (triage-collector.ps1) are flagged ($($keys -join ', '))"
+    Write-TestResult -Succeeded (($keys -contains "invoice.vbs") -and ($keys -contains "triage-collector.ps1")) -Message "${Label}: the attacker script (invoice.vbs) and the same-name impostor (triage-collector.ps1) are flagged ($($keys -join ', '))"
+    $launcherRow = (@(for ($i = 0; $i -lt $rows.Count; $i++) { if ($rows[$i].Source -eq "Memory-CommandLine" -and $rows[$i].Description -eq "Process command line: cmd.exe (PID: 8840)") { $i + 2 } }))[0]
+    Write-TestResult -Succeeded ($launcherRow -and -not ($keys -contains "Run-TriageCollector.bat") -and ($colRowNums -contains [int]$launcherRow) -and [int]$cp.OutsideTree -eq 0 -and
+        @($model.Coverage.Notes | Where-Object { $_ -match "was altered" }).Count -eq 0) -Message "${Label}: the launcher's Run-TriageCollector.bat command line (row $launcherRow) is left out with the collector, not an EXEC-STAGING lead; no altered note"
     $impRow = (@(for ($i = 0; $i -lt $rows.Count; $i++) { if ($rows[$i].Source -eq "Memory-CommandLine" -and $rows[$i].Description -eq "Process command line: powershell.exe (PID: 7000)") { $i + 2 } }))[0]
     $colCmdRow = (@(for ($i = 0; $i -lt $rows.Count; $i++) { if ($rows[$i].Source -eq "Memory-CommandLine" -and $rows[$i].Description -eq "Process command line: powershell.exe (PID: 9120)") { $i + 2 } }))[0]
     $triage = @($exec | Where-Object { $_.GroupKey -eq "triage-collector.ps1" })
@@ -300,6 +303,17 @@ try {
     Write-TestResult -Succeeded ($hiveInfo.ComputerName -eq "IMAGED-PC" -and $hiveInfo.ComputerNameSource -eq "SYSTEM hive" -and $hiveInfo.CollectorHost -eq "ANALYST-WS") -Message "mounted image: the examined computer's name from the SYSTEM hive ('$($hiveInfo.ComputerName)')"
     $liveInfo = Get-TimelineReportCollectionInfo -InfoJsonPath (Join-Path $collection "collection_info.json") -ExaminedComputerName "HIVE-NAME"
     Write-TestResult -Succeeded ($liveInfo.ComputerName -eq "REPORT-FIXTURE" -and $liveInfo.ComputerNameSource -eq "collection_info.json" -and $liveInfo.CollectorHost -eq "" -and $liveInfo.ExaminedComputerName -eq "HIVE-NAME") -Message "live collection: the computer from collection_info.json ('$($liveInfo.ComputerName)')"
+    # Whether collection_info.json was read, is missing or could not be read
+    # (the report then says why the collector's own process IDs are unknown)
+    $badJson = Join-Path $infoDir "truncated.json"
+    [System.IO.File]::WriteAllText($badJson, '{ "SchemaVersion": 1, "Mode": "Live", "CollectorProcesses": [ { "Role": "Collec')
+    $emptyJson = Join-Path $infoDir "empty-processes.json"
+    [System.IO.File]::WriteAllText($emptyJson, '{ "SchemaVersion": 1, "Mode": "Live", "CollectionStartUtc": "2026-03-02T12:00:00Z", "CollectorProcesses": [] }')
+    $badInfo = Get-TimelineReportCollectionInfo -InfoJsonPath $badJson
+    $missingInfo = Get-TimelineReportCollectionInfo -InfoJsonPath (Join-Path $infoDir "no-such-file.json")
+    $emptyInfo = Get-TimelineReportCollectionInfo -InfoJsonPath $emptyJson
+    Write-TestResult -Succeeded ($liveInfo.CollectionInfoState -eq "Read" -and $badInfo.CollectionInfoState -eq "Unreadable" -and $missingInfo.CollectionInfoState -eq "Missing" -and
+        $emptyInfo.CollectionInfoState -eq "Read" -and $null -ne $emptyInfo.CollectorProcesses -and @($emptyInfo.CollectorProcesses).Count -eq 0) -Message "collection_info.json read ($($liveInfo.CollectionInfoState)), truncated ($($badInfo.CollectionInfoState)), missing ($($missingInfo.CollectionInfoState)); an empty CollectorProcesses stays an empty field, not an absent one"
 
     # --- 1. A full builder run writes the report next to the timeline ---
     $runDir = Join-Path $workDir "run"
@@ -553,7 +567,35 @@ try {
         $oldExec = @($oldModel.Findings | Where-Object { $_.RuleId -eq "EXEC-STAGING" -and $_.GroupKey -eq "triage-collector.ps1" })
         $comesBack = ($oldExec.Count -eq 1 -and (@($oldExec[0].RowNumbers) -contains $colCmdRow))
         $olderNote = $oldModel -and @($oldModel.Coverage.Notes | Where-Object { $_ -match "does not record the collector's own process IDs" }).Count -eq 1
-        Write-TestResult -Succeeded ($oldRun.ExitCode -eq 0 -and $oldModel -and -not $oldModel.Coverage.CollectorProcesses.Recorded -and $comesBack -and $olderNote) -Message "collector: with CollectorProcesses removed, the collector's own run (PID 9120) is flagged again and the older-collector note appears (exit $($oldRun.ExitCode))"
+        $batBack = @($oldModel.Findings | Where-Object { $_.RuleId -eq "EXEC-STAGING" -and $_.GroupKey -eq "Run-TriageCollector.bat" }).Count -eq 1
+        Write-TestResult -Succeeded ($oldRun.ExitCode -eq 0 -and $oldModel -and -not $oldModel.Coverage.CollectorProcesses.Recorded -and $comesBack -and $batBack -and $olderNote) -Message "collector: with CollectorProcesses removed, the collector's own run (PID 9120) and its launcher .bat are flagged again and the older-collector note appears (exit $($oldRun.ExitCode))"
+
+        # A copy whose collection_info.json also lists the attacker's script
+        # host (the pslist row of PID 6000, whose parent is not the
+        # collector's) as a Child: the entry is rejected, the attacker's lead
+        # stays, and the builder log and the report say to check whether the
+        # file was altered
+        $editDir = Join-Path $workDir "collector-edited"
+        New-Item -ItemType Directory -Path $editDir | Out-Null
+        Copy-Item -LiteralPath (Join-Path $colRunDir "timeline.csv") -Destination (Join-Path $editDir "timeline.csv")
+        Copy-Item -LiteralPath (Join-Path $collectorFix "collection\collection_log.txt") -Destination (Join-Path $editDir "collection_log.txt")
+        # (Windows PowerShell's ConvertFrom-Json sends the array as one object:
+        # keep it in a variable, then enumerate it)
+        $pslistEntries = @(Get-Content -LiteralPath (Join-Path $collectorFix "vol\windows.pslist.json") -Raw | ConvertFrom-Json)
+        $attacker = @($pslistEntries | ForEach-Object { $_ } | Where-Object { [int]$_.PID -eq 6000 })[0]
+        $editJson = Get-Content -LiteralPath (Join-Path $collectorFix "collection\collection_info.json") -Raw | ConvertFrom-Json
+        $editJson.CollectorProcesses = @($editJson.CollectorProcesses) + @([PSCustomObject]@{ Role = "Child"; Pid = 6000; Name = [string]$attacker.ImageFileName; StartUtc = "2026-03-02T12:01:00.1000000Z"; ParentPid = 9120 })
+        [System.IO.File]::WriteAllText((Join-Path $editDir "collection_info.json"), ($editJson | ConvertTo-Json -Depth 6))
+        $editRun = Invoke-TimelineBuilder -Arguments @("-ReportOnly", $editDir, "-NoExcel", "-Viewer", "None")
+        $editModel = $null
+        if (Test-Path -LiteralPath (Join-Path $editDir "report-model.json")) { $editModel = Get-Content -LiteralPath (Join-Path $editDir "report-model.json") -Raw | ConvertFrom-Json }
+        $editHtml = ""
+        if (Test-Path -LiteralPath (Join-Path $editDir "report.html")) { $editHtml = [System.IO.File]::ReadAllText((Join-Path $editDir "report.html")) }
+        $editLead = $editModel -and @($editModel.Findings | Where-Object { $_.RuleId -eq "EXEC-STAGING" -and $_.GroupKey -eq "invoice.vbs" }).Count -eq 1
+        $editNote = $editModel -and [int]$editModel.Coverage.CollectorProcesses.OutsideTree -eq 1 -and [int]$editModel.Coverage.CollectorProcesses.Count -eq 6 -and
+            @($editModel.Coverage.Notes | Where-Object { $_ -match "lists 1 process\(es\) the collector would not have recorded that way" -and $_ -match "Check whether collection_info.json was altered" }).Count -eq 1
+        $editLog = @($editRun.Output | Where-Object { $_ -match "collection_info.json lists 1 process\(es\) the collector would not have recorded that way" }).Count -eq 1
+        Write-TestResult -Succeeded ($editRun.ExitCode -eq 0 -and $editLead -and $editNote -and $editLog -and $editHtml.Contains("Check whether collection_info.json was altered after the collection.")) -Message "collector: an entry added to collection_info.json for the attacker's process is rejected (its lead stays, the 6 collector processes are still left out) and the log, the model and report.html say to check whether the file was altered (exit $($editRun.ExitCode))"
     }
 
     # --- 3. -ReportOnly with another rules file, workbook left alone ---
