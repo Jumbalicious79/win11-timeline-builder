@@ -3,8 +3,9 @@ dumps), for the tests that do not read a dump: tests\Test-ReportBuilder.ps1
 (its canned helper sends them through the builder's real protocol reader
 and rows), and any test through Read-TestCannedEntries (tests\MemoryTestKit.ps1).
 
-One file per entry kind, canned-<kind>.txt, ASCII, CRLF. Each work package
-adds and edits only its own files. A line is one of:
+One file per entry kind, canned-<kind>.txt (or per area when it has several
+kinds, as canned-registry.txt: Hive and RunValue), ASCII, CRLF. Each work
+package adds and edits only its own files. A line is one of:
   # <comment>
   #AREA<TAB><area><TAB><Read|Partial|NotRead><TAB><note>
       the AREA line of that area (Name as in Get-DbgEngAreas: ProcessDetails,

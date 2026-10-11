@@ -981,7 +981,9 @@ function New-DbgEngLayout {
     if ($Spec) {
         foreach ($typeName in @($Spec.Keys)) {
             $type = Get-DbgEngCachedTypeLayout -Session $Session -TypeName ([string]$typeName)
-            if ($type.Offsets.Count -eq 0) {
+            # get_Count(): .Count of a hashtable with a field named Count
+            # (_CHILD_LIST) is that field's offset
+            if ($type.Offsets.get_Count() -eq 0) {
                 if (-not $Layout.Missing.Contains([string]$typeName)) { $Layout.Missing.Add([string]$typeName) }
                 continue
             }

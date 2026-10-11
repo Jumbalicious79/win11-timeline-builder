@@ -2437,9 +2437,58 @@ of WinDbg -- instead:
         Not built yet.
       Handles (Handles): a subset of the handles of each process; Source
         Memory-Handles. Not built yet.
-      Registry hives (Registry): the hives in memory, Run and RunOnce
-        values, the Services key; Source Memory-Registry. SAM and SECURITY
-        are listed by name only, never read. Not built yet.
+      Registry hives (Registry): the registry in memory; Source
+        Memory-Registry. On Windows 11 the hives' data is mapped into the
+        Registry process, so it is read there (in the process each hive's
+        view map names). What it reads:
+          - the kernel's hive list, walked both ways like the process list:
+            one Snapshot row per hive, "Registry hive in memory: <root
+            path>", with Details File= (the hive's file; \??\ and known
+            devices as drive letters, \SystemRoot\ as it is), Readable=
+            (the share of the hive's 4 KB blocks that is in the dump, from
+            the page tables: the blocks themselves are not read), Root=
+            Read|Unreadable|NotRead (its root key, from the hive's base
+            block, its root key control block or its first cell), FoundBy=
+            HiveListForward,HiveListBackward and Offset= (the hive's
+            _CMHIVE, for WinDbg); User is the SID of a user's hive;
+          - the Run, RunOnce and Policies\Explorer\Run keys (also under
+            Wow6432Node) of the SOFTWARE hive and of each user's hive
+            (HKU\<SID>, and .DEFAULT, the system account's): one row per
+            value, "Run key value in memory: <name> [<key>]",
+            PersistenceChange at the key's last write time (an older value
+            keeps that time), with Details Command= (the data as the
+            collector's run_keys.csv writes it, not expanded), Key=,
+            Time=key last write, OnDisk= (below), and Data=Unreadable when
+            the value is there but its data is not in the dump; User is the
+            hive's SID;
+          - SYSTEM\<current control set>\Services: ImagePath, ServiceDll
+            (of its Parameters key), Start, Type, ObjectName and
+            DisplayName of each service key, with no rows of its own: the
+            services area's rows are combined with it.
+        SAM and SECURITY (by root path or file name) are listed by name
+        only: none of their data is read, nor of a hive whose root path is
+        not in the dump.
+        OnDisk= compares a Run value with the collection's copy of the same
+        hive's Run key (the dump is parsed last): Yes when it has a value of
+        that name with the same data, Changed when it has one with other
+        data, No when the collection read that hive's Run keys and has no
+        value of that name, Unknown when it did not (the hive is read live
+        through the collector's run_keys.csv or run_keys.txt, HKLM and the
+        loaded users' hives, and through a user's collected NTUSER.DAT,
+        which the builder loads only when run as Administrator; neither is
+        there when -Sources leaves out Persistence and Registry). PERSIST-RUNKEY-SUSPICIOUS and PERSIST-RUNKEY-STAGING
+        also look at these rows, except OnDisk=Yes ones (the on-disk row
+        with the same command makes that lead), and
+        PERSIST-RUNKEY-MEMORY-ONLY (Medium, Persistence) makes a lead of
+        each OnDisk=No value.
+        A live copy leaves much of the hives out (35-55% of their blocks
+        were in the dumps this was built on): a key is called absent only
+        when the subkey lists above it were read in full, else it was "not
+        in the dump", and nothing missing from memory is ever a lead. The
+        coverage note says how much of the hives was in the dump; the log
+        has the counts (hives, root keys by source, Run keys read, absent
+        and not in the dump, Run values, Services subkeys, blocks, cells)
+        and the seconds per part, about 1-2 s in all on an 8 GB dump.
       Console history (Console): commands typed in console windows; Source
         Memory-ConsoleHistory. Not built yet.
       Services (Services): the service control manager's list, as
@@ -3787,6 +3836,22 @@ parsing is skipped, and the timeline CSV can be opened manually.
   into Memory-Modules and Memory-PrivateCode rows, and those rows through
   the real report rules. Its rules' own cases are in
   tests\fixtures\report\rules\cases-memory-modules.csv.
+
+  tests\Test-MemoryRegistry.ps1 -- the registry area on synthetic memory:
+  hives written cell by cell (key nodes, values, lh, lf, li and ri subkey
+  lists, big data), their cell maps in kernel memory and their bins in the
+  Registry process, the structures as 'dt' text with other offsets than
+  Windows 11's. It checks the hive list walked both ways, the files, the
+  root key from each of its three sources, that no page of SAM's or
+  SECURITY's cell map, bins, base block or key control block is read, the
+  Run values, the Services key offered to the joins, a key not in the dump
+  against one that is absent, the time limit, the reasons it is not read,
+  and then the rows through the builder's protocol reader, OnDisk= against
+  Persistence-RunKeys and Registry-UserRunKey rows, and the Run key rules on
+  them. Its rules' cases are in
+  tests\fixtures\report\rules\cases-memory-registry.csv, and
+  tests\fixtures\memory\canned-registry.txt gives tests\Test-ReportBuilder.ps1
+  a hive and a Run value.
 
   tests\MemoryTestKit.ps1 -- what these tests share (dot-sourced): it loads
   the helper's and the area files' functions (and with -Builder the

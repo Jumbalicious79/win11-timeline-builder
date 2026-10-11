@@ -495,20 +495,161 @@ function Add-DbgEngHandleRows {
 
 # --- WP4: registry hives in memory (item g) ---------------------------------------------
 
-# Memory-Registry rows of the hives. Not built yet.
+# Memory-Registry rows of the hives (Hive entries of
+# lib\memory\TimelineDbgEng.Registry.ps1): one Snapshot row per hive of the
+# kernel's hive list, "Registry hive in memory: <root path>", Details
+# "File=<its file> | Readable=<n>% | Root=Read|Unreadable|NotRead |
+# FoundBy=HiveListForward,HiveListBackward[ | NotRead=CredentialHive|
+# NamesNotInDump] | Offset=0x<_CMHIVE>"; User: the SID of a user's hive.
 function Add-DbgEngHiveRows {
     param([object[]]$Entries, [string]$Source, [datetime]$CaptureTimeUtc, [datetime]$AcquisitionEndUtc, [string]$DumpPath)
-    $null = $Entries, $Source, $CaptureTimeUtc, $AcquisitionEndUtc, $DumpPath
-    return (New-DbgEngRowCounts)
+    $snapshot = 0
+    foreach ($entry in @($Entries)) {
+        if ($null -eq $entry) { continue }
+        $root = "$($entry.Root)"
+        if (-not $root) { $root = "(no root path)" }
+        $readable = $null
+        if ("$($entry.Readable)" -match '^\d+$') { $readable = "$($entry.Readable)%" }
+        $notRead = $null
+        if ("$($entry.NotRead)") { $notRead = "$($entry.NotRead)" }
+        $details = Format-DbgEngDetails ([ordered]@{
+                File = "$($entry.File)"; Readable = $readable; Root = "$($entry.RootState)"; FoundBy = "$($entry.FoundBy)"; NotRead = $notRead; Offset = "$($entry.Offset)"
+            })
+        [void](Add-DbgEngEntryRow -Source $Source -Description "Registry hive in memory: $root" -User "$($entry.Sid)" -Details $details `
+                -CaptureTimeUtc $CaptureTimeUtc -AcquisitionEndUtc $AcquisitionEndUtc -DumpPath $DumpPath)
+        $snapshot++
+    }
+    return (New-DbgEngRowCounts -Snapshot $snapshot)
 }
 
-# Memory-Registry rows of the Run and RunOnce values (OnDisk= from the
-# Registry-UserRunKey and Persistence-RunKeys rows already in the timeline:
-# Memory is parsed last). Not built yet.
+# "<hive id>|<key path>" -> value name -> its commands, and the hive ids
+# whose Run keys the collection read, from the rows already in the timeline (Memory is parsed
+# last): Persistence-RunKeys (the collector's run_keys.csv / run_keys.txt,
+# read live: "HKLM" and "HKU\<SID>") and Registry-UserRunKey (a collected
+# NTUSER.DAT: "FOLDER:<profile folder>"). A hive id counts as read when one
+# of its Run values is in the timeline (the collector reads every Run key of
+# a hive in one pass), or, for a collected NTUSER.DAT, when any Registry-*
+# row of that file is (Read-NtUserHive reads its Run keys with the rest).
+# Ids, paths and names are lower case. -Rows: the timeline's rows.
+function Get-DbgEngOnDiskRunKeys {
+    param([object]$Rows)
+    $parsed = @{}
+    $values = @{}
+    $seenFiles = @{}
+    $add = {
+        param([string]$HiveId, [string]$KeyPath, [string]$Name, [string]$Command)
+        $HiveId = $HiveId.ToLowerInvariant()
+        $parsed[$HiveId] = $true
+        $key = "$HiveId|$($KeyPath.Trim('\').ToLowerInvariant())"
+        if (-not $values.ContainsKey($key)) { $values[$key] = @{} }
+        $name = $Name.ToLowerInvariant()
+        if (-not $values[$key].ContainsKey($name)) { $values[$key][$name] = New-Object System.Collections.Generic.List[string] }
+        $values[$key][$name].Add($Command.Trim())
+    }
+    if ($null -eq $Rows) { return [PSCustomObject]@{ Parsed = $parsed; Values = $values } }
+    foreach ($row in $Rows) {
+        $source = [string]$row.Source
+        if ($source -eq "Persistence-RunKeys") {
+            $description = [string]$row.Description
+            $fullKey = $null
+            $name = $null
+            if ($description -match '^Run key last written: (.+) \(value: (.*)\)$') { $fullKey = $Matches[1]; $name = $Matches[2] }
+            elseif ($description -match '^Run key value: (.*) \[(.+)\]$') { $name = $Matches[1]; $fullKey = $Matches[2] -replace ' \([^)]*\)$', '' }
+            if ($null -eq $fullKey) { continue }
+            # "Command=<data> | Key=<key>" (run_keys.csv), "Command=<data>" (run_keys.txt)
+            $command = ""
+            if ([string]$row.Details -match '^Command=(.*?)(?: \| Key=[^|]*)?$') { $command = $Matches[1] }
+            if ($fullKey -match '^HKLM\\(.+)$') { & $add "HKLM" $Matches[1] $name $command }
+            elseif ($fullKey -match '^(?:HKU|HKEY_USERS)\\([^\\]+)\\(.+)$') { & $add "HKU\$($Matches[1])" $Matches[2] $name $command }
+        }
+        elseif ($source.StartsWith("Registry-", [System.StringComparison]::Ordinal)) {
+            $rawPath = [string]$row.RawPath
+            $folder = $null
+            if ($seenFiles.ContainsKey($rawPath)) { $folder = $seenFiles[$rawPath] }
+            else {
+                if ($rawPath -match '\\Registry\\([^\\]+)\\NTUSER\.DAT$') { $folder = $Matches[1] }
+                $seenFiles[$rawPath] = $folder
+            }
+            if (-not $folder) { continue }
+            $parsed["folder:$($folder.ToLowerInvariant())"] = $true
+            if ($source -eq "Registry-UserRunKey") {
+                # "User Run key: <name> = <command>", "Key=HKCU\<path>; Time=..."
+                $name = $null
+                $command = ""
+                $keyPath = $null
+                if ([string]$row.Description -match '^User Run key: (.*?) = (.*)$') { $name = $Matches[1]; $command = $Matches[2] }
+                if ([string]$row.Details -match '(?:^|; |\| )Key=HKCU\\([^;|]+?)\s*(?:;|\||$)') { $keyPath = $Matches[1] }
+                if ($null -ne $name -and $keyPath) { & $add "FOLDER:$folder" $keyPath $name $command }
+            }
+        }
+    }
+    return [PSCustomObject]@{ Parsed = $parsed; Values = $values }
+}
+
+# Whether a Run value of memory is in the collection's copy of the same
+# hive's Run key: Yes (that key has a value of this name with the same
+# data, case aside), Changed (a value of this name with other data), No
+# (the hive's Run keys were read and this key has no value of this name) or
+# Unknown (the collection did not read that hive's Run keys). A value is
+# looked for in the live read of the hive (HKLM, HKU\<SID>) and in its
+# collected NTUSER.DAT (the profile folder of the hive's file); Yes wins,
+# then Changed, then No.
+function Get-DbgEngRunValueOnDisk {
+    param($Entry, $OnDisk)
+    $hive = "$($Entry.Hive)"
+    $ids = New-Object System.Collections.Generic.List[string]
+    $ids.Add($hive.ToLowerInvariant())
+    if ("$($Entry.HiveFile)" -match '\\Users\\([^\\]+)\\NTUSER\.DAT$') { $ids.Add("folder:$($Matches[1].ToLowerInvariant())") }
+    $keyPath = "$($Entry.Key)"
+    if ($keyPath.StartsWith("$hive\", [System.StringComparison]::OrdinalIgnoreCase)) { $keyPath = $keyPath.Substring($hive.Length + 1) }
+    if ($hive -eq "HKLM" -and $keyPath -notmatch '^SOFTWARE\\') { $keyPath = "SOFTWARE\$keyPath" }
+    $keyPath = $keyPath.Trim('\').ToLowerInvariant()
+    $name = "$($Entry.Name)".ToLowerInvariant()
+    $command = "$($Entry.Command)".Trim()
+    $unreadable = "$($Entry.Data)" -eq "Unreadable"
+    $answer = "Unknown"
+    foreach ($id in $ids) {
+        if (-not $OnDisk.Parsed.ContainsKey($id)) { continue }
+        $key = "$id|$keyPath"
+        if ($OnDisk.Values.ContainsKey($key) -and $OnDisk.Values[$key].ContainsKey($name)) {
+            # Data not in the dump: the name is all there is to compare
+            if ($unreadable) { return "Yes" }
+            foreach ($diskCommand in $OnDisk.Values[$key][$name]) { if ([string]::Equals($diskCommand, $command, [System.StringComparison]::OrdinalIgnoreCase)) { return "Yes" } }
+            $answer = "Changed"
+        }
+        elseif ($answer -ne "Changed") { $answer = "No" }
+    }
+    return $answer
+}
+
+# Memory-Registry rows of the Run and RunOnce values (RunValue entries):
+# "Run key value in memory: <name> [<key>]", PersistenceChange at the key's
+# last write time (a Snapshot row when that is not valid); Details
+# "Command=<data> | Key=<key> | Time=key last write | OnDisk=Yes|Changed|No|Unknown"
+# (Get-DbgEngRunValueOnDisk, against the Registry-UserRunKey and
+# Persistence-RunKeys rows already in the timeline: Memory is parsed last),
+# then "Data=Unreadable" when the value's data is not in the dump; User: the
+# SID of a user's hive.
 function Add-DbgEngRunValueRows {
     param([object[]]$Entries, [string]$Source, [datetime]$CaptureTimeUtc, [datetime]$AcquisitionEndUtc, [string]$DumpPath)
-    $null = $Entries, $Source, $CaptureTimeUtc, $AcquisitionEndUtc, $DumpPath
-    return (New-DbgEngRowCounts)
+    $timed = 0
+    $snapshot = 0
+    $entryList = @($Entries | Where-Object { $null -ne $_ })
+    if ($entryList.Count -eq 0) { return (New-DbgEngRowCounts) }
+    $onDisk = Get-DbgEngOnDiskRunKeys -Rows $script:timelineEntries
+    foreach ($entry in $entryList) {
+        $time = Get-MemoryEntryTime -Value "$($entry.LastWrite)" -LatestUtc $AcquisitionEndUtc.AddDays(1)
+        $timeText = if ($null -ne $time.TimeUtc) { "key last write" } elseif ($time.Text) { "capture time (the key's last write time $($time.Text) is not valid)" } else { "capture time" }
+        $data = $null
+        if ("$($entry.Data)" -eq "Unreadable") { $data = "Unreadable" }
+        $details = Format-DbgEngDetails ([ordered]@{
+                Command = "$($entry.Command)"; Key = "$($entry.Key)"; Time = $timeText; OnDisk = (Get-DbgEngRunValueOnDisk -Entry $entry -OnDisk $onDisk); Data = $data
+            })
+        $row = Add-DbgEngEntryRow -Source $Source -EventType "PersistenceChange" -Description "Run key value in memory: $($entry.Name) [$($entry.Key)]" -User "$($entry.Sid)" `
+            -Details $details -Time "$($entry.LastWrite)" -CaptureTimeUtc $CaptureTimeUtc -AcquisitionEndUtc $AcquisitionEndUtc -DumpPath $DumpPath
+        if ($row.Timed) { $timed++ } else { $snapshot++ }
+    }
+    return (New-DbgEngRowCounts -Timed $timed -Snapshot $snapshot)
 }
 
 # --- WP5: console command history (item h) -----------------------------------------------
