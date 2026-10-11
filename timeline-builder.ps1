@@ -17223,6 +17223,14 @@ function Add-MemoryPluginRows {
                     if ($created.Text) { $details += " CreateTime=$($created.Text)" }
                     $snapshot++
                 }
+                # Microsoft's debugger engine path only (memory\TimelineDbgEng.ps1):
+                # which ways found the process in the kernel's structures, the
+                # ID the process ID table holds it under when that is not its
+                # own, and what copying memory does not explain (the findings
+                # report's INTEG-PROCESS-HIDDEN rule reads Anomaly=)
+                if ($entry.FoundBy) { $details += " FoundBy=$($entry.FoundBy)" }
+                if ($entry.TableId) { $details += " TableId=$($entry.TableId)" }
+                if ($entry.Anomaly) { $details += " Anomaly=$($entry.Anomaly)" }
 
                 Add-TimelineEntry -Timestamp $ts -Source $Source -EventType $eventType `
                     -Description "Process in memory: $name (PID: $procId, PPID: $ppid)" `
@@ -17485,9 +17493,10 @@ function ConvertFrom-DbgEngWorkerNumber {
 
 # One line of the helper's output: "TBDBG|LOG|<I, W or S>|<text>" is logged
 # here (Log, Log-Warning, Log-Success), "TBDBG|R|<name>|<value>" is a result
-# value, "TBDBG|P|..." a windows.pslist entry, "TBDBG|C|..." a
-# windows.cmdline entry, "TBDBG|END|<processes>|<command lines>" the end.
-# Other lines (PowerShell's own output) are ignored.
+# value, "TBDBG|P|..." a windows.pslist entry (with the helper's FoundBy,
+# TableId and Anomaly), "TBDBG|C|..." a windows.cmdline entry,
+# "TBDBG|END|<processes>|<command lines>" the end. Other lines
+# (PowerShell's own output) are ignored.
 function Receive-DbgEngWorkerLine {
     param([string]$Line, $State)
     $at = "$Line".IndexOf("TBDBG|")
@@ -17503,13 +17512,14 @@ function Receive-DbgEngWorkerLine {
             }
             "R" { $State.Values[$fields[1]] = ConvertFrom-DbgEngBase64 $fields[2] }
             "P" {
-                if ($fields.Count -ne 9) { throw "a process line with $($fields.Count) fields" }
+                if ($fields.Count -ne 12) { throw "a process line with $($fields.Count) fields" }
                 $created = ConvertFrom-DbgEngBase64 $fields[7]
                 $exited = ConvertFrom-DbgEngBase64 $fields[8]
                 $State.Processes.Add([PSCustomObject]@{
                         PID = (ConvertFrom-DbgEngWorkerNumber $fields[1]); PPID = (ConvertFrom-DbgEngWorkerNumber $fields[2]); ImageFileName = (ConvertFrom-DbgEngBase64 $fields[6])
                         Offset = $fields[5]; Threads = (ConvertFrom-DbgEngWorkerNumber $fields[3]); SessionId = (ConvertFrom-DbgEngWorkerNumber $fields[4])
                         CreateTime = $(if ($created) { $created } else { $null }); ExitTime = $(if ($exited) { $exited } else { $null })
+                        FoundBy = (ConvertFrom-DbgEngBase64 $fields[9]); TableId = (ConvertFrom-DbgEngBase64 $fields[10]); Anomaly = (ConvertFrom-DbgEngBase64 $fields[11])
                     })
             }
             "C" {
@@ -17641,13 +17651,20 @@ function Invoke-DbgEngMemoryAnalysis {
     $timeout = 900
     if ($script:dbgEngTimeoutSeconds -gt 0) { $timeout = [int]$script:dbgEngTimeoutSeconds }
     $jobFolder = Join-Path (Get-ScratchFolder) "dbgeng"
+    # When the capture started (DumpIt writes it in the dump's header): the
+    # helper judges a process missing from the kernel's process list by it.
+    # A file time is when the capture ended, so it is not passed.
+    $captureStart = ""
+    if ($DumpInfo.TimeSource -eq "crash dump header" -and $DumpInfo.CaptureTimeUtc) {
+        $captureStart = [datetime]::SpecifyKind([datetime]$DumpInfo.CaptureTimeUtc, [DateTimeKind]::Utc).ToString("o", [System.Globalization.CultureInfo]::InvariantCulture)
+    }
     $timer = [System.Diagnostics.Stopwatch]::StartNew()
     $state = $null
     try {
         [void][System.IO.Directory]::CreateDirectory($jobFolder)
         $state = Start-DbgEngWorker -WorkerPath $worker -WorkingDirectory $jobFolder -TimeoutSeconds $timeout -Arguments ([ordered]@{
                 DumpPath = $DumpPath; EngineFolder = $engine.Folder; EngineDlls = (@($engine.Dlls) -join ",")
-                SymbolCache = (Join-Path (Get-BuilderToolsFolder) "symbols"); JobFolder = $jobFolder
+                SymbolCache = (Join-Path (Get-BuilderToolsFolder) "symbols"); JobFolder = $jobFolder; CaptureStart = $captureStart
             })
     }
     catch {

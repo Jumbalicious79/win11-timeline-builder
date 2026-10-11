@@ -28,6 +28,7 @@
 #   powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File TimelineDbgEng.ps1
 #     -DumpPath <dump> -EngineFolder <folder> -EngineDlls <a.dll,b.dll>
 #     -SymbolCache <builder>\tools\symbols -JobFolder <work folder>\scratch\dbgeng
+#     -CaptureStart <the dump header's time, ISO 8601 UTC, or "">
 # =============================================================
 [CmdletBinding()]
 param(
@@ -41,7 +42,11 @@ param(
     [string]$SymbolCache,
     # A folder for this run's files (empty symbol and extension folders,
     # the symbol file when the cache cannot be written)
-    [string]$JobFolder
+    [string]$JobFolder,
+    # When the capture started (the time in the dump's header, as
+    # yyyy-MM-ddTHH:mm:ss.fffffffZ), or "" when it is not known: a process
+    # that is missing from the kernel's process list is judged against it
+    [string]$CaptureStart
 )
 
 # The C# host (C# 5: Windows PowerShell 5.1 compiles it too). The engine's
@@ -347,7 +352,11 @@ function Write-DbgEngLog {
 # processes were read). PartialReason: why the command lines are missing
 # when the processes were read. Processes and CommandLines: the entries,
 # with the property names of Volatility's windows.pslist and
-# windows.cmdline JSON. The counts are for the builder's log.
+# windows.cmdline JSON; a process found in the kernel's own structures also
+# has FoundBy (the ways that found it), TableId (the ID the process ID table
+# holds it under, when that is not its own) and Anomaly (what copying memory
+# does not explain), each "" when there is nothing to say. The counts are
+# for the builder's log.
 function New-DbgEngResult {
     return [PSCustomObject]@{
         Reason = ""; PartialReason = ""
@@ -358,8 +367,10 @@ function New-DbgEngResult {
     }
 }
 
-# The result as protocol lines: the counts, one line per process ("P") and
-# command line ("C"), then END with both numbers (the builder checks them)
+# The result as protocol lines: the counts, one line per process ("P":
+# PID, PPID, Threads, SessionId, Offset, then in Base64 ImageFileName,
+# CreateTime, ExitTime, FoundBy, TableId, Anomaly) and command line ("C"),
+# then END with both numbers (the builder checks them)
 function Write-DbgEngWorkerResult {
     param($Result)
     $invariant = [System.Globalization.CultureInfo]::InvariantCulture
@@ -374,7 +385,8 @@ function Write-DbgEngWorkerResult {
     $number = { param($value) if ($null -eq $value) { "" } else { ([long]$value).ToString($invariant) } }
     foreach ($entry in @($Result.Processes)) {
         Write-DbgEngWorkerLine ("TBDBG|P|" + (& $number $entry.PID) + "|" + (& $number $entry.PPID) + "|" + (& $number $entry.Threads) + "|" + (& $number $entry.SessionId) + "|" +
-            $entry.Offset + "|" + (ConvertTo-DbgEngBase64 $entry.ImageFileName) + "|" + (ConvertTo-DbgEngBase64 $entry.CreateTime) + "|" + (ConvertTo-DbgEngBase64 $entry.ExitTime))
+            $entry.Offset + "|" + (ConvertTo-DbgEngBase64 $entry.ImageFileName) + "|" + (ConvertTo-DbgEngBase64 $entry.CreateTime) + "|" + (ConvertTo-DbgEngBase64 $entry.ExitTime) + "|" +
+            (ConvertTo-DbgEngBase64 $entry.FoundBy) + "|" + (ConvertTo-DbgEngBase64 $entry.TableId) + "|" + (ConvertTo-DbgEngBase64 $entry.Anomaly))
     }
     foreach ($entry in @($Result.CommandLines)) {
         Write-DbgEngWorkerLine ("TBDBG|C|" + (& $number $entry.PID) + "|" + (ConvertTo-DbgEngBase64 $entry.Process) + "|" + (ConvertTo-DbgEngBase64 $entry.Args))
@@ -827,7 +839,14 @@ function ConvertFrom-DbgEngFileTime {
 # not describe those structures, the engine's own list is used (dx
 # queries), and the log says so. When the ways disagree, the log has a
 # warning that the findings report shows as a coverage note ("Memory dump
-# process list: ...").
+# process list: ..."). Copying explains a process missing from the list
+# only when it ended or started during the copy: one that neither walk
+# found, created before the capture started and without an exit time, is
+# what a process hidden from the list (unlinked from it) looks like, and a
+# process ID of 0, one that is not a multiple of 4, or one the process ID
+# table does not hold the process under, is what a process ID changed in
+# memory looks like. Those come first in the warning, by PID, and their
+# rows say so (Anomaly=; every row says which ways found it, FoundBy=).
 
 # A kernel address that a link or pointer of the kernel's structures can
 # hold: its top byte all ones (the kernel half of a 48-bit or 57-bit
@@ -938,12 +957,12 @@ function Get-DbgEngKernelLayout {
     return $layout
 }
 
-# The EPROCESS at an address when it is one: its bytes (the structure's
-# size), else $null: not in the dump, its dispatcher header's type is not 3
-# (a process object; memory that was reused is not taken for a process),
-# or its process ID is not a multiple of 4 below 2^32. -Cache (address ->
-# bytes or $null) keeps every answer, so the walks and the process ID table
-# read each address once.
+# The bytes of a process object at an address (the EPROCESS's size), else
+# $null: not in the dump, or its dispatcher header's type is not 3 (a
+# process object; most memory that was reused is not taken for a process).
+# Its process ID is checked by the caller (Get-DbgEngProcessIdKind).
+# -Cache (address -> bytes or $null) keeps every answer, so the walks and
+# the process ID table read each address once.
 function Get-DbgEngProcessBlock {
     param($Session, $Layout, [uint64]$Address, $Cache)
     if ($Cache.ContainsKey($Address)) {
@@ -954,24 +973,49 @@ function Get-DbgEngProcessBlock {
     $block = $null
     if (Test-DbgEngKernelAddress $Address) {
         $bytes = Read-DbgEngVirtual -Session $Session -Process 0 -Address $Address -Count $Layout.ProcessSize
-        if ($bytes.Length -eq $Layout.ProcessSize -and $bytes[0] -eq 3) {
-            $procId = [BitConverter]::ToUInt64($bytes, $Layout.Offsets["UniqueProcessId"])
-            if ($procId -lt [uint64]4294967296 -and ($procId -band 3) -eq 0) { $block = $bytes }
-        }
+        if ($bytes.Length -eq $Layout.ProcessSize -and $bytes[0] -eq 3) { $block = $bytes }
     }
     $Cache[$Address] = $block
     if ($null -eq $block) { return $null }
     return , $block
 }
 
+# What the process ID in an EPROCESS is: Valid (a multiple of 4 from 4 to
+# 2^32 - 4, as Windows gives them), Zero (only the idle process has 0, and
+# it is in neither the process list nor the process ID table) or Invalid
+function Get-DbgEngProcessIdKind {
+    param($Layout, [byte[]]$Block)
+    $procId = [BitConverter]::ToUInt64($Block, $Layout.Offsets["UniqueProcessId"])
+    if ($procId -eq 0) { return "Zero" }
+    if ($procId -lt [uint64]4294967296 -and ($procId -band 3) -eq 0) { return "Valid" }
+    return "Invalid"
+}
+
+# $true when a process object's own fields look like a process's: both
+# links of ActiveProcessLinks and its token are kernel addresses (a process
+# taken out of the list keeps links, often to itself). Asked of an object
+# whose process ID does not fit, before it is listed: memory that was
+# reused and starts with a 3 by chance is not.
+function Test-DbgEngProcessShape {
+    param($Layout, [byte[]]$Block)
+    $links = [int]$Layout.Offsets["ActiveProcessLinks"]
+    $token = [BitConverter]::ToUInt64($Block, $Layout.Offsets["Token"]) -band (-bnot [uint64]$Layout.TokenRefMask)
+    return ((Test-DbgEngKernelAddress ([BitConverter]::ToUInt64($Block, $links))) -and (Test-DbgEngKernelAddress ([BitConverter]::ToUInt64($Block, $links + 8))) -and
+        (Test-DbgEngKernelAddress $token))
+}
+
 # The kernel's process list walked from its head (nt!PsActiveProcessHead)
 # through ActiveProcessLinks: forwards (Flink), or with -Backward (Blink).
 # An entry whose link back does not point to the entry before it is
 # counted (Mismatches) and the walk goes on. The walk ends at the head
-# (Complete), or, Stop saying why, at a link that is not a kernel address,
-# a link to an entry already walked, an entry that is not a process
-# (Broken: the list itself is damaged there) or after -MaxEntries (Capped).
-# Entries: the EPROCESS addresses in walk order.
+# (Complete), or, Stop saying why (a noun phrase, after "stopped at"), at a
+# link that is not a kernel address, a link to an entry already walked, an
+# entry that is not a process (Broken: the list itself is damaged there)
+# or after -MaxEntries (Capped). A process object whose process ID does not
+# fit is walked through only when its link back is consistent and its
+# fields look like a process's (a real process whose ID was changed);
+# otherwise it is memory that was reused. Entries: the EPROCESS addresses
+# in walk order.
 function Invoke-DbgEngProcessWalk {
     param($Session, $Layout, $Cache, [switch]$Backward, [int]$MaxEntries = 20000)
     $result = [PSCustomObject]@{
@@ -983,7 +1027,7 @@ function Invoke-DbgEngProcessWalk {
     if ($Backward) { $nextField = 8; $backField = 0 }
     $head = [uint64]$Layout.ListHead
     $headBytes = Read-DbgEngVirtual -Session $Session -Process 0 -Address $head -Count 16
-    if ($headBytes.Length -lt 16) { $result.Stop = "the list head is not in the dump"; return $result }
+    if ($headBytes.Length -lt 16) { $result.Stop = "the list head, which is not in the dump"; return $result }
     $seen = New-Object 'System.Collections.Generic.HashSet[uint64]'
     $previous = $head
     $link = [BitConverter]::ToUInt64($headBytes, $nextField)
@@ -996,8 +1040,13 @@ function Invoke-DbgEngProcessWalk {
         $address = $link - [uint64]$links
         $block = Get-DbgEngProcessBlock -Session $Session -Layout $Layout -Address $address -Cache $Cache
         if ($null -eq $block) { $result.Stop = "an entry that is not a process"; break }
+        $consistent = [BitConverter]::ToUInt64($block, $links + $backField) -eq $previous
+        if ((Get-DbgEngProcessIdKind -Layout $Layout -Block $block) -eq "Invalid" -and -not ($consistent -and (Test-DbgEngProcessShape -Layout $Layout -Block $block))) {
+            $result.Stop = "an entry that is not a process"
+            break
+        }
         $result.Broken = $false
-        if ([BitConverter]::ToUInt64($block, $links + $backField) -ne $previous) { $result.Mismatches++ }
+        if (-not $consistent) { $result.Mismatches++ }
         $result.Entries.Add($address)
         $previous = $link
         $link = [BitConverter]::ToUInt64($block, $links + $nextField)
@@ -1027,12 +1076,22 @@ function Get-DbgEngTablePointers {
 # entries of 16 bytes, entry k of page n for ID (n * 256 + k) * 4, and an
 # entry's object is ObjectPointerBits shifted left by 4 and sign-extended
 # (a kernel address). Of the objects, the processes (dispatcher type 3; a
-# thread's is 6) whose process ID is the entry's ID are kept. Entries:
-# EPROCESS addresses in ID order; Error: why the table could not be read;
-# UnreadablePages: pages of entries not in the dump.
+# thread's is 6) are kept: those whose process ID is the entry's ID, and
+# those whose ID is another (Mismatched) when their fields look like a
+# process's (Test-DbgEngProcessShape; a free entry's bits can point
+# anywhere). Entries: each process once (EPROCESS addresses, in ID order);
+# Own: those held under their own ID; Mismatched: @(entry ID, EPROCESS) of
+# each entry that holds a process under another ID; NotProcesses: entries
+# whose process object does not look like a process (left out); Error: why
+# the table could not be read; UnreadablePages: pages of entries not in the
+# dump.
 function Get-DbgEngCidProcesses {
     param($Session, $Layout, $Cache, [int]$MaxPages = 4096)
-    $result = [PSCustomObject]@{ Entries = (New-Object 'System.Collections.Generic.List[uint64]'); Error = ""; UnreadablePages = 0 }
+    $result = [PSCustomObject]@{
+        Entries = (New-Object 'System.Collections.Generic.List[uint64]'); Own = (New-Object 'System.Collections.Generic.HashSet[uint64]')
+        Mismatched = (New-Object System.Collections.Generic.List[object]); NotProcesses = 0; Error = ""; UnreadablePages = 0
+    }
+    $listed = New-Object 'System.Collections.Generic.HashSet[uint64]'
     $pointer = Read-DbgEngVirtual -Session $Session -Process 0 -Address $Layout.CidTable -Count 8
     $code = $null
     if ($pointer.Length -eq 8) {
@@ -1081,7 +1140,12 @@ function Get-DbgEngCidProcesses {
                 if ($type.Length -ne 1 -or $type[0] -ne 3) { $Cache[$object] = $null; continue }
             }
             $block = Get-DbgEngProcessBlock -Session $Session -Layout $Layout -Address $object -Cache $Cache
-            if ($null -ne $block -and [BitConverter]::ToUInt64($block, $pidOffset) -eq [uint64](($first + $k) * 4)) { $result.Entries.Add($object) }
+            if ($null -eq $block) { continue }
+            $id = ($first + $k) * 4
+            if ([BitConverter]::ToUInt64($block, $pidOffset) -eq [uint64]$id) { [void]$result.Own.Add($object) }
+            elseif (Test-DbgEngProcessShape -Layout $Layout -Block $block) { $result.Mismatched.Add(@([long]$id, $object)) }
+            else { $result.NotProcesses++; continue }
+            if ($listed.Add($object)) { $result.Entries.Add($object) }
         }
     }
     if ($pages.Count -gt 0 -and $result.UnreadablePages -ge $pages.Count) { $result.Error = "its pages are not in the dump" }
@@ -1136,16 +1200,51 @@ function Format-DbgEngCount {
     return "$Count $Many"
 }
 
+# Items of a list in a sentence: "a", "a and b", "a, b and c"; with
+# -Semicolons (items that have commas of their own) "a; b; c". After -Max
+# items, "and N more".
+function Join-DbgEngWords {
+    param([string[]]$Items, [switch]$Semicolons, [int]$Max = 10)
+    $all = @($Items)
+    $shown = @($all | Select-Object -First $Max)
+    $more = $all.Count - $shown.Count
+    if ($Semicolons) {
+        $text = $shown -join "; "
+        if ($more -gt 0) { $text += "; and $more more" }
+        return $text
+    }
+    if ($more -gt 0) { return ($shown -join ", ") + " and $more more" }
+    if ($shown.Count -le 1) { return ($shown -join "") }
+    return ($shown[0..($shown.Count - 2)] -join ", ") + " and " + $shown[-1]
+}
+
 # What the log says about the process scan. Info: what each way found
-# (always logged). Note: for an analyst to judge the dump when the ways
-# disagree, the list was inconsistent, or the debugger engine's own list
-# has another count ("" when all agree): the warning "Memory dump process
-# list: <note>", which the findings report shows as a coverage note. It
-# has no ": " (the report's notes have one colon). -Methods: the ways that
-# found each process (Join-DbgEngProcessSets); -EngineCount: the engine's
-# own list (-1: not read); -EngineCorrupt: it reported a corrupted list.
+# (logged when the scan's processes are used); Ways: the same without the
+# total (for the line that says the scan found none). Note: for an analyst
+# to judge the dump when something does not fit, the ways disagree, the
+# list was inconsistent, or the debugger engine's own list has another
+# count ("" when all agree): the warning "Memory dump process list: <note>",
+# which the findings report shows as a coverage note. What copying memory
+# does not explain comes first: processes that look hidden from the list
+# and process IDs that look changed, by PID. It has no ": " (the report's
+# notes have one colon).
+#   -Methods        the ways that found each process (Join-DbgEngProcessSets)
+#   -Missed         each process both walks missed: Pid, and Why: Hidden
+#                   (created before the capture started, no exit time, and
+#                   a walk reached the list's end), Exited, New (created
+#                   after the capture started), Unwalked (both walks stopped
+#                   early) or "" (its create time or the capture start is
+#                   not known)
+#   -IdChanges      each process whose ID does not fit: Address, Pid, Kind
+#                   (Zero, Invalid, or Table: held in the process ID table
+#                   under another ID) and TableIds
+#   -StaleEntries   entries of the process ID table that hold a process
+#                   that is there under its own ID too
+#   -EngineCount    the engine's own list (-1: not read); -EngineCorrupt:
+#                   it reported a corrupted list
 function Get-DbgEngScanText {
-    param($Forward, $Backward, $Cid, [int[]]$Methods, [long]$EngineCount = -1, [bool]$EngineCorrupt = $false)
+    param($Forward, $Backward, $Cid, [int[]]$Methods, [object[]]$Missed = @(), [object[]]$IdChanges = @(), [int]$StaleEntries = 0, [long]$EngineCount = -1, [bool]$EngineCorrupt = $false)
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
     $walkText = {
         param($walk)
         $parts = @()
@@ -1156,13 +1255,17 @@ function Get-DbgEngScanText {
         return $text
     }
     $total = @($Methods).Count
-    $info = "    Processes found: $total; the kernel's process list walked forwards $(& $walkText $Forward), backwards $(& $walkText $Backward)"
-    if ($Cid.Error) { $info += ", its process ID table not read [$($Cid.Error)]" }
+    $ways = "the kernel's process list walked forwards $(& $walkText $Forward), backwards $(& $walkText $Backward)"
+    if ($Cid.Error) { $ways += ", its process ID table not read [$($Cid.Error)]" }
     else {
-        $info += ", in its process ID table $($Cid.Entries.Count)"
-        if ($Cid.UnreadablePages -gt 0) { $info += " ($(Format-DbgEngCount -Count $Cid.UnreadablePages -One 'page' -Many 'pages') of it not in the dump)" }
+        $ways += ", in its process ID table $($Cid.Entries.Count)"
+        $tableParts = @()
+        if ($Cid.UnreadablePages -gt 0) { $tableParts += "$(Format-DbgEngCount -Count $Cid.UnreadablePages -One 'page' -Many 'pages') of it not in the dump" }
+        if ($Cid.NotProcesses -gt 0) { $tableParts += "$(Format-DbgEngCount -Count $Cid.NotProcesses -One 'entry' -Many 'entries') left out whose object only starts like a process" }
+        if ($tableParts.Count -gt 0) { $ways += " ($($tableParts -join ', '))" }
     }
-    if ($EngineCount -ge 0) { $info += ", in the debugger engine's own list $EngineCount" }
+    if ($EngineCount -ge 0) { $ways += ", in the debugger engine's own list $EngineCount" }
+    $info = "    Processes found: $total; $ways"
 
     # How many processes each combination of ways found
     $all = 3
@@ -1173,29 +1276,68 @@ function Get-DbgEngScanText {
     foreach ($walk in @($Forward, $Backward)) { $places = [Math]::Max($places, [int]$walk.Mismatches + [int][bool]$walk.Broken) }
     $partial = @($counts.Keys | Where-Object { $_ -ne $all })
     $engineDiffers = $EngineCount -ge 0 -and ($EngineCount -ne $total -or $EngineCorrupt)
-    if ($places -eq 0 -and $partial.Count -eq 0 -and -not $engineDiffers) { return [PSCustomObject]@{ Info = $info; Note = "" } }
+    $missedList = @($Missed | Where-Object { $null -ne $_ })
+    $changes = @($IdChanges | Where-Object { $null -ne $_ })
+    if ($places -eq 0 -and $partial.Count -eq 0 -and -not $engineDiffers -and $changes.Count -eq 0 -and $StaleEntries -eq 0) {
+        return [PSCustomObject]@{ Info = $info; Ways = $ways; Note = "" }
+    }
 
     $sentences = New-Object System.Collections.Generic.List[string]
+    # What copying memory does not explain, first
+    $hidden = @($missedList | Where-Object { $_.Why -eq "Hidden" })
+    if ($hidden.Count -gt 0) {
+        $ids = Join-DbgEngWords -Items @($hidden | ForEach-Object { ([long]$_.Pid).ToString($invariant) })
+        if ($hidden.Count -eq 1) { $sentences.Add("PID $ids is in neither walk of the kernel's process list, only in its process ID table, yet it was created before the capture started and has no exit time.") }
+        else { $sentences.Add("PIDs $ids are in neither walk of the kernel's process list, only in its process ID table, yet they were created before the capture started and have no exit time.") }
+        $sentences.Add("Copying memory does not explain that, as a process leaves the list only when it ends, and a process hidden from the list (unlinked from it) looks exactly like this.")
+    }
+    if ($changes.Count -gt 0) {
+        $items = foreach ($change in $changes) {
+            $item = "PID $(([long]$change.Pid).ToString($invariant)) at 0x$(([uint64]$change.Address).ToString('x'))"
+            if ($change.Kind -eq "Zero") { $item += ", an ID only the idle process has" }
+            elseif ($change.Kind -eq "Invalid") { $item += ", not a multiple of 4 as Windows gives them" }
+            $tableIds = @($change.TableIds | ForEach-Object { ([long]$_).ToString($invariant) })
+            if ($tableIds.Count -eq 1) { $item += ", held in the process ID table under ID $($tableIds[0])" }
+            elseif ($tableIds.Count -gt 1) { $item += ", held in the process ID table under IDs $(Join-DbgEngWords -Items $tableIds)" }
+            $item
+        }
+        $sentences.Add("$(Format-DbgEngCount -Count $changes.Count -One 'process has a process ID that Windows did not give it' -Many 'processes have a process ID that Windows did not give them') ($(Join-DbgEngWords -Items @($items) -Semicolons)).")
+        $sentences.Add("Copying memory does not explain that, and a process whose ID was changed in memory, to hide or disguise it, looks like this.")
+    }
     if ($places -gt 0) {
-        $sentences.Add("the kernel's list of processes was inconsistent in $(Format-DbgEngCount -Count $places -One 'place' -Many 'places'), as when memory is copied while Windows runs and processes start or end during the copy.")
+        $sentences.Add("The kernel's list of processes was inconsistent in $(Format-DbgEngCount -Count $places -One 'place' -Many 'places'), as when memory is copied while Windows runs and processes start or end during the copy.")
+    }
+    if ($StaleEntries -gt 0) {
+        $sentences.Add("$(Format-DbgEngCount -Count $StaleEntries -One 'entry' -Many 'entries') of the process ID table $(if ($StaleEntries -eq 1) { 'holds' } else { 'hold' }) a process that is there under its own ID too, as when the table changes during the copy.")
     }
     $only = @{ 1 = "only by walking forwards"; 2 = "only by walking backwards"; 4 = "only in the process ID table" }
-    $missed = @{ 1 = "missed by walking forwards"; 2 = "missed by walking backwards"; 4 = "not in the process ID table" }
-    $ways = if ($all -eq 7) { "all three ways (walking the kernel's process list forwards, walking it backwards, and its process ID table)" } else { "both walks of the kernel's process list" }
-    $found = "$(Format-DbgEngCount -Count $total -One 'process was' -Many 'processes were') found, $([int]$counts[$all]) of them by $ways"
+    $missedBy = @{ 1 = "missed by walking forwards"; 2 = "missed by walking backwards"; 4 = "not in the process ID table" }
+    $allWays = if ($all -eq 7) { "all three ways (walking the kernel's process list forwards, walking it backwards, and its process ID table)" } else { "both walks of the kernel's process list" }
+    $found = "$(Format-DbgEngCount -Count $total -One 'process was' -Many 'processes were') found, $([int]$counts[$all]) of them by $allWays"
     foreach ($signature in @($partial | Sort-Object -Property @{ Expression = { $counts[$_] }; Descending = $true }, @{ Expression = { $_ } })) {
         $phrase = $only[$signature]
-        if (-not $phrase) { $phrase = $missed[$all - $signature] }
+        if (-not $phrase) { $phrase = $missedBy[$all - $signature] }
         $found += ", $($counts[$signature]) $phrase"
+        # The processes both walks missed, by PID
+        if ($signature -eq 4 -and $missedList.Count -gt 0) {
+            $why = @{ Exited = ", which had exited"; New = ", created after the capture started" }
+            $found += " ($(Join-DbgEngWords -Items @($missedList | ForEach-Object { "PID $(([long]$_.Pid).ToString($invariant))$($why[[string]$_.Why])" }) -Semicolons))"
+        }
     }
     $sentences.Add("$found.")
+    if (@($missedList | Where-Object { $_.Why -eq "Unwalked" }).Count -gt 0) {
+        $sentences.Add("Both walks stopped before the end of the list, so a process only in the process ID table can be in the part of the list that neither walk reached.")
+    }
     if ($Cid.Error) { $sentences.Add("The process ID table could not be read [$($Cid.Error)].") }
     if ($engineDiffers) {
         $engineText = "The debugger engine's own process list (dx @`$cursession.Processes in WinDbg) has $(Format-DbgEngCount -Count $EngineCount -One 'entry' -Many 'entries')"
         if ($EngineCorrupt) { $engineText += " and stops at the first inconsistent link" }
         $sentences.Add("$engineText.")
     }
-    return [PSCustomObject]@{ Info = $info; Note = ($sentences -join " ") }
+    # After "Memory dump process list: " the note goes on in lower case
+    $note = $sentences -join " "
+    if ($note.StartsWith("The ")) { $note = "t" + $note.Substring(1) }
+    return [PSCustomObject]@{ Info = $info; Ways = $ways; Note = $note }
 }
 
 # The session id of a process (its EPROCESS bytes): none when
@@ -1223,55 +1365,105 @@ function Get-DbgEngProcessSessionId {
 }
 
 # One windows.pslist entry from an EPROCESS's bytes, with the property
-# names of Volatility's JSON
+# names of Volatility's JSON (a process ID that does not fit is read as a
+# signed number, as it is), and FoundBy, TableId and Anomaly, "" for now
 function ConvertFrom-DbgEngProcessBlock {
     param($Session, $Layout, [uint64]$Address, [byte[]]$Block)
     $o = $Layout.Offsets
     $name = New-Object byte[] 15
     [Array]::Copy($Block, [int]$o["ImageFileName"], $name, 0, 15)
     return [PSCustomObject]@{
-        PID = [long][BitConverter]::ToUInt64($Block, $o["UniqueProcessId"]); PPID = [BitConverter]::ToInt64($Block, $o["InheritedFromUniqueProcessId"])
+        PID = [BitConverter]::ToInt64($Block, $o["UniqueProcessId"]); PPID = [BitConverter]::ToInt64($Block, $o["InheritedFromUniqueProcessId"])
         ImageFileName = (ConvertFrom-DbgEngImageFileName $name); Offset = "0x$($Address.ToString('x'))"
         Threads = [long][BitConverter]::ToUInt32($Block, $o["ActiveThreads"]); SessionId = (Get-DbgEngProcessSessionId -Session $Session -Layout $Layout -Block $Block)
         CreateTime = (ConvertFrom-DbgEngFileTime ([BitConverter]::ToInt64($Block, $o["CreateTime"]))); ExitTime = (ConvertFrom-DbgEngFileTime ([BitConverter]::ToInt64($Block, $o["ExitTime"])))
+        FoundBy = ""; TableId = ""; Anomaly = ""
     }
 }
 
 # The processes from the kernel's own structures (a layout without Error):
-# Processes (windows.pslist entries), Pebs (@(EPROCESS, PEB) of each, for
-# its command line), Capped; logs what each way found and, when they
-# disagree, the warning the findings report shows. Processes is empty when
-# nothing was found.
+# Processes (windows.pslist entries, every process any way found, also one
+# whose process ID does not fit, as windows.pslist lists what the list
+# holds), Pebs (@(EPROCESS, PEB) of each, for its command line), Capped,
+# and the log's text (Get-DbgEngScanText: Info, Ways, Note), which the
+# caller logs only when these processes are used. Each entry says which
+# ways found it (FoundBy: ListForward, ListBackward, ProcessIdTable), the
+# ID the process ID table holds it under when that is not its own (TableId)
+# and what copying memory does not explain (Anomaly: NotInProcessList, a
+# process neither walk found, created before -CaptureFileTime, without an
+# exit time, while a walk reached the list's end; ProcessIdChanged, an ID of
+# 0, one that is not a multiple of 4, or one the table does not hold it
+# under). -CaptureFileTime: when the capture started (FILETIME), 0 when not
+# known. Processes is empty when nothing was found.
 function Read-DbgEngScannedProcesses {
-    param($Session, $Layout)
+    param($Session, $Layout, [long]$CaptureFileTime = 0)
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
     $cache = New-Object 'System.Collections.Generic.Dictionary[uint64,object]'
     $forward = Invoke-DbgEngProcessWalk -Session $Session -Layout $Layout -Cache $cache
     $backward = Invoke-DbgEngProcessWalk -Session $Session -Layout $Layout -Cache $cache -Backward
-    if ($Layout.CidError) { $cid = [PSCustomObject]@{ Entries = @(); Error = $Layout.CidError; UnreadablePages = 0 } }
+    if ($Layout.CidError) {
+        $cid = [PSCustomObject]@{ Entries = @(); Own = (New-Object 'System.Collections.Generic.HashSet[uint64]'); Mismatched = @(); NotProcesses = 0; Error = $Layout.CidError; UnreadablePages = 0 }
+    }
     else { $cid = Get-DbgEngCidProcesses -Session $Session -Layout $Layout -Cache $cache }
     $joined = Join-DbgEngProcessSets -Forward $forward.Entries -Backward $backward.Entries -Cid $cid.Entries
+    # The entries that hold a process under another ID than its own (a
+    # List[object] from New-Object is walked as it is: @() around it fails
+    # in both PowerShell editions with "Argument types do not match")
+    $tableIds = @{}
+    foreach ($entry in $cid.Mismatched) {
+        $key = "$($entry[1])"
+        if (-not $tableIds.ContainsKey($key)) { $tableIds[$key] = New-Object System.Collections.Generic.List[long] }
+        $tableIds[$key].Add([long]$entry[0])
+    }
+    $walkEnded = $forward.Complete -or $backward.Complete
+    $o = $Layout.Offsets
     $processes = New-Object System.Collections.Generic.List[object]
     $pebs = New-Object System.Collections.Generic.List[object]
-    $methods = New-Object System.Collections.Generic.List[int]
+    $missed = New-Object System.Collections.Generic.List[object]
+    $idChanges = New-Object System.Collections.Generic.List[object]
+    $staleEntries = 0
     for ($i = 0; $i -lt $joined.Addresses.Count; $i++) {
         $address = $joined.Addresses[$i]
+        $methods = $joined.Methods[$i]
         $block = [byte[]]$cache[$address]
-        # The idle process (PID 0) is not in the kernel's process list
-        # that windows.pslist walks
-        if ([BitConverter]::ToUInt64($block, $Layout.Offsets["UniqueProcessId"]) -eq 0) { continue }
-        $processes.Add((ConvertFrom-DbgEngProcessBlock -Session $Session -Layout $Layout -Address $address -Block $block))
-        $pebs.Add(@($address, [BitConverter]::ToUInt64($block, $Layout.Offsets["Peb"])))
-        $methods.Add($joined.Methods[$i])
+        $entry = ConvertFrom-DbgEngProcessBlock -Session $Session -Layout $Layout -Address $address -Block $block
+        $entry.FoundBy = (@(@(1, "ListForward"), @(2, "ListBackward"), @(4, "ProcessIdTable")) | Where-Object { ($methods -band $_[0]) -ne 0 } | ForEach-Object { $_[1] }) -join ","
+        $anomalies = @()
+        # Both walks missed it: did it end, start during the copy, or hide?
+        if (($methods -band 3) -eq 0) {
+            $exitTime = [BitConverter]::ToInt64($block, $o["ExitTime"])
+            $createTime = [BitConverter]::ToInt64($block, $o["CreateTime"])
+            $why = ""
+            if ($exitTime -gt 0) { $why = "Exited" }
+            elseif ($CaptureFileTime -gt 0 -and $createTime -ge $CaptureFileTime) { $why = "New" }
+            elseif (-not $walkEnded) { $why = "Unwalked" }
+            elseif ($CaptureFileTime -gt 0 -and $createTime -gt 0) { $why = "Hidden"; $anomalies += "NotInProcessList" }
+            $missed.Add([PSCustomObject]@{ Pid = $entry.PID; Why = $why })
+        }
+        # Its process ID: one Windows gives, and the one the table holds it under?
+        $kind = Get-DbgEngProcessIdKind -Layout $Layout -Block $block
+        $ids = @()
+        if ($tableIds.ContainsKey("$address")) { $ids = @($tableIds["$address"]) }
+        if ($ids.Count -gt 0) { $entry.TableId = (@($ids | ForEach-Object { $_.ToString($invariant) }) -join ",") }
+        if ($kind -ne "Valid" -or ($ids.Count -gt 0 -and -not $cid.Own.Contains($address))) {
+            $anomalies += "ProcessIdChanged"
+            $changeKind = if ($kind -ne "Valid") { $kind } else { "Table" }
+            $idChanges.Add([PSCustomObject]@{ Address = $address; Pid = $entry.PID; Kind = $changeKind; TableIds = $ids })
+        }
+        elseif ($ids.Count -gt 0) { $staleEntries += $ids.Count }
+        $entry.Anomaly = $anomalies -join ","
+        $processes.Add($entry)
+        $pebs.Add(@($address, [BitConverter]::ToUInt64($block, $o["Peb"])))
     }
     $engine = [PSCustomObject]@{ Count = [long]-1; Corrupt = $false }
     try { $engine = Get-DbgEngEngineProcessCount -Session $Session }
     catch { Write-DbgEngLog "    The debugger engine's own process list could not be counted: $(Get-DbgEngShortError (Get-DbgEngErrorText $_))" }
-    $text = Get-DbgEngScanText -Forward $forward -Backward $backward -Cid $cid -Methods $methods.ToArray() -EngineCount $engine.Count -EngineCorrupt $engine.Corrupt
-    Write-DbgEngLog $text.Info
-    if ($text.Note) { Write-DbgEngLog -Warning "  Memory dump process list: $($text.Note)" }
-    $capped = $forward.Capped -or $backward.Capped
-    if ($capped) { Write-DbgEngLog -Warning "  The kernel's process list did not end after 20000 entries (a damaged dump?): the first 20000 each way are used." }
-    return [PSCustomObject]@{ Processes = $processes.ToArray(); Pebs = $pebs.ToArray(); Capped = $capped; BadItems = 0 }
+    $text = Get-DbgEngScanText -Forward $forward -Backward $backward -Cid $cid -Methods $joined.Methods -Missed $missed.ToArray() -IdChanges $idChanges.ToArray() `
+        -StaleEntries $staleEntries -EngineCount $engine.Count -EngineCorrupt $engine.Corrupt
+    return [PSCustomObject]@{
+        Processes = $processes.ToArray(); Pebs = $pebs.ToArray(); Capped = ($forward.Capped -or $backward.Capped); BadItems = 0
+        Info = $text.Info; Ways = $text.Ways; Note = $text.Note
+    }
 }
 
 # The processes from the debugger engine's own list (dx queries), when the
@@ -1362,11 +1554,21 @@ function Read-DbgEngEngineProcesses {
     return $found
 }
 
+# When the capture started, from -CaptureStart (yyyy-MM-ddTHH:mm:ss.fffffffZ)
+# as a FILETIME; 0 when it is empty or not such a time
+function ConvertFrom-DbgEngCaptureStart {
+    param([string]$Text)
+    $time = [datetime]::MinValue
+    if ($Text -and [datetime]::TryParseExact($Text.Trim(), "o", [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$time) -and
+        $time.Kind -eq [DateTimeKind]::Utc -and $time.Year -ge 1980) { return $time.ToFileTimeUtc() }
+    return [long]0
+}
+
 # The dump's processes and command lines (New-DbgEngResult). Nothing read:
 # Reason says why. The processes read but not the command lines:
-# PartialReason says why.
+# PartialReason says why. -CaptureStart: as the script's parameter.
 function Read-DbgEngDump {
-    param([string]$DumpPath, [string]$EngineFolder, [string[]]$EngineDlls, [string]$SymbolCache, [string]$JobFolder)
+    param([string]$DumpPath, [string]$EngineFolder, [string[]]$EngineDlls, [string]$SymbolCache, [string]$JobFolder, [string]$CaptureStart)
     $result = New-DbgEngResult
     $timer = [System.Diagnostics.Stopwatch]::StartNew()
     $emptySymbols = Join-Path $JobFolder "nosymbols"
@@ -1427,10 +1629,17 @@ function Read-DbgEngDump {
         $layout = Get-DbgEngKernelLayout -Session $session
         $found = $null
         if (-not $layout.Error) {
-            $found = Read-DbgEngScannedProcesses -Session $session -Layout $layout
+            $found = Read-DbgEngScannedProcesses -Session $session -Layout $layout -CaptureFileTime (ConvertFrom-DbgEngCaptureStart $CaptureStart)
             if (@($found.Processes).Count -eq 0) {
+                # Its counts and note are not about the rows the timeline gets
+                Write-DbgEngLog "    No process was found in the kernel's own process structures: $($found.Ways)"
                 $layout.Error = "no process was found in them"
                 $found = $null
+            }
+            else {
+                Write-DbgEngLog $found.Info
+                if ($found.Note) { Write-DbgEngLog -Warning "  Memory dump process list: $($found.Note)" }
+                if ($found.Capped) { Write-DbgEngLog -Warning "  The kernel's process list did not end after 20000 entries (a damaged dump?): the first 20000 each way are used." }
             }
         }
         if (-not $found) {
@@ -1486,7 +1695,7 @@ if ($JobFolder) {
     $ProgressPreference = "SilentlyContinue"
     $workerResult = $null
     try {
-        $workerResult = Read-DbgEngDump -DumpPath $DumpPath -EngineFolder $EngineFolder -EngineDlls @("$EngineDlls" -split ',' | Where-Object { $_ }) -SymbolCache $SymbolCache -JobFolder $JobFolder
+        $workerResult = Read-DbgEngDump -DumpPath $DumpPath -EngineFolder $EngineFolder -EngineDlls @("$EngineDlls" -split ',' | Where-Object { $_ }) -SymbolCache $SymbolCache -JobFolder $JobFolder -CaptureStart $CaptureStart
     }
     catch {
         $workerResult = New-DbgEngResult

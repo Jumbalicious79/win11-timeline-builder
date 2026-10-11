@@ -903,7 +903,8 @@ once more.
      missing), notes (among them a memory dump of the collection that was
      not analyzed, and why, or what was read from a Windows ARM64 dump and,
      when the ways of finding its processes disagreed, how many each found),
-     and the Integrity leads
+     and the Integrity leads (among them a process in a Windows ARM64 dump
+     that looks hidden from Windows' process list)
   3  Antivirus verdicts       4  Access       5  Persistence
   6  Execution                7  Initial access       8  File system
      (and "Other leads" when a rule uses another category)
@@ -2175,6 +2176,10 @@ of WinDbg -- instead:
         the 168 a row made of reused memory). The walks go on past an
         inconsistent link and count it; the process ID table does not use
         the list at all.
+      Each process row says which ways found it, in Details:
+        FoundBy=ListForward,ListBackward,ProcessIdTable (or the ways that
+        did). A process found by fewer ways is listed all the same, as
+        Volatility's windows.pslist would list what the list holds.
       The log says what each way found ("Processes found: 192; the kernel's
         process list walked forwards 192 (1 inconsistent link), backwards
         191 (1 inconsistent link), in its process ID table 192, in the
@@ -2190,15 +2195,44 @@ of WinDbg -- instead:
             process list (dx @$cursession.Processes in WinDbg) has 183
             entries and stops at the first inconsistent link.
         ("8 missed by walking forwards" when the forward walk stopped at
-        memory that was reused, "1 only in the process ID table" for a
-        process that was being created). A process found by fewer ways is
-        listed all the same: it can be one that ended during the copy (its
-        exit time is set), as Volatility's windows.pslist would show it too.
+        memory that was reused). Copying memory explains a process missing
+        from the list only when it ended or started during the copy. A
+        process that neither walk found, only the process ID table, is
+        named by its PID ("1 only in the process ID table (PID 7100,
+        created after the capture started)", or "PID 7000, which had
+        exited"). What copying does not explain comes first in the warning,
+        and its row is marked (Details Anomaly=):
+          Anomaly=NotInProcessList: a process that neither walk found, only
+            the process ID table, although it was created before the capture
+            started (the time in the dump's header) and has no exit time,
+            while a walk reached the end of the list. A process leaves the
+            list only when it ends, so this is what a process hidden from
+            the list (unlinked from it, as rootkits do) looks like: "PID 7300
+            is in neither walk of the kernel's process list, only in its
+            process ID table, yet it was created before the capture started
+            and has no exit time. Copying memory does not explain that, ...".
+            When both walks stopped early, or the dump's header has no
+            capture time, such a process is named but not marked.
+          Anomaly=ProcessIdChanged: a process whose own process ID is 0
+            (only the idle process has it, and it is in neither the list
+            nor the table), not a multiple of 4, or not the ID the process
+            ID table holds it under (TableId= on its row). It is listed with
+            the ID it has, and the warning names it by PID and address.
+        An entry of the process ID table that holds a process also held
+        under its own ID (the table changed during the copy) gives TableId=
+        and a sentence in the warning, but no mark. An object of the process
+        type whose own fields do not look like a process's (memory that was
+        reused) is never listed; the counts say how many entries of the
+        table were left out that way. The findings report's
+        INTEG-PROCESS-HIDDEN rule (High, Integrity) makes a lead of every
+        marked row.
         When the kernel's symbols do not describe these structures (the log
-        says why), the debugger engine's own list is used instead, with a
-        warning; when that list reports itself corrupted ("corrupted linked
-        list"), the "Memory dump process list" warning says that the newest
-        processes can be missing.
+        says why), or they do but no process is found in them (the log says
+        so in a plain line, with why each way found none), the debugger
+        engine's own list is used instead, with a warning; when that list
+        reports itself corrupted ("corrupted linked list"), the "Memory dump
+        process list" warning says that the newest processes can be
+        missing, and it is then the only such warning.
       command lines, as windows.cmdline: read from each process's own
         memory exactly as stored (quotes, tabs, line breaks, any
         character). None for the kernel's own processes (System, Registry,
@@ -3434,14 +3468,30 @@ parsing is skipped, and the timeline CSV can be opened manually.
   that ended during the copy (a stale link forwards to it; still in the
   process ID table) gives every row of the consistent dump and its own,
   the counts and the "Memory dump process list" warning, which the
-  findings report's log reader reads back; a link forwards into reused
-  memory (the forward walk stops; the backward walk and the table find
-  the rest; no row of the reused memory); a list that loops and a process
-  only in the process ID table (each process once); symbols with
+  findings report's log reader reads back; every row's FoundBy= (all three
+  ways, or the ways that found it); a link forwards into reused memory
+  (the forward walk stops; the backward walk and the table find the rest;
+  no row of the reused memory); a list that loops and a process only in
+  the process ID table created after the capture started (each process
+  once, it named by PID, not marked); a process hidden from the list
+  (unlinked cleanly, only in the table, created before the capture, no
+  exit time: its rows, Anomaly=NotInProcessList, the warning that names it
+  first and says copying does not explain it, read back by the report),
+  the same without a capture start (named, not marked) and with both walks
+  stopped early (not marked, the warning says why); process IDs changed in
+  memory (0, one not a multiple of 4, System's 4: every process listed with
+  the ID it has, Anomaly=ProcessIdChanged and TableId=, named first); a
+  stale entry of the process ID table (TableId=, not marked) and one whose
+  object only starts like a process (counted, no row, no warning); the
+  scan finding nothing (list head and table not in the dump: a plain line,
+  then the engine's own list, its warning the only "Memory dump process
+  list" line, matching the rows); symbols with
   _MM_SESSION_SPACE (its ids, the token's where a session space is not in
   the dump); no process ID table in the symbols (both walks, no warning);
-  the note's wording without the table; the layout's refusals (fields of
-  another type named) and a capped walk. The same 146 processes as canned
+  the note's wording without the table and with more than 10 PIDs; the
+  layout's refusals (fields of another type named) and a capped walk. The
+  idle process is in neither the fake list nor the table, as in a real
+  kernel. The same 146 processes as canned
   dx output (two pages with bad items, a duplicate and the idle process;
   one unreadable session id) for the debugger engine's own list, used when
   the symbols do not describe the process structure: the same rows, the

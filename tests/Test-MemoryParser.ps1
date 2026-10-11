@@ -71,14 +71,22 @@
 # kernel (EPROCESS blocks at the offsets of canned "dt -v" output, the
 # process list, the process ID table, tokens and session spaces) through
 # the builder's protocol reader and Add-MemoryPluginRows (rows, counts, log
-# lines, de-DE, cache reuse, offline, a damaged cached file): the list
-# copied while Windows ran (a process that ended during the copy, a link
-# into reused memory, a loop, a process only in the process ID table; the
-# "Memory dump process list" warning and the report's reading of it),
-# session ids per process (_MM_SESSION_SPACE or the token), the layout's
-# refusals, and the debugger engine's own list (canned dx output) when the
-# symbols do not describe the process structure (a failing process query,
-# its "corrupted linked list" warning, session ids decided per process).
+# lines, de-DE, cache reuse, offline, a damaged cached file; FoundBy= on
+# every process row): the list copied while Windows ran (a process that
+# ended during the copy, a link into reused memory, a loop, a process only
+# in the process ID table created after the capture started; the "Memory
+# dump process list" warning and the report's reading of it), what copying
+# does not explain (a process unlinked from the list: Anomaly=
+# NotInProcessList, named first in the warning; not marked without a
+# capture start or when both walks stopped early; process IDs changed to 0,
+# to one not a multiple of 4 and to another process's: Anomaly=
+# ProcessIdChanged and TableId=), the process ID table changed during the
+# copy (a stale entry) and an object that only starts like a process, the
+# scan finding nothing (one warning, the engine's own list's), session ids
+# per process (_MM_SESSION_SPACE or the token), the layout's refusals, and
+# the debugger engine's own list (canned dx output) when the symbols do not
+# describe the process structure (a failing process query, its "corrupted
+# linked list" warning, session ids decided per process).
 # Real helper processes: the real
 # helper on a fake dump, canned entries with every kind of character, a
 # crash, an error, a hang (ended), output without its end, no helper.
@@ -1869,18 +1877,31 @@ try {
         # proc21: its session space is not in the dump
         New-TestProcess -Index $i -ProcId (6000 + 4 * $i) -ParentId 4000 -Create $capture.AddMinutes(-10) -Exit 0 -Threads 2 -Name "proc$i.exe" -CommandLine "C:\Windows\proc$i.exe /x" -NoToken:($i -eq 20) -NoSpace:($i -eq 21)
     }
+    # The idle process: as in a real kernel, in neither the process list
+    # nor the process ID table (only the engine's own dx list has it)
     New-TestProcess -Index 146 -ProcId 0 -ParentId 0 -Create 0 -Exit 0 -Threads 4 -Name "Idle" -CommandLine "" -NoPeb
     # Not in the process list by default: a process that ended during the
-    # copy (gone.exe), one that was being created (new.exe), and memory of a
-    # process that was reused (dispatcher type 28, a link to 0x10001)
+    # copy (gone.exe), one that was being created after the capture started
+    # (new.exe), one that is hidden (hidden.exe: created hours before the
+    # capture, no exit time, its links point to itself), memory of a process
+    # that was reused (dispatcher type 28, a link to 0x10001), and memory
+    # that only starts like a process (type 3, links that are no kernel
+    # addresses)
     New-TestProcess -Index 150 -ProcId 7000 -ParentId 4000 -Create $capture.AddMinutes(-5) -Exit $capture.AddMinutes(-4) -Threads 0 -Name "gone.exe" -CommandLine "x" -NoParameters
-    New-TestProcess -Index 152 -ProcId 7100 -ParentId 4000 -Create $capture.AddMinutes(-1) -Exit 0 -Threads 1 -Name "new.exe" -CommandLine "new.exe /n"
+    New-TestProcess -Index 152 -ProcId 7100 -ParentId 4000 -Create $capture.AddSeconds(30) -Exit 0 -Threads 1 -Name "new.exe" -CommandLine "new.exe /n"
+    New-TestProcess -Index 153 -ProcId 7300 -ParentId 4000 -Create $capture.AddHours(-3) -Exit 0 -Threads 5 -Name "hidden.exe" -CommandLine "hidden.exe -q"
     $reused = New-Object byte[] 0x900
     $reused[0] = 28
     Set-TestUInt64 -Bytes $reused -Offset $fakeOffsets.UniqueProcessId -Value ([uint64]0x123456789)
     Set-TestUInt64 -Bytes $reused -Offset $fakeOffsets.ActiveProcessLinks -Value ([uint64]0x10001)
     $reusedAddress = $eprocessBase + [uint64](151 * 0x1000)
     Add-TestRegion -Process 0 -Start $reusedAddress -Bytes $reused
+    $partlyProcess = New-Object byte[] 0x900
+    $partlyProcess[0] = 3
+    Set-TestUInt64 -Bytes $partlyProcess -Offset $fakeOffsets.UniqueProcessId -Value ([uint64]0x10001)
+    Set-TestUInt64 -Bytes $partlyProcess -Offset $fakeOffsets.ActiveProcessLinks -Value ([uint64]0x10001)
+    $partlyAddress = $eprocessBase + [uint64](154 * 0x1000)
+    Add-TestRegion -Process 0 -Start $partlyAddress -Bytes $partlyProcess
     # Threads (dispatcher type 6) at IDs between the processes'
     $threadEntries = foreach ($threadId in @(8, 12, 16, 20, 4100, 4104)) {
         $thread = New-Object byte[] 16
@@ -1889,16 +1910,20 @@ try {
         Add-TestRegion -Process 0 -Start $threadAddress -Bytes $thread
         , @($threadId, $threadAddress)
     }
+    Set-TestLinks -Index 153 -Flink (Get-TestLinkAddress 153) -Blink (Get-TestLinkAddress 153)
     $defaultOrder = [int[]](0..145)
-    # Every process at its ID, the threads, and an entry whose process has
-    # another ID (not taken)
-    $defaultCid = @($procs | Where-Object { $_.Index -le 145 -and $_.ProcId -gt 0 } | ForEach-Object { , @($_.ProcId, $_.E) }) + @($threadEntries) + @(, @(7200, $procs[3].E))
+    # Every process at its ID, and the threads
+    $defaultCid = @($procs | Where-Object { $_.Index -le 145 -and $_.ProcId -gt 0 } | ForEach-Object { , @($_.ProcId, $_.E) }) + @($threadEntries)
     function Reset-TestKernel {
         Set-TestProcessList -Order $defaultOrder
         Set-TestCidTable -Entries $defaultCid
         $script:dtText = $script:dtDefault
         $script:engineCountText = "@`$cursession.Processes.Where(p => p.Id != 0).Count() : 0x92`n"
         $script:dxWarning = ""
+        $script:headSymbol = $listHead
+        $script:cidSymbol = $cidVariable
+        # The process IDs of the default processes, as New-TestProcess wrote them
+        foreach ($p in $procs) { Set-TestUInt64 -Bytes $script:blocks[$p.Index] -Offset $fakeOffsets.UniqueProcessId -Value ([uint64]$p.ProcId) }
     }
     Reset-TestKernel
     function Format-TestItems { param([string[]]$Lines) return (@(for ($i = 0; $i -lt $Lines.Count; $i++) { "    [0x$($i.ToString('x'))]          : $($Lines[$i])" }) -join "`n") }
@@ -1937,8 +1962,8 @@ try {
             if ($script:dtText.ContainsKey($Matches[1])) { return $script:dtText[$Matches[1]] }
             return "Symbol nt!$($Matches[1]) not found.`n"
         }
-        if ($Command -eq "? nt!PsActiveProcessHead") { return (Format-TestEvaluate $listHead) }
-        if ($Command -eq "? nt!PspCidTable") { return (Format-TestEvaluate $cidVariable) }
+        if ($Command -eq "? nt!PsActiveProcessHead") { return (Format-TestEvaluate $script:headSymbol) }
+        if ($Command -eq "? nt!PspCidTable") { return (Format-TestEvaluate $script:cidSymbol) }
         if ($Command -eq 'dx @$cursession.Processes.Where(p => p.Id != 0).Count()') { return $script:engineCountText }
         if ($Command -match '^dx -r1 @\$cursession\.Processes\.Skip\((\d+)\)\.Take\(100\)\.Select\(p => "(TB[PS])\|') {
             $skip = [int]$Matches[1]
@@ -1965,7 +1990,7 @@ try {
         param([System.Collections.IDictionary]$Arguments)
         $script:testWorkerState = New-DbgEngWorkerState
         $script:workerArguments = $Arguments
-        $workerResult = Read-DbgEngDump -DumpPath $Arguments["DumpPath"] -EngineFolder $Arguments["EngineFolder"] -EngineDlls @("$($Arguments['EngineDlls'])" -split ',') -SymbolCache $Arguments["SymbolCache"] -JobFolder $Arguments["JobFolder"]
+        $workerResult = Read-DbgEngDump -DumpPath $Arguments["DumpPath"] -EngineFolder $Arguments["EngineFolder"] -EngineDlls @("$($Arguments['EngineDlls'])" -split ',') -SymbolCache $Arguments["SymbolCache"] -JobFolder $Arguments["JobFolder"] -CaptureStart $Arguments["CaptureStart"]
         Write-DbgEngWorkerResult $workerResult
         $script:testWorkerState.ExitCode = 0
         return $script:testWorkerState
@@ -1982,7 +2007,7 @@ try {
         [System.IO.File]::WriteAllBytes($Path, $bytes)
     }
     $engineDump = "D:\Cases\Fall $([char]0x00E9) [2]\TriageCollection_2026-10-11_00-08_memory_dump.dmp"
-    $engineDumpInfo = [PSCustomObject]@{ CaptureTimeUtc = $capture; LastWriteUtc = $acquisitionEnd; Architecture = "ARM64" }
+    $engineDumpInfo = [PSCustomObject]@{ CaptureTimeUtc = $capture; LastWriteUtc = $acquisitionEnd; Architecture = "ARM64"; TimeSource = "crash dump header" }
     # One analysis: the rows ("Source|Timestamp|EventType|Description|User|
     # Details"), the result, the log (its file too) and what was opened,
     # closed, downloaded
@@ -2002,26 +2027,33 @@ try {
         }
     }
     # The rows of a run, sorted (the scan and the engine's list give them in
-    # different orders)
-    function Get-TestSortedRows { param($Run) return ((@($Run.Rows) | Sort-Object) -join "`n") }
+    # different orders); -Plain: without the scan's FoundBy= (which ways
+    # found each process; the engine's own list does not say)
+    function Get-TestSortedRows {
+        param($Run, [switch]$Plain)
+        $rows = @($Run.Rows)
+        if ($Plain) { $rows = @($rows | ForEach-Object { $_ -replace ' FoundBy=\S+', '' }) }
+        return (($rows | Sort-Object) -join "`n")
+    }
     $symbolRoot = Join-Path $script:testToolsFolder "symbols"
     Remove-Item -LiteralPath $symbolRoot -Recurse -Force -ErrorAction SilentlyContinue
     $script:offline = $false
     $run = Invoke-TestEngineRun
     $captureRowTime = "2026-10-11 00:09:00.000"
+    $allWays = "ListForward,ListBackward,ProcessIdTable"
     $expectedRows = @(
-        "Memory-Processes|2026-10-10 06:00:00.000|ProcessCreation|Process in memory: System (PID: 4, PPID: 0)||Threads=150 SessionId=",
-        "Memory-Processes|2026-10-10 06:00:00.000|ProcessCreation|Process in memory: Registry (PID: 92, PPID: 4)||Threads=4 SessionId=",
-        "Memory-Processes|2026-10-10 06:00:01.234|ProcessCreation|Process in memory: smss.exe (PID: 404, PPID: 4)||Threads=2 SessionId=",
-        "Memory-Processes|2026-10-10 23:39:00.000|ProcessCreation|Process in memory: My App.exe (PID: 5000, PPID: 4000)||Threads=7 SessionId=1",
-        "Memory-Processes|2026-10-10 23:40:00.000|ProcessCreation|Process in memory: SearchProtocolH (PID: 5004, PPID: 4000)||Threads=7 SessionId=1",
-        "Memory-Processes|2026-10-10 23:41:00.000|ProcessCreation|Process in memory: caf$([char]0xFFFD).exe (PID: 5008, PPID: 4000)||Threads=1 SessionId=1",
-        "Memory-Processes|2026-10-10 23:42:00.000|ProcessCreation|Process in memory: exited.exe (PID: 5012, PPID: 4000)||Threads=0 SessionId=1",
-        "Memory-Processes|$captureRowTime|Snapshot|Process in memory: notime.exe (PID: 5016, PPID: 4000)||Threads=1 SessionId=1",
-        "Memory-Processes|$captureRowTime|Snapshot|Process in memory: future.exe (PID: 5020, PPID: 4000)||Threads=1 SessionId=1 CreateTime=2026-10-12 00:11:01.000",
-        "Memory-Processes|2026-10-10 23:55:00.000|ProcessCreation|Process in memory: services.exe (PID: 5048, PPID: 4000)||Threads=3 SessionId=0",
-        "Memory-Processes|2026-10-10 23:59:00.000|ProcessCreation|Process in memory: proc20.exe (PID: 6080, PPID: 4000)||Threads=2 SessionId=",
-        "Memory-Processes|2026-10-10 23:59:00.000|ProcessCreation|Process in memory: proc145.exe (PID: 6580, PPID: 4000)||Threads=2 SessionId=1",
+        "Memory-Processes|2026-10-10 06:00:00.000|ProcessCreation|Process in memory: System (PID: 4, PPID: 0)||Threads=150 SessionId= FoundBy=$allWays",
+        "Memory-Processes|2026-10-10 06:00:00.000|ProcessCreation|Process in memory: Registry (PID: 92, PPID: 4)||Threads=4 SessionId= FoundBy=$allWays",
+        "Memory-Processes|2026-10-10 06:00:01.234|ProcessCreation|Process in memory: smss.exe (PID: 404, PPID: 4)||Threads=2 SessionId= FoundBy=$allWays",
+        "Memory-Processes|2026-10-10 23:39:00.000|ProcessCreation|Process in memory: My App.exe (PID: 5000, PPID: 4000)||Threads=7 SessionId=1 FoundBy=$allWays",
+        "Memory-Processes|2026-10-10 23:40:00.000|ProcessCreation|Process in memory: SearchProtocolH (PID: 5004, PPID: 4000)||Threads=7 SessionId=1 FoundBy=$allWays",
+        "Memory-Processes|2026-10-10 23:41:00.000|ProcessCreation|Process in memory: caf$([char]0xFFFD).exe (PID: 5008, PPID: 4000)||Threads=1 SessionId=1 FoundBy=$allWays",
+        "Memory-Processes|2026-10-10 23:42:00.000|ProcessCreation|Process in memory: exited.exe (PID: 5012, PPID: 4000)||Threads=0 SessionId=1 FoundBy=$allWays",
+        "Memory-Processes|$captureRowTime|Snapshot|Process in memory: notime.exe (PID: 5016, PPID: 4000)||Threads=1 SessionId=1 FoundBy=$allWays",
+        "Memory-Processes|$captureRowTime|Snapshot|Process in memory: future.exe (PID: 5020, PPID: 4000)||Threads=1 SessionId=1 CreateTime=2026-10-12 00:11:01.000 FoundBy=$allWays",
+        "Memory-Processes|2026-10-10 23:55:00.000|ProcessCreation|Process in memory: services.exe (PID: 5048, PPID: 4000)||Threads=3 SessionId=0 FoundBy=$allWays",
+        "Memory-Processes|2026-10-10 23:59:00.000|ProcessCreation|Process in memory: proc20.exe (PID: 6080, PPID: 4000)||Threads=2 SessionId= FoundBy=$allWays",
+        "Memory-Processes|2026-10-10 23:59:00.000|ProcessCreation|Process in memory: proc145.exe (PID: 6580, PPID: 4000)||Threads=2 SessionId=1 FoundBy=$allWays",
         "Memory-CommandLine|$captureRowTime|Snapshot|Process command line: smss.exe (PID: 404)||Args=\SystemRoot\System32\smss.exe",
         "Memory-CommandLine|$captureRowTime|Snapshot|Process command line: My App.exe (PID: 5000)||Args=`"C:\Program Files\My App\My App.exe`" --flag",
         "Memory-CommandLine|$captureRowTime|Snapshot|Process command line: cmd.exe (PID: 5024)||Args=$special",
@@ -2029,13 +2061,14 @@ try {
         "Memory-CommandLine|$captureRowTime|Snapshot|Process command line: odd.exe (PID: 5036)||Args=odd.e"
     )
     $missingRows = @($expectedRows | Where-Object { $run.Rows -cnotcontains $_ })
-    Assert-Equal -Name "debugger engine, a whole analysis (the scan of the fake kernel): the rows of the edge processes (System, Registry and smss.exe without a session, a name with spaces, 15 bytes, invalid UTF-8, exited, no time, a time past the end, session 0 and 1 from the token, an unreadable token; exact command lines)" -Expected "" -Actual ($missingRows -join " / ")
+    Assert-Equal -Name "debugger engine, a whole analysis (the scan of the fake kernel): the rows of the edge processes (System, Registry and smss.exe without a session, a name with spaces, 15 bytes, invalid UTF-8, exited, no time, a time past the end, session 0 and 1 from the token, an unreadable token; each found all three ways, FoundBy=; exact command lines)" -Expected "" -Actual ($missingRows -join " / ")
+    Assert-Equal -Name "debugger engine, a whole analysis: no row has TableId= or Anomaly= (a consistent dump)" -Expected "0" -Actual "$(@($run.Rows | Where-Object { $_ -match 'TableId=|Anomaly=' }).Count)"
     $longRow = @($run.Entries | Where-Object { $_.Description -eq "Process command line: long.exe (PID: 5028)" })
     $noRows = @($run.Entries | Where-Object { $_.Source -eq "Memory-CommandLine" -and $_.Description -match 'exited\.exe|empty\.exe|partial\.exe|: System \(|: Registry \(|\(PID: 0\)' })
     $idle = @($run.Rows | Where-Object { $_ -match 'Idle' })
     Assert-Equal -Name "debugger engine, a whole analysis: 146 pslist and 141 cmdline rows, a 32,767-character command line whole, no command line row for kernel, exited, empty and partly paged-out processes, no idle process" -Expected "146|141|1|32772|0|0" -Actual "$(@($run.Rows | Where-Object { $_.StartsWith('Memory-Processes|') }).Count)|$(@($run.Rows | Where-Object { $_.StartsWith('Memory-CommandLine|') }).Count)|$($longRow.Count)|$(if ($longRow.Count) { $longRow[0].Details.Length })|$($noRows.Count)|$($idle.Count)"
     Assert-Equal -Name "debugger engine, a whole analysis: the result, one session opened and closed, one download, the work folder removed, the dump as RawPath on every row" -Expected "287|146|141|||1|1|1|False|0" -Actual "$($run.Result.Entries)|$($run.Result.Processes)|$($run.Result.CommandLines)|$($run.Result.Reason)|$($run.Result.PartialReason)|$($run.Opened)|$($run.Closed)|$($run.Downloads)|$($run.JobLeft)|$(@($run.Entries | Where-Object { $_.RawPath -ne $engineDump -or $_.Artifact -ne 'MemoryDump' }).Count)"
-    Assert-Equal -Name "debugger engine: the helper's arguments (the engine, the symbol cache in tools\, the work folder) and the empty symbol and extension folders" -Expected "C:\stub|dbgeng.dll|$engineDump|True|True|$symbolRoot|$(Join-Path $script:runScratchDir 'dbgeng')" -Actual "$($script:openedWith)|$($script:workerArguments['SymbolCache'])|$($script:workerArguments['JobFolder'])"
+    Assert-Equal -Name "debugger engine: the helper's arguments (the engine, the symbol cache in tools\, the work folder, the capture start from the dump header in UTC) and the empty symbol and extension folders" -Expected "C:\stub|dbgeng.dll|$engineDump|True|True|$symbolRoot|$(Join-Path $script:runScratchDir 'dbgeng')|2026-10-11T00:09:00.0000000Z" -Actual "$($script:openedWith)|$($script:workerArguments['SymbolCache'])|$($script:workerArguments['JobFolder'])|$($script:workerArguments['CaptureStart'])"
     $expectedLog = @(
         "  Debugger engine: dbgeng.dll 10.0.26100.1 from C:\stub (part of Windows)",
         "  Downloading the Windows kernel symbol file (about 10 MB) from Microsoft's symbol server: https://msdl.microsoft.com/download/symbols/ntkrnlmp.pdb/$kernelKey/ntkrnlmp.pdb",
@@ -2055,7 +2088,7 @@ try {
     Assert-Equal -Name "debugger engine, a whole analysis: the structures from the symbols (dt -v), the list head and the process ID table (?), the engine's own list counted once, its dx pages not read" -Expected "_EPROCESS,_TOKEN,_EX_FAST_REF,_MM_SESSION_SPACE,_HANDLE_TABLE,_HANDLE_TABLE_ENTRY|1|1|1|0" -Actual "$typesRead|$headLookups|$tableLookups|$engineCounts|$enginePages"
     $cachedFile = Join-Path $symbolRoot "ntkrnlmp.pdb\$kernelKey\ntkrnlmp.pdb"
     Assert-Equal -Name "debugger engine: the kernel symbol file is kept in tools\symbols\<name>\<key>\<name>" -Expected "True" -Actual "$(Test-Path -LiteralPath $cachedFile)"
-    $scanRows = Get-TestSortedRows $run
+    $scanRows = Get-TestSortedRows $run -Plain
 
     # The same under de-DE (set inside one script block for Windows PowerShell)
     $germanRun = & {
@@ -2081,8 +2114,8 @@ try {
     $endedRun = Invoke-TestEngineRun
     Reset-TestKernel
     $endedNote = "the kernel's list of processes was inconsistent in 1 place, as when memory is copied while Windows runs and processes start or end during the copy. 147 processes were found, 146 of them by all three ways (walking the kernel's process list forwards, walking it backwards, and its process ID table), 1 missed by walking backwards. The debugger engine's own process list (dx @`$cursession.Processes in WinDbg) has 128 entries and stops at the first inconsistent link."
-    $goneRow = "Memory-Processes|2026-10-11 00:04:00.000|ProcessCreation|Process in memory: gone.exe (PID: 7000, PPID: 4000)||Threads=0 SessionId=1"
-    Assert-Equal -Name "memory copied while Windows ran, a process that ended during the copy: every row of the consistent dump (the newest after the break too) and the ended process's, once" -Expected ((@($run.Rows) + @($goneRow) | Sort-Object) -join "`n") -Actual (Get-TestSortedRows $endedRun)
+    $goneRow = "Memory-Processes|2026-10-11 00:04:00.000|ProcessCreation|Process in memory: gone.exe (PID: 7000, PPID: 4000)||Threads=0 SessionId=1 FoundBy=ListForward,ProcessIdTable"
+    Assert-Equal -Name "memory copied while Windows ran, a process that ended during the copy: every row of the consistent dump (the newest after the break too) and the ended process's, once, with the ways that found it" -Expected ((@($run.Rows) + @($goneRow) | Sort-Object) -join "`n") -Actual (Get-TestSortedRows $endedRun)
     Assert-Equal -Name "memory copied while Windows ran, a process that ended during the copy: what each way found, and the warning that says how they disagree" -Expected "True|True|147" -Actual "$($endedRun.Log.Contains("    Processes found: 147; the kernel's process list walked forwards 147 (1 inconsistent link), backwards 146 (1 inconsistent link), in its process ID table 147, in the debugger engine's own list 128`r`n"))|$($endedRun.Log.Contains("WARNING:   Memory dump process list: $endedNote`r`n"))|$($endedRun.Result.Processes)"
     # The findings report reads the warning back as its coverage note
     $endedReportLog = Read-ReportEngineBuilderLog -Path $endedRun.LogFile
@@ -2096,19 +2129,97 @@ try {
     $reusedRun = Invoke-TestEngineRun
     Reset-TestKernel
     $reusedNote = "the kernel's list of processes was inconsistent in 1 place, as when memory is copied while Windows runs and processes start or end during the copy. 146 processes were found, 101 of them by all three ways (walking the kernel's process list forwards, walking it backwards, and its process ID table), 45 missed by walking forwards. The debugger engine's own process list (dx @`$cursession.Processes in WinDbg) has 102 entries and stops at the first inconsistent link."
-    Assert-Equal -Name "a forward walk that stops at reused memory: the same rows as the consistent dump (none of the reused memory), what each way found, the warning" -Expected "True|True|True|0" -Actual "$((Get-TestSortedRows $reusedRun) -ceq $scanRows)|$($reusedRun.Log.Contains("    Processes found: 146; the kernel's process list walked forwards 101 (stopped at an entry that is not a process), backwards 146 (1 inconsistent link), in its process ID table 146, in the debugger engine's own list 102`r`n"))|$($reusedRun.Log.Contains("WARNING:   Memory dump process list: $reusedNote`r`n"))|$(@($reusedRun.Rows | Where-Object { $_ -match 'PID: -|PID: 4886718345' }).Count)"
+    Assert-Equal -Name "a forward walk that stops at reused memory: the same rows as the consistent dump (none of the reused memory; 45 found backwards and in the table), what each way found, the warning" -Expected "True|True|True|0|45" -Actual "$((Get-TestSortedRows $reusedRun -Plain) -ceq $scanRows)|$($reusedRun.Log.Contains("    Processes found: 146; the kernel's process list walked forwards 101 (stopped at an entry that is not a process), backwards 146 (1 inconsistent link), in its process ID table 146, in the debugger engine's own list 102`r`n"))|$($reusedRun.Log.Contains("WARNING:   Memory dump process list: $reusedNote`r`n"))|$(@($reusedRun.Rows | Where-Object { $_ -match 'PID: -|PID: 4886718345' }).Count)|$(@($reusedRun.Rows | Where-Object { $_.EndsWith(' FoundBy=ListBackward,ProcessIdTable') }).Count)"
 
     # A list that loops back (its last link forwards points to an earlier
-    # entry) and a process only in the process ID table (being created):
-    # every process once
+    # entry) and a process only in the process ID table that was created
+    # after the capture started (being created during the copy): every
+    # process once, the new one named, not marked
     Set-TestLinks -Index 145 -Flink (Get-TestLinkAddress 10) -Blink (Get-TestLinkAddress 144)
     Set-TestCidTable -Entries ($defaultCid + @(, @(7100, ($eprocessBase + [uint64](152 * 0x1000)))))
     $loopRun = Invoke-TestEngineRun
     Reset-TestKernel
-    $loopNote = "the kernel's list of processes was inconsistent in 1 place, as when memory is copied while Windows runs and processes start or end during the copy. 147 processes were found, 146 of them by all three ways (walking the kernel's process list forwards, walking it backwards, and its process ID table), 1 only in the process ID table. The debugger engine's own process list (dx @`$cursession.Processes in WinDbg) has 146 entries."
+    $loopNote = "the kernel's list of processes was inconsistent in 1 place, as when memory is copied while Windows runs and processes start or end during the copy. 147 processes were found, 146 of them by all three ways (walking the kernel's process list forwards, walking it backwards, and its process ID table), 1 only in the process ID table (PID 7100, created after the capture started). The debugger engine's own process list (dx @`$cursession.Processes in WinDbg) has 146 entries."
     $loopProcessRows = @($loopRun.Entries | Where-Object { $_.Source -eq "Memory-Processes" })
     $distinctPids = @($loopProcessRows | ForEach-Object { if ($_.Description -match '\(PID: (\d+),') { $Matches[1] } } | Sort-Object -Unique).Count
-    Assert-Equal -Name "a list that loops and a process only in the process ID table: 147 process rows, each process once (new.exe too), what each way found, the warning" -Expected "147|147|1|True|True" -Actual "$($loopProcessRows.Count)|$distinctPids|$(@($loopRun.Rows | Where-Object { $_.Contains('Process in memory: new.exe (PID: 7100, PPID: 4000)') }).Count)|$($loopRun.Log.Contains("    Processes found: 147; the kernel's process list walked forwards 146 (stopped at a link to an entry already walked), backwards 146 (1 inconsistent link), in its process ID table 147, in the debugger engine's own list 146`r`n"))|$($loopRun.Log.Contains("WARNING:   Memory dump process list: $loopNote`r`n"))"
+    Assert-Equal -Name "a list that loops and a process only in the process ID table, created after the capture started: 147 process rows, each process once (new.exe too, found by the table, not marked), what each way found, the warning naming it" -Expected "147|147|1|True|True" -Actual "$($loopProcessRows.Count)|$distinctPids|$(@($loopRun.Rows | Where-Object { $_.EndsWith('Process in memory: new.exe (PID: 7100, PPID: 4000)||Threads=1 SessionId=1 FoundBy=ProcessIdTable') }).Count)|$($loopRun.Log.Contains("    Processes found: 147; the kernel's process list walked forwards 146 (stopped at a link to an entry already walked), backwards 146 (1 inconsistent link), in its process ID table 147, in the debugger engine's own list 146`r`n"))|$($loopRun.Log.Contains("WARNING:   Memory dump process list: $loopNote`r`n"))"
+
+    # A process hidden from the list (unlinked cleanly: its neighbours'
+    # links consistent, its own pointing to itself), only in the process ID
+    # table, created hours before the capture and without an exit time:
+    # listed, marked (Anomaly=NotInProcessList), named first in the warning
+    # as something copying does not explain; the report reads the warning
+    $hiddenCid = $defaultCid + @(, @(7300, ($eprocessBase + [uint64](153 * 0x1000))))
+    Set-TestCidTable -Entries $hiddenCid
+    $hiddenRun = Invoke-TestEngineRun
+    Reset-TestKernel
+    $hiddenNote = "PID 7300 is in neither walk of the kernel's process list, only in its process ID table, yet it was created before the capture started and has no exit time. Copying memory does not explain that, as a process leaves the list only when it ends, and a process hidden from the list (unlinked from it) looks exactly like this. 147 processes were found, 146 of them by all three ways (walking the kernel's process list forwards, walking it backwards, and its process ID table), 1 only in the process ID table (PID 7300). The debugger engine's own process list (dx @`$cursession.Processes in WinDbg) has 146 entries."
+    $hiddenRows = @(
+        "Memory-Processes|2026-10-10 21:09:00.000|ProcessCreation|Process in memory: hidden.exe (PID: 7300, PPID: 4000)||Threads=5 SessionId=1 FoundBy=ProcessIdTable Anomaly=NotInProcessList",
+        "Memory-CommandLine|$captureRowTime|Snapshot|Process command line: hidden.exe (PID: 7300)||Args=hidden.exe -q"
+    )
+    Assert-Equal -Name "a process hidden from the list (unlinked, only in the process ID table, created before the capture, no exit time): every row of the consistent dump and its own two, its process row marked" -Expected ((@($run.Rows) + $hiddenRows | Sort-Object) -join "`n") -Actual (Get-TestSortedRows $hiddenRun)
+    Assert-Equal -Name "a process hidden from the list: what each way found (no inconsistent link), the warning names it first and says copying does not explain it, read back by the findings report" -Expected "True|True|$hiddenNote" -Actual "$($hiddenRun.Log.Contains("    Processes found: 147; the kernel's process list walked forwards 146, backwards 146, in its process ID table 147, in the debugger engine's own list 146`r`n"))|$($hiddenRun.Log.Contains("WARNING:   Memory dump process list: $hiddenNote`r`n"))|$((Read-ReportEngineBuilderLog -Path $hiddenRun.LogFile).MemoryDumpProcessList)"
+    # The same without a capture start (the dump's time is its file's): the
+    # process is named and found by the table, but not marked
+    $savedSource = $engineDumpInfo.TimeSource
+    $engineDumpInfo.TimeSource = "dump file last-write time"
+    Set-TestCidTable -Entries $hiddenCid
+    try { $noStartRun = Invoke-TestEngineRun }
+    finally { $engineDumpInfo.TimeSource = $savedSource; Reset-TestKernel }
+    Assert-Equal -Name "a process only in the process ID table, the capture start not known: no capture start passed, named in the warning, found by the table, not marked" -Expected "|True|1|0" -Actual "$($script:workerArguments['CaptureStart'])|$($noStartRun.Log.Contains("WARNING:   Memory dump process list: 147 processes were found, 146 of them by all three ways (walking the kernel's process list forwards, walking it backwards, and its process ID table), 1 only in the process ID table (PID 7300). The debugger engine's"))|$(@($noStartRun.Rows | Where-Object { $_.EndsWith('hidden.exe (PID: 7300, PPID: 4000)||Threads=5 SessionId=1 FoundBy=ProcessIdTable') }).Count)|$(@($noStartRun.Rows | Where-Object { $_.Contains('Anomaly=') }).Count)"
+    # Both walks stop early (links into reused memory, forwards after entry
+    # 100 and backwards before entry 120): the processes between are only in
+    # the table, so missing from the list says nothing there; none is marked
+    Set-TestLinks -Index 100 -Flink ($reusedAddress + [uint64]$fakeOffsets.ActiveProcessLinks) -Blink (Get-TestLinkAddress 99)
+    Set-TestLinks -Index 120 -Flink (Get-TestLinkAddress 121) -Blink ($reusedAddress + [uint64]$fakeOffsets.ActiveProcessLinks)
+    Set-TestCidTable -Entries $hiddenCid
+    $unwalkedRun = Invoke-TestEngineRun
+    Reset-TestKernel
+    Assert-Equal -Name "both walks stopped early: the processes between them and the unlinked one only in the table, all listed, none marked, the warning says the walks did not reach them" -Expected "147|20|0|True" -Actual "$(@($unwalkedRun.Rows | Where-Object { $_.StartsWith('Memory-Processes|') }).Count)|$(@($unwalkedRun.Rows | Where-Object { $_.Contains(' FoundBy=ProcessIdTable') }).Count)|$(@($unwalkedRun.Rows | Where-Object { $_.Contains('Anomaly=') }).Count)|$($unwalkedRun.Log.Contains('Both walks stopped before the end of the list, so a process only in the process ID table can be in the part of the list that neither walk reached.'))"
+
+    # Process IDs changed in memory (the process stays in the list and the
+    # table): 0, one that is not a multiple of 4, and System's 4 (the table
+    # holds System under 4): each listed as the list holds it, marked
+    # (Anomaly=ProcessIdChanged, TableId= the table's ID), named first in
+    # the warning; no process is lost
+    Set-TestUInt64 -Bytes $script:blocks[140] -Offset $fakeOffsets.UniqueProcessId -Value ([uint64]0)
+    Set-TestUInt64 -Bytes $script:blocks[141] -Offset $fakeOffsets.UniqueProcessId -Value ([uint64]6566)
+    Set-TestUInt64 -Bytes $script:blocks[142] -Offset $fakeOffsets.UniqueProcessId -Value ([uint64]4)
+    $changedRun = Invoke-TestEngineRun
+    Reset-TestKernel
+    $changedNote = "3 processes have a process ID that Windows did not give them (PID 0 at 0xffffa0000008c000, an ID only the idle process has, held in the process ID table under ID 6560; PID 6566 at 0xffffa0000008d000, not a multiple of 4 as Windows gives them, held in the process ID table under ID 6564; PID 4 at 0xffffa0000008e000, held in the process ID table under ID 6568). Copying memory does not explain that, and a process whose ID was changed in memory, to hide or disguise it, looks like this. 146 processes were found, 146 of them by all three ways (walking the kernel's process list forwards, walking it backwards, and its process ID table)."
+    $changedRows = @(
+        "Memory-Processes|2026-10-10 23:59:00.000|ProcessCreation|Process in memory: proc140.exe (PID: 0, PPID: 4000)||Threads=2 SessionId=1 FoundBy=$allWays TableId=6560 Anomaly=ProcessIdChanged",
+        "Memory-Processes|2026-10-10 23:59:00.000|ProcessCreation|Process in memory: proc141.exe (PID: 6566, PPID: 4000)||Threads=2 SessionId=1 FoundBy=$allWays TableId=6564 Anomaly=ProcessIdChanged",
+        "Memory-Processes|2026-10-10 23:59:00.000|ProcessCreation|Process in memory: proc142.exe (PID: 4, PPID: 4000)||Threads=2 SessionId=1 FoundBy=$allWays TableId=6568 Anomaly=ProcessIdChanged"
+    )
+    $changedMissing = @($changedRows | Where-Object { $changedRun.Rows -cnotcontains $_ })
+    Assert-Equal -Name "process IDs changed in memory (0, 6566, System's 4): 146 rows, each marked with the table's ID, what each way found, the warning names them first, read back by the findings report" -Expected "|146|3|True|$changedNote" -Actual "$($changedMissing -join ' / ')|$(@($changedRun.Rows | Where-Object { $_.StartsWith('Memory-Processes|') }).Count)|$(@($changedRun.Rows | Where-Object { $_.Contains('Anomaly=') }).Count)|$($changedRun.Log.Contains("    Processes found: 146; the kernel's process list walked forwards 146, backwards 146, in its process ID table 146, in the debugger engine's own list 146`r`n"))|$((Read-ReportEngineBuilderLog -Path $changedRun.LogFile).MemoryDumpProcessList)"
+
+    # The process ID table changed during the copy: an entry that holds a
+    # process also held under its own ID (said, TableId=, not marked), and
+    # an entry whose object only starts like a process (its links are no
+    # kernel addresses: counted, left out, no warning)
+    Set-TestCidTable -Entries ($defaultCid + @(, @(7200, $procs[3].E)))
+    $staleRun = Invoke-TestEngineRun
+    Set-TestCidTable -Entries ($defaultCid + @(, @(7204, $partlyAddress)))
+    $partlyRun = Invoke-TestEngineRun
+    Reset-TestKernel
+    Assert-Equal -Name "a stale entry of the process ID table: the process once, TableId=, not marked, the warning says the table changed during the copy" -Expected "146|1|0|True" -Actual "$(@($staleRun.Rows | Where-Object { $_.StartsWith('Memory-Processes|') }).Count)|$(@($staleRun.Rows | Where-Object { $_.EndsWith('My App.exe (PID: 5000, PPID: 4000)||Threads=7 SessionId=1 FoundBy=ListForward,ListBackward,ProcessIdTable TableId=7200') }).Count)|$(@($staleRun.Rows | Where-Object { $_.Contains('Anomaly=') }).Count)|$($staleRun.Log.Contains('WARNING:   Memory dump process list: 1 entry of the process ID table holds a process that is there under its own ID too, as when the table changes during the copy. 146 processes were found, 146 of them by all three ways'))"
+    Assert-Equal -Name "an entry of the process ID table whose object only starts like a process: counted in what the table found, no row, no warning" -Expected "True|True|0" -Actual "$($partlyRun.Log.Contains("    Processes found: 146; the kernel's process list walked forwards 146, backwards 146, in its process ID table 146 (1 entry left out whose object only starts like a process), in the debugger engine's own list 146`r`n"))|$((Get-TestSortedRows $partlyRun) -ceq (Get-TestSortedRows $run))|$(@([regex]::Matches($partlyRun.Log, 'WARNING')).Count)"
+
+    # The symbols describe the structures, but the list head and the
+    # process ID table are not in the dump: the scan finds nothing and says
+    # so in a plain line; the engine's own list is used, and its warning is
+    # the only "Memory dump process list" line, matching the rows
+    $script:headSymbol = $kernelBase + [uint64]0x300000
+    $script:cidSymbol = $kernelBase + [uint64]0x300100
+    $script:dxWarning = "WARNING: corrupted linked list found. Previous (_LIST_ENTRY*) 0xffffa000000962c8, current (_LIST_ENTRY*) 0xffffa000000651c8.`n"
+    $emptyScanRun = Invoke-TestEngineRun
+    Reset-TestKernel
+    $emptyScanNote = "the debugger engine found the kernel's list of processes inconsistent (corrupted linked list), as when memory is copied while Windows runs and processes start or end during the copy, and lists only the 146 processes before that place, so the newest processes can be missing. The kernel's own process structures could not be read to find them."
+    Assert-Equal -Name "the scan finds no process (list head and process ID table not in the dump): a plain line says so, then the engine's own list, one 'Memory dump process list' warning that the findings report reads, the same rows" -Expected "True|True|1|$emptyScanNote|True|False" -Actual "$($emptyScanRun.Log.Contains("    No process was found in the kernel's own process structures: the kernel's process list walked forwards 0 (stopped at the list head, which is not in the dump), backwards 0 (stopped at the list head, which is not in the dump), its process ID table not read [it is not in the dump], in the debugger engine's own list 146`r`n"))|$($emptyScanRun.Log.Contains("WARNING:   The kernel's own process structures could not be read (no process was found in them): the debugger engine's own process list is used"))|$(@([regex]::Matches($emptyScanRun.Log, 'Memory dump process list')).Count)|$((Read-ReportEngineBuilderLog -Path $emptyScanRun.LogFile).MemoryDumpProcessList)|$((Get-TestSortedRows $emptyScanRun -Plain) -ceq $scanRows)|$($emptyScanRun.Log.Contains('Processes found:'))"
 
     # Symbols with _MM_SESSION_SPACE: the session space's id (the fake one
     # is the token's + 2), the token's for a process whose session space is
@@ -2119,7 +2230,7 @@ try {
     Reset-TestKernel
     $spaceChecks = @("System (PID: 4, PPID: 0)||Threads=150 SessionId=", "My App.exe (PID: 5000, PPID: 4000)||Threads=7 SessionId=3", "services.exe (PID: 5048, PPID: 4000)||Threads=3 SessionId=2",
         "proc20.exe (PID: 6080, PPID: 4000)||Threads=2 SessionId=3", "proc21.exe (PID: 6084, PPID: 4000)||Threads=2 SessionId=1")
-    $spaceMissing = @($spaceChecks | Where-Object { $text = $_; @($spaceRun.Rows | Where-Object { $_.EndsWith($text) }).Count -ne 1 })
+    $spaceMissing = @($spaceChecks | Where-Object { $text = $_; @($spaceRun.Rows | ForEach-Object { $_ -replace ' FoundBy=\S+', '' } | Where-Object { $_.EndsWith($text) }).Count -ne 1 })
     Assert-Equal -Name "symbols with _MM_SESSION_SPACE: its session ids, the token's where the session space is not in the dump, none without a session" -Expected "|session ids for 143" -Actual "$($spaceMissing -join ' / ')|$(if ($spaceRun.Log -match 'session ids for \d+') { $Matches[0] })"
 
     # The kernel's symbols without the process structure: the engine's own
@@ -2128,7 +2239,7 @@ try {
     $script:dtText = @{}
     $fallbackRun = Invoke-TestEngineRun
     $fallbackWarning = "WARNING:   The kernel's own process structures could not be read (the kernel's symbols do not describe its process structure _EPROCESS): the debugger engine's own process list is used, which misses the newest processes when the list changed while the memory was copied."
-    Assert-Equal -Name "no process structure in the symbols: the engine's own list (bad items, a duplicate and the idle process left out), the same rows as the scan, the warning, no process list note" -Expected "True|True|True|False" -Actual "$((Get-TestSortedRows $fallbackRun) -ceq $scanRows)|$($fallbackRun.Log.Contains($fallbackWarning))|$($fallbackRun.Log.Contains('    Processes (windows.pslist rows): 146 entries (144 timed, 2 snapshot); 2 list item(s) could not be read; session ids for 142'))|$($fallbackRun.Log.Contains('Memory dump process list'))"
+    Assert-Equal -Name "no process structure in the symbols: the engine's own list (bad items, a duplicate and the idle process left out), the same rows as the scan, the warning, no process list note" -Expected "True|True|True|False" -Actual "$((Get-TestSortedRows $fallbackRun -Plain) -ceq $scanRows)|$($fallbackRun.Log.Contains($fallbackWarning))|$($fallbackRun.Log.Contains('    Processes (windows.pslist rows): 146 entries (144 timed, 2 snapshot); 2 list item(s) could not be read; session ids for 142'))|$($fallbackRun.Log.Contains('Memory dump process list'))"
     $script:dxWarning = "WARNING: corrupted linked list found. Previous (_LIST_ENTRY*) 0xffffa000000962c8, current (_LIST_ENTRY*) 0xffffa000000651c8.`n"
     $corruptRun = Invoke-TestEngineRun
     $corruptNote = "the debugger engine found the kernel's list of processes inconsistent (corrupted linked list), as when memory is copied while Windows runs and processes start or end during the copy, and lists only the 146 processes before that place, so the newest processes can be missing. The kernel's own process structures could not be read to find them."
@@ -2153,8 +2264,8 @@ try {
     $script:sessionLines = $defaultSessionLines
     $script:dtText = $script:dtDefault
     $tokenSystem = @($tokenRun.Rows | Where-Object { $_.Contains("Process in memory: System (PID: 4, PPID: 0)") })
-    Assert-Equal -Name "the engine's own list, the session query fails as a whole: logged, the token's session ids (none for System), the same rows" -Expected "True|True|1|True" -Actual "$($tokenRun.Log.Contains("    Session ids: Error - Unable to find type '_MM_SESSION_SPACE *' for cast; the token's session id is used for 146 process(es)"))|$($tokenRun.Log.Contains('session ids for 142'))|$(@($tokenSystem | Where-Object { $_.EndsWith('Threads=150 SessionId=') }).Count)|$((Get-TestSortedRows $tokenRun) -ceq $scanRows)"
-    Assert-Equal -Name "the engine's own list, session ids only for the processes without a session: the token's for the others, the same rows" -Expected "True|True|True" -Actual "$($mixedRun.Log.Contains("    Session ids: Unable to find type '_MM_SESSION_SPACE *' for cast; the token's session id is used for 143 process(es)"))|$($mixedRun.Log.Contains('session ids for 142'))|$((Get-TestSortedRows $mixedRun) -ceq $scanRows)"
+    Assert-Equal -Name "the engine's own list, the session query fails as a whole: logged, the token's session ids (none for System), the same rows" -Expected "True|True|1|True" -Actual "$($tokenRun.Log.Contains("    Session ids: Error - Unable to find type '_MM_SESSION_SPACE *' for cast; the token's session id is used for 146 process(es)"))|$($tokenRun.Log.Contains('session ids for 142'))|$(@($tokenSystem | Where-Object { $_.EndsWith('Threads=150 SessionId=') }).Count)|$((Get-TestSortedRows $tokenRun -Plain) -ceq $scanRows)"
+    Assert-Equal -Name "the engine's own list, session ids only for the processes without a session: the token's for the others, the same rows" -Expected "True|True|True" -Actual "$($mixedRun.Log.Contains("    Session ids: Unable to find type '_MM_SESSION_SPACE *' for cast; the token's session id is used for 143 process(es)"))|$($mixedRun.Log.Contains('session ids for 142'))|$((Get-TestSortedRows $mixedRun -Plain) -ceq $scanRows)"
 
     # The kernel's layout from its symbols: what the scan needs, and what
     # it does without
@@ -2176,11 +2287,19 @@ try {
         $script:dtText.Remove("_HANDLE_TABLE_ENTRY")
         try { Invoke-TestEngineRun } finally { $script:dtText = $script:dtDefault }
     }
-    Assert-Equal -Name "no process ID table in the symbols: both walks, the same rows, said in the counts, no warning" -Expected "True|True|0" -Actual "$((Get-TestSortedRows $noCidRun) -ceq $scanRows)|$($noCidRun.Log.Contains("    Processes found: 146; the kernel's process list walked forwards 146, backwards 146, its process ID table not read [the kernel's symbols do not give _HANDLE_TABLE_ENTRY.ObjectPointerBits as expected], in the debugger engine's own list 146`r`n"))|$(@([regex]::Matches($noCidRun.Log, 'WARNING')).Count)"
+    Assert-Equal -Name "no process ID table in the symbols: both walks, the same rows, said in the counts, no warning" -Expected "True|True|0" -Actual "$((Get-TestSortedRows $noCidRun -Plain) -ceq $scanRows)|$($noCidRun.Log.Contains("    Processes found: 146; the kernel's process list walked forwards 146, backwards 146, its process ID table not read [the kernel's symbols do not give _HANDLE_TABLE_ENTRY.ObjectPointerBits as expected], in the debugger engine's own list 146`r`n"))|$(@([regex]::Matches($noCidRun.Log, 'WARNING')).Count)"
     # The note's wording when the process ID table is not read and the walks disagree
     $fakeWalk = { param([int]$Count, [int]$Mismatches) [PSCustomObject]@{ Entries = @(1..$Count); Mismatches = $Mismatches; Complete = $true; Broken = $false; Capped = $false; Stop = "" } }
     $scanText = Get-DbgEngScanText -Forward (& $fakeWalk 10 0) -Backward (& $fakeWalk 12 1) -Cid ([PSCustomObject]@{ Entries = @(); Error = "it is not in the dump"; UnreadablePages = 0 }) -Methods ([int[]](@(3) * 10 + @(2) * 2))
     Assert-Equal -Name "Get-DbgEngScanText: without the process ID table, both walks named, a process only one walk found, why the table is not read" -Expected "the kernel's list of processes was inconsistent in 1 place, as when memory is copied while Windows runs and processes start or end during the copy. 12 processes were found, 10 of them by both walks of the kernel's process list, 2 only by walking backwards. The process ID table could not be read [it is not in the dump]." -Actual $scanText.Note
+    # Many processes only in the table: 10 named, then how many more
+    $manyMissed = @(1..12 | ForEach-Object { [PSCustomObject]@{ Pid = 8000 + 4 * $_; Why = $(if ($_ -eq 1) { "Exited" } else { "" }) } })
+    $manyText = Get-DbgEngScanText -Forward (& $fakeWalk 10 0) -Backward (& $fakeWalk 10 0) -Cid ([PSCustomObject]@{ Entries = @(1..22); Error = ""; UnreadablePages = 0 }) -Methods ([int[]](@(7) * 10 + @(4) * 12)) -Missed $manyMissed
+    Assert-Equal -Name "Get-DbgEngScanText: 12 processes only in the process ID table, 10 of them named (one that had exited said so), then how many more" -Expected "22 processes were found, 10 of them by all three ways (walking the kernel's process list forwards, walking it backwards, and its process ID table), 12 only in the process ID table (PID 8004, which had exited; PID 8008; PID 8012; PID 8016; PID 8020; PID 8024; PID 8028; PID 8032; PID 8036; PID 8040; and 2 more)." -Actual $manyText.Note
+    $wordCases = @(@(, "a"), @("a", "b"), @("a", "b", "c"), @(1..12 | ForEach-Object { "$_" }))
+    Assert-Equal -Name "Join-DbgEngWords: one, two, three, and more than 10 items; with semicolons" -Expected "a|a and b|a, b and c|1, 2, 3, 4, 5, 6, 7, 8, 9, 10 and 2 more|a, x; b|1; 2; 3; 4; 5; 6; 7; 8; 9; 10; and 2 more" -Actual ((@($wordCases | ForEach-Object { Join-DbgEngWords -Items $_ }) + @((Join-DbgEngWords -Items @("a, x", "b") -Semicolons), (Join-DbgEngWords -Items @(1..12 | ForEach-Object { "$_" }) -Semicolons))) -join "|")
+    $startCases = @("2026-10-11T05:08:35.9341509Z", "", "not a time", "2026-10-11T05:08:35.9341509+02:00", "1601-01-01T00:00:00.0000000Z")
+    Assert-Equal -Name "ConvertFrom-DbgEngCaptureStart: a UTC time as a FILETIME; empty, not a time, not UTC, before 1980: 0" -Expected "$([datetime]::new(2026, 10, 11, 5, 8, 35, [DateTimeKind]::Utc).AddTicks(9341509).ToFileTimeUtc())|0|0|0|0" -Actual ((@($startCases | ForEach-Object { ConvertFrom-DbgEngCaptureStart $_ })) -join "|")
 
     # A cached symbol file that does not match the dump: deleted, downloaded
     # once more
@@ -2256,13 +2375,13 @@ try {
     $cannedHelper = Join-Path $engineDir "canned helper.ps1"
     $cannedFunction = @'
 function Read-DbgEngDump {
-    param([string]$DumpPath, [string]$EngineFolder, [string[]]$EngineDlls, [string]$SymbolCache, [string]$JobFolder)
-    Write-DbgEngLog "  canned: $DumpPath|$EngineFolder|$($EngineDlls -join '+')|$SymbolCache|$JobFolder"
+    param([string]$DumpPath, [string]$EngineFolder, [string[]]$EngineDlls, [string]$SymbolCache, [string]$JobFolder, [string]$CaptureStart)
+    Write-DbgEngLog "  canned: $DumpPath|$EngineFolder|$($EngineDlls -join '+')|$SymbolCache|$JobFolder|$CaptureStart"
     Write-DbgEngLog -Warning "  canned warning"
     $result = New-DbgEngResult
     $text = "say ""hi""|there`ttab`r`nnext " + [string][char]0x00FC + [char]0x4E2D + [char]0x20AC + [char]0xD83D + [char]0xDE00 + [char]0xFFFE + " end"
     $result.Processes = @(
-        [PSCustomObject]@{ PID = [long]4321; PPID = [long]3000; ImageFileName = ("fixture " + [char]0x00E9 + "|x"); Offset = "0xffffa00000001000"; Threads = [long]3; SessionId = $null; CreateTime = "2026-10-10T23:59:01.1234567+00:00"; ExitTime = $null },
+        [PSCustomObject]@{ PID = [long]4321; PPID = [long]3000; ImageFileName = ("fixture " + [char]0x00E9 + "|x"); Offset = "0xffffa00000001000"; Threads = [long]3; SessionId = $null; CreateTime = "2026-10-10T23:59:01.1234567+00:00"; ExitTime = $null; FoundBy = "ListForward,ProcessIdTable"; TableId = "15804"; Anomaly = "NotInProcessList,ProcessIdChanged" },
         [PSCustomObject]@{ PID = [long]4400; PPID = $null; ImageFileName = ""; Offset = "0xffffa00000002000"; Threads = $null; SessionId = [long]0; CreateTime = $null; ExitTime = "2026-10-10T23:59:02.0000000+00:00" }
     )
     $result.CommandLines = @([PSCustomObject]@{ PID = [long]4321; Process = "fixture-stage.exe"; Args = $text }, [PSCustomObject]@{ PID = [long]4400; Process = "long.exe"; Args = ("y" * 32767) })
@@ -2286,13 +2405,13 @@ function Read-DbgEngDump {
     $cannedText = "say ""hi""|there`ttab`r`nnext " + [string][char]0x00FC + [char]0x4E2D + [char]0x20AC + [char]0xD83D + [char]0xDE00 + [char]0xFFFE + " end"
     $cannedRows = @($script:timelineEntries | ForEach-Object { "$($_.Source)|$($_.Timestamp)|$($_.EventType)|$($_.Description)|$($_.Details)" })
     $expectedCanned = @(
-        "Memory-Processes|2026-10-10 23:59:01.123|ProcessCreation|Process in memory: fixture $([char]0x00E9)|x (PID: 4321, PPID: 3000)|Threads=3 SessionId=",
+        "Memory-Processes|2026-10-10 23:59:01.123|ProcessCreation|Process in memory: fixture $([char]0x00E9)|x (PID: 4321, PPID: 3000)|Threads=3 SessionId= FoundBy=ListForward,ProcessIdTable TableId=15804 Anomaly=NotInProcessList,ProcessIdChanged",
         "Memory-Processes|$captureRowTime|Snapshot|Process in memory: Unknown (PID: 4400, PPID: )|Threads= SessionId=0",
         "Memory-CommandLine|$captureRowTime|Snapshot|Process command line: fixture-stage.exe (PID: 4321)|Args=$($script:xmlInvalidRegex.Replace($cannedText, ''))",
         "Memory-CommandLine|$captureRowTime|Snapshot|Process command line: long.exe (PID: 4400)|Args=$("y" * 32767)"
     )
     Assert-Equal -Name "the helper as a process: canned entries (non-ASCII, |, quotes, CR/LF, tab, a surrogate pair, U+FFFE, 32,767 characters) come through the pipe whole, as rows" -Expected ($expectedCanned -join "`n") -Actual ($cannedRows -join "`n")
-    $argumentLine = "  canned: $engineDump|C:\stub dir|dbgeng.dll|$symbolRoot|$(Join-Path $script:runScratchDir 'dbgeng')"
+    $argumentLine = "  canned: $engineDump|C:\stub dir|dbgeng.dll|$symbolRoot|$(Join-Path $script:runScratchDir 'dbgeng')|2026-10-11T00:09:00.0000000Z"
     Assert-Equal -Name "the helper as a process: its arguments (spaces, [ ], non-ASCII), its log lines relayed (a warning too), the counts logged" -Expected "True|True|True|True|4" -Actual "$($cannedLog.Contains($argumentLine))|$($cannedLog.Contains('WARNING:   canned warning'))|$($cannedLog.Contains('    Processes (windows.pslist rows): 2 entries (1 timed, 1 snapshot); 1 list item(s) could not be read; session ids for 1'))|$($cannedLog.Contains('    Command lines (windows.cmdline rows): 2 entries; none for 2 kernel process(es) without a PEB, 3 not readable (paged out or exited), 4 empty; 1.5 s'))|$($cannedResult.Entries)"
     $script:logFile = Join-Path $workDir "engine-direct.log"
     $state = Start-DbgEngWorker -WorkerPath $cannedHelper -WorkingDirectory $engineDir -TimeoutSeconds 120 -Arguments ([ordered]@{ DumpPath = $engineDump; EngineFolder = "C:\x\"; EngineDlls = "a.dll,b.dll"; SymbolCache = "C:\y"; JobFolder = $engineDir })
@@ -2305,14 +2424,14 @@ function Read-DbgEngDump {
     )
     foreach ($case in $standIns) {
         $script:testHelperPath = Join-Path $engineDir "stand-in $($standIns.IndexOf($case)).ps1"
-        [System.IO.File]::WriteAllText($script:testHelperPath, "param([string]`$DumpPath, [string]`$EngineFolder, [string]`$EngineDlls, [string]`$SymbolCache, [string]`$JobFolder)`r`n$($case.Script)`r`n")
+        [System.IO.File]::WriteAllText($script:testHelperPath, "param([string]`$DumpPath, [string]`$EngineFolder, [string]`$EngineDlls, [string]`$SymbolCache, [string]`$JobFolder, [string]`$CaptureStart)`r`n$($case.Script)`r`n")
         $script:logFile = Join-Path $workDir ("engine-stand-in-" + [guid]::NewGuid().ToString("N") + ".log")
         $standIn = Invoke-DbgEngMemoryAnalysis -DumpPath $engineDump -DumpInfo $engineDumpInfo
         Assert-Equal -Name "the helper as a process, $($case.Name): the reason$(if ($case.Log) { ', its log line relayed' })" -Expected "$($case.Reason)|0|True" -Actual "$($standIn.Reason)|$($standIn.Entries)|$(-not $case.Log -or (Get-TestLog).Contains($case.Log))"
     }
     $script:testHelperPath = Join-Path $engineDir "stand-in hang.ps1"
     $pidFile = Join-Path $engineDir "hang.pid"
-    [System.IO.File]::WriteAllText($script:testHelperPath, "param([string]`$DumpPath, [string]`$EngineFolder, [string]`$EngineDlls, [string]`$SymbolCache, [string]`$JobFolder)`r`n[System.IO.File]::WriteAllText('$($pidFile.Replace("'", "''"))', `"`$PID`")`r`nStart-Sleep -Seconds 120`r`n")
+    [System.IO.File]::WriteAllText($script:testHelperPath, "param([string]`$DumpPath, [string]`$EngineFolder, [string]`$EngineDlls, [string]`$SymbolCache, [string]`$JobFolder, [string]`$CaptureStart)`r`n[System.IO.File]::WriteAllText('$($pidFile.Replace("'", "''"))', `"`$PID`")`r`nStart-Sleep -Seconds 120`r`n")
     $script:dbgEngTimeoutSeconds = 4
     $hangTimer = [System.Diagnostics.Stopwatch]::StartNew()
     $hang = Invoke-DbgEngMemoryAnalysis -DumpPath $engineDump -DumpInfo $engineDumpInfo
