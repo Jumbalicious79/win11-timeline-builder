@@ -1097,10 +1097,12 @@ once more.
   time does not match -- a memory-only lead on that process (the .bat run
   from Downloads) keeps the "possibly the collector" card note.
 
-  Memory network and service
-  rows (Memory-Network, Memory-Services) of these processes are always kept
-  and checked -- no rule reads them, and a stale socket can belong to an
-  earlier process that reused the PID. Volatility 3's pslist reports a
+  Memory service rows (Memory-Services) of these processes are always kept
+  and checked, and so are Volatility's network rows (Memory-Network of an
+  x64 dump): a stale socket can belong to an earlier process that reused
+  the PID. A network row of a Windows ARM64 dump names its owner's create
+  time (OwnerCreated=), so it is left out with its process only when that
+  time is the left-out process's. Volatility 3's pslist reports a
   process's create time cut to the whole second, so the recorded 100-ns start
   time is matched against its own second. The Windows debugger engine (a
   Windows ARM64 dump) gives the full 100-ns create time, which the timeline
@@ -2299,8 +2301,70 @@ of WinDbg -- instead:
       Services (Services): the service control manager's list, as
         Volatility's windows.svcscan; Source Memory-Services. Not built yet.
       Network connections (Network): TCP connections, listeners and UDP
-        endpoints from one read-only pass over the dump file, as
-        Volatility's windows.netscan; Source Memory-Network. Not built yet.
+        endpoints, as Volatility's windows.netscan gives them on x64 dumps;
+        Source Memory-Network, the same rows ("Memory network: <proto>
+        <local>:<port> -> <foreign>:<port> (<state>)", NetworkConnection at
+        the time the endpoint was made, else Snapshot; Details "PID=<n>
+        Process=<owner>"). tcpip.sys keeps them in kernel memory that no
+        symbol file describes, so they are found the way Volatility finds
+        them: by the tag of each pool allocation (TTcb a connection, TcpL a
+        listener, UdpA a UDP endpoint), in one read-only pass over the dump
+        file itself (lib\memory\TimelineDbgEng.PoolScan.ps1), start to end,
+        16 MB at a time, on a thread of its own while the other areas run:
+        about 10 seconds for an 8 GB dump on an internal SSD, longer from a
+        USB drive. The pass has the area's time limit, 300 seconds; past it,
+        what the part read holds is listed and the area is partly read
+        ("the pass over the dump file stopped at its time limit of 300 s
+        after N% of it"). Only a full memory dump is scanned (DumpIt writes
+        one); another kind is "not read (the dump file is not a full memory
+        dump [dump type N])". The objects' fields are at offsets no symbol
+        file gives: a table per Windows build (lib\memory\
+        TimelineDbgEng.Network.ps1; Windows 11 24H2 and 25H2, builds 26100
+        to 26299), used only when the dump's objects pass self-checks (their
+        allocation size, their address family object, a known TCP state,
+        plausible create times, owners that are listed processes). A kind
+        that fails them is not listed and the coverage note says so; a
+        Windows build outside the table is "not read (the network objects
+        of Windows build N are not known to this builder)". Appended to
+        Details, in the same space style:
+          FoundBy=PoolScan PoolTag=<TTcb|TcpL|UdpA> Stale=<Yes|No>
+          [RemoteScope=<Public|Private|Loopback|LinkLocal|Other>]
+          [OwnerCreated=<the owner's create time>] [Anomaly=OwnerHidden]
+          [OwnerPath=<the owner's program path>]
+        A scan of memory also finds objects that were freed. Stale=Yes: the
+        entry is closed (CLOSED, DELETE_TCB), its owner has exited, or its
+        owner memory is no longer that process (not a process object, or a
+        process started after the entry was made; PID and Process are then
+        empty). Stale rows are never flagged. RemoteScope (connections
+        only): Public, an address on the internet; Private, 10/8,
+        172.16/12, 192.168/16, 100.64/10 and fc00::/7; Loopback; LinkLocal;
+        Other, unspecified, multicast, broadcast and reserved or
+        documentation ranges. Anomaly=OwnerHidden: the owner is a process
+        row with Anomaly=NotInProcessList, or a process object no way of the
+        process scan found, without an exit time and created before the
+        capture started. A listener's foreign address is 0.0.0.0:0 or ::
+        port 0, a UDP endpoint's *:0 with an empty state. The User column
+        is the owner's account (from the process details area). An entry
+        found twice in memory (an old copy of the same object) gives the
+        same row twice, which the builder's duplicate check combines
+        (Occurrences=N). Counted in the log only: connections in TIME_WAIT
+        (TcTW; their local address is not read, and the coverage note says
+        how many), sockets (AfdE), and objects of other sizes with these
+        tags. The log has "The pass over the dump file: 8.0 GB in N s (the
+        whole file), Windows build 26100" and the area's counts. Leads:
+          INTEG-NET-OWNER-HIDDEN (High): a connection of a hidden process
+          EXEC-NET-LISTENER-USERPATH (Medium): a listener or UDP endpoint of
+            a program in a user-writable folder (OwnerPath=)
+          EXEC-NET-SCRIPTHOST-PUBLIC (Medium, switched off): an ESTABLISHED
+            connection to a public address owned by a script host or a
+            built-in Windows tool; switched off because the real collections
+            it was measured on had a lead the collector does not explain
+            ("enabled": true in a copy of the rules file switches it on)
+        The collector's own processes' network rows are left out of the
+        rules by PID= and OwnerCreated= (see "The collector's own processes
+        in the memory dump"). Nothing is downloaded: tcpip.pdb (public
+        symbols only) would tell live connections from freed ones exactly,
+        and is not used.
   - Kernel symbols: the engine needs the symbol file of the dump's exact
     Windows kernel. The builder reads its name and ID from the kernel image
     in the dump and takes the file from tools\symbols\, or downloads it once
@@ -3611,6 +3675,24 @@ parsing is skipped, and the timeline CSV can be opened manually.
   tests\MemoryTestKit.ps1 (no dump in CI). While an area is not built yet,
   its test checks only that the area reports "not read (not built yet)" and
   that its rows functions add no rows.
+
+  tests\Test-MemoryNetwork.ps1 -- the network connections area: the dump
+  file's layout (runs, physical addresses, a file cut short, the dumps it
+  does not scan), the pass over the dump file on small synthetic full
+  memory dumps written to %TEMP% (each tag at its offset, a copy across
+  the pass's 16 MB reads, a run's end, the cap of 8192 hits per tag, the
+  time limit, passes that cannot start), the Network area on synthetic
+  kernel memory (connections, listeners and UDP endpoints in IPv4 and
+  IPv6; Stale=Yes for a closed entry, an exited owner, owner memory that
+  is not a process or is a later process's; OwnerHidden for a hidden
+  listed owner and for a process object found only through the
+  connection; the self-checks, a Windows build the table does not know,
+  the time limit, the counts and notes), its entries through the protocol
+  into the builder's rows, and those rows through the report engine's
+  Details parser and the network rules. The switched-off
+  EXEC-NET-SCRIPTHOST-PUBLIC is switched on in memory for its cases
+  (tests\fixtures\memory\net-rules-switched-off.csv); the other rules'
+  cases are in tests\fixtures\report\rules\cases-memory-network.csv.
 
   tests\MemoryTestKit.ps1 -- what these tests share (dot-sourced): it loads
   the helper's and the area files' functions (and with -Builder the

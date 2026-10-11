@@ -1,0 +1,10 @@
+# The Net entries of the canned dump (work package WP6, item i: network
+# connections, lib\memory\TimelineDbgEng.Network.ps1): a connection, a
+# listener and a UDP endpoint of the canned process (PID 4321), and a closed
+# connection whose owner memory is no longer a process (Stale=Yes, no PID).
+# Synthetic private and documentation addresses; no rule flags them.
+#AREA	Network	Read	1 connection in TIME_WAIT was found but is not listed, as its local address is not read
+Net	Offset=0x80000110	Proto=TCPv4	LocalAddr=192.168.56.10	LocalPort=50123	ForeignAddr=192.168.56.1	ForeignPort=8443	State=ESTABLISHED	PID=4321	Owner=fixture-stage.	Created=2026-03-02T11:31:00.0000000+00:00	PoolTag=TTcb	Stale=No	RemoteScope=Private	OwnerCreated=2026-03-02 11:30:00.123
+Net	Offset=0x80001110	Proto=TCPv4	LocalAddr=0.0.0.0	LocalPort=49700	ForeignAddr=0.0.0.0	ForeignPort=0	State=LISTENING	PID=4321	Owner=fixture-stage.	Created=2026-03-02T11:30:30.0000000+00:00	PoolTag=TcpL	Stale=No	OwnerCreated=2026-03-02 11:30:00.123
+Net	Offset=0x80002110	Proto=UDPv6	LocalAddr=::	LocalPort=5353	ForeignAddr=*	ForeignPort=0	State=	PID=4321	Owner=fixture-stage.	Created=2026-03-02T11:30:31.0000000+00:00	PoolTag=UdpA	Stale=No	OwnerCreated=2026-03-02 11:30:00.123
+Net	Offset=0x80003110	Proto=TCPv4	LocalAddr=192.168.56.10	LocalPort=50124	ForeignAddr=192.0.2.80	ForeignPort=443	State=CLOSED	PoolTag=TTcb	Stale=Yes	RemoteScope=Other	Created=2026-03-02T11:20:00.0000000+00:00

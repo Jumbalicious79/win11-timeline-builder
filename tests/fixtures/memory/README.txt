@@ -16,3 +16,9 @@ adds and edits only its own files. A line is one of:
       letters and digits; the value is everything after the first "=" (no
       TAB in it).
 The values are synthetic (fixture-*.exe and the like), never from a real dump.
+
+net-rules-switched-off.csv (WP6): the cases of a network rule that ships
+switched off (EXEC-NET-SCRIPTHOST-PUBLIC), in the format of
+tests\fixtures\report\rules\cases*.csv; tests\Test-MemoryNetwork.ps1 runs
+them with the rule switched on in memory (tests\Test-ReportRules.ps1 does
+not run a switched-off rule, so its HIT cases cannot be there).
