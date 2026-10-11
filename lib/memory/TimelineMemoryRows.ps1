@@ -687,12 +687,36 @@ function Add-DbgEngConsoleRows {
 
 # --- WP6: network connections (item i) ----------------------------------------------------
 
-# Memory-Network rows (Add-MemoryPluginRows "windows.netscan", with the
-# ARM64 fields in .ExtraDetails). Not built yet.
+# Memory-Network rows: each Net entry (lib\memory\TimelineDbgEng.Network.ps1)
+# as an entry of Volatility's windows.netscan, through Add-MemoryPluginRows
+# (Description "Memory network: <proto> <local>:<port> -> <foreign>:<port>
+# (<state>)", NetworkConnection at Created when it is valid, else Snapshot;
+# Details "PID=<n> Process=<owner>"), with the ARM64 fields appended in the
+# same space style, those whose values can hold spaces last:
+#   FoundBy=PoolScan PoolTag=<tag> Stale=Yes|No[ RemoteScope=<scope>]
+#   [ OwnerCreated=<yyyy-MM-dd HH:mm:ss.fff>][ Anomaly=OwnerHidden][ OwnerPath=<path>]
+# PID= and OwnerCreated= name the owner process (the findings report leaves
+# the collector's own out by them). The User column is the owner's token SID
+# (OwnerSid) when it was read.
 function Add-DbgEngNetRows {
     param([object[]]$Entries, [string]$Source, [datetime]$CaptureTimeUtc, [datetime]$AcquisitionEndUtc, [string]$DumpPath)
-    $null = $Entries, $Source, $CaptureTimeUtc, $AcquisitionEndUtc, $DumpPath
-    return (New-DbgEngRowCounts)
+    $netscan = New-Object System.Collections.Generic.List[object]
+    foreach ($entry in @($Entries)) {
+        if ($null -eq $entry) { continue }
+        $extra = "FoundBy=PoolScan"
+        foreach ($key in @("PoolTag", "Stale", "RemoteScope", "OwnerCreated", "Anomaly", "OwnerPath")) {
+            $value = "$($entry.$key)".Trim()
+            if ($value) { $extra += " $key=$value" }
+        }
+        $netscan.Add([PSCustomObject]@{
+                Proto = [string]$entry.Proto; LocalAddr = [string]$entry.LocalAddr; LocalPort = [string]$entry.LocalPort
+                ForeignAddr = [string]$entry.ForeignAddr; ForeignPort = [string]$entry.ForeignPort; State = [string]$entry.State
+                PID = [string]$entry.PID; Owner = [string]$entry.Owner; Created = [string]$entry.Created
+                User = [string]$entry.OwnerSid; ExtraDetails = $extra
+            })
+    }
+    $counts = Add-MemoryPluginRows -Plugin "windows.netscan" -Source $Source -Entries $netscan.ToArray() -CaptureTimeUtc $CaptureTimeUtc -AcquisitionEndUtc $AcquisitionEndUtc -DumpPath $DumpPath
+    return (New-DbgEngRowCounts -Timed $counts.Timed -Snapshot $counts.Snapshot)
 }
 
 # --- WP7: services (item j) ------------------------------------------------------------------
