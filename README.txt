@@ -2535,8 +2535,60 @@ of WinDbg -- instead:
         they read the memory command lines; the rules that key on program
         names and paths (EXEC-STAGING, EXEC-HACKTOOL-RAN, INITIAL-EMAIL-*)
         do not.
-      Services (Services): the service control manager's list, as
-        Volatility's windows.svcscan; Source Memory-Services. Not built yet.
+      Services (Services): the service control manager's list in the
+        memory of services.exe, as Volatility's windows.svcscan gives it on
+        x64 dumps (lib\memory\TimelineDbgEng.Services.ps1); Source
+        Memory-Services, one Snapshot row per service at the capture time
+        (a service record has no time of its own):
+          Description  Service in memory: <display name> (<name>)
+          Details      State=<SERVICE_RUNNING, SERVICE_STOPPED, ...>
+                       StartType=<SERVICE_AUTO_START, ...> Binary=<the
+                       program the service control manager runs; for a
+                       driver its driver object, \Driver\<name> or
+                       \FileSystem\<name>, as Volatility gives it>
+                       PID=<the process of a service that is not stopped>,
+                       then Type=<its type flags, comma-separated> Order=<n>
+                       FoundBy=<ScmList: the list; MemoryScan: found by a
+                       search of services.exe's memory; ,Registry: joined
+                       with the registry in memory; Registry alone: from the
+                       registry, when the list could not be read>
+                       [Anomaly=<HostNotListed: its process ID is not a
+                       process of the dump; NoRegistryKey: not stopped, but
+                       the SYSTEM hive's Services key in memory, read in
+                       full, has no key of its name>] and, when known,
+                       Account= RegistryBinary=<the key's ImagePath>
+                       ServiceDll=<its Parameters\ServiceDll>, these last
+                       (their values can hold spaces)
+          User         the token user of the service's process (from the
+                       process users and paths area; empty when not known)
+        How it is read: services.exe is taken from the processes (the one
+        wininit.exe started first), its image base from its PEB, and the
+        list's first and last records from a pair of pointers in its .data
+        section; the list is walked forward, and backward from its end when
+        a page that a live copy left out stops the walk (then the area is
+        partly read and its coverage note says how many records were read).
+        When the list's ends are not found, services.exe's private memory is
+        searched for the records, and only a record whose neighbours link
+        back to it is taken (stale copies are left out). The record layout
+        is in no symbol file: it is the one published for 64-bit Windows 11
+        build 26100 and later (MemProcFS's offsets), checked on three ARM64
+        dumps (615 services each, the list whole, the process ID of every
+        running service a process of the dump). A dump whose records fail
+        the self-check (the states, start types, types and names of nine in
+        ten records) is "not read (the service records are not in the layout
+        this helper knows ...)", never given rows from a wrong layout. The
+        registry in memory is joined when the registry hives area offers
+        the Services key. Under a second for an 8 GB dump.
+        The findings report: PERSIST-SERVICE-MEMORY-SUSPICIOUS (Medium,
+        Persistence) for a service whose Binary= or RegistryBinary= runs
+        cmd /c, PowerShell, a LOLBin, a program from a user-writable folder
+        or from an ADMIN$ share, or whose ServiceDll= is in a user-writable
+        folder (the patterns of PERSIST-SERVICE-SUSPICIOUS; it also reads
+        Volatility's x64 rows); PERSIST-SERVICE-REMOTEACCESS (Medium) also
+        reads the name, display name and binary of these rows;
+        INTEG-SERVICE-NO-REGISTRY-KEY (Medium, Integrity: Anomaly=
+        NoRegistryKey) is switched off until it has been measured with the
+        registry in memory.
       Network connections (Network): TCP connections, listeners and UDP
         endpoints, as Volatility's windows.netscan gives them on x64 dumps;
         Source Memory-Network, the same rows ("Memory network: <proto>
@@ -3991,6 +4043,22 @@ parsing is skipped, and the timeline CSV can be opened manually.
   EXEC-NET-SCRIPTHOST-PUBLIC is switched on in memory for its cases
   (tests\fixtures\memory\net-rules-switched-off.csv); the other rules'
   cases are in tests\fixtures\report\rules\cases-memory-network.csv.
+
+  tests\Test-MemoryServices.ps1 -- the Services area on synthetic memory
+  (no dump, no admin): a services.exe whose PEB and PE sections lead to the
+  list's first and last records (beside pairs of pointers that only look
+  like them), five records with their image records and strings. The list
+  read whole and in list order with every field; the E lines and the
+  builder's Memory-Services rows; the join with an object shaped as the
+  registry area's Services key (read in full, in part, not read); a record
+  not in the dump (the walks forward and backward, partly read); the search
+  of services.exe's memory when the list's ends are not found (a stale copy
+  left out); the image base from the memory regions when the PEB is not in
+  the dump; records of another layout (not read, or the registry alone);
+  no services.exe, its memory not in the dump, the time limit, two
+  services.exe; the rules PERSIST-SERVICE-MEMORY-SUSPICIOUS and
+  INTEG-SERVICE-NO-REGISTRY-KEY (switched on for the test) on the rows and
+  on tests\fixtures\report\rules\cases-memory-services.csv.
 
   tests\MemoryTestKit.ps1 -- what these tests share (dot-sourced): it loads
   the helper's and the area files' functions (and with -Builder the
