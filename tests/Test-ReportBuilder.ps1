@@ -5,9 +5,9 @@
 # and BAM rows) and checks what the report adds next to the timeline:
 # findings.csv, report-model.json, report.html, report.pdf (skipped only
 # when Microsoft Edge is missing), the copied collection_info.json and
-# collection_log.txt and, when the workbook was made, its first sheet
-# "Findings" (hyperlinks to the Timeline rows) and the Timeline sheet's
-# "Finding" column. Then:
+# collection_log.txt and, when the workbook was made, its sheets (it opens
+# on the full Timeline sheet; the second sheet "Findings" has hyperlinks to
+# the Timeline rows) and the Timeline sheet's "Finding" column. Then:
 #   -ReportOnly rebuilds the report in the same folder (one Findings sheet
 #      and one Finding column, the same findings, no administrator rights
 #      needed, no error output -- Windows PowerShell printed a Test-Path
@@ -144,6 +144,8 @@ function Read-TestWorkbook {
             }
         }
         $timeline = $package.Workbook.Worksheets["Timeline"]
+        $timelineSelected = [bool]$timeline.View.TabSelected
+        $activeTab = [int]$package.Workbook.View.ActiveTab
         $headers = @(for ($c = 1; $c -le $timeline.Dimension.End.Column; $c++) { [string]$timeline.Cells[1, $c].Value })
         $findingColumn = [Array]::IndexOf($headers, "Finding") + 1
         $timelineRows = @(for ($r = 2; $r -le $timeline.Dimension.End.Row; $r++) {
@@ -155,6 +157,8 @@ function Read-TestWorkbook {
         return [PSCustomObject]@{
             Sheets           = $sheets
             FindingsSelected = $findingsSelected
+            TimelineSelected = $timelineSelected
+            ActiveTab        = $activeTab
             FindingsRows     = $findingsRows.ToArray()
             Headers          = $headers
             TimelineRows     = $timelineRows
@@ -434,7 +438,7 @@ try {
         }
     }
 
-    # The workbook: first sheet Findings, hyperlinks, Finding column
+    # The workbook: Timeline first and selected, Findings second, hyperlinks, Finding column
     $workbook = $null
     $firstFindingColumn = @()
     if (-not (Test-Path -LiteralPath $xlsxPath)) {
@@ -448,7 +452,7 @@ try {
         }
         else {
             Write-TestResult -Succeeded ($model.Workbook.Available -and $html.Contains('href="./timeline.xlsx"')) -Message "the report links to the workbook"
-            Write-TestResult -Succeeded ($workbook.Sheets[0] -eq "Findings" -and $workbook.Sheets -contains "Timeline" -and $workbook.FindingsSelected) -Message "the workbook's first (and selected) sheet is Findings ($($workbook.Sheets -join ', '))"
+            Write-TestResult -Succeeded (($workbook.Sheets -join ",") -eq "Timeline,Findings" -and $workbook.TimelineSelected -and -not $workbook.FindingsSelected -and $workbook.ActiveTab -eq 0) -Message "the workbook opens on the full Timeline sheet (first and only selected); Findings is the second sheet ($($workbook.Sheets -join ', '); active tab $($workbook.ActiveTab))"
             $summaryRows = @($workbook.FindingsRows | Where-Object { $_.RowType -eq "Summary" })
             $evidenceRows = @($workbook.FindingsRows | Where-Object { $_.RowType -ne "Summary" })
             Write-TestResult -Succeeded ($summaryRows.Count -eq $expected.Count -and (@($summaryRows | ForEach-Object { $_.Finding }) -join ",") -eq ($ids -join ",")) -Message "the Findings sheet has a summary row per finding"
@@ -493,8 +497,9 @@ try {
     Write-TestResult -Succeeded ($rebuiltModel.Collection.ComputerName -eq "REPORT-FIXTURE" -and $rebuiltModel.Collection.CollectorUser -eq "FIXTURE\analyst") -Message "-ReportOnly reads the copied collection_info.json"
     if ($workbook) {
         $rebuiltWorkbook = Read-TestWorkbook -Path $xlsxPath
-        Write-TestResult -Succeeded ($rebuiltModel.Workbook.Available -and $rebuiltWorkbook.Sheets[0] -eq "Findings" -and @($rebuiltWorkbook.Sheets | Where-Object { $_ -eq "Findings" }).Count -eq 1 -and
-            @($rebuiltWorkbook.Headers | Where-Object { $_ -eq "Finding" }).Count -eq 1) -Message "-ReportOnly replaces the Findings sheet and the Finding column (no duplicates)"
+        Write-TestResult -Succeeded ($rebuiltModel.Workbook.Available -and ($rebuiltWorkbook.Sheets -join ",") -eq "Timeline,Findings" -and $rebuiltWorkbook.TimelineSelected -and
+            -not $rebuiltWorkbook.FindingsSelected -and $rebuiltWorkbook.ActiveTab -eq 0 -and
+            @($rebuiltWorkbook.Headers | Where-Object { $_ -eq "Finding" }).Count -eq 1) -Message "-ReportOnly replaces the Findings sheet and the Finding column (no duplicates); the workbook still opens on the full Timeline sheet"
         Write-TestResult -Succeeded ((@($rebuiltWorkbook.TimelineRows | ForEach-Object { $_.Finding }) -join "|") -eq ($firstFindingColumn -join "|")) -Message "-ReportOnly writes the same Finding column"
         $rebuiltWidths = @(Get-TestTimelineWidths -Path $xlsxPath)
         Write-TestResult -Succeeded (@($rebuiltWidths | Where-Object { $_ -eq "Details=80" }).Count -eq 1 -and @($rebuiltWidths | Where-Object { [double]($_ -replace '^.*=', '') -gt 80 }).Count -eq 0) -Message "-ReportOnly caps the Timeline sheet's column widths of an older workbook at 80 ($($rebuiltWidths -join ', '))"

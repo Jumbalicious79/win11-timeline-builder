@@ -521,8 +521,9 @@ The script creates a timestamped report folder next to the script:
         timeline.csv                 -- The unified timeline (~110 MB for
                                         ~300K events with the $MFT and USN
                                         journal)
-        timeline.xlsx                -- Color-coded Excel version (~12 MB); its
-                                        first sheet "Findings" links to the
+        timeline.xlsx                -- Color-coded Excel version (~12 MB): the
+                                        full timeline on its first sheet, plus
+                                        a "Findings" sheet that links to the
                                         rows of each finding
         report.pdf                   -- Findings report (printed by Microsoft Edge)
         report.html                  -- The same report as one offline HTML file
@@ -839,8 +840,9 @@ they find as leads to review. Next to the timeline:
                      "Collector" block (FindingId "Collector", Severity "Not
                      flagged") lists the rows left out of the rules
   report-model.json  Everything the report shows, as data (for scripts)
-  timeline.xlsx      Gets a first sheet "Findings" and a "Finding" column
-                     (see below)
+  timeline.xlsx      Gets a "Findings" sheet after the Timeline sheet and a
+                     "Finding" column (see below); it still opens on the
+                     full Timeline sheet
 
 -NoReport turns the report off. -ReportOnly rebuilds it later from an
 existing timeline, for example after the rules were tuned. A problem with
@@ -1117,7 +1119,9 @@ once more.
 
 ### The workbook: Findings sheet and Finding column
 
-  timeline.xlsx opens on its first sheet, "Findings": for each finding a
+  timeline.xlsx opens on its first sheet, "Timeline": the full timeline,
+  every row of timeline.csv. Its second sheet, "Findings", lists for each
+  finding a
   bold summary row in the severity's color (count, first and last time,
   group, escalation, how many rows are listed, and notes such as
   "Captured in the memory dump"), then one row per evidence
@@ -3738,7 +3742,8 @@ parsing is skipped, and the timeline CSV can be opened manually.
   and severities, row numbers that point at the right timeline rows),
   report-model.json, report.html, report.pdf (skipped without Edge), the
   copied collection_info.json and collection_log.txt, and the workbook: the
-  first sheet is Findings, every row links to its Timeline row, the
+  first and selected sheet is the full Timeline and the second is Findings,
+  every Findings row links to its Timeline row, the
   Finding column tags exactly the rows of each finding, and the Timeline
   sheet's columns are at most 80 wide (the log says "with row colors", and
   opening Excel logs no repair note). Then -ReportOnly

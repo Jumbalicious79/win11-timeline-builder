@@ -1271,11 +1271,12 @@ function Limit-TimelineColumnWidth {
 }
 
 # Adds the report's findings to an open workbook (EPPlus package from
-# ImportExcel): a FIRST sheet "Findings" -- per finding a summary row, then
-# one row per evidence row, each linked to its row on the Timeline sheet --
-# and a "Finding" column on the Timeline sheet with the finding ids of every
-# matching row, to filter on. A Findings sheet and Finding column from an
-# earlier run (-ReportOnly) are replaced. Throws on failure.
+# ImportExcel): a sheet "Findings" AFTER the Timeline sheet -- per finding a
+# summary row, then one row per evidence row, each linked to its row on the
+# Timeline sheet -- and a "Finding" column on the Timeline sheet with the
+# finding ids of every matching row, to filter on. The workbook still opens
+# on the Timeline sheet, the full timeline. A Findings sheet and Finding
+# column from an earlier run (-ReportOnly) are replaced. Throws on failure.
 function Add-TimelineReportWorkbookSheets {
     param($Package, [object[]]$Findings, $CollectorRows)
     $invariant = [System.Globalization.CultureInfo]::InvariantCulture
@@ -1336,7 +1337,9 @@ function Add-TimelineReportWorkbookSheets {
     # --- The Findings sheet ---
     if ($workbook.Worksheets["Findings"]) { $workbook.Worksheets.Delete("Findings") }
     $sheet = $workbook.Worksheets.Add("Findings")
-    $workbook.Worksheets.MoveToStart("Findings")
+    # The Timeline sheet stays first: the workbook is the full timeline, the
+    # Findings sheet a guide into it
+    $workbook.Worksheets.MoveAfter("Findings", "Timeline")
     $headers = @("Finding", "Severity", "Row type", "Timeline row", "Time (UTC)", "Title", "Description", "Source", "Event type", "User", "Category", "Rule")
     $widths = @(9, 9, 11, 12, 23, 45, 90, 28, 16, 20, 13, 28)
     for ($c = 0; $c -lt $headers.Count; $c++) {
@@ -1432,16 +1435,20 @@ function Add-TimelineReportWorkbookSheets {
     $sheet.Cells[1, 1, ($row - 1), $headers.Count].AutoFilter = $true
     $sheet.View.FreezePanes(2, 1)
 
-    # Open the workbook on the Findings sheet, the only selected tab. The
+    # Open the workbook on the Timeline sheet, the only selected tab. The
     # attribute is set in the sheet XML: EPPlus 4.5's View.TabSelected setter
     # does not select a sheet.
+    $timelineTab = 0
+    $tab = 0
     foreach ($worksheet in $workbook.Worksheets) {
+        if ($worksheet.Name -eq "Timeline") { $timelineTab = $tab }
+        $tab++
         $namespaces = New-Object System.Xml.XmlNamespaceManager($worksheet.WorksheetXml.NameTable)
         $namespaces.AddNamespace("d", "http://schemas.openxmlformats.org/spreadsheetml/2006/main")
         $sheetView = $worksheet.WorksheetXml.SelectSingleNode("//d:sheetViews/d:sheetView", $namespaces)
-        if ($sheetView) { $sheetView.SetAttribute("tabSelected", $(if ($worksheet.Name -eq "Findings") { "1" } else { "0" })) }
+        if ($sheetView) { $sheetView.SetAttribute("tabSelected", $(if ($worksheet.Name -eq "Timeline") { "1" } else { "0" })) }
     }
-    $workbook.View.ActiveTab = 0
+    $workbook.View.ActiveTab = $timelineTab
 }
 
 # -ReportOnly: adds the findings to an existing workbook (it must hold the
@@ -19472,8 +19479,9 @@ if (-not $skipExcel -and (Get-Module -ListAvailable -Name ImportExcel)) {
             }
         }
 
-        # Findings report: a first sheet "Findings" that links to the
-        # evidence rows, and a "Finding" column on the Timeline sheet
+        # Findings report: a "Findings" sheet after the Timeline sheet that
+        # links to the evidence rows, and a "Finding" column on the Timeline
+        # sheet (the workbook opens on the Timeline sheet)
         if ($reportState) {
             try {
                 Add-TimelineReportWorkbookSheets -Package $excelPkg -Findings $reportState.Findings -CollectorRows $reportState.CollectorRows
