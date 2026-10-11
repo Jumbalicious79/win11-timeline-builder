@@ -55,7 +55,7 @@
 # debugger engine" line (also processes only), the WinDbg command, and no
 # Volatility 3.
 # The debugger engine path for Windows ARM64 dumps, with the helper's
-# functions (memory\TimelineDbgEng.ps1) loaded from its syntax tree: the
+# functions (lib\memory\TimelineDbgEng.ps1) loaded from its syntax tree: the
 # architecture folder, Find-DbgEngine (System32; copies of System32's DLLs
 # in tools\dbgeng\<arch>\ accepted, an unsigned DLL in a subfolder or a
 # missing DLL refused with a warning, no engine), the C# host on the
@@ -174,7 +174,7 @@ ${function:Get-BuilderToolsFolder} = { return $script:testToolsFolder }
 $script:dbgEngTimeoutSeconds = 900
 # The findings report's own log reader (TimelineReport.Engine.ps1): the
 # lines the Memory parser writes for the report must read back
-$engineAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Split-Path $builder -Parent) "report\TimelineReport.Engine.ps1"), [ref]$null, [ref]$null)
+$engineAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Split-Path $builder -Parent) "lib\report\TimelineReport.Engine.ps1"), [ref]$null, [ref]$null)
 $engineAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
         @('Read-ReportEngineLogText', 'Read-ReportEngineBuilderLog') -contains $node.Name }, $false) |
     ForEach-Object { . ([scriptblock]::Create($_.Extent.Text)) }
@@ -1252,10 +1252,10 @@ try {
 
     # --- Windows ARM64 dumps: Microsoft's debugger engine ---------------------
     Write-Host "Testing the debugger engine path for Windows ARM64 dumps ..."
-    $workerPath = Join-Path (Split-Path $builder -Parent) "memory\TimelineDbgEng.ps1"
+    $workerPath = Join-Path (Split-Path $builder -Parent) "lib\memory\TimelineDbgEng.ps1"
     $workerErrors = $null
     $workerAst = [System.Management.Automation.Language.Parser]::ParseFile($workerPath, [ref]$null, [ref]$workerErrors)
-    Assert-Equal -Name "debugger engine helper: memory\TimelineDbgEng.ps1 parses" -Expected 0 -Actual @($workerErrors).Count
+    Assert-Equal -Name "debugger engine helper: lib\memory\TimelineDbgEng.ps1 parses" -Expected 0 -Actual @($workerErrors).Count
     $workerFunctions = @($workerAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false))
     foreach ($shared in @("Get-DbgEngShortError", "Get-DbgEngErrorText")) {
         $sharedBodies = @(@($functionAsts) + $workerFunctions | Where-Object { $_.Name -eq $shared } | ForEach-Object { $_.Body.Extent.Text })
@@ -1425,7 +1425,7 @@ try {
     $workerText = [System.IO.File]::ReadAllText($workerPath)
     $sentCommands = @([regex]::Matches($workerText, '-Command "([^"]+)"') | ForEach-Object { $_.Groups[1].Value }) + @([regex]::Matches($workerText, '\$session\.Execute\("([^"]+)"') | ForEach-Object { $_.Groups[1].Value }) + @("Process", "Session", "TokenSession" | ForEach-Object { Get-DbgEngQuery $_ })
     Assert-Equal -Name "the helper sends no extension (!) command (fixed commands and queries)" -Expected "0|True" -Actual "$(@($sentCommands | Where-Object { $_.TrimStart().StartsWith('!') }).Count)|$($sentCommands.Count -ge 9)"
-    $rulesJson = Get-Content -LiteralPath (Join-Path (Split-Path $builder -Parent) "report\report-rules.json") -Raw | ConvertFrom-Json
+    $rulesJson = Get-Content -LiteralPath (Join-Path (Split-Path $builder -Parent) "lib\report\report-rules.json") -Raw | ConvertFrom-Json
     $toolPatterns = @($rulesJson.lists.attackerTools)
     $queryText = (@("Process", "Session", "TokenSession") | ForEach-Object { Get-DbgEngQuery $_ }) -join "`n"
     $named = @($toolPatterns | Where-Object { $_ -and ([regex]::IsMatch($workerText, '\b(?:' + $_ + ')', 'IgnoreCase') -or [regex]::IsMatch($queryText, '\b(?:' + $_ + ')', 'IgnoreCase')) })
@@ -2443,7 +2443,7 @@ function Read-DbgEngDump {
     Assert-Equal -Name "the helper as a process, a hang: ended after the time limit, the reason" -Expected "the Windows debugger engine did not finish within 4 seconds|True|True" -Actual "$($hang.Reason)|$hangGone|$($hangSeconds -lt 60)"
     $script:testHelperPath = Join-Path $engineDir "no such helper.ps1"
     $noHelper = Invoke-DbgEngMemoryAnalysis -DumpPath $engineDump -DumpInfo $engineDumpInfo
-    Assert-Equal -Name "no helper script: the reason" -Expected "the debugger engine helper memory\TimelineDbgEng.ps1 is missing, an antivirus may have removed it; copy the whole win11-timeline-builder folder again" -Actual $noHelper.Reason
+    Assert-Equal -Name "no helper script: the reason" -Expected "the debugger engine helper lib\memory\TimelineDbgEng.ps1 is missing, an antivirus may have removed it; copy the whole win11-timeline-builder folder again" -Actual $noHelper.Reason
     ${function:Find-DbgEngine} = { return [PSCustomObject]@{ Path = ""; Folder = ""; Source = ""; Version = ""; Dlls = @(); Warning = "tools\dbgeng\arm64\ is not used: x"; Reason = "the Windows debugger engine (dbgeng.dll) is not in C:\none" } }
     $script:logFile = Join-Path $workDir "engine-none.log"
     $noEngine = Invoke-DbgEngMemoryAnalysis -DumpPath $engineDump -DumpInfo $engineDumpInfo

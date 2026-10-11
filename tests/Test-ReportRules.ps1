@@ -1,7 +1,7 @@
 # =============================================================
 # Report rules test
-# Dot-sources report\TimelineReport.Engine.ps1, loads the real report rules
-# (report\report-rules.json) and runs them over a synthetic timeline of
+# Dot-sources lib\report\TimelineReport.Engine.ps1, loads the real report rules
+# (lib\report\report-rules.json) and runs them over a synthetic timeline of
 # cases (tests\fixtures\report\rules\cases.csv).
 #
 # Each fixture row carries its expectation in the RawPath column (the
@@ -46,12 +46,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path $PSScriptRoot -Parent
-if (-not $RulesPath) { $RulesPath = Join-Path $repoRoot "report\report-rules.json" }
+if (-not $RulesPath) { $RulesPath = Join-Path $repoRoot "lib\report\report-rules.json" }
 if (-not $CasesPath) { $CasesPath = Join-Path $PSScriptRoot "fixtures\report\rules\cases.csv" }
 if (-not $LongLinesPath) { $LongLinesPath = Join-Path $PSScriptRoot "fixtures\report\rules\long-lines.json" }
 
 # --- Locate the engine ---------------------------------------
-if (-not $EnginePath) { $EnginePath = Join-Path $repoRoot "report\TimelineReport.Engine.ps1" }
+if (-not $EnginePath) { $EnginePath = Join-Path $repoRoot "lib\report\TimelineReport.Engine.ps1" }
 if (-not (Test-Path -LiteralPath $EnginePath)) {
     Write-Host "FAIL: report engine not found: $EnginePath" -ForegroundColor Red
     if ($env:GITHUB_ACTIONS) { Write-Host "::error file=tests/Test-ReportRules.ps1::report engine not found: $EnginePath" }

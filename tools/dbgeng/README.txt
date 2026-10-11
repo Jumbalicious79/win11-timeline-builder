@@ -52,8 +52,9 @@ HOW THE BUILDER USES IT
     file and why, and the engine of Windows is used instead.
   - The DLLs are loaded by their full path (dbghelp, dbgcore, msdia140,
     dbgmodel, then dbgeng), in a PowerShell process of its own
-    (memory\TimelineDbgEng.ps1); their own imports are looked for only in
-    this folder and in System32, never on the PATH or in the current folder.
+    (lib\memory\TimelineDbgEng.ps1); their own imports are looked for only
+    in this folder and in System32, never on the PATH or in the current
+    folder.
   - The log names the engine: "Debugger engine: dbgeng.dll <version> from
     <folder> (signed by Microsoft)".
   - What it reads: the dump's processes (as Volatility's windows.pslist)

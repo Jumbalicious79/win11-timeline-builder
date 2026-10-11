@@ -1,4 +1,5 @@
-# Reports (generated at runtime)
+# Reports (generated at runtime). The builder's own scripts live in lib\
+# (lib\report\, lib\memory\) and are committed.
 reports/
 
 # Work folder fallback (used only when %LOCALAPPDATA% cannot be written)

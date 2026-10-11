@@ -30,9 +30,10 @@ Required directory structure:
     win11-timeline-builder\       <-- this repo
       timeline-builder.ps1
       Run-TimelineBuilder.bat
-      report\                     <-- findings report rules and renderer
+      lib\                        <-- the builder's own scripts
+        report\                   <-- findings report rules and renderer
                                       (needed for report.pdf)
-      memory\                     <-- the debugger engine helper (Windows
+        memory\                   <-- the debugger engine helper (Windows
                                       ARM64 memory dumps)
       reports\                    <-- timelines save here
       tools\                      <-- auto-downloaded on first run
@@ -121,8 +122,9 @@ Both tools are designed to live side-by-side on a USB drive:
     win11-timeline-builder\
       timeline-builder.ps1
       Run-TimelineBuilder.bat
-      report\                     <-- findings report rules and renderer
-      memory\                     <-- the debugger engine helper (ARM64 dumps)
+      lib\                        <-- the builder's own scripts
+        report\                   <-- findings report rules and renderer
+        memory\                   <-- the debugger engine helper (ARM64 dumps)
       tools\                      <-- auto-downloaded: sqlite3, Timeline Explorer
         volatility3\              <-- optional: vol.exe for memory analysis
         dbgeng\                   <-- optional: Microsoft's debugger engine
@@ -376,9 +378,9 @@ tools\symbols\, where later runs find it.
                   its steps is logged, that step skipped, and the report
                   still made, as in a full run).
   -ReportRules    Rules file for the findings report (default:
-                  report\report-rules.json next to the script). See "Report
-                  rules file". A missing or invalid file is logged as a
-                  warning and the run finishes without a report (with
+                  lib\report\report-rules.json next to the script). See
+                  "Report rules file". A missing or invalid file is logged
+                  as a warning and the run finishes without a report (with
                   -ReportOnly it is an error).
   -MftDays        $MFT file-system events: only times within this many days
                   before the collection are added. Default 7; 0 = all. A
@@ -532,12 +534,13 @@ The script creates a timestamped report folder next to the script:
         collection_info.json         -- Copied from the collection (for -ReportOnly)
         collection_log.txt           -- Copied from the collection (for -ReportOnly)
         report_log.txt               -- Log of -ReportOnly runs (only after one)
-    report\
-      report-rules.json              -- The findings report's rules (data)
-      TimelineReport.Engine.ps1      -- Rules engine and report model
-      TimelineReport.Render.ps1      -- report.html and report.pdf
-    memory\
-      TimelineDbgEng.ps1             -- Reads Windows ARM64 memory dumps with
+    lib\
+      report\
+        report-rules.json            -- The findings report's rules (data)
+        TimelineReport.Engine.ps1    -- Rules engine and report model
+        TimelineReport.Render.ps1    -- report.html and report.pdf
+      memory\
+        TimelineDbgEng.ps1           -- Reads Windows ARM64 memory dumps with
                                         Microsoft's debugger engine (run in a
                                         PowerShell process of its own)
     tools\
@@ -1207,8 +1210,8 @@ once more.
 
 ### Report rules file
 
-  The rules are data: report\report-rules.json, or another file given with
-  -ReportRules. Keyword lists (attacker tools, LOLBins, staging folders,
+  The rules are data: lib\report\report-rules.json, or another file given
+  with -ReportRules. Keyword lists (attacker tools, LOLBins, staging folders,
   download cradles, ...) live only in this file: Defender's AMSI blocks
   PowerShell code that contains such names, so never move them into a .ps1
   file, and edit the JSON in a text editor, not through PowerShell commands
@@ -1337,9 +1340,9 @@ once more.
       repository and pass it with -ReportRules, so an update does not
       overwrite it.
     - Check the effect with -ReportOnly: it needs no new collection.
-    - tests\Test-ReportRules.ps1 checks report\report-rules.json against
-      tests\fixtures\report\rules\cases.csv (a matching and a near-miss row
-      for every rule); add cases there when you change a rule.
+    - tests\Test-ReportRules.ps1 checks lib\report\report-rules.json
+      against tests\fixtures\report\rules\cases.csv (a matching and a
+      near-miss row for every rule); add cases there when you change a rule.
 
   Memory command lines where a script host runs a script, HTA or DLL from a
   staging folder (Downloads, Users\Public, PerfLogs, the Recycle Bin) are
@@ -2147,9 +2150,9 @@ of WinDbg -- instead:
     a valid signature from Microsoft, otherwise the log has a warning and
     the engine of Windows is used. The DLLs are always loaded by their full
     path, never searched for. The builder runs the engine in a PowerShell
-    process of its own (memory\TimelineDbgEng.ps1), so a damaged dump that
-    crashes or hangs the engine cannot stop the builder: that process is
-    ended after 15 minutes, and the dump is reported as not analyzed.
+    process of its own (lib\memory\TimelineDbgEng.ps1), so a damaged dump
+    that crashes or hangs the engine cannot stop the builder: that process
+    is ended after 15 minutes, and the dump is reported as not analyzed.
   - What is read (the same rows as Volatility's plugins, Source
     Memory-Processes and Memory-CommandLine):
       processes, as windows.pslist: PID, parent PID, name, threads, session
@@ -2278,8 +2281,8 @@ of WinDbg -- instead:
     of these reasons:
       the Windows debugger engine (dbgeng.dll) is not in <folder>; see
         "ARM64 memory dumps" in README.txt
-      the debugger engine helper memory\TimelineDbgEng.ps1 is missing, an
-        antivirus may have removed it; copy the whole
+      the debugger engine helper lib\memory\TimelineDbgEng.ps1 is missing,
+        an antivirus may have removed it; copy the whole
         win11-timeline-builder folder again
       the Windows debugger engine could not open it (<error>)
       <what is wrong with the kernel image> (the Windows debugger engine
@@ -3428,9 +3431,9 @@ parsing is skipped, and the timeline CSV can be opened manually.
   run on an x64 dump: the rows at the header's capture time (not the
   file's last write), the counts per plugin in the log, and the warning
   for a plugin without output. Volatility 3 is not run; no admin needed.
-  The debugger engine for Windows ARM64 dumps (memory\TimelineDbgEng.ps1,
-  its functions loaded from its syntax tree; the two functions it shares
-  with the builder must be the same): the architecture folder name;
+  The debugger engine for Windows ARM64 dumps
+  (lib\memory\TimelineDbgEng.ps1, its functions loaded from its syntax
+  tree; the two functions it shares with the builder must be the same): the architecture folder name;
   Find-DbgEngine (System32; copies of System32's catalog-signed DLLs in
   tools\dbgeng\<arch>\ used, in their load order; an unsigned DLL in a
   subfolder or a missing dbghelp.dll refused with a warning naming it; no
@@ -3581,7 +3584,7 @@ parsing is skipped, and the timeline CSV can be opened manually.
   not run the builder:
 
   tests\Test-ReportEngine.ps1 -- the rules engine and report model
-  (report\TimelineReport.Engine.ps1) on synthetic rows and rules in
+  (lib\report\TimelineReport.Engine.ps1) on synthetic rows and rules in
   tests\fixtures\report\engine\: every match condition, lists, grouping,
   threshold windows, escalation, the allowlist, numbering, evidence limits,
   maxFindings roll-ups, activityTime, the stop of a rule whose pattern
@@ -3665,9 +3668,9 @@ parsing is skipped, and the timeline CSV can be opened manually.
   field with no usable entry -- [] or {} --, no field, a mounted image)
   gives its own note.
 
-  tests\Test-ReportRules.ps1 -- loads report\report-rules.json with the
-  engine and checks it against tests\fixtures\report\rules\cases.csv: rows
-  in timeline format, in the shapes the parsers write now (memory command
+  tests\Test-ReportRules.ps1 -- loads lib\report\report-rules.json with
+  the engine and checks it against tests\fixtures\report\rules\cases.csv:
+  rows in timeline format, in the shapes the parsers write now (memory command
   lines as Snapshot rows, author-supplied task dates, task actions written
   with environment variables (%TEMP%, %PUBLIC%, ...), Security 4698/4702
   Command/Arguments rows, ShimCache FileLastModified rows, the User
@@ -3775,8 +3778,8 @@ parsing is skipped, and the timeline CSV can be opened manually.
   collection_info.json also lists the attacker's process as a Child: it is
   not left out, and the builder log, report-model.json and report.html say
   to check whether collection_info.json was altered; a copy of the builder
-  whose debugger engine helper (memory\TimelineDbgEng.ps1) returns canned
-  entries, run with -MemoryDumpPath on a synthetic Windows ARM64 dump
+  whose debugger engine helper (lib\memory\TimelineDbgEng.ps1) returns
+  canned entries, run with -MemoryDumpPath on a synthetic Windows ARM64 dump
   header (the engine lookup, the helper in a process of its own and its
   output are real): the engine and the "analyzed with the Windows debugger
   engine" lines, the rows, the note and caveat in report-model.json, the
@@ -3799,7 +3802,7 @@ parsing is skipped, and the timeline CSV can be opened manually.
   missing or readable collection_info.json is told apart (an empty
   CollectorProcesses stays an empty field). It needs admin
   like the builder, or -BuilderPath with
-  a copy without the admin check that has the report\ folder beside it.
+  a copy without the admin check that has the lib\ folder beside it.
   Like a user run, the builder installs ImportExcel from the PowerShell
   Gallery when it is missing; if it cannot, the workbook checks are SKIPPED.
 
@@ -3877,7 +3880,8 @@ parsing is skipped, and the timeline CSV can be opened manually.
   dbghelp.dll,         dbgmodel.dll in C:\Windows\System32) reads Windows
   dbgmodel.dll         ARM64 memory dumps: the processes and their command
                        lines (parser #15). Loaded by full path in a
-                       PowerShell process of its own (memory\TimelineDbgEng.ps1).
+                       PowerShell process of its own
+                       (lib\memory\TimelineDbgEng.ps1).
 
   PowerShell cmdlets   Import-Csv, Export-Csv, Expand-Archive,
                        Invoke-WebRequest, ConvertFrom-Json.
@@ -3970,8 +3974,8 @@ Temporary actions (all cleaned up automatically, also after an error or Ctrl+C):
     made writable) -- deleted after processing
   - Writes Volatility 3's JSON output (Memory parser) into the work folder
     -- deleted after each plugin
-  - For a Windows ARM64 memory dump: runs memory\TimelineDbgEng.ps1 in a
-    PowerShell process of its own, with empty symbol and extension folders
+  - For a Windows ARM64 memory dump: runs lib\memory\TimelineDbgEng.ps1 in
+    a PowerShell process of its own, with empty symbol and extension folders
     in the work folder (scratch\dbgeng\; the kernel symbol file too when
     tools\symbols\ cannot be written) -- deleted after the analysis; the
     process is ended if it is still running after 15 minutes or when the

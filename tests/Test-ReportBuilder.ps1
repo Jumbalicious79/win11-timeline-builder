@@ -43,8 +43,8 @@
 #
 # Needs Administrator rights, like the builder (GitHub Actions Windows
 # runners are elevated). For a local run without them, pass -BuilderPath
-# with a copy of the builder that has no admin check, with the report\
-# folder beside it (e.g. under the git-ignored reports\ folder). Like a user
+# with a copy of the builder that has no admin check, with the lib\ folder
+# beside it (e.g. under the git-ignored reports\ folder). Like a user
 # run, the builder installs ImportExcel from the PowerShell Gallery when it
 # is missing; if that is not possible, the workbook checks are SKIPPED.
 # Exit code 0 = pass, 1 = fail.
@@ -314,7 +314,7 @@ $reportsBefore = @(Get-ChildItem -LiteralPath $reportsDir -Directory -ErrorActio
 $workDir = Join-Path ([System.IO.Path]::GetTempPath()) ("timeline-report-test-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $workDir | Out-Null
 try {
-    . (Join-Path $repoRoot "report\TimelineReport.Render.ps1")
+    . (Join-Path $repoRoot "lib\report\TimelineReport.Render.ps1")
     $edge = Find-ReportPdfEdge
 
     # --- 0. What the report says about the collection (the builder's
@@ -506,7 +506,7 @@ try {
     }
 
     # --- 2b. A lead seen only in the memory dump: a copy of the builder (with
-    # report\ beside it, in this test's folder) whose Find-VolatilityExe gives
+    # lib\ beside it, in this test's folder) whose Find-VolatilityExe gives
     # a stub that prints canned Volatility 3 output, run with -MemoryDumpPath
     # on a synthetic x64 crash dump header captured during the collection.
     # fixture-stage.exe runs from C:\Users\Public only in the dump (a
@@ -515,7 +515,7 @@ try {
     $memBuilderDir = Join-Path $workDir "memory-builder"
     $volDir = Join-Path $memBuilderDir "vol"
     New-Item -ItemType Directory -Path $volDir | Out-Null
-    Copy-Item -LiteralPath (Join-Path $builderDir "report") -Destination (Join-Path $memBuilderDir "report") -Recurse
+    Copy-Item -LiteralPath (Join-Path $builderDir "lib") -Destination (Join-Path $memBuilderDir "lib") -Recurse
     $volStub = Join-Path $volDir "vol-canned.cmd"
     [System.IO.File]::WriteAllText($volStub, "@echo off`r`nif not exist `"%~dp0%5.json`" (`r`n  echo No output for %5 1>&2`r`n  exit /b 1`r`n)`r`ntype `"%~dp0%5.json`"`r`n")
     $cannedOutput = @{
@@ -650,8 +650,8 @@ try {
     }
 
     # --- 2d. A Windows ARM64 dump, read with Microsoft's debugger engine: a
-    # copy of the builder (with report\ beside it) whose debugger engine
-    # helper (memory\TimelineDbgEng.ps1) returns canned entries instead of
+    # copy of the builder (with lib\ beside it) whose debugger engine
+    # helper (lib\memory\TimelineDbgEng.ps1) returns canned entries instead of
     # reading the dump, run with -MemoryDumpPath on a synthetic ARM64 crash
     # dump header. The builder's own path is real: the engine lookup, the
     # helper in a PowerShell process of its own, its output read back, the
@@ -661,10 +661,10 @@ try {
     # lead still says "Captured in the memory dump", and -ReportOnly keeps
     # them ---
     $armBuilderDir = Join-Path $workDir "arm64-builder"
-    New-Item -ItemType Directory -Path (Join-Path $armBuilderDir "memory") | Out-Null
-    Copy-Item -LiteralPath (Join-Path $builderDir "report") -Destination (Join-Path $armBuilderDir "report") -Recurse
+    New-Item -ItemType Directory -Path $armBuilderDir | Out-Null
+    Copy-Item -LiteralPath (Join-Path $builderDir "lib") -Destination (Join-Path $armBuilderDir "lib") -Recurse
     Copy-Item -LiteralPath $builder -Destination (Join-Path $armBuilderDir "timeline-builder.ps1")
-    $helperText = [System.IO.File]::ReadAllText((Join-Path $builderDir "memory\TimelineDbgEng.ps1"))
+    $helperText = [System.IO.File]::ReadAllText((Join-Path $builderDir "lib\memory\TimelineDbgEng.ps1"))
     $helperAnchor = "function Read-DbgEngDump {"
     $cannedHelper = @'
 function Read-DbgEngDump {
@@ -685,7 +685,7 @@ function Read-DbgEngDumpReal {
     $helperAnchorFound = ([regex]::Matches($helperText, [regex]::Escape($helperAnchor))).Count -eq 1
     if (-not $helperAnchorFound) { Write-TestResult -Succeeded $false -Message "the debugger engine helper has no single Read-DbgEngDump to replace for the ARM64 run" }
     else {
-        [System.IO.File]::WriteAllText((Join-Path $armBuilderDir "memory\TimelineDbgEng.ps1"), $helperText.Replace($helperAnchor, $cannedHelper))
+        [System.IO.File]::WriteAllText((Join-Path $armBuilderDir "lib\memory\TimelineDbgEng.ps1"), $helperText.Replace($helperAnchor, $cannedHelper))
         $armDump = Join-Path $workDir "arm64 memory.dmp"
         $armBytes = New-Object byte[] 0x2000
         [Array]::Copy([System.Text.Encoding]::ASCII.GetBytes("PAGEDU64"), 0, $armBytes, 0, 8)
@@ -827,14 +827,14 @@ function Read-DbgEngDumpReal {
     Write-TestResult -Succeeded ($noTimeline.ExitCode -eq 1 -and @($noTimeline.Output | Where-Object { $_ -match '-ReportOnly needs a timeline\.csv' }).Count -eq 1) -Message "-ReportOnly on a folder without timeline.csv exits with 1 and says why"
 
     # --- 7. An unexpected error during -ReportOnly: a copy of the builder
-    # (with report\ beside it, in this test's folder) with one injected
+    # (with lib\ beside it, in this test's folder) with one injected
     # change. A statement-terminating error in the rebuild's body is logged
     # and only its statement is skipped (the report is still made, exit code
     # 0); a rebuild that stops before it gives its exit code, or an error
     # thrown out of it, gives exit code 1, never 0 ---
     $injectDir = Join-Path $workDir "inject"
     New-Item -ItemType Directory -Path $injectDir | Out-Null
-    Copy-Item -LiteralPath (Join-Path $builderDir "report") -Destination (Join-Path $injectDir "report") -Recurse
+    Copy-Item -LiteralPath (Join-Path $builderDir "lib") -Destination (Join-Path $injectDir "lib") -Recurse
     $builderText = [System.IO.File]::ReadAllText($builder)
     # A .NET exception whose message names the file in both PowerShell
     # editions (Windows PowerShell's [int]::Parse message has no value)

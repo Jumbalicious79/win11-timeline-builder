@@ -77,7 +77,7 @@ param(
     [Parameter(ParameterSetName = "ReportOnly", Mandatory = $true)]
     [string]$ReportOnly,
 
-    # Rules file for the findings report (default: report\report-rules.json)
+    # Rules file for the findings report (default: lib\report\report-rules.json)
     [Parameter(Mandatory = $false)]
     [string]$ReportRules,
 
@@ -105,7 +105,7 @@ param(
 
 # --- The builder's own folder: no [ ] * ? in its path ---
 # The timeline, the workbook and the report are written under reports\ next
-# to the script, and tools\ and report\ are read from there, with commands
+# to the script, and tools\ and lib\ are read from there, with commands
 # that read [ ], * and ? as wildcards (Export-Csv, ImportExcel): from such a
 # folder the run would end without a timeline.csv. Checked first, for every
 # mode.
@@ -995,21 +995,22 @@ $script:xmlInvalidRegex = New-Object System.Text.RegularExpressions.Regex($scrip
 # =============================================================
 # Findings report (report.html, report.pdf, findings.csv)
 # =============================================================
-# The rules engine and report model (report\TimelineReport.Engine.ps1) and the
-# renderer (report\TimelineReport.Render.ps1) are dot-sourced here, at script
-# level, so their functions and compiled helper stay available. The rules
-# are data (report\report-rules.json, or -ReportRules): keyword lists such as
-# attacker-tool names live only there, never in a .ps1 file (Defender's AMSI
-# blocks PowerShell code that holds such names). A report problem never fails
-# the timeline: it is logged as a warning and the run goes on.
-$script:reportRulesFile = Join-Path $PSScriptRoot "report\report-rules.json"
+# The rules engine and report model (lib\report\TimelineReport.Engine.ps1)
+# and the renderer (lib\report\TimelineReport.Render.ps1) are dot-sourced
+# here, at script level, so their functions and compiled helper stay
+# available. The rules are data (lib\report\report-rules.json, or
+# -ReportRules): keyword lists such as attacker-tool names live only there,
+# never in a .ps1 file (Defender's AMSI blocks PowerShell code that holds
+# such names). A report problem never fails the timeline: it is logged as a
+# warning and the run goes on.
+$script:reportRulesFile = Join-Path $PSScriptRoot "lib\report\report-rules.json"
 if ($ReportRules) { $script:reportRulesFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ReportRules) }
 $script:reportScriptsLoaded = $false
 $script:reportLoadError = ""
 if (-not $NoReport) {
     try {
-        . (Join-Path $PSScriptRoot "report\TimelineReport.Engine.ps1")
-        . (Join-Path $PSScriptRoot "report\TimelineReport.Render.ps1")
+        . (Join-Path $PSScriptRoot "lib\report\TimelineReport.Engine.ps1")
+        . (Join-Path $PSScriptRoot "lib\report\TimelineReport.Render.ps1")
         $script:reportScriptsLoaded = $true
     }
     catch { $script:reportLoadError = $_.Exception.Message }
@@ -1144,7 +1145,7 @@ function Invoke-TimelineReportRules {
     Log ""
     Log "--- Running Report Rules ---"
     if (-not $script:reportScriptsLoaded) {
-        Log-Warning "  The report scripts in report\ could not be loaded ($($script:reportLoadError)) -- no findings report."
+        Log-Warning "  The report scripts in lib\report\ could not be loaded ($($script:reportLoadError)) -- no findings report."
         return $null
     }
     if (-not (Test-Path -LiteralPath $RulesPath -PathType Leaf)) {
@@ -1830,7 +1831,7 @@ function Invoke-TimelineReportOnly {
         if ($ignoredParameters.Count -gt 0) { Log-Warning "-ReportOnly parses nothing, so these are ignored: $($ignoredParameters -join ', ')" }
         Log ""
         if (-not $script:reportScriptsLoaded) {
-            Log-Error "The report scripts in report\ could not be loaded: $($script:reportLoadError)"
+            Log-Error "The report scripts in lib\report\ could not be loaded: $($script:reportLoadError)"
             return 1
         }
         $reportOnlyTimer = [System.Diagnostics.Stopwatch]::StartNew()
@@ -17230,7 +17231,7 @@ function Add-MemoryPluginRows {
                     if ($created.Text) { $details += " CreateTime=$($created.Text)" }
                     $snapshot++
                 }
-                # Microsoft's debugger engine path only (memory\TimelineDbgEng.ps1):
+                # Microsoft's debugger engine path only (lib\memory\TimelineDbgEng.ps1):
                 # which ways found the process in the kernel's structures, the
                 # ID the process ID table holds it under when that is not its
                 # own, and what copying memory does not explain (the findings
@@ -17318,8 +17319,8 @@ function Find-VolatilityExe {
 
 # --- Windows ARM64 dumps: Microsoft's debugger engine ----------------------
 # Volatility 3 cannot read Windows ARM64 memory. For an ARM64 dump the
-# builder runs memory\TimelineDbgEng.ps1 in a PowerShell process of its own
-# (the same PowerShell, so the same processor architecture): it loads the
+# builder runs lib\memory\TimelineDbgEng.ps1 in a PowerShell process of its
+# own (the same PowerShell, so the same processor architecture): it loads the
 # debugger engine (dbgeng.dll, part of Windows, or a copy signed by
 # Microsoft in tools\dbgeng\<arch>\) by full path, takes the kernel's symbol
 # file from tools\symbols\ or downloads it once from Microsoft's symbol
@@ -17341,7 +17342,7 @@ function Get-BuilderToolsFolder {
 # The helper script that runs the debugger engine (a function of its own so
 # the tests can put another script in its place)
 function Get-DbgEngWorkerPath {
-    return (Join-Path $PSScriptRoot "memory\TimelineDbgEng.ps1")
+    return (Join-Path $PSScriptRoot "lib\memory\TimelineDbgEng.ps1")
 }
 
 # The NuGet content folder name for this PowerShell PROCESS's processor
@@ -17429,7 +17430,7 @@ function Find-DbgEngine {
 
 # The message of an error: of the innermost exception (a .NET method's own
 # message, not PowerShell's "Exception calling ..." around it). The same
-# function is in memory\TimelineDbgEng.ps1.
+# function is in lib\memory\TimelineDbgEng.ps1.
 function Get-DbgEngErrorText {
     param($ErrorRecord)
     $exception = $ErrorRecord.Exception
@@ -17439,7 +17440,8 @@ function Get-DbgEngErrorText {
 
 # A short, single-line form of an error message for a reason in the log:
 # no ";", " -- ", ": " or parentheses (the report splits the line on them),
-# at most 120 characters. The same function is in memory\TimelineDbgEng.ps1.
+# at most 120 characters. The same function is in
+# lib\memory\TimelineDbgEng.ps1.
 function Get-DbgEngShortError {
     param([string]$Message)
     $text = (("$Message" -split "\r?\n") | Where-Object { $_.Trim() } | Select-Object -First 1)
@@ -17652,7 +17654,7 @@ function Invoke-DbgEngMemoryAnalysis {
     Log "  Debugger engine: dbgeng.dll $($engine.Version) from $($engine.Folder) ($where)"
     $worker = Get-DbgEngWorkerPath
     if (-not (Test-Path -LiteralPath $worker -PathType Leaf)) {
-        $result.Reason = "the debugger engine helper memory\TimelineDbgEng.ps1 is missing, an antivirus may have removed it; copy the whole win11-timeline-builder folder again"
+        $result.Reason = "the debugger engine helper lib\memory\TimelineDbgEng.ps1 is missing, an antivirus may have removed it; copy the whole win11-timeline-builder folder again"
         return $result
     }
     $timeout = 900

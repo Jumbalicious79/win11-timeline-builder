@@ -1,6 +1,6 @@
 # =============================================================
 # Report engine test (Phase 3)
-# Loads report\TimelineReport.Engine.ps1 and checks it on the synthetic
+# Loads lib\report\TimelineReport.Engine.ps1 and checks it on the synthetic
 # fixtures in tests\fixtures\report\engine\ (rules.json, timeline.csv,
 # collection_info.json, collection_log.txt, timeline_builder_log.txt):
 #   - every rule feature: match / anyOf / not* conditions, lists, groupBy
@@ -75,7 +75,7 @@ function New-TestTextFile {
     [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding($false)))
 }
 
-. (Join-Path $repoRoot "report\TimelineReport.Engine.ps1")
+. (Join-Path $repoRoot "lib\report\TimelineReport.Engine.ps1")
 
 $workDir = Join-Path ([System.IO.Path]::GetTempPath()) ("report-engine-test-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $workDir | Out-Null
@@ -633,7 +633,7 @@ try {
     # The shipped rules import with no error, and no compiled condition is an
     # empty regex (one that would match every row)
     $shippedErrors = $null
-    $shipped = Import-ReportRules -Path (Join-Path $repoRoot "report\report-rules.json") -ErrorVariable shippedErrors
+    $shipped = Import-ReportRules -Path (Join-Path $repoRoot "lib\report\report-rules.json") -ErrorVariable shippedErrors
     $emptyConditions = New-Object System.Collections.Generic.List[string]
     $conditionNames = @("Source", "EventType", "Description", "Details", "User", "NotSource", "NotEventType", "NotDescription", "NotDetails", "NotUser")
     foreach ($shippedRule in $shipped.Rules) {
