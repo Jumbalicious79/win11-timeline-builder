@@ -243,18 +243,83 @@ function Register-DbgEngLogonNames {
 
 # --- WP2: DLLs and executable private memory (items c and f) ---------------------------
 
-# Memory-Modules rows. Not built yet.
-function Add-DbgEngModuleRows {
-    param([object[]]$Entries, [string]$Source, [datetime]$CaptureTimeUtc, [datetime]$AcquisitionEndUtc, [string]$DumpPath)
-    $null = $Entries, $Source, $CaptureTimeUtc, $AcquisitionEndUtc, $DumpPath
-    return (New-DbgEngRowCounts)
+# A field of an entry as text, or $null when it is missing or empty (for
+# Format-DbgEngDetails, which leaves $null out)
+function Get-DbgEngOptionalField {
+    param($Entry, [string]$Name)
+    $value = [string]$Entry.$Name
+    if ($value) { return $value }
+    return $null
 }
 
-# Memory-PrivateCode rows. Not built yet.
+# Memory-Modules rows (item c, lib\memory\TimelineDbgEng.Modules.ps1): one per
+# Module entry, a DLL outside the Windows folder or one the helper judged
+# (Anomaly= NotInLoaderLists, NoImageMapping, NameMismatch). ModuleLoad at
+# the loader's load time when the helper sent one (it sends only a time
+# inside the process's lifetime), else a Snapshot row at the capture time.
+#   Description  Module in memory: <file name> (PID: <n>, Process: <name>)
+#   Details      PID | ProcessCreated | Path | Base | Size [| LoadReason] |
+#                FoundBy [| Protection] [| Managed=Yes] [| Anomaly]
+#                [| LoaderPath]
+# (Protection and Managed only on an image in no loader list: the mapping's
+# protection, read-only for a resource-only load, and Managed=Yes for a .NET
+# assembly its runtime mapped.)
+# User: the process token's SID. An entry without a Base is not a module and
+# is skipped.
+function Add-DbgEngModuleRows {
+    param([object[]]$Entries, [string]$Source, [datetime]$CaptureTimeUtc, [datetime]$AcquisitionEndUtc, [string]$DumpPath)
+    $timed = 0
+    $snapshot = 0
+    foreach ($entry in @($Entries)) {
+        if ($null -eq $entry -or "$($entry.Base)" -cnotmatch '^0x[0-9a-f]{1,16}$') { continue }
+        $name = [string]$entry.Name
+        if (-not $name) { $name = ([string]$entry.Path -split '\\')[-1] }
+        $details = Format-DbgEngDetails ([ordered]@{
+                PID = [string]$entry.PID; ProcessCreated = [string]$entry.ProcessCreated; Path = [string]$entry.Path; Base = [string]$entry.Base; Size = [string]$entry.Size
+                LoadReason = (Get-DbgEngOptionalField $entry "LoadReason"); FoundBy = [string]$entry.FoundBy; Protection = (Get-DbgEngOptionalField $entry "Protection"); Managed = (Get-DbgEngOptionalField $entry "Managed")
+                Anomaly = (Get-DbgEngOptionalField $entry "Anomaly"); LoaderPath = (Get-DbgEngOptionalField $entry "LoaderPath")
+            })
+        $row = Add-DbgEngEntryRow -Source $Source -EventType "ModuleLoad" -Description "Module in memory: $name (PID: $($entry.PID), Process: $($entry.Process))" `
+            -User ([string]$entry.User) -Details $details -Time ([string]$entry.LoadTime) -CaptureTimeUtc $CaptureTimeUtc -AcquisitionEndUtc $AcquisitionEndUtc -DumpPath $DumpPath
+        if ($row.Timed) { $timed++ } else { $snapshot++ }
+    }
+    return (New-DbgEngRowCounts -Timed $timed -Snapshot $snapshot)
+}
+
+# A region's size for a description: "64 MB", "1076 KB", or "<n> bytes"
+function Format-DbgEngRegionSize {
+    param([uint64]$Size)
+    if ($Size -gt 0 -and $Size % 1048576 -eq 0) { return "$([uint64]($Size / 1048576)) MB" }
+    if ($Size -gt 0 -and $Size % 1024 -eq 0) { return "$([uint64]($Size / 1024)) KB" }
+    return "$Size bytes"
+}
+
+# Memory-PrivateCode rows (item f, lib\memory\TimelineDbgEng.PrivateCode.ps1):
+# one Snapshot row per executable private region at the capture time (a
+# region has no time of its own).
+#   Description  Executable private memory: <size> at <start> (PID: <n>,
+#                Process: <name>)
+#   Details      PID | ProcessCreated | Start | Size | Protection | FirstBytes
+#                | JitHost [| ProcessProtected=Yes] [| Anomaly=PeHeader]
+# User: the process token's SID. An entry without a Start is not a region
+# and is skipped.
 function Add-DbgEngPrivateCodeRows {
     param([object[]]$Entries, [string]$Source, [datetime]$CaptureTimeUtc, [datetime]$AcquisitionEndUtc, [string]$DumpPath)
-    $null = $Entries, $Source, $CaptureTimeUtc, $AcquisitionEndUtc, $DumpPath
-    return (New-DbgEngRowCounts)
+    $snapshot = 0
+    foreach ($entry in @($Entries)) {
+        if ($null -eq $entry -or "$($entry.Start)" -cnotmatch '^0x[0-9a-f]{1,16}$') { continue }
+        $size = [uint64]0
+        if ("$($entry.Size)" -cmatch '^0x([0-9a-f]{1,16})$') { $size = [Convert]::ToUInt64($Matches[1], 16) }
+        $details = Format-DbgEngDetails ([ordered]@{
+                PID = [string]$entry.PID; ProcessCreated = [string]$entry.ProcessCreated; Start = [string]$entry.Start; Size = [string]$entry.Size
+                Protection = [string]$entry.Protection; FirstBytes = [string]$entry.FirstBytes; JitHost = [string]$entry.JitHost; ProcessProtected = (Get-DbgEngOptionalField $entry "ProcessProtected")
+                Anomaly = (Get-DbgEngOptionalField $entry "Anomaly")
+            })
+        [void](Add-DbgEngEntryRow -Source $Source -Description "Executable private memory: $(Format-DbgEngRegionSize $size) at $($entry.Start) (PID: $($entry.PID), Process: $($entry.Process))" `
+                -User ([string]$entry.User) -Details $details -CaptureTimeUtc $CaptureTimeUtc -AcquisitionEndUtc $AcquisitionEndUtc -DumpPath $DumpPath)
+        $snapshot++
+    }
+    return (New-DbgEngRowCounts -Snapshot $snapshot)
 }
 
 # --- WP3: kernel drivers and handles (items d and e) -----------------------------------

@@ -2281,11 +2281,63 @@ of WinDbg -- instead:
       Process users and paths (ProcessDetails): the user, integrity level
         and elevation of each process from its token, its full program
         path and current folder. Not built yet.
-      DLLs (Modules): each process's DLLs from the loader's lists and the
-        image mappings, with mapped-but-unlinked ones; Source
-        Memory-Modules. Not built yet.
-      Executable private memory (PrivateCode): executable memory without a
-        file behind it; Source Memory-PrivateCode. Not built yet.
+      DLLs (Modules): each process's DLLs, from the loader's own lists (the
+        64-bit one and, for a 32-bit process, its 32-bit one) and from the
+        images mapped into its memory (its VADs, with the file behind each
+        mapping). Source Memory-Modules: one row per process and DLL outside
+        the Windows folder (its Temp folder counts as outside), and per
+        image that is mapped but missing from the loader's lists; the other
+        DLLs (about 9,500 per dump) are only counted in the log. A row is a
+        ModuleLoad event at the loader's own load time of the DLL when that
+        lies in the process's lifetime, else a Snapshot row. Details: PID,
+        ProcessCreated, Path (the mapped file, with the drive letter the
+        loader's own paths give), Base, Size, LoadReason (the loader's
+        reason, such as StaticDependency or DynamicLoad), FoundBy
+        (LoaderList, LoaderList32, ImageMapping), and where they apply
+        Protection and Managed=Yes (for an image in no loader list: the
+        mapping's protection, ReadOnly for a resource-only load such as
+        reading a file's icon; a .NET assembly, which the .NET runtime maps
+        itself), Anomaly and LoaderPath (the loader's path when it is not
+        Path). Anomaly=:
+          NotInLoaderLists  mapped but in no loader list; judged only in a
+                            process whose loader lists were read to their end
+          NoImageMapping    a loader entry with no image mapped at its base;
+                            judged only when the process's memory-region tree
+                            added up
+          NameMismatch      the loader's file name is not the mapped file's
+                            (8.3 short names are not judged)
+        A protected process (an anti-malware engine maps files to scan them)
+        is never judged: its mapped-only images are only counted. Rules:
+        EXEC-MODULE-USERPATH (Medium: a DLL from Downloads, Users\Public,
+        PerfLogs, the Recycle Bin or a Temp folder, not a resource-only
+        load), INTEG-MODULE-UNLINKED-USERPATH (Medium: an image mapped as code
+        from a user folder that no loader list has; not a resource-only load,
+        a .NET assembly, .mui, .winmd or a Windows Store app),
+        INTEG-MODULE-UNLINKED (Info: the same outside the Windows and user
+        folders) and INTEG-MODULE-NAME-MISMATCH (Info). A process whose loader
+        list is gone (it exited) or paged out is not judged, nor are the
+        loader entries of a process whose memory-region tree did not add up
+        (memory copied while Windows runs); the "Memory dump coverage: DLLs"
+        line counts both. Measured on three 8 GB ARM64 dumps: 8,700-9,900
+        loader entries, 9,300-10,200 image mappings, 380-460 rows, 0.3-3 s.
+      Executable private memory (PrivateCode): memory a process can run code
+        from that has no file behind it (private memory regions with an
+        execute protection), the memory Volatility's malfind plugin looks
+        at. Source Memory-PrivateCode, one Snapshot row per region: PID,
+        ProcessCreated, Start, Size, Protection (Execute, ExecuteRead,
+        ExecuteReadWrite, ExecuteWriteCopy), FirstBytes (PE: the first page
+        starts with a program header, MZ or PE with the MZ erased; Zero;
+        Data; Unreadable: not in the dump), JitHost (Yes: the process has a
+        run-time compiler loaded -- .NET, a script or browser engine, Java,
+        the x86/x64 emulator of Windows on Arm -- which makes such memory as
+        it runs; No; Unknown: its modules were not read),
+        ProcessProtected=Yes for a protected process, and Anomaly=PeHeader
+        with a program header. Rules: INTEG-PRIVATE-CODE-PE (High: a program
+        header in such memory) and INTEG-PRIVATE-CODE (Info: such memory in a
+        process without a run-time compiler, not a protected one). Measured
+        on three 8 GB ARM64 dumps: 19-21 regions in 3-4 processes, none with
+        a program header, well under 0.1 s (it reuses the DLLs area's walk of
+        the memory regions).
       Kernel drivers (Drivers): loaded kernel modules, drivers hidden from
         the module list, recently unloaded drivers; Source Memory-Drivers.
         Not built yet.
@@ -3611,6 +3663,18 @@ parsing is skipped, and the timeline CSV can be opened manually.
   tests\MemoryTestKit.ps1 (no dump in CI). While an area is not built yet,
   its test checks only that the area reports "not read (not built yet)" and
   that its rows functions add no rows.
+
+  tests\Test-MemoryModules.ps1 -- the DLLs and executable private memory
+  areas (work package WP2) on synthetic memory: canned "dt -v" output, six
+  processes (a 64-bit one with DLLs in and out of its loader list, a
+  protected one, a WoW64 one with a 32-bit list, one whose list is cut
+  short, an exited one, one without a PEB), VAD trees with image mappings
+  (file names, volumes, PE and CLR headers) and private regions; the
+  entries, counts and coverage notes, a tree that does not add up, the
+  missing-symbol and time-limit paths, the entries through the protocol
+  into Memory-Modules and Memory-PrivateCode rows, and those rows through
+  the real report rules. Its rules' own cases are in
+  tests\fixtures\report\rules\cases-memory-modules.csv.
 
   tests\MemoryTestKit.ps1 -- what these tests share (dot-sourced): it loads
   the helper's and the area files' functions (and with -Builder the
