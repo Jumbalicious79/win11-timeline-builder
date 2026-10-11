@@ -67,9 +67,10 @@ no dependencies, no command-line knowledge needed.
 
   1. COLLECT: Run triage-collector on the target system
   2. ANALYZE: Run timeline-builder on the collection (this tool)
-  3. REVIEW: choose a viewer from the menu: the color-coded Excel workbook,
-     Timeline Explorer (downloaded on first use), both, or Open report (the
-     findings report PDF)
+  3. REVIEW: choose a viewer from the menu: Excel + findings report (the
+     color-coded Excel workbook and the findings report PDF, opened
+     together), Excel, Timeline Explorer (downloaded on first use), Excel +
+     Timeline Explorer, or Open report (the findings report alone)
 
 ### Live System (Dirty Forensics)
 
@@ -81,7 +82,8 @@ For incident response, triage, or non-legal investigations:
   4. Unplug the USB, take it to your analysis workstation
   5. Double-click Run-TimelineBuilder.bat -- it auto-finds the triage zips
   6. Pick a collection; the timeline and the findings report are built, then
-     choose a viewer: Excel, Timeline Explorer, Both, Open report or None
+     choose a viewer: Excel + findings report (both at once), Excel,
+     Timeline Explorer, Excel + Timeline Explorer, Open report or None
 
 ### Forensic Image (Clean Forensics)
 
@@ -151,9 +153,11 @@ themselves are never committed.
     7. Writes the findings report: report.pdf, report.html and findings.csv
        -- leads to review, each linked to its rows in the Excel file (see
        "Findings Report")
-    8. Asks how you want to view: Excel (colored), Timeline Explorer, Both,
-       Open report, None (the numbers change when there is no Excel file or
-       no report; a number that is not listed is asked again)
+    8. Asks how you want to view: Excel + findings report (the colored
+       workbook and the report PDF, opened together), Excel (colored),
+       Timeline Explorer, Excel + Timeline Explorer, Open report, None (the
+       numbers change when there is no Excel file or no report; a number
+       that is not listed is asked again)
 
   You can also pass a collection folder or a collection .zip directly (or
   drop either on the .bat), optionally followed by a comma-separated
@@ -315,10 +319,14 @@ themselves are never committed.
                   are kept (older ones are dropped first). Default 0 =
                   unlimited. The USN journal is usually the largest source;
                   see "Known Limitations" for the Excel row limit.
-  -Viewer         Viewer to open at the end without the menu: Excel,
-                  TimelineExplorer, Both, Report (the findings report:
-                  report.pdf, or report.html when no PDF was made) or None
-                  (for scripts and automation).
+  -Viewer         Viewer to open at the end without the menu:
+                  ExcelAndReport (the Excel workbook and the findings report
+                  together; when one of them was not made, the other is
+                  opened and the log says which is missing), Excel,
+                  TimelineExplorer, Both (Excel and Timeline Explorer),
+                  Report (the findings report: report.pdf, or report.html
+                  when no PDF was made) or None (for scripts and
+                  automation).
   -NoExcel        CSV only: don't generate timeline.xlsx (ImportExcel is then
                   not needed). The findings report is still written; its row
                   numbers are then rows of timeline.csv. With -ReportOnly:
@@ -2191,20 +2199,39 @@ tools. Artifact SRUM:
 
 After the timeline builds, the script presents a viewer menu:
 
-  [1] Excel -- rows pre-colored by EventType, ready to analyze
+  [1] Excel + findings report -- the color-coded workbook and the
+      findings report (PDF), opened together (recommended)
+  [2] Excel -- rows pre-colored by EventType, ready to analyze
       (Logon=Green, Execution=Orange, Persistence=Red, Network=Blue, etc.)
-  [2] Timeline Explorer -- powerful forensic CSV viewer (no colors,
+  [3] Timeline Explorer -- powerful forensic CSV viewer (no colors,
       requires manual conditional formatting setup per session)
-  [3] Both -- open Excel (colored) and Timeline Explorer side by side
-  [4] Open report -- the findings report (PDF): leads to review,
+  [4] Excel + Timeline Explorer -- open both side by side
+  [5] Open report -- the findings report (PDF): leads to review,
       each with its timeline rows (plain-English summary first)
-  [5] None -- just save the files, don't open anything
+  [6] None -- just save the files, don't open anything
 
-Options that do not apply are left out and the rest renumbered: Excel and
-Both without a workbook, Open report without a report (-NoReport, or a
-report that could not be written). Open report opens report.pdf, or
-report.html when no PDF was made. -Viewer Excel|TimelineExplorer|Both|
-Report|None skips the menu.
+Options that do not apply are left out and the rest renumbered: Excel +
+findings report needs both the workbook and the report; Excel and Excel +
+Timeline Explorer need the workbook (not with -NoExcel, or when the
+workbook could not be written); Open report needs the report (-NoReport,
+or a report that could not be written). Without a report the menu is:
+
+  [1] Excel  [2] Timeline Explorer  [3] Excel + Timeline Explorer  [4] None
+
+and without a workbook:
+
+  [1] Timeline Explorer  [2] Open report  [3] None
+
+The report opens as report.pdf, or report.html when no PDF was made. A
+number that is not listed is asked again; at the end of redirected input
+nothing is opened.
+
+-Viewer skips the menu: ExcelAndReport (the workbook and the report; when
+one of them was not made, the other is opened and the log says which is
+missing), Excel, TimelineExplorer, Both (Excel and Timeline Explorer, menu
+entry "Excel + Timeline Explorer"), Report or None. Excel is started first,
+then the report; neither is waited for, and one that cannot be opened is
+logged and does not stop the other.
 
 The output files are always generated regardless of viewer choice:
   - timeline.csv   -- plain CSV for any tool (Timeline Explorer, SIEM, etc.)
@@ -2213,7 +2240,19 @@ The output files are always generated regardless of viewer choice:
     "Findings Report")
 
 
-### Option 1: Excel (recommended for most users)
+### Option 1: Excel and the findings report (recommended)
+
+Opens the workbook in Excel and the findings report in your PDF viewer
+(report.html in the browser when no PDF was made) at the same time. Read
+the report's summary page and lead cards first, then work through the rows
+in Excel: each card names its timeline rows, and the report's links point
+into timeline.xlsx (the Findings sheet links every lead to its rows, and the
+Timeline sheet's Finding column filters them; see "The workbook: Findings
+sheet and Finding column"). -Viewer ExcelAndReport does the same without
+the menu.
+
+
+### Option 2: Excel
 
 The .xlsx file has every row pre-colored by EventType using the ImportExcel
 PowerShell module. No manual formatting needed -- open it and start analyzing.
@@ -2249,7 +2288,7 @@ differences" above.
   If you used -Keywords, filter the Flagged column to TRUE for quick hits.
 
 
-### Option 2: Timeline Explorer (Eric Zimmerman)
+### Option 3: Timeline Explorer (Eric Zimmerman)
 
 A powerful forensic CSV viewer designed for timeline analysis. Downloaded
 automatically on first selection and cached for future use.
@@ -2273,11 +2312,13 @@ automatically on first selection and cached for future use.
   option exists -- it applies the same color scheme automatically.
 
 
-### Option 3: Both
+### Option 4: Excel + Timeline Explorer (-Viewer Both)
 
 Opens Excel (colored) and Timeline Explorer side by side. Useful when you
 want the visual color-coding in Excel and the forensic filtering power of
-Timeline Explorer at the same time.
+Timeline Explorer at the same time. Before this menu had the Excel +
+findings report choice, this entry was called "Both"; -Viewer Both still
+selects it.
 
 
 ### Other options for reading the output:
@@ -2311,10 +2352,12 @@ Timeline Explorer at the same time.
      every row of a lead. Leads are reasons to look, not a verdict.
 
   5. CHOOSE a viewer when prompted
+     Excel + findings report: both at once (the report's leads next to
+     the rows)
      Excel: pre-colored rows, ready to analyze immediately
      Timeline Explorer: powerful forensic CSV viewer (manual color setup)
-     Both: side by side for maximum flexibility
-     Open report: the findings report
+     Excel + Timeline Explorer: side by side for maximum flexibility
+     Open report: the findings report alone
 
   6. TRIAGE in your chosen viewer
      Filter the Finding column for a lead's id to see all of its rows
@@ -2679,7 +2722,8 @@ installation or configuration is needed.
   Cached at:  tools\TimelineExplorer\
   Size:       ~86 MB (zip)
   Used by:    Opened when chosen from the viewer menu (Timeline Explorer or
-              Both), or with -Viewer TimelineExplorer / Both
+              Excel + Timeline Explorer), or with -Viewer TimelineExplorer /
+              Both
   Requires:   .NET 9 Runtime (Timeline Explorer will prompt to install if missing)
 
 Both zips are downloaded to %TEMP%, extracted, and the zip is deleted. If
@@ -2774,8 +2818,9 @@ parsing is skipped, and the timeline CSV can be opened manually.
   devices, the Memory parser (where it finds the dump, the dump's capture
   time and the rows made from Volatility's output), the ShimCache rows of
   the PowerShellHistory parser, the run summary's counts per artifact,
-  how the builder handles its input (secrets, zip input) and its console
-  window (QuickEdit). CI runs them after Test-Parsers.ps1 in both
+  how the builder handles its input (secrets, zip input), its console
+  window (QuickEdit) and the viewer menu at the end of a run. CI runs them
+  after Test-Parsers.ps1 in both
   PowerShell versions (GitHub Actions runners are elevated):
 
   tests\Test-EventLogParsers.ps1 -- Part 1 feeds the Security, System
@@ -3078,6 +3123,20 @@ parsing is skipped, and the timeline CSV can be opened manually.
   exit code instead of calling exit, so its finally block runs). The
   console the test runs in is never changed. No admin needed.
 
+  tests\Test-ViewerMenu.ps1 -- loads the builder's Invoke-TimelineViewer
+  and checks what it opens at the end of a run, with stand-ins for
+  Start-Process, Read-Host, the log and Timeline Explorer (nothing is
+  started): the menu's entries, numbers and colors for each mix of files
+  (the workbook and the report both made: Excel + findings report first,
+  in green; no report; no workbook; neither), PDF or HTML named, what each
+  answer starts (Excel before the report), a number that is not listed
+  asked again, the end of redirected input (nothing opened), every
+  -Viewer value with and without the files (ExcelAndReport opens what was
+  made and logs which file is missing), and that Excel or the report
+  failing to open does not stop the other. In the builder's syntax tree:
+  -Viewer's ValidateSet values, each handled by the function and each
+  named in this README's -Viewer entry. No admin needed.
+
   Four scripts test the findings report (CI runs them after the parser
   tests, in both PowerShell versions). The first three need no admin and do
   not run the builder:
@@ -3316,6 +3375,7 @@ parsing is skipped, and the timeline CSV can be opened manually.
     powershell -ExecutionPolicy Bypass -File tests\Test-SummaryCounts.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-ScheduledTasks.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-ConsoleMode.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-ViewerMenu.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers.ps1 -AllowSystemChanges
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers2.ps1 -AllowSystemChanges
     powershell -ExecutionPolicy Bypass -File tests\Test-RegistryParsers.ps1 -AllowSystemChanges
