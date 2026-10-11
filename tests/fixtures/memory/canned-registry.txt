@@ -1,0 +1,6 @@
+# The Registry area's canned entries (work package WP4): one hive row and one
+# Run value whose data is the collection fixture's run_keys.csv value of the
+# same name (Persistence parsed: OnDisk=Yes, so no finding).
+#AREA	Registry	Read	55% of the hives' 4 KB blocks are in the dump, the rest was not in memory
+Hive	Offset=0xffffa00000200000	Root=\REGISTRY\MACHINE\SOFTWARE	File=\SystemRoot\System32\Config\SOFTWARE	Readable=54	RootState=Read	FoundBy=HiveListForward,HiveListBackward
+RunValue	Hive=HKLM	Key=HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run	Name=SecurityHealth	Command=%windir%\system32\SecurityHealthSystray.exe	Data=Read	ValueType=REG_EXPAND_SZ	LastWrite=2026-02-10T08:00:00.0000000+00:00	HiveFile=\SystemRoot\System32\Config\SOFTWARE	Values=Complete

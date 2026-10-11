@@ -301,7 +301,14 @@ $why = $script:DbgEngCompileProblems["Modules"]
     $script:rawPass = New-Object System.IO.MemoryStream
     $realModules = ${function:Invoke-DbgEngModulesArea}; $realPrivate = ${function:Invoke-DbgEngPrivateCodeArea}; $realDrivers = ${function:Invoke-DbgEngDriversArea}
     $realRaw = ${function:Start-DbgEngRawPass}; $realJoins = ${function:Invoke-DbgEngJoins}
+    # Every area not under test as a stub ("not built yet"), whether or not
+    # its work package has been built yet
+    $realAreas = @{}
+    foreach ($areaName in @(Get-DbgEngAreas | ForEach-Object { $_.Name })) {
+        $realAreas[$areaName] = (Get-Item -LiteralPath "function:Invoke-DbgEng${areaName}Area" -ErrorAction SilentlyContinue).ScriptBlock
+    }
     try {
+        foreach ($areaName in @($realAreas.Keys)) { Set-Item -LiteralPath "function:script:Invoke-DbgEng${areaName}Area" -Value { param($Context, $Area) $null = $Context; $Area.SetNotRead("not built yet") } }
         ${function:Invoke-DbgEngModulesArea} = { param($Context, $Area) $script:areaOrder.Add("Modules:$($Context.Processes.Count):$($Context.RawPass -ne $null)"); [void]$Area.Add("Module").Set("PID", $Context.Processes[0].Pid).Set("ProcessCreated", $Context.Processes[0].CreatedText); $Area.Coverage.Count("modules", 1); $Area.Coverage.Note("1 process's loader list could not be read") }
         ${function:Invoke-DbgEngPrivateCodeArea} = { param($Context, $Area) $null = $Context; [void]$Area.Add("PrivateCode").Set("PID", "1"); throw "boom: after one entry" }
         ${function:Invoke-DbgEngDriversArea} = { param($Context, $Area) $null = $Context, $Area; throw "boom (before any entry)" }
@@ -311,6 +318,7 @@ $why = $script:DbgEngCompileProblems["Modules"]
         $run = Invoke-DbgEngAreas -Session $null -Memory $processMemory -Processes $scanEntries -Blocks @(, $block) -DumpPath "C:\dumps\fixture.dmp"
     }
     finally {
+        foreach ($areaName in @($realAreas.Keys)) { if ($null -ne $realAreas[$areaName]) { Set-Item -LiteralPath "function:script:Invoke-DbgEng${areaName}Area" -Value $realAreas[$areaName] } }
         ${function:Invoke-DbgEngModulesArea} = $realModules; ${function:Invoke-DbgEngPrivateCodeArea} = $realPrivate; ${function:Invoke-DbgEngDriversArea} = $realDrivers
         ${function:Start-DbgEngRawPass} = $realRaw; ${function:Invoke-DbgEngJoins} = $realJoins
         $script:DbgEngFileProblems = @{}
