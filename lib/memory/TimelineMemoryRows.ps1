@@ -312,10 +312,37 @@ function Add-DbgEngNetRows {
 
 # --- WP7: services (item j) ------------------------------------------------------------------
 
-# Memory-Services rows (Add-MemoryPluginRows "windows.svcscan", with the
-# ARM64 fields in .ExtraDetails). Not built yet.
+# Memory-Services rows: the Service entries of the service control
+# manager's list (lib\memory\TimelineDbgEng.Services.ps1) through
+# Add-MemoryPluginRows "windows.svcscan", as Volatility's rows on x64 dumps
+# ("Service in memory: <display> (<name>)", Snapshot at the capture time,
+# "State=.. StartType=.. Binary=.. PID=n"), with the ARM64 fields appended in
+# space style, the ones whose values can hold spaces last:
+# " Type=.. Order=n FoundBy=ScmList[,Registry][ Anomaly=..][ Account=..]
+# [ RegistryBinary=..][ ServiceDll=..]" (a field the entry does not have is
+# left out). User: the token user of a running service's process (empty
+# when not known). A record whose name was not in the dump is named by its
+# address.
 function Add-DbgEngServiceRows {
     param([object[]]$Entries, [string]$Source, [datetime]$CaptureTimeUtc, [datetime]$AcquisitionEndUtc, [string]$DumpPath)
-    $null = $Entries, $Source, $CaptureTimeUtc, $AcquisitionEndUtc, $DumpPath
-    return (New-DbgEngRowCounts)
+    $services = New-Object System.Collections.Generic.List[object]
+    foreach ($entry in @($Entries)) {
+        if ($null -eq $entry) { continue }
+        $extra = New-Object System.Collections.Generic.List[string]
+        foreach ($pair in @(@("Type", "Type"), @("Order", "Order"), @("FoundBy", "FoundBy"), @("Anomaly", "Anomaly"), @("Account", "Account"),
+                @("RegistryBinary", "RegistryBinary"), @("ServiceDll", "Dll"))) {
+            $value = "$($entry.($pair[1]))".Trim()
+            if ($value) { $extra.Add("$($pair[0])=$value") }
+        }
+        $name = [string]$entry.Name
+        $display = [string]$entry.Display
+        if (-not $name -and -not $display) { $display = "service record at $($entry.Offset)" }
+        $services.Add([PSCustomObject]@{
+                Name = $name; Display = $display; Binary = [string]$entry.Binary; State = [string]$entry.State; Start = [string]$entry.Start
+                PID = [string]$entry.PID; User = [string]$entry.User; ExtraDetails = ($extra.ToArray() -join " ")
+            })
+    }
+    if ($services.Count -eq 0) { return (New-DbgEngRowCounts) }
+    $counts = Add-MemoryPluginRows -Plugin "windows.svcscan" -Source $Source -Entries $services.ToArray() -CaptureTimeUtc $CaptureTimeUtc -AcquisitionEndUtc $AcquisitionEndUtc -DumpPath $DumpPath
+    return (New-DbgEngRowCounts -Timed $counts.Timed -Snapshot $counts.Snapshot)
 }

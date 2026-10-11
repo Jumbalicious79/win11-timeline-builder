@@ -1,0 +1,7 @@
+# The Service entries of the canned services (work package WP7, item j): the
+# service control manager's list as TimelineDbgEng.Services.ps1 writes it
+# (the svcscan shape: Offset, Order, PID, Start, State, Type, Name, Display,
+# Binary, then RegistryBinary, Dll, Account, FoundBy, Anomaly, User).
+#AREA	Services	Read
+Service	Offset=0x1f2a0c01040	Order=12	PID=900	Start=SERVICE_AUTO_START	State=SERVICE_RUNNING	Type=SERVICE_WIN32_SHARE_PROCESS	Name=FixtureDhcp	Display=Fixture DHCP Client	Binary=C:\Windows\system32\svchost.exe -k LocalServiceNetworkRestricted -p	RegistryBinary=%SystemRoot%\system32\svchost.exe -k LocalServiceNetworkRestricted -p	Dll=%SystemRoot%\system32\fixture-dhcp.dll	Account=NT AUTHORITY\LocalService	FoundBy=ScmList,Registry	User=S-1-5-19
+Service	Offset=0x1f2a0c03040	Order=14	Start=SERVICE_DEMAND_START	State=SERVICE_STOPPED	Type=SERVICE_KERNEL_DRIVER	Name=fixturedrv	Display=Fixture Driver	Binary=	RegistryBinary=\SystemRoot\System32\drivers\fixturedrv.sys	FoundBy=ScmList,Registry
