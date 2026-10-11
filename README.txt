@@ -2914,6 +2914,19 @@ Both zips are downloaded to %TEMP%, extracted, and the zip is deleted. If
 download fails (no internet, firewall), the script continues -- browser
 parsing is skipped, and the timeline CSV can be opened manually.
 
+### Windows kernel symbol file (ARM64 memory dumps)
+  Purpose:    Lets Microsoft's debugger engine find the processes in a
+              Windows ARM64 memory dump. Downloaded only when such a dump
+              is analyzed.
+  Author:     Microsoft
+  Source:     https://msdl.microsoft.com/download/symbols (Microsoft's
+              public symbol server)
+  Cached at:  tools\symbols\ (once per Windows build)
+  Size:       About 10 MB
+  Used by:    Parser #15 (Memory Dump), Windows ARM64 dumps only -- opt-in.
+              What the request sends, and what happens offline: see
+              "Windows kernel symbols" under "Auto-Downloaded Dependencies".
+
 
 ## Optional Tools (User-Provided)
 
