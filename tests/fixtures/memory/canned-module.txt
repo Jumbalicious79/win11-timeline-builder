@@ -1,0 +1,7 @@
+# The Modules area's canned entries (work package WP2): two DLLs of the canned
+# process (PID 4321), one outside the Windows folder with the loader's load
+# time, one image no loader list has but that no rule flags (a resource-only
+# load under the Windows folder), and the area's coverage note.
+#AREA	Modules	Read	the loader lists of 1 process could not be read to their end, exited or paged out, so their images were not judged
+Module	PID=4321	ProcessCreated=2026-03-02 11:30:00.123	Process=fixture-stage.	Name=fixture-helper.dll	Path=C:\Program Files\Fixture\fixture-helper.dll	Base=0x7ffa00000000	Size=0x10000	LoadReason=StaticDependency	LoadTime=2026-03-02T11:30:01.0000000+00:00	FoundBy=LoaderList,ImageMapping
+Module	PID=4321	ProcessCreated=2026-03-02 11:30:00.123	Process=fixture-stage.	Name=fixture-res.dll	Path=C:\Windows\System32\fixture-res.dll	Base=0x7ff810000000	Size=0x10000	FoundBy=ImageMapping	Protection=ReadOnly	Anomaly=NotInLoaderLists
