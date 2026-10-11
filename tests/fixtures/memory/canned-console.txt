@@ -1,0 +1,6 @@
+# Console area (WP5): commands of a console host's history, as
+# lib\memory\TimelineDbgEng.Console.ps1 sends them. Synthetic; nothing here
+# may make a lead (Test-ReportBuilder expects one memory-only lead only).
+#AREA	Console	Partial	the command history of 1 of 2 console hosts could not be read because its memory is not in the dump, as when it was paged out or the console had closed
+Console	PID=4500	ProcessCreated=2026-03-02 11:00:00.000	App=cmd.exe	ClientPID=4510	Index=0	HistoryCount=2	FoundBy=ConsoleHistoryList	Command=dir C:\fixture	User=S-1-5-21-1-2-3-1001
+Console	PID=4500	ProcessCreated=2026-03-02 11:00:00.000	App=cmd.exe	ClientPID=4510	Index=1	HistoryCount=2	FoundBy=ConsoleHistoryList	Command=fixture-tool.exe /status | findstr ok	User=S-1-5-21-1-2-3-1001
