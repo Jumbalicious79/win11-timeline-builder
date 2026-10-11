@@ -163,6 +163,25 @@ function Read-TestWorkbook {
     finally { Close-ExcelPackage $package -NoSave }
 }
 
+# The Timeline sheet's column widths ("Header=width", widths rounded), or
+# $null when ImportExcel cannot be loaded; with -SetColumn/-SetWidth, sets
+# that column's width first and saves (an older builder's autosized width)
+function Get-TestTimelineWidths {
+    param([string]$Path, [int]$SetColumn = 0, [double]$SetWidth = 0)
+    try { Import-Module ImportExcel -ErrorAction Stop }
+    catch { return $null }
+    $package = Open-ExcelPackage -Path $Path
+    $save = $false
+    try {
+        $sheet = $package.Workbook.Worksheets["Timeline"]
+        if ($SetColumn -gt 0) { $sheet.Column($SetColumn).Width = $SetWidth; $save = $true }
+        return @(for ($c = 1; $c -le $sheet.Dimension.End.Column; $c++) { "$([string]$sheet.Cells[1, $c].Value)=$([Math]::Round($sheet.Column($c).Width))" })
+    }
+    finally {
+        if ($save) { Close-ExcelPackage $package } else { Close-ExcelPackage $package -NoSave }
+    }
+}
+
 # Checks the lead seen only in the memory dump of the memory run (section
 # 2b) in a run folder: "Captured in the memory dump" in report-model.json
 # (MemoryOnly), findings.csv, the card and the Findings sheet, and every
@@ -301,6 +320,10 @@ try {
     Write-TestResult -Succeeded ($imageInfo.ComputerName -eq "" -and $imageInfo.CollectorHost -eq "ANALYST-WS" -and $imageInfo.ComputerNameSource -eq "") -Message "mounted image: collection_info.json's computer is the collector host, not the examined computer ('$($imageInfo.ComputerName)', host '$($imageInfo.CollectorHost)')"
     $hiveInfo = Get-TimelineReportCollectionInfo -InfoJsonPath $imageJson -BuilderInfo ([PSCustomObject]@{ Mode = "MountedImage"; ComputerName = "ANALYST-WS" }) -ExaminedComputerName "IMAGED-PC"
     Write-TestResult -Succeeded ($hiveInfo.ComputerName -eq "IMAGED-PC" -and $hiveInfo.ComputerNameSource -eq "SYSTEM hive" -and $hiveInfo.CollectorHost -eq "ANALYST-WS") -Message "mounted image: the examined computer's name from the SYSTEM hive ('$($hiveInfo.ComputerName)')"
+    # The workbook validates (no repair needed): opening it in Excel must not
+    # tell the user to accept a repair, which could hide real damage
+    $viewerFunction = @($builderAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq "Invoke-TimelineViewer" }, $true))
+    Write-TestResult -Succeeded ($viewerFunction.Count -eq 1 -and $viewerFunction[0].Extent.Text -notmatch 'repair') -Message "opening Excel logs no 'Excel may prompt to repair the file' note"
     $liveInfo = Get-TimelineReportCollectionInfo -InfoJsonPath (Join-Path $collection "collection_info.json") -ExaminedComputerName "HIVE-NAME"
     Write-TestResult -Succeeded ($liveInfo.ComputerName -eq "REPORT-FIXTURE" -and $liveInfo.ComputerNameSource -eq "collection_info.json" -and $liveInfo.CollectorHost -eq "" -and $liveInfo.ExaminedComputerName -eq "HIVE-NAME") -Message "live collection: the computer from collection_info.json ('$($liveInfo.ComputerName)')"
     # Whether collection_info.json was read, is missing or could not be read
@@ -435,12 +458,24 @@ try {
             })
             Write-TestResult -Succeeded ($wrongTags.Count -eq 0) -Message "the Finding column tags exactly the rows of each finding ($($wrongTags.Count) wrong)"
             $firstFindingColumn = @($workbook.TimelineRows | ForEach-Object { $_.Finding })
+            # Export-Excel -AutoSize fits each column to its longest text;
+            # the builder caps the Timeline sheet's widths at 80 so that
+            # Description and Details stay on the screen (the fixture's
+            # Details are longer than that)
+            $widths = @(Get-TestTimelineWidths -Path $xlsxPath)
+            $wide = @($widths | Where-Object { [double]($_ -replace '^.*=', '') -gt 80 })
+            Write-TestResult -Succeeded ($widths.Count -ge 8 -and $wide.Count -eq 0 -and @($widths | Where-Object { $_ -eq "Details=80" }).Count -eq 1) -Message "the Timeline sheet's columns are at most 80 wide, Details capped at 80 ($($widths -join ', '))"
         }
     }
+    $excelLines = @($run.Output | Where-Object { $_ -match 'rows to Excel with' })
+    Write-TestResult -Succeeded ($excelLines.Count -eq 0 -or ($excelLines[0] -match 'with row colors' -and $excelLines[0] -notmatch 'conditional formatting')) -Message "the Excel step says 'with row colors', not 'conditional formatting' (the workbook has none): $($excelLines -join ' / ')"
 
     # --- 2. -ReportOnly rebuilds the report in the same folder ---
     $firstFindings = [System.IO.File]::ReadAllText($findingsCsv)
     $firstHtmlTime = (Get-Item -LiteralPath $htmlPath).LastWriteTimeUtc
+    # A workbook from an older builder has autosized columns: Details as
+    # wide as its longest text in the first 1,000 rows
+    if ($workbook) { $null = Get-TestTimelineWidths -Path $xlsxPath -SetColumn 6 -SetWidth 300 }
     Start-Sleep -Milliseconds 1100
     $rebuild = Invoke-TimelineBuilder -Arguments @("-ReportOnly", $runDir, "-Viewer", "None")
     Write-TestResult -Succeeded ($rebuild.ExitCode -eq 0 -and (Test-Path -LiteralPath (Join-Path $runDir "report_log.txt"))) -Message "-ReportOnly <folder> exits with 0 and logs to report_log.txt (exit code $($rebuild.ExitCode))"
@@ -454,6 +489,8 @@ try {
         Write-TestResult -Succeeded ($rebuiltModel.Workbook.Available -and $rebuiltWorkbook.Sheets[0] -eq "Findings" -and @($rebuiltWorkbook.Sheets | Where-Object { $_ -eq "Findings" }).Count -eq 1 -and
             @($rebuiltWorkbook.Headers | Where-Object { $_ -eq "Finding" }).Count -eq 1) -Message "-ReportOnly replaces the Findings sheet and the Finding column (no duplicates)"
         Write-TestResult -Succeeded ((@($rebuiltWorkbook.TimelineRows | ForEach-Object { $_.Finding }) -join "|") -eq ($firstFindingColumn -join "|")) -Message "-ReportOnly writes the same Finding column"
+        $rebuiltWidths = @(Get-TestTimelineWidths -Path $xlsxPath)
+        Write-TestResult -Succeeded (@($rebuiltWidths | Where-Object { $_ -eq "Details=80" }).Count -eq 1 -and @($rebuiltWidths | Where-Object { [double]($_ -replace '^.*=', '') -gt 80 }).Count -eq 0) -Message "-ReportOnly caps the Timeline sheet's column widths of an older workbook at 80 ($($rebuiltWidths -join ', '))"
     }
 
     # --- 2b. A lead seen only in the memory dump: a copy of the builder (with

@@ -710,10 +710,13 @@ gets it):
      This is Excel's hard cell limit. The full data is always in the CSV.
      Affected fields are typically long UserAssist entries or command lines.
 
-  2. Excel may show a "Repaired Records" or "Do you want to recover" prompt
-     when opening the file. Click Yes -- this is a known ImportExcel/EPPlus
-     library issue with XML formatting. The data and color-coding are intact.
-     This does not indicate data loss or corruption.
+  2. Columns of the Timeline sheet are at most 80 characters wide (Excel
+     would size Description, Details and RawPath to their longest text,
+     several screens wide). Wrap is off, so every row stays one line high;
+     the full text is in the cell (widen the column, or read it in the
+     formula bar). The workbook opens without a repair prompt: if Excel
+     ever offers to repair it, say No and keep the original -- the CSV has
+     the same rows -- and report it, since a repair can change data.
 
   3. An Excel worksheet holds at most 1,048,575 data rows. If the timeline is
      larger (usually because of a very large USN journal), the .xlsx is not
@@ -773,7 +776,15 @@ once more.
          registration date (the task XML's RegistrationInfo/Date, which
          whoever wrote the task sets). A lead that also has a time Windows
          recorded (the TaskCache "registered" or a "last run" row) is dated
-         by those times, not by the author-supplied one;
+         by those times, not by the author-supplied one. Times the triage
+         collector itself caused do not date a lead either: when the
+         collector adds its temporary Defender exclusion at the collection
+         start, the Exclusions\Paths key's last-write time changes, and the
+         rows of the other exclusions in that key (their Details say "when
+         the triage collector added its own exclusion during the
+         collection") get that time. Such rows stay in the lead, but its
+         first and last time come from its other rows; a lead with only
+         such rows is left out of the window and counted beside it;
        - key facts: computer, operating system, user accounts, when the
          evidence was collected and how, the machine's time zone (marked
          "assumed" when the collection does not record it), the time span
@@ -860,13 +871,18 @@ once more.
                            started earlier: check that it is not the
                            collector or its memory tool; "Folds N similar
                            groups" (see maxFindings below); "Dated by file
-                           times", or "Dated only by a scheduled task's
-                           author-supplied registration date"
+                           times", "Dated only by a scheduled task's
+                           author-supplied registration date", or "Dated
+                           only by a registry key's last-write time that
+                           the triage collector itself set during the
+                           collection" (that lead is not flagged "from
+                           during the collection")
     evidence rows          row number, time, source and event type,
                            description and details, user -- at most 15 on
                            the card: the rows that raised the severity and
                            the earliest ("Showing 15 of the 59 rows of this
-                           lead" when there are more). findings.csv and the
+                           lead" when there are more; the latest for a rule
+                           with "evidence": "latest"). findings.csv and the
                            Findings sheet list up to the rule's limit
                            (maxEvidence), and the Finding column tags all
     In Excel: ...          where to find every row of the finding
@@ -1125,6 +1141,7 @@ once more.
         "why": "...", "technical": "...", "nextSteps": "...",
         "falsePositives": "...", "references": ["MITRE ATT&CK T1204.002"],
         "maxEvidence": 40,                     evidence rows listed (25)
+        "evidence": "latest",                  which rows ("earliest")
         "maxFindings": 5,                      separate leads at most (20)
         "activityTime": false,                 times are file times (true)
         "enabled": true                        false turns the rule off
@@ -1154,13 +1171,25 @@ once more.
   Description is the key. {{group}} in the title or why is replaced by the
   group's value.
   threshold (optional): a group becomes a finding only when at least
-  "count" rows fall within "windowMinutes".
+  "count" rows fall within "windowMinutes". With "distinct" ("description",
+  "user", "source", "eventType" or "detail:<Key>") the window must hold
+  at least "count" distinct values of it instead (case does not count; a
+  row without the value counts on its own): FS-RANSOM-RENAME counts files
+  this way, since one rename writes two or three USN rows with the same
+  description. The evidence then lists the first row of each value before
+  any repeat.
   escalate (optional): a row matching escalate.match up to withinMinutes
   after one of the finding's rows, with the same sameKey value ("user",
   "source", "description", "eventType", "detail:<Key>" or "none"), raises
   the finding to escalate.severity and is added to its evidence.
   maxEvidence (default 25): the evidence rows findings.csv and the
   Findings sheet list per finding (the card prints at most 15 of them).
+  evidence (default "earliest"): which of the rule's rows those are, after
+  any that raised the severity: "earliest", or "latest" for a rule whose
+  newest rows matter most (FS-WINDOWS-UPDATE lists the latest 40 installs,
+  the ones nearest the collection, not the oldest a long System log still
+  holds). The summary line then says "latest N rows listed", the card
+  prints the latest, and Appendix A's row list ends with the last rows.
   maxFindings (default 20; 0 = no limit): at most this many separate leads
   from the rule. When there are more groups (one per attacking address of
   a password-spraying run, say), the escalated ones and those with the most
@@ -1172,7 +1201,15 @@ once more.
   whose Details say its time is "author-supplied, not recorded by Windows"
   (a task XML registration date) does not set a lead's first and last time
   when the lead has a row with another time; a lead with only such rows
-  keeps their dates but is treated like activityTime false.
+  keeps their dates but is treated like activityTime false. The same holds
+  for a row whose time the triage collector caused ("when the triage
+  collector added its own exclusion during the collection", or "... added
+  this exclusion": a Defender Exclusions key's last-write time); a lead
+  with only such rows is also not flagged as from during the collection.
+  Only a Registry-DefenderExclusions row whose last Details field is the
+  builder's Time= note counts: the same words anywhere else (an exclusion
+  path, a service's image path, a command line) are text whoever made that
+  data chose, and change nothing.
   Members whose names start with "_", and "comment" and "notes", are
   comments. Any other unknown member, a bad regular expression or an
   unknown list stops the report with an error that names the rule and the
@@ -1187,9 +1224,13 @@ once more.
       on the finding and in the log but never flagged. The collector's own
       temporary Defender exclusion of its output folder
       (TriageCollection_<date>_<time>) is allowlisted this way when it is
-      added or removed (Defender Operational 5007, MPLog, and the
-      registry row the builder labels); an exclusion of such a folder that
-      is still in effect after a collection is listed.
+      added or removed (Defender Operational 5007, MPLog); the registry
+      row the builder labels as the collector's own is a Snapshot row,
+      which the antivirus-exclusion rules do not match. An exclusion of
+      such a folder that is still in effect after a collection is listed,
+      also the collector's own when collection_log.txt says it could not
+      remove it. No allowlist entry matches a free piece of text such as
+      "triage collector": an exclusion's path is chosen by whoever adds it.
     - A rule you don't want: "enabled": false.
     - A noisy rule: narrow its match, add a threshold, group it differently
       or lower its severity. Keep your copy of the file outside the
@@ -1241,6 +1282,29 @@ once more.
     - EXEC-PS-DOWNLOAD is High only when the download is also run
       (Invoke-Expression, as the plan's "cradle plus IEX"); a download alone
       is EXEC-PS-DOWNLOAD-FILE (Medium).
+    - FS-RANSOM-RENAME ("Many files were renamed to one extension at once:
+      .<ext>") counts files, not USN records: 50 or more files renamed to
+      one new extension (up to 24 characters) within ten minutes, in the
+      same folder with the extension changed (the From=/ExtChanged=/Moved=
+      details of the USN parser). A Windows update moves thousands of
+      system files between folders with their own names and extensions
+      (.dll, .exe, .cat, .mum, .cdf-ms, ...) or through temporary names
+      (<32 hex digits>_<name>, $$<name>); those are never counted, also
+      not on a timeline from an older builder, which has no such details
+      and is counted by the extension lists alone. .lock counts (some
+      ransomware appends it; git renames its lock files away from .lock).
+      Not counted either: a rename that only drops a temporary suffix
+      (ExtChanged=removed: a finished download "photo.jpg.part" ->
+      "photo.jpg", ExifTool's "IMG.JPG_exiftool_tmp" -> "IMG.JPG", a sync
+      tool's or editor's atomic save), and ExifTool's backups
+      ("<name>.<ext>_original", made for every file it edits). The
+      trade-off: ransomware that writes "<name>.<new ext>.tmp" and then
+      drops ".tmp" is missed, and so is ransomware that gives each file a
+      different extension (each extension is its own group).
+      FS-WINDOWS-UPDATE (Info) lists the Windows updates installed, for
+      comparing times: the latest 40 (evidence "latest"), so the ones
+      nearest the collection are listed also when the System log holds
+      more.
     - Not expressible with the current rule engine, so not flagged: a
       task deleted soon after it was created (R7), a timestomped file that
       also ran (R14 High), a security service stop "near a finding" (R15:
@@ -1328,6 +1392,17 @@ Parses .evtx files using Get-WinEvent. Targets high-value forensic events
     (1074/6008), event log cleared (104, SecurityAlert, with the log name
     and who cleared it), event log service started/stopped (6005/6006: the
     markers of a boot and of a clean shutdown)
+  - System, Windows Update (Microsoft-Windows-WindowsUpdateClient only;
+    EventType Installation): "Windows Update download started" (44),
+    "Windows Update installation started" (43), "Windows Update installed"
+    (19) and "Windows Update installation failed" (20, with the error
+    code), each with the update's title (and KB number) in the
+    description, and Update, KB, ErrorCode, UpdateGuid and Revision in
+    Details. Defender's security intelligence updates come several times
+    a day, so expect a few rows a day. An update renames and moves
+    thousands of system files while it installs: these rows explain such
+    bursts in the USN journal and $MFT, and the report lists the installed
+    updates with a KB number as an Info item (FS-WINDOWS-UPDATE)
   - Application: software installed or removed (MsiInstaller 1033/1034,
     EventType Installation, with Product, Version, Manufacturer, Status and
     the installing account as User, named from its SID (see "User
@@ -1737,6 +1812,26 @@ Older collections without a $MFT: file listing CSVs are parsed if present
 ### 9. USN Journal
 Parses $UsnJrnl_$J.txt exported by the triage collector:
   - File create, modify, delete, rename, security change events
+  - Renames: a rename writes a "Rename: old name" record ("USN deleted:
+    <old name>") and then one or more "Rename: new name" records ("USN
+    renamed to: <new name>", the last with "| Close") for the same File
+    ID. The builder pairs them by File ID, and each "renamed to" row's
+    Details get what the file was renamed from and whether the extension
+    or the folder changed:
+        Reason=Rename: new name | ExtChanged=yes | Moved=no | From=report.docx
+    ExtChanged: "yes" when the text after the last dot differs (case does
+    not count; "notes" -> "notes.txt" counts as changed); "removed" when
+    the change only dropped a suffix that followed a "." or "_" (the old
+    name is the new one plus that suffix: "photo.jpg.part" -> "photo.jpg",
+    "IMG.JPG_exiftool_tmp" -> "IMG.JPG", "HEAD.lock" -> "HEAD"), as a
+    finished download or an atomic save does ("q.docx.ZXCRYT" ->
+    "q.docx.ZXCRY" has no separator and stays "yes"); "no" otherwise.
+    Moved: the parent folder's File ID changed. A rename whose old-name
+    record is older than the journal, or a USN text export without the
+    File ID columns, keeps only Reason=. The descriptions are unchanged.
+    Ransomware renames files in place to a new extension (ExtChanged=yes,
+    Moved=no); a Windows update moves thousands of system files between
+    folders with their names (Moved=yes, ExtChanged=no)
   - Filters out noisy "Close" and "Basic info change | Close" entries
   - Keeps every row by default; with -MaxUsnEntries N only the NEWEST N
     rows are kept, so the most recent activity before collection is always
@@ -1900,8 +1995,14 @@ no dump is found for a collection whose systeminfo.txt says ARM64, the
 offer step says so instead of asking for the dump to be copied next to
 the zip. A dump of the collection that is found or listed but not
 analyzed (ARM64, answered 2 at the prompt, no vol.exe, not found) gets a
-log line "Memory dump not analyzed: <dump> (<size>): <reason>", which the
-findings report shows in its Evidence coverage notes and as a caveat.
+log line "Memory dump not analyzed: <dump> (<size>) -- <reason>[; <what
+to do>]", for example "... -- Volatility 3 cannot read Windows ARM64
+dumps; examine it in WinDbg." The findings report shows that line in its
+Evidence coverage notes, and the reason alone in its caveat ("A memory
+dump of this collection was not analyzed (Volatility 3 cannot read Windows
+ARM64 dumps), so the programs, network connections and command lines in
+memory are not in this report."). -ReportOnly reads the older wording
+("<dump> (<size>): <reason>") the same way.
   - windows.pslist: Running processes with creation timestamps, PIDs, parent
     PIDs (ProcessCreation at the creation time)
   - windows.netscan: Network connections with protocol, addresses, ports,
@@ -2117,9 +2218,8 @@ The output files are always generated regardless of viewer choice:
 The .xlsx file has every row pre-colored by EventType using the ImportExcel
 PowerShell module. No manual formatting needed -- open it and start analyzing.
 
-Note: Excel may show a repair prompt when opening -- click Yes. This is a
-known ImportExcel library issue, not data corruption. See "CSV vs Excel
-differences" above for details.
+Columns are at most 80 characters wide, with wrap off; see "CSV vs Excel
+differences" above.
 
   Color scheme (applied automatically):
 
@@ -2469,10 +2569,11 @@ Timeline Explorer at the same time.
 
   - Excel row limit -- Timelines over 1,048,575 rows are written to CSV only.
 
-  - Excel "Repaired Records" or recovery prompt -- Known ImportExcel/EPPlus
-    library issue. Click Yes to proceed. Data and color-coding are intact.
-    The CSV file contains the complete unmodified data. See "CSV vs Excel
-    differences" above.
+  - Excel "Repaired Records" or recovery prompt -- not expected: the
+    workbook validates (no conditional formatting, cells cleaned of
+    characters an .xlsx cannot hold and cut at 32,767 characters). Say No,
+    keep the file, and report it with the repair log Excel names; the CSV
+    has the complete unmodified data. See "CSV vs Excel differences" above.
 
   - "windows.netscan: 0 entries" -- Volatility 3's netscan plugin may return
     no results on Windows 11 Build 26200+ due to kernel structure changes.
@@ -2551,11 +2652,9 @@ installation or configuration is needed.
   Install:    Auto-installed from PSGallery (Install-Module -Scope CurrentUser)
   Size:       ~5 MB
   Used by:    Excel timeline generation (color-coded .xlsx output)
-  Known issue: Excel may show a "Repaired Records" or recovery prompt when
-              opening the generated .xlsx file. This is a known EPPlus library
-              issue with XML formatting -- not data corruption. Click Yes to
-              proceed. All data and color-coding are intact. The CSV file
-              contains the complete unmodified data as a fallback.
+  Notes:      Rows are colored with cell fills (no conditional formatting);
+              the Timeline sheet's columns are capped at 80 characters
+              wide. The CSV file has the complete unmodified data.
 
 ### sqlite3.exe
   Purpose:    Parses browser history databases (Chrome, Edge, Firefox).
@@ -2648,6 +2747,15 @@ parsing is skipped, and the timeline CSV can be opened manually.
                with USB and other device installs and deletions
     usb\       USB -- a synthetic mounted_devices.csv (GPT, MBR, USB and
                other device paths) and usb_storage_devices.csv
+    usn\       UsnJournal -- a synthetic fsutil export: renames paired by
+               File ID (an appended, swapped, added and removed extension,
+               a dropped temporary suffix after a "." or "_" -- ".part",
+               "_exiftool_tmp", ".lock": ExtChanged=removed -- and a
+               shortened extension with no separator, still "yes", a
+               servicing move to another folder, a file renamed twice, a
+               case-only change, interleaved records), a rename whose
+               old-name record is missing, and a line without the File ID
+               columns
   CI runs it on every pull request in Windows PowerShell 5.1 and
   PowerShell 7.
 
@@ -2670,8 +2778,10 @@ parsing is skipped, and the timeline CSV can be opened manually.
   window (QuickEdit). CI runs them after Test-Parsers.ps1 in both
   PowerShell versions (GitHub Actions runners are elevated):
 
-  tests\Test-EventLogParsers.ps1 -- Part 1 feeds the Security, System,
-  Defender and Application handlers synthetic event records and checks
+  tests\Test-EventLogParsers.ps1 -- Part 1 feeds the Security, System
+  (also Windows Update 19/20/43/44, and the same IDs from other providers,
+  which give no row), Defender and Application handlers synthetic event
+  records and checks
   their rows and which event IDs and providers each log reads, and the User
   of the Security, PowerShell (4104/4103) and BITS rows. It also checks the
   User column: the one form per account for each kind of value, SID names
@@ -2993,8 +3103,21 @@ parsing is skipped, and the timeline CSV can be opened manually.
   run ended incomplete (its log lines, its end banners, or the counts the
   builder passes) without repeating it in the notes, and names a memory
   dump the builder did not analyze (its "Memory dump not analyzed" log
-  line) in the notes, with a caveat that does not say the dump exists
-  (it may not have been found). A lead seen only in
+  line, in the current and the older wording) in the notes, with the
+  reason and advice after one colon, and a caveat that gives the reason as
+  one short phrase and does not say the dump exists (it may not have been
+  found). threshold.distinct counts distinct values (records of one file
+  once; a row without the value on its own) and lists each value once in
+  the evidence first. "evidence": "latest" lists the latest rows after the
+  one that raised the severity, and findings.csv says "latest N rows
+  listed"; with the shipped rules, FS-WINDOWS-UPDATE lists the newest of
+  52 installs and not the oldest; an unknown "evidence" value is a
+  rules-file error. A Defender Exclusions row whose time the collector
+  caused must not set a lead's last time or the flagged-activity window;
+  a lead with only such rows keeps them, is not dated by activity and is
+  not "during the collection". The collector's words in an exclusion
+  path, in a service's image path or on a row of another source must not
+  do that: such a lead stays dated by its own time and in the window. A lead seen only in
   Snapshot rows from during the collection (a task listed then) must be
   CapturedDuringCollection, not DuringCollection; a lead whose rows all
   come from the memory dump must be MemoryOnly, never
@@ -3042,7 +3165,19 @@ parsing is skipped, and the timeline CSV can be opened manually.
   lines as Snapshot rows, author-supplied task dates, task actions written
   with environment variables (%TEMP%, %PUBLIC%, ...), Security 4698/4702
   Command/Arguments rows, ShimCache FileLastModified rows, the User
-  column's forms), each tagged with the
+  column's forms, USN rename rows with and without the From=/ExtChanged=/
+  Moved= details: Windows servicing bursts that must not count as
+  ransomware -- hash-named WinSxS temporary names, same-name .dll moves,
+  .cdf-ms transacted renames, files moved or renamed with their extension,
+  34 files written as 102 records -- other bulk renames that must not
+  either -- ExifTool's "<name>.<ext>_original" backups, finished downloads
+  ("photo.jpg.part" -> "photo.jpg") and temporary copies made permanent
+  ("_exiftool_tmp" dropped), both ExtChanged=removed -- the triage
+  collector's own temporary exclusion (a Snapshot row) not flagged, while
+  its exclusion left in place after a collection and a path that merely
+  contains "Triage Collector" are -- and ransomware bursts that must, with
+  an appended, swapped, 16-character or .lock extension, also from an
+  older timeline), each tagged with the
   rules it must (HIT) or must not (MISS) trigger, or with KEY <rule>
   <group>: a hit whose finding must be grouped under that value. Every
   enabled rule needs a hit and a near-miss case. The rules file must load
@@ -3079,8 +3214,9 @@ parsing is skipped, and the timeline CSV can be opened manually.
   one seen only in Snapshot rows then, one seen only in the memory dump
   (exactly "Captured in the memory dump", with no Snapshot note or
   collector hint; with the during-collection note too when the dump shows
-  the process started then), and one dated only by an
-  author-supplied task date (also in the summary's activity window). It
+  the process started then), one dated only by an
+  author-supplied task date and one dated only by a time the collector
+  set (both also in the summary's activity window). It
   checks the collector key fact and the "The collector's own processes (not
   flagged)" subsection of Evidence coverage (the process table with each
   process's rows and plain process IDs, a mismatch note, and the text for a
@@ -3100,10 +3236,13 @@ parsing is skipped, and the timeline CSV can be opened manually.
   and severities, row numbers that point at the right timeline rows),
   report-model.json, report.html, report.pdf (skipped without Edge), the
   copied collection_info.json and collection_log.txt, and the workbook: the
-  first sheet is Findings, every row links to its Timeline row, and the
-  Finding column tags exactly the rows of each finding. Then -ReportOnly
-  (the same findings, no duplicate sheet or column, and no error output,
-  also in Windows PowerShell); a lead seen only in the memory dump, from a
+  first sheet is Findings, every row links to its Timeline row, the
+  Finding column tags exactly the rows of each finding, and the Timeline
+  sheet's columns are at most 80 wide (the log says "with row colors", and
+  opening Excel logs no repair note). Then -ReportOnly
+  (the same findings, no duplicate sheet or column, no error output, also
+  in Windows PowerShell, and an older workbook's wide column capped at
+  80); a lead seen only in the memory dump, from a
   copy of the builder (in the test's folder) whose Volatility 3 is a stub
   with canned output, run with -MemoryDumpPath on a synthetic dump header:
   "Captured in the memory dump" in report-model.json (MemoryOnly),

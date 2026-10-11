@@ -417,15 +417,22 @@ function Get-ReportHtmlRowTotal {
 }
 
 # Row number list text ("12, 40, 41 +299 more"): the first evidence rows,
-# then how many more rows the finding has in all (not only evidence rows)
+# then how many more rows the finding has in all (not only evidence rows).
+# For a rule that lists its latest rows (EvidenceLatest): how many other
+# rows, then the last evidence rows ("+299 earlier, 340, 341, 342")
 function Format-ReportHtmlRowList {
     param([object]$Finding, [int]$Max = 6)
     $numbers = Get-ReportHtmlRowNumbers -Finding $Finding
     if ($numbers.Count -eq 0) { return "" }
-    $shown = @($numbers | Select-Object -First $Max)
+    $latest = [bool](Get-ReportHtmlField $Finding "EvidenceLatest")
+    $shown = if ($latest) { @($numbers | Select-Object -Last $Max) } else { @($numbers | Select-Object -First $Max) }
     $text = $shown -join ", "
     $total = Get-ReportHtmlRowTotal -Finding $Finding
-    if ($total -gt $shown.Count) { $text += " +" + ($total - $shown.Count).ToString("N0", $script:ReportHtmlInvariant) + " more" }
+    if ($total -gt $shown.Count) {
+        $others = ($total - $shown.Count).ToString("N0", $script:ReportHtmlInvariant)
+        if ($latest) { $text = "+" + $others + " earlier, " + $text }
+        else { $text += " +" + $others + " more" }
+    }
     return $text
 }
 
@@ -764,7 +771,8 @@ function Add-ReportHtmlFinding {
     $count = Get-ReportHtmlField $Finding "Count"
     $evidence = Get-ReportHtmlList $Finding "Evidence"
     # The card prints at most $script:ReportHtmlCardEvidenceRows rows: the
-    # ones that raised the severity, then the earliest. The Findings sheet,
+    # ones that raised the severity, then the earliest (the latest for a
+    # rule that lists its latest rows: EvidenceLatest). The Findings sheet,
     # findings.csv and the Finding column keep the rest.
     $printed = $evidence
     if ($evidence.Count -gt $script:ReportHtmlCardEvidenceRows) {
@@ -772,7 +780,10 @@ function Add-ReportHtmlFinding {
         for ($e = 0; $e -lt $evidence.Count -and $keepIndex.Count -lt $script:ReportHtmlCardEvidenceRows; $e++) {
             if ([bool](Get-ReportHtmlField $evidence[$e] "Escalation")) { $keepIndex.Add($e) }
         }
-        for ($e = 0; $e -lt $evidence.Count -and $keepIndex.Count -lt $script:ReportHtmlCardEvidenceRows; $e++) {
+        $order = @(0..($evidence.Count - 1))
+        if ([bool](Get-ReportHtmlField $Finding "EvidenceLatest")) { [array]::Reverse($order) }
+        foreach ($e in $order) {
+            if ($keepIndex.Count -ge $script:ReportHtmlCardEvidenceRows) { break }
             if (-not $keepIndex.Contains($e)) { $keepIndex.Add($e) }
         }
         $keepIndex.Sort()
@@ -843,6 +854,9 @@ function Add-ReportHtmlFinding {
     if ([bool](Get-ReportHtmlField $Finding "TimesAuthorSupplied")) {
         $flags.Add('<span class="flag">Dated only by a scheduled task&#39;s author-supplied registration date, which whoever wrote the task sets (it can be old or forged)</span>')
     }
+    elseif ([bool](Get-ReportHtmlField $Finding "TimesCollectorCaused")) {
+        $flags.Add('<span class="flag">Dated only by a registry key&#39;s last-write time that the triage collector itself set during the collection: the activity is older</span>')
+    }
     elseif ((Get-ReportHtmlField $Finding "ActivityTime") -eq $false) {
         $flags.Add('<span class="flag">Dated by file times, which can be older than the activity or altered</span>')
     }
@@ -875,7 +889,7 @@ function Add-ReportHtmlFinding {
     $excel = New-Object System.Collections.Generic.List[string]
     $total = Get-ReportHtmlRowTotal -Finding $Finding
     if ($printed.Count -gt 0 -and $total -gt $printed.Count) {
-        $shownText = "Showing " + (Format-ReportHtmlNumber $printed.Count) + " of the " + (Format-ReportHtmlNumber $total) + " rows of this lead (the earliest"
+        $shownText = "Showing " + (Format-ReportHtmlNumber $printed.Count) + " of the " + (Format-ReportHtmlNumber $total) + " rows of this lead (the " + $(if ([bool](Get-ReportHtmlField $Finding "EvidenceLatest")) { "latest" } else { "earliest" })
         if (@($printed | Where-Object { [bool](Get-ReportHtmlField $_ "Escalation") }).Count -gt 0) { $shownText += ", and the rows that raised its severity" }
         $shownText += ")."
         if ($evidence.Count -gt $printed.Count) { $shownText += " findings.csv" + $(if ($Context.WorkbookAvailable) { " and the Findings sheet list " } else { " lists " }) + (Format-ReportHtmlNumber $evidence.Count) + "." }
@@ -915,22 +929,27 @@ function Add-ReportHtmlSummary {
     if ($leads -gt 0) {
         # The window leaves out leads dated by file times (timestomp
         # candidates, Amcache/ShimCache) or only by a task author's date:
-        # those times can be old or forged
+        # those times can be old or forged; and leads dated only by a time
+        # the collector itself set (the Defender Exclusions key it changed)
         $timed = Get-ReportHtmlActivityFindings -Findings $Context.Findings
         $fileTimed = $Context.Findings.Count - $timed.Count
         $authorDated = @($Context.Findings | Where-Object { [bool](Get-ReportHtmlField $_ "TimesAuthorSupplied") }).Count
-        $datedBy = "file times"
-        if ($authorDated -gt 0 -and $authorDated -eq $fileTimed) { $datedBy = "author-supplied task dates" }
-        elseif ($authorDated -gt 0) { $datedBy = "file times or author-supplied task dates" }
+        $collectorDated = @($Context.Findings | Where-Object { [bool](Get-ReportHtmlField $_ "TimesCollectorCaused") }).Count
+        $kinds = @()
+        if ($fileTimed - $authorDated - $collectorDated -gt 0) { $kinds += "file times" }
+        if ($authorDated -gt 0) { $kinds += "author-supplied task dates" }
+        if ($collectorDated -gt 0) { $kinds += "times the collector itself set" }
+        $datedBy = if ($kinds.Count -le 1) { "$(@($kinds + 'file times')[0])" } else { ($kinds[0..($kinds.Count - 2)] -join ", ") + " or " + $kinds[-1] }
+        $caution = if ($collectorDated -gt 0) { "which do not show when the activity happened" } else { "which can be older than the activity or altered" }
         $span = Get-ReportHtmlFindingSpan -Findings $timed
         $text = "The rules flagged " + (Format-ReportHtmlCount -Value $leads -Singular "lead" -Plural "leads") + " to review."
         if ($span.First) {
             $text += " The flagged activity falls between <b>" + (Format-ReportHtmlUtcAndLocal -Value $span.First -TimeZone $tz) + "</b> and <b>" + (Format-ReportHtmlUtcAndLocal -Value $span.Last -TimeZone $tz) + "</b>"
-            if ($fileTimed -gt 0) { $text += " (plus " + (Format-ReportHtmlCount -Value $fileTimed -Singular "lead" -Plural "leads") + " dated by $datedBy, which can be older than the activity or altered)" }
+            if ($fileTimed -gt 0) { $text += " (plus " + (Format-ReportHtmlCount -Value $fileTimed -Singular "lead" -Plural "leads") + " dated by $datedBy, $caution)" }
             $text += "."
         }
         elseif ($fileTimed -gt 0) {
-            $text += " The flagged items are dated by $datedBy, which can be older than the activity or altered, so they give no activity window."
+            $text += " The flagged items are dated by $datedBy, $caution, so they give no activity window."
         }
         $null = $Builder.AppendLine('<p>' + $text + '</p>')
         $null = $Builder.AppendLine('<p class="framing">A lead is a reason to look closer, not proof that the computer was compromised. Each one needs a person to review the evidence rows listed with it.</p>')

@@ -330,6 +330,28 @@ Test-Case -Name "System 104 log cleared, 6005/6006 event log service (other prov
     @{ EventType = "ServiceChange"; Description = "Event log service started (system startup)"; Details = "EventID=6005" }
 )
 
+Test-Case -Name "System WindowsUpdateClient 44/43/19/20: download, installation started, installed, failed (other providers ignored)" -Action {
+    $wu = "Microsoft-Windows-WindowsUpdateClient"
+    $lcu = "2026-09 Security Update (KB5129195) (26100.9457)"
+    $guid = "{9600076e-4052-45ba-9d6f-a475e5b22d74}"
+    Add-SystemEventEntry -Record (New-TestRecord -Provider $wu -Id 44 -Time "2026-01-02 11:10:00" -Body (New-EventDataXml -Data ([ordered]@{ updateTitle = $lcu; updateGuid = $guid; updateRevisionNumber = "1" }))) -FileName $sys -FilePath "X:\System.evtx"
+    Add-SystemEventEntry -Record (New-TestRecord -Provider $wu -Id 43 -Time "2026-01-02 11:15:00" -Body (New-EventDataXml -Data ([ordered]@{ updateTitle = $lcu; updateGuid = $guid; updateRevisionNumber = "1" }))) -FileName $sys -FilePath "X:\System.evtx"
+    Add-SystemEventEntry -Record (New-TestRecord -Provider $wu -Id 19 -Time "2026-01-02 11:38:07" -Body (New-EventDataXml -Data ([ordered]@{ updateTitle = $lcu; updateGuid = $guid; updateRevisionNumber = "1"; serviceGuid = "{8b24b027-1dee-babb-9a95-3517dfb9c552}" }))) -FileName $sys -FilePath "X:\System.evtx"
+    Add-SystemEventEntry -Record (New-TestRecord -Provider $wu -Id 20 -Time "2026-01-02 11:40:00" -Level 2 -Body (New-EventDataXml -Data ([ordered]@{ errorCode = "0x80073d02"; updateTitle = "9WZDNCRD29V9-MICROSOFT.MICROSOFTOFFICEHUB"; updateGuid = "{7d4bf8cd-56d4-4c4e-8b8d-3fb36d42776e}"; updateRevisionNumber = "1" }))) -FileName $sys -FilePath "X:\System.evtx"
+    # The same IDs from other providers are not Windows Update events
+    Add-SystemEventEntry -Record (New-TestRecord -Provider "Some-Other-Provider" -Id 19 -Time "2026-01-02 11:41:00" -Body (New-EventDataXml -Data ([ordered]@{ updateTitle = "x" }))) -FileName $sys -FilePath "X:\System.evtx"
+    Add-SystemEventEntry -Record (New-TestRecord -Provider "Microsoft-Windows-Kernel-General" -Id 20 -Time "2026-01-02 11:42:00" -Body (New-EventDataXml -Data @("x"))) -FileName $sys -FilePath "X:\System.evtx"
+    # No title: the event alone
+    Add-SystemEventEntry -Record (New-TestRecord -Provider $wu -Id 43 -Time "2026-01-02 11:43:00" -Body (New-EventDataXml -Data ([ordered]@{ updateGuid = $guid }))) -FileName $sys -FilePath "X:\System.evtx"
+} -Expected @(
+    @{ Timestamp = "2026-01-02 11:10:00.000"; Source = $sys; EventType = "Installation"; Description = "Windows Update download started: 2026-09 Security Update (KB5129195) (26100.9457)"; User = ""
+        Details = "EventID=44 | Update=2026-09 Security Update (KB5129195) (26100.9457) | KB=KB5129195 | UpdateGuid={9600076e-4052-45ba-9d6f-a475e5b22d74} | Revision=1"; Artifact = "EventLogs"; RawPath = "X:\System.evtx" },
+    @{ EventType = "Installation"; Description = "Windows Update installation started: 2026-09 Security Update (KB5129195) (26100.9457)"; Details = "EventID=43 | Update=2026-09 Security Update (KB5129195) (26100.9457) | KB=KB5129195 | UpdateGuid={9600076e-4052-45ba-9d6f-a475e5b22d74} | Revision=1" },
+    @{ Timestamp = "2026-01-02 11:38:07.000"; EventType = "Installation"; Description = "Windows Update installed: 2026-09 Security Update (KB5129195) (26100.9457)"; Details = "EventID=19 | Update=2026-09 Security Update (KB5129195) (26100.9457) | KB=KB5129195 | UpdateGuid={9600076e-4052-45ba-9d6f-a475e5b22d74} | Revision=1" },
+    @{ EventType = "Installation"; Description = "Windows Update installation failed: 9WZDNCRD29V9-MICROSOFT.MICROSOFTOFFICEHUB (error 0x80073d02)"; Details = "EventID=20 | Update=9WZDNCRD29V9-MICROSOFT.MICROSOFTOFFICEHUB | ErrorCode=0x80073d02 | UpdateGuid={7d4bf8cd-56d4-4c4e-8b8d-3fb36d42776e} | Revision=1" },
+    @{ Timestamp = "2026-01-02 11:43:00.000"; EventType = "Installation"; Description = "Windows Update installation started"; Details = "EventID=43 | UpdateGuid={9600076e-4052-45ba-9d6f-a475e5b22d74}" }
+)
+
 # --- Defender Operational ---
 $def = "Microsoft-Windows-Windows Defender%4Operational.evtx"
 $defender = "Microsoft-Windows-Windows Defender"
@@ -877,7 +899,15 @@ try {
         (New-TestRecord -Provider "EventLog" -Id 6006 -Time "2026-01-04 09:02:00" -Body (New-EventDataXml -Data @())),
         (New-TestRecord -Provider "Service Control Manager" -Id 7040 -Time "2026-01-04 09:03:00" -Body (New-EventDataXml -Data ([ordered]@{ param1 = "Test Service"; param2 = "demand start"; param3 = "disabled"; param4 = "TestSvc" }))),
         (New-TestRecord -Provider "Service Control Manager" -Id 7045 -Time "2026-01-04 09:04:00" -Body (New-EventDataXml -Data ([ordered]@{ ServiceName = "TestSvc"; ImagePath = "C:\Temp\svc.exe -k run"; ServiceType = "user mode service"; StartType = "demand start"; AccountName = "LocalSystem" }))),
-        (New-TestRecord -Provider "Some Other Provider" -Id 9999 -Time "2026-01-04 09:05:00")
+        (New-TestRecord -Provider "Some Other Provider" -Id 9999 -Time "2026-01-04 09:05:00"),
+        # Windows Update: read only from its own provider (ID 20 and 43 of
+        # another provider give no row)
+        (New-TestRecord -Provider "Microsoft-Windows-WindowsUpdateClient" -Id 43 -Time "2026-01-04 09:06:00" -Body (New-EventDataXml -Data ([ordered]@{ updateTitle = "2026-01 Security Update (KB5000001)" }))),
+        (New-TestRecord -Provider "Microsoft-Windows-WindowsUpdateClient" -Id 19 -Time "2026-01-04 09:07:00" -Body (New-EventDataXml -Data ([ordered]@{ updateTitle = "2026-01 Security Update (KB5000001)" }))),
+        (New-TestRecord -Provider "Microsoft-Windows-WindowsUpdateClient" -Id 20 -Time "2026-01-04 09:08:00" -Body (New-EventDataXml -Data ([ordered]@{ errorCode = "0x80070643"; updateTitle = "2026-01 .NET Update (KB5000002)" }))),
+        (New-TestRecord -Provider "Microsoft-Windows-WindowsUpdateClient" -Id 44 -Time "2026-01-04 09:09:00" -Body (New-EventDataXml -Data ([ordered]@{ updateTitle = "2026-01 .NET Update (KB5000002)" }))),
+        (New-TestRecord -Provider "Microsoft-Windows-Kernel-General" -Id 20 -Time "2026-01-04 09:10:00" -Body (New-EventDataXml -Data @("x"))),
+        (New-TestRecord -Provider "Some Other Provider" -Id 43 -Time "2026-01-04 09:11:00")
     )
     $asrData = [ordered]@{ ID = "{9E6C4E1F-7D60-472F-BA1A-A39EF669E4B2}"; User = "TESTHOST\alice"; Path = "C:\Windows\System32\lsass.exe"; "Process Name" = "C:\Tools\scan.exe" }
     $blockData = [ordered]@{ ID = "D4F940AB-401B-4EFC-AADC-AD5F3C50688A"; User = "TESTHOST\alice"; Path = "C:\Windows\System32\cmd.exe"; "Process Name" = "C:\Office\WINWORD.EXE" }
@@ -961,6 +991,10 @@ try {
         @("System.evtx", "ServiceChange", "Event log service stopped (clean shutdown)", "EventID=6006"),
         @("System.evtx", "ServiceChange", "Service start type changed: Test Service", "Service=TestSvc | OldType=demand start | NewType=disabled"),
         @("System.evtx", "PersistenceChange", "New service installed: TestSvc", "ImagePath=C:\Temp\svc.exe -k run | StartType=demand start"),
+        @("System.evtx", "Installation", "Windows Update installation started: 2026-01 Security Update (KB5000001)", "EventID=43 | Update=2026-01 Security Update (KB5000001) | KB=KB5000001"),
+        @("System.evtx", "Installation", "Windows Update installed: 2026-01 Security Update (KB5000001)", "EventID=19 | Update=2026-01 Security Update (KB5000001) | KB=KB5000001"),
+        @("System.evtx", "Installation", "Windows Update installation failed: 2026-01 .NET Update (KB5000002) (error 0x80070643)", "EventID=20 | Update=2026-01 .NET Update (KB5000002) | KB=KB5000002 | ErrorCode=0x80070643"),
+        @("System.evtx", "Installation", "Windows Update download started: 2026-01 .NET Update (KB5000002)", "EventID=44 | Update=2026-01 .NET Update (KB5000002) | KB=KB5000002"),
         @($defName, "SecurityAlert", "Defender malware detection history purged by retention (items before 2025-12-20T10:00:00Z)", "EventID=1013 | Trigger=Retention*"),
         @($defName, "SecurityAlert", "Defender attack surface reduction rule blocked: Block all Office applications from creating child processes", "*"),
         @($defName, "SecurityAlert", "Defender attack surface reduction rule audited: Block credential stealing from the Windows local security authority subsystem", "*Count=2 | LastSeen=2026-01-04 10:03:00"),
