@@ -1924,3 +1924,4 @@
 "2026-05-20 07:10:04.000","Memory-Processes","ProcessCreation","Process in memory: gone.exe (PID: 7000, PPID: 640)","","Threads=0 SessionId=1 FoundBy=ListForward,ProcessIdTable","MemoryDump","MISS INTEG-PROCESS-HIDDEN"
 "2026-05-20 07:10:05.000","Memory-CommandLine","Snapshot","Process command line: notepad.exe (PID: 7200)","","Args=notepad.exe Anomaly=NotInProcessList","MemoryDump","MISS INTEG-PROCESS-HIDDEN"
 "2026-05-20 07:10:06.000","Memory-Processes","ProcessCreation","Process in memory: other.exe (PID: 7204, PPID: 640)","","Threads=1 SessionId=1 FoundBy=ListForward,ListBackward,ProcessIdTable Anomaly=NotInProcessListX","MemoryDump","MISS INTEG-PROCESS-HIDDEN"
+"2026-05-20 07:10:07.000","Memory-Processes","ProcessCreation","Process in memory: sleep.exe (PID: 7284, PPID: 12148)","","Threads=4 SessionId=1 FoundBy=ProcessIdTable TableId=3488","MemoryDump","MISS INTEG-PROCESS-HIDDEN"

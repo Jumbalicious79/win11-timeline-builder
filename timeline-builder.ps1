@@ -17661,8 +17661,11 @@ function Invoke-DbgEngMemoryAnalysis {
     if ($script:dbgEngTimeoutSeconds -gt 0) { $timeout = [int]$script:dbgEngTimeoutSeconds }
     $jobFolder = Join-Path (Get-ScratchFolder) "dbgeng"
     # When the capture started (DumpIt writes it in the dump's header): the
-    # helper judges a process missing from the kernel's process list by it.
-    # A file time is when the capture ended, so it is not passed.
+    # helper judges a process missing from the kernel's process list, or
+    # held in its process ID table under another ID, by it (one created
+    # during the copy or just before it is capture churn, not marked). A
+    # file time is when the capture ended, so it is not passed, and then
+    # nothing is marked.
     $captureStart = ""
     if ($DumpInfo.TimeSource -eq "crash dump header" -and $DumpInfo.CaptureTimeUtc) {
         $captureStart = [datetime]::SpecifyKind([datetime]$DumpInfo.CaptureTimeUtc, [DateTimeKind]::Utc).ToString("o", [System.Globalization.CultureInfo]::InvariantCulture)

@@ -2225,6 +2225,35 @@ of WinDbg -- instead:
             nor the table), not a multiple of 4, or not the ID the process
             ID table holds it under (TableId= on its row). It is listed with
             the ID it has, and the warning names it by PID and address.
+          Both marks are only for a process created more than 5 seconds
+            before the capture started (the time in the dump's header).
+        Capture churn: a process created while memory was being copied, or
+        at most 5 seconds before the header's time, is never marked. The
+        process ID table and a process's memory are copied at different
+        moments, and on a computer busy with short-lived processes one that
+        ends in between leaves its ID or its memory to a new process, so the
+        table can hold a new process under the ID of one that is not in the
+        dump (a stale entry), and the walks can miss it. Its row keeps
+        FoundBy= and TableId=, and the warning counts it: "6 processes are
+        capture churn, started while memory was being copied (or at most 5
+        seconds before it), with stale process ID table entries (PID 16252
+        at 0x..., held in the process ID table under ID 2256; ...). The
+        process ID table and a process's memory are copied at different
+        moments, ..., so copying memory explains this; they are not
+        marked." Why 5 seconds: the capture tool writes the header as it
+        starts (in four real ARM64 dumps its own process was created 0.05
+        to 0.27 s before the header's time), and in a real dump of such a
+        busy computer the six processes the table held under another ID
+        had all been created during the copy but one, created 0.78 s before
+        the header's time, which ended during the copy. When only the
+        table has such a process, the warning's list of those processes
+        says "created after the capture started" or "created just before
+        the capture started".
+        Without the capture start (the dump's header has no time) or a
+        process's create time, nothing is marked: a process ID that does
+        not fit is named ("... have a process ID that does not fit (...).
+        Whether copying memory explains that cannot be judged without the
+        capture's start time ... so they are not marked.").
         An entry of the process ID table that holds a process also held
         under its own ID (the table changed during the copy) gives TableId=
         and a sentence in the warning, but no mark. An object of the process
@@ -3487,7 +3516,15 @@ parsing is skipped, and the timeline CSV can be opened manually.
   the same without a capture start (named, not marked) and with both walks
   stopped early (not marked, the warning says why); process IDs changed in
   memory (0, one not a multiple of 4, System's 4: every process listed with
-  the ID it has, Anomaly=ProcessIdChanged and TableId=, named first); a
+  the ID it has, Anomaly=ProcessIdChanged and TableId=, named first, "as
+  they were created before the capture started"); capture churn (two
+  processes only in the table under the ID of a process not in the dump,
+  created 20 s after the capture started and 0.78 s before it: TableId=,
+  not marked, counted as capture churn in the warning, never "does not
+  explain"; one created 6 s before it, outside the 5-second margin, is
+  marked NotInProcessList and ProcessIdChanged); no capture start (changed
+  IDs and churn alike listed with TableId=, none marked, the warning says
+  they cannot be judged); the singular wording; a
   stale entry of the process ID table (TableId=, not marked) and one whose
   object only starts like a process (counted, no row, no warning); the
   scan finding nothing (list head and table not in the dump: a plain line,
