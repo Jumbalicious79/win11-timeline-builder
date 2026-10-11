@@ -29,6 +29,7 @@
 #     -DumpPath <dump> -EngineFolder <folder> -EngineDlls <a.dll,b.dll>
 #     -SymbolCache <builder>\tools\symbols -JobFolder <work folder>\scratch\dbgeng
 #     -CaptureStart <the dump header's time, ISO 8601 UTC, or "">
+#     -CaptureEnd <the dump file's last-write time, ISO 8601 UTC, or "">
 # =============================================================
 [CmdletBinding()]
 param(
@@ -48,7 +49,11 @@ param(
     # that is missing from the kernel's process list, or held in its process
     # ID table under another ID, is judged against it (without it, nothing
     # is marked)
-    [string]$CaptureStart
+    [string]$CaptureStart,
+    # When the capture ended (the dump file's last-write time, in the same
+    # form), or "" when it is not known: a process created after the start
+    # is capture churn only up to it
+    [string]$CaptureEnd
 )
 
 # The C# host (C# 5: Windows PowerShell 5.1 compiles it too). The engine's
@@ -849,29 +854,82 @@ function ConvertFrom-DbgEngFileTime {
 # table does not hold the process under, is what a process ID changed in
 # memory looks like. Those come first in the warning, by PID, and their
 # rows say so (Anomaly=; every row says which ways found it, FoundBy=).
-# Copying explains both for a process created during the copy or just
+# Copying explains both for a process created during the copy or shortly
 # before it (capture churn, Get-DbgEngChurnSeconds): the process ID table
 # and a process's memory are copied at different moments, and a
 # short-lived process that ends in between leaves its ID or its memory to
 # a new process. The warning counts such processes as capture churn, and
-# their rows keep FoundBy= and TableId= without a mark. Without the
-# capture start (the dump header's time) or a process's create time,
-# nothing is marked.
+# their rows keep FoundBy= and TableId= without a mark. Capture churn is
+# judged by the process's own create time, between the capture's start
+# (the dump header's time) less the margin and its end (the dump file's
+# last-write time): a create time of 0, or one after the end, is not
+# churn. Copying never explains an ID that is not a multiple of 4, nor 0
+# for a process the table does not hold under another ID. Without the
+# capture start, nothing is marked. A rootkit that can change a process's
+# ID can also change its create time, and one that keeps it within the
+# capture is not marked: the warning still names the process.
 
 # Capture churn: how many seconds before the capture start (the dump
 # header's time) a process can have been created and still be taken as
-# part of the copy rather than older than it. The capture tool writes the
-# header as it starts: in four real ARM64 dumps its own process was created
-# 0.05 to 0.27 s before the header's time. In one of them, of a computer
-# busy with short-lived processes, the six processes that the process ID
-# table held under the ID of a process not in the dump had all been
-# created during the copy but one, created 0.78 s before the header's time
-# (it ended during the copy, and a new process took its memory before the
-# table was copied). 5 seconds covers that with room; a process created
-# earlier is judged (marked when it is missing from the list or held under
-# another ID).
+# part of the copy rather than older than it. A process created before the
+# start shows up so only when it ended during the copy (a new process then
+# took its ID or its memory), so the margin is set by how long the
+# computer's short-lived processes live, not by when the capture tool
+# starts (0.05 to 0.27 s before the header's time in four real ARM64
+# dumps). In one of them, of a computer busy with polling loops that
+# waited 5 and 10 seconds, the six processes the process ID table held
+# under the ID of a process not in the dump were created during the copy
+# but one, 0.78 s before the header's time. The processes that had ended
+# (an exit time in the dump) in those four dumps had lived 0.1 to 24.1 s,
+# apart from ones that ran for hours, and one 60.3 s: created 36.7 s
+# before the header's time, it ended during the copy (the case that needs
+# the margin). 120 seconds is twice the longest of those; a process
+# created earlier is judged (marked when it is missing from the list or
+# held under another ID), as a process hidden from the list is normally
+# minutes to hours old.
 function Get-DbgEngChurnSeconds {
-    return 5
+    return 120
+}
+
+# How many seconds after the capture end (the dump file's last-write time)
+# a create time is still taken as part of the copy: file times can be
+# rounded to 2 seconds (FAT, ZIP). In four real ARM64 dumps the newest
+# process was created 11.7 to 46.6 s before the file's last write.
+function Get-DbgEngCaptureEndSlackSeconds {
+    return 2
+}
+
+# When a process was created, against the capture (FILETIMEs; 0: not
+# known): Before (more than the churn margin before the start: judged),
+# Churn (during the copy, or within the margin before it), NoTime (no
+# create time), Late (after the end and its slack), NoEnd (after the start
+# while the end is not known), or "" (the start is not known)
+function Get-DbgEngCreateWhen {
+    param([long]$CreateTime, [long]$CaptureFileTime, [long]$CaptureEndFileTime)
+    if ($CaptureFileTime -le 0) { return "" }
+    if ($CreateTime -le 0) { return "NoTime" }
+    if ($CreateTime -lt $CaptureFileTime - [long](Get-DbgEngChurnSeconds) * 10000000) { return "Before" }
+    if ($CreateTime -le $CaptureFileTime) { return "Churn" }
+    if ($CaptureEndFileTime -lt $CaptureFileTime) { return "NoEnd" }
+    if ($CreateTime -le $CaptureEndFileTime + [long](Get-DbgEngCaptureEndSlackSeconds) * 10000000) { return "Churn" }
+    return "Late"
+}
+
+# What a process ID that does not fit gets: Marked (Anomaly=
+# ProcessIdChanged), Churn (a stale entry of the process ID table, which
+# copying explains) or Unjudged (named, not marked). -Kind: Table (held in
+# the table under another ID), Zero or Invalid (not a multiple of 4);
+# -When: Get-DbgEngCreateWhen. Only a stale entry can be churn: an ID
+# Windows never gives cannot come from one, and neither can 0 unless the
+# table holds the process under an ID.
+function Get-DbgEngIdChangeVerdict {
+    param([string]$Kind, [int]$TableIdCount, [string]$When)
+    if (-not $When) { return "Unjudged" }
+    $staleEntry = $Kind -eq "Table" -or ($Kind -eq "Zero" -and $TableIdCount -gt 0)
+    if (-not $staleEntry) { return "Marked" }
+    if ($When -eq "Churn") { return "Churn" }
+    if ($When -eq "NoEnd") { return "Unjudged" }
+    return "Marked"
 }
 
 # A kernel address that a link or pointer of the kernel's structures can
@@ -1256,20 +1314,19 @@ function Join-DbgEngWords {
 # judged and the capture churn (counted). It has no ": " (the report's
 # notes have one colon).
 #   -Methods        the ways that found each process (Join-DbgEngProcessSets)
-#   -Missed         each process both walks missed: Pid, and Why: Hidden
-#                   (created before the capture started and the churn
-#                   margin, no exit time, and a walk reached the list's
-#                   end), Exited, New (created after the capture started),
-#                   JustBefore (created within the churn margin before it),
-#                   Unwalked (both walks stopped early) or "" (its create
-#                   time or the capture start is not known)
+#   -Missed         each process both walks missed: Pid, Why: Hidden (not
+#                   created during the copy or within the churn margin
+#                   before it, no exit time, and a walk reached the list's
+#                   end), Exited, New (created during the copy), JustBefore
+#                   (created within the churn margin before it), Unwalked
+#                   (both walks stopped early) or "" (the capture start, or
+#                   for a process created after it the end, is not known),
+#                   and When (Get-DbgEngCreateWhen)
 #   -IdChanges      each process whose ID does not fit: Address, Pid, Kind
 #                   (Zero, Invalid, or Table: held in the process ID table
-#                   under another ID), TableIds and When: Before (created
-#                   before the capture started and the churn margin:
-#                   marked), Churn (created during the copy or within the
-#                   margin before it) or "" (its create time or the capture
-#                   start is not known)
+#                   under another ID), TableIds and When
+#                   (Get-DbgEngCreateWhen), judged by
+#                   Get-DbgEngIdChangeVerdict
 #   -StaleEntries   entries of the process ID table that hold a process
 #                   that is there under its own ID too
 #   -EngineCount    the engine's own list (-1: not read); -EngineCorrupt:
@@ -1315,17 +1372,31 @@ function Get-DbgEngScanText {
     }
 
     $sentences = New-Object System.Collections.Generic.List[string]
+    $oddTimes = @("NoTime", "Late")
     # What copying memory does not explain, first
     $hidden = @($missedList | Where-Object { $_.Why -eq "Hidden" })
     if ($hidden.Count -gt 0) {
-        $ids = Join-DbgEngWords -Items @($hidden | ForEach-Object { ([long]$_.Pid).ToString($invariant) })
-        if ($hidden.Count -eq 1) { $sentences.Add("PID $ids is in neither walk of the kernel's process list, only in its process ID table, yet it was created before the capture started and has no exit time.") }
-        else { $sentences.Add("PIDs $ids are in neither walk of the kernel's process list, only in its process ID table, yet they were created before the capture started and have no exit time.") }
+        $one = $hidden.Count -eq 1
+        if (@($hidden | Where-Object { $_.When -ne "Before" }).Count -eq 0) {
+            $ids = Join-DbgEngWords -Items @($hidden | ForEach-Object { ([long]$_.Pid).ToString($invariant) })
+            if ($one) { $sentences.Add("PID $ids is in neither walk of the kernel's process list, only in its process ID table, yet it was created before the capture started and has no exit time.") }
+            else { $sentences.Add("PIDs $ids are in neither walk of the kernel's process list, only in its process ID table, yet they were created before the capture started and have no exit time.") }
+        }
+        else {
+            # A create time that is 0 or after the capture ended: said by PID
+            $timeText = @{ NoTime = " (no create time)"; Late = " (created after the capture ended)" }
+            $ids = Join-DbgEngWords -Items @($hidden | ForEach-Object { "$(([long]$_.Pid).ToString($invariant))$($timeText[[string]$_.When])" })
+            if ($one) { $sentences.Add("PID $ids is in neither walk of the kernel's process list, only in its process ID table, yet it has no exit time and was not created while memory was being copied.") }
+            else { $sentences.Add("PIDs $ids are in neither walk of the kernel's process list, only in its process ID table, yet they have no exit time and were not created while memory was being copied.") }
+        }
         $sentences.Add("Copying memory does not explain that, as a process leaves the list only when it ends, and a process hidden from the list (unlinked from it) looks exactly like this.")
     }
-    # The processes whose ID does not fit, by PID and address
+    # The processes whose ID does not fit, by PID and address; -Times: when
+    # each was created, against the capture
     $changeItems = {
-        param([object[]]$List)
+        param([object[]]$List, [switch]$Times)
+        $timeText = @{ Before = ", created before the capture started"; NoTime = ", without a create time"; Late = ", created after the capture ended"
+            Churn = ", created during the copy or shortly before it"; NoEnd = ", created after the capture started" }
         $items = foreach ($change in $List) {
             $item = "PID $(([long]$change.Pid).ToString($invariant)) at 0x$(([uint64]$change.Address).ToString('x'))"
             if ($change.Kind -eq "Zero") { $item += ", an ID only the idle process has" }
@@ -1333,23 +1404,39 @@ function Get-DbgEngScanText {
             $tableIds = @($change.TableIds | ForEach-Object { ([long]$_).ToString($invariant) })
             if ($tableIds.Count -eq 1) { $item += ", held in the process ID table under ID $($tableIds[0])" }
             elseif ($tableIds.Count -gt 1) { $item += ", held in the process ID table under IDs $(Join-DbgEngWords -Items $tableIds)" }
+            if ($Times) { $item += $timeText[[string]$change.When] }
             $item
         }
         return (Join-DbgEngWords -Items @($items) -Semicolons)
     }
-    $changed = @($changes | Where-Object { $_.When -eq "Before" })
-    $churn = @($changes | Where-Object { $_.When -eq "Churn" })
-    $unjudged = @($changes | Where-Object { $_.When -ne "Before" -and $_.When -ne "Churn" })
+    $verdicts = @{ Marked = @(); Churn = @(); Unjudged = @() }
+    foreach ($change in $changes) {
+        $verdict = Get-DbgEngIdChangeVerdict -Kind $change.Kind -TableIdCount @($change.TableIds).Count -When $change.When
+        $verdicts[$verdict] += $change
+    }
+    $changed = @($verdicts["Marked"])
+    $churn = @($verdicts["Churn"])
     if ($changed.Count -gt 0) {
-        $sentences.Add("$(Format-DbgEngCount -Count $changed.Count -One 'process has a process ID that Windows did not give it' -Many 'processes have a process ID that Windows did not give them') ($(& $changeItems $changed)).")
-        $sentences.Add("Copying memory does not explain that, as $(if ($changed.Count -eq 1) { 'it was' } else { 'they were' }) created before the capture started, and a process whose ID was changed in memory, to hide or disguise it, looks like this.")
+        $one = $changed.Count -eq 1
+        $allBefore = @($changed | Where-Object { $_.When -ne "Before" }).Count -eq 0
+        $sentences.Add("$(Format-DbgEngCount -Count $changed.Count -One 'process has a process ID that Windows did not give it' -Many 'processes have a process ID that Windows did not give them') ($(& $changeItems $changed -Times:(-not $allBefore))).")
+        if ($allBefore) { $sentences.Add("Copying memory does not explain that, as $(if ($one) { 'it was' } else { 'they were' }) created before the capture started, and a process whose ID was changed in memory, to hide or disguise it, looks like this.") }
+        else { $sentences.Add("Copying memory does not explain that, and a process whose ID was changed in memory, to hide or disguise it, looks like this.") }
     }
-    # Not judged: nothing to compare the create time with
-    if ($unjudged.Count -gt 0) {
+    # A create time of 0 or after the capture ended does not make churn
+    if (@(@($hidden) + @($changed) | Where-Object { $oddTimes -contains [string]$_.When }).Count -gt 0) {
+        $sentences.Add("Capture churn is a process created between the capture's start and end (the time in the dump's header and the dump file's last-write time) or shortly before: one without a create time, or created after the capture ended, is not.")
+    }
+    # Not judged: the capture start, or for a process created after it the
+    # end, is not known
+    foreach ($group in @(@("", "the capture's start time (the time in the dump's header)", "", ""), @("NoEnd", "the capture's end time (the dump file's last-write time)", ", as it was created after the capture started", ", as they were created after the capture started"))) {
+        $unjudged = @($verdicts["Unjudged"] | Where-Object { [string]$_.When -eq $group[0] })
+        if ($unjudged.Count -eq 0) { continue }
+        $one = $unjudged.Count -eq 1
         $sentences.Add("$(Format-DbgEngCount -Count $unjudged.Count -One 'process has a process ID that does not fit' -Many 'processes have a process ID that does not fit') ($(& $changeItems $unjudged)).")
-        $sentences.Add("Whether copying memory explains that cannot be judged without the capture's start time (the time in the dump's header) and $(if ($unjudged.Count -eq 1) { 'its create time, so it is' } else { 'their create times, so they are' }) not marked.")
+        $sentences.Add("Whether copying memory explains that cannot be judged without $($group[1])$(if ($one) { $group[2] } else { $group[3] }), so $(if ($one) { 'it is' } else { 'they are' }) not marked.")
     }
-    # Capture churn: created while the memory was copied, or just before
+    # Capture churn: created while the memory was copied, or shortly before
     if ($churn.Count -gt 0) {
         $one = $churn.Count -eq 1
         $sentences.Add("$(Format-DbgEngCount -Count $churn.Count -One 'process is' -Many 'processes are') capture churn, started while memory was being copied (or at most $(Get-DbgEngChurnSeconds) seconds before it), with $(if ($one) { 'a stale process ID table entry' } else { 'stale process ID table entries' }) ($(& $changeItems $churn)).")
@@ -1371,7 +1458,7 @@ function Get-DbgEngScanText {
         $found += ", $($counts[$signature]) $phrase"
         # The processes both walks missed, by PID
         if ($signature -eq 4 -and $missedList.Count -gt 0) {
-            $why = @{ Exited = ", which had exited"; New = ", created after the capture started"; JustBefore = ", created just before the capture started" }
+            $why = @{ Exited = ", which had exited"; New = ", created after the capture started"; JustBefore = ", created at most $(Get-DbgEngChurnSeconds) seconds before the capture started" }
             $found += " ($(Join-DbgEngWords -Items @($missedList | ForEach-Object { "PID $(([long]$_.Pid).ToString($invariant))$($why[[string]$_.Why])" }) -Semicolons))"
         }
     }
@@ -1443,16 +1530,18 @@ function ConvertFrom-DbgEngProcessBlock {
 # and what copying memory does not explain (Anomaly: NotInProcessList, a
 # process neither walk found, without an exit time, while a walk reached
 # the list's end; ProcessIdChanged, an ID of 0, one that is not a multiple
-# of 4, or one the table does not hold it under), each only for a process
-# created before -CaptureFileTime and the churn margin
-# (Get-DbgEngChurnSeconds): one created later is capture churn, and one
-# whose create time is not known, or without -CaptureFileTime, is not
-# judged. -CaptureFileTime: when the capture started (FILETIME), 0 when not
-# known. Processes is empty when nothing was found.
+# of 4, or one the table does not hold it under), judged by its create
+# time against the capture (Get-DbgEngCreateWhen): one created during the
+# copy or within the churn margin before it (Get-DbgEngChurnSeconds) is
+# capture churn, which copying explains for a missed link or a stale table
+# entry (Get-DbgEngIdChangeVerdict); one created earlier, without a create
+# time or after the capture ended is marked; without -CaptureFileTime
+# nothing is judged. -CaptureFileTime and -CaptureEndFileTime: when the
+# capture started and ended (FILETIMEs), 0 when not known. Processes is
+# empty when nothing was found.
 function Read-DbgEngScannedProcesses {
-    param($Session, $Layout, [long]$CaptureFileTime = 0)
+    param($Session, $Layout, [long]$CaptureFileTime = 0, [long]$CaptureEndFileTime = 0)
     $invariant = [System.Globalization.CultureInfo]::InvariantCulture
-    $margin = [long](Get-DbgEngChurnSeconds) * 10000000
     $cache = New-Object 'System.Collections.Generic.Dictionary[uint64,object]'
     $forward = Invoke-DbgEngProcessWalk -Session $Session -Layout $Layout -Cache $cache
     $backward = Invoke-DbgEngProcessWalk -Session $Session -Layout $Layout -Cache $cache -Backward
@@ -1484,16 +1573,11 @@ function Read-DbgEngScannedProcesses {
         $entry = ConvertFrom-DbgEngProcessBlock -Session $Session -Layout $Layout -Address $address -Block $block
         $entry.FoundBy = (@(@(1, "ListForward"), @(2, "ListBackward"), @(4, "ProcessIdTable")) | Where-Object { ($methods -band $_[0]) -ne 0 } | ForEach-Object { $_[1] }) -join ","
         $anomalies = @()
-        # When it was created, against the capture start: Before (earlier
-        # than the start and the churn margin: judged), Churn (during the
-        # copy or within the margin before it: copying explains a missed
-        # link or a stale table entry) or "" (the capture start or the
-        # create time is not known: not judged)
+        # When it was created, against the capture (Get-DbgEngCreateWhen):
+        # copying explains a missed link or a stale table entry only for a
+        # process created during the copy or shortly before it (Churn)
         $createTime = [BitConverter]::ToInt64($block, $o["CreateTime"])
-        $when = ""
-        if ($CaptureFileTime -gt 0 -and $createTime -gt 0) {
-            if ($createTime -ge $CaptureFileTime - $margin) { $when = "Churn" } else { $when = "Before" }
-        }
+        $when = Get-DbgEngCreateWhen -CreateTime $createTime -CaptureFileTime $CaptureFileTime -CaptureEndFileTime $CaptureEndFileTime
         # Both walks missed it: did it end, start during the copy, or hide?
         if (($methods -band 3) -eq 0) {
             $exitTime = [BitConverter]::ToInt64($block, $o["ExitTime"])
@@ -1502,18 +1586,18 @@ function Read-DbgEngScannedProcesses {
             elseif ($when -eq "Churn" -and $createTime -ge $CaptureFileTime) { $why = "New" }
             elseif ($when -eq "Churn") { $why = "JustBefore" }
             elseif (-not $walkEnded) { $why = "Unwalked" }
-            elseif ($when -eq "Before") { $why = "Hidden"; $anomalies += "NotInProcessList" }
-            $missed.Add([PSCustomObject]@{ Pid = $entry.PID; Why = $why })
+            elseif ($when -eq "Before" -or $when -eq "NoTime" -or $when -eq "Late") { $why = "Hidden"; $anomalies += "NotInProcessList" }
+            $missed.Add([PSCustomObject]@{ Pid = $entry.PID; Why = $why; When = $when })
         }
         # Its process ID: one Windows gives, and the one the table holds it
-        # under? Marked only for a process created before the copy
+        # under? (Get-DbgEngIdChangeVerdict)
         $kind = Get-DbgEngProcessIdKind -Layout $Layout -Block $block
         $ids = @()
         if ($tableIds.ContainsKey("$address")) { $ids = @($tableIds["$address"]) }
         if ($ids.Count -gt 0) { $entry.TableId = (@($ids | ForEach-Object { $_.ToString($invariant) }) -join ",") }
         if ($kind -ne "Valid" -or ($ids.Count -gt 0 -and -not $cid.Own.Contains($address))) {
-            if ($when -eq "Before") { $anomalies += "ProcessIdChanged" }
             $changeKind = if ($kind -ne "Valid") { $kind } else { "Table" }
+            if ((Get-DbgEngIdChangeVerdict -Kind $changeKind -TableIdCount $ids.Count -When $when) -eq "Marked") { $anomalies += "ProcessIdChanged" }
             $idChanges.Add([PSCustomObject]@{ Address = $address; Pid = $entry.PID; Kind = $changeKind; TableIds = $ids; When = $when })
         }
         elseif ($ids.Count -gt 0) { $staleEntries += $ids.Count }
@@ -1620,8 +1704,9 @@ function Read-DbgEngEngineProcesses {
     return $found
 }
 
-# When the capture started, from -CaptureStart (yyyy-MM-ddTHH:mm:ss.fffffffZ)
-# as a FILETIME; 0 when it is empty or not such a time
+# When the capture started (or ended), from -CaptureStart (-CaptureEnd),
+# yyyy-MM-ddTHH:mm:ss.fffffffZ, as a FILETIME; 0 when it is empty or not
+# such a time
 function ConvertFrom-DbgEngCaptureStart {
     param([string]$Text)
     $time = [datetime]::MinValue
@@ -1632,9 +1717,10 @@ function ConvertFrom-DbgEngCaptureStart {
 
 # The dump's processes and command lines (New-DbgEngResult). Nothing read:
 # Reason says why. The processes read but not the command lines:
-# PartialReason says why. -CaptureStart: as the script's parameter.
+# PartialReason says why. -CaptureStart, -CaptureEnd: as the script's
+# parameters.
 function Read-DbgEngDump {
-    param([string]$DumpPath, [string]$EngineFolder, [string[]]$EngineDlls, [string]$SymbolCache, [string]$JobFolder, [string]$CaptureStart)
+    param([string]$DumpPath, [string]$EngineFolder, [string[]]$EngineDlls, [string]$SymbolCache, [string]$JobFolder, [string]$CaptureStart, [string]$CaptureEnd)
     $result = New-DbgEngResult
     $timer = [System.Diagnostics.Stopwatch]::StartNew()
     $emptySymbols = Join-Path $JobFolder "nosymbols"
@@ -1695,7 +1781,7 @@ function Read-DbgEngDump {
         $layout = Get-DbgEngKernelLayout -Session $session
         $found = $null
         if (-not $layout.Error) {
-            $found = Read-DbgEngScannedProcesses -Session $session -Layout $layout -CaptureFileTime (ConvertFrom-DbgEngCaptureStart $CaptureStart)
+            $found = Read-DbgEngScannedProcesses -Session $session -Layout $layout -CaptureFileTime (ConvertFrom-DbgEngCaptureStart $CaptureStart) -CaptureEndFileTime (ConvertFrom-DbgEngCaptureStart $CaptureEnd)
             if (@($found.Processes).Count -eq 0) {
                 # Its counts and note are not about the rows the timeline gets
                 Write-DbgEngLog "    No process was found in the kernel's own process structures: $($found.Ways)"
@@ -1761,7 +1847,7 @@ if ($JobFolder) {
     $ProgressPreference = "SilentlyContinue"
     $workerResult = $null
     try {
-        $workerResult = Read-DbgEngDump -DumpPath $DumpPath -EngineFolder $EngineFolder -EngineDlls @("$EngineDlls" -split ',' | Where-Object { $_ }) -SymbolCache $SymbolCache -JobFolder $JobFolder -CaptureStart $CaptureStart
+        $workerResult = Read-DbgEngDump -DumpPath $DumpPath -EngineFolder $EngineFolder -EngineDlls @("$EngineDlls" -split ',' | Where-Object { $_ }) -SymbolCache $SymbolCache -JobFolder $JobFolder -CaptureStart $CaptureStart -CaptureEnd $CaptureEnd
     }
     catch {
         $workerResult = New-DbgEngResult
