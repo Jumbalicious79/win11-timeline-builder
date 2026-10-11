@@ -1,0 +1,6 @@
+# The Handle entries of the canned handles area (TimelineDbgEng.Handles.ps1):
+# a named mutex and a process handle of a SYSTEM process; the area was read
+# with a gap a live copy leaves (its note becomes a coverage note)
+#AREA	Handles	Read	the objects of 3 handle(s) could not be read, as when memory is copied while Windows runs
+Handle	Pid=4321	ProcessCreated=2026-03-02 11:30:00.123	Process=fixture-stage.exe	User=S-1-5-21-1-2-3-1001	Type=Mutant	Handle=0x1a4	Access=0x1f0001	Target=\Sessions\1\BaseNamedObjects\fixture-mutex
+Handle	Pid=600	ProcessCreated=2026-03-01 08:00:01.000	Process=fixture-host.exe	User=S-1-5-18	Type=Process	Handle=0x2c0	Access=0x1fffff	Target=fixture-stage.exe	TargetPid=4321	TargetProcess=fixture-stage.exe	TargetCreated=2026-03-02 11:30:00.123

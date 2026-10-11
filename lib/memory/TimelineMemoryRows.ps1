@@ -424,18 +424,73 @@ function Add-DbgEngPrivateCodeRows {
 
 # --- WP3: kernel drivers and handles (items d and e) -----------------------------------
 
-# Memory-Drivers rows. Not built yet.
+# Memory-Drivers rows (lib\memory\TimelineDbgEng.Drivers.ps1's Driver
+# entries; no User: a kernel module belongs to no process):
+#   State=Loaded    Snapshot "Kernel module in memory: <name>", Details
+#                   "Path=<drive-letter path> | Base=0x.. | Size=0x.. |
+#                   FoundBy=ModuleList[,DriverObject][ | DriverObject=\Driver\
+#                   <n>[,..]][ | Anomaly=NotInModuleList]"
+#   State=Unloaded  DriverUnload at its unload time (a Snapshot row with
+#                   UnloadTime= when that time is not valid), "Kernel module
+#                   unloaded: <name>", Details "Base=0x.. | Size=0x.. |
+#                   FoundBy=UnloadedDriverList"
 function Add-DbgEngDriverRows {
     param([object[]]$Entries, [string]$Source, [datetime]$CaptureTimeUtc, [datetime]$AcquisitionEndUtc, [string]$DumpPath)
-    $null = $Entries, $Source, $CaptureTimeUtc, $AcquisitionEndUtc, $DumpPath
-    return (New-DbgEngRowCounts)
+    $timed = 0
+    $snapshot = 0
+    foreach ($entry in @($Entries)) {
+        if ($null -eq $entry) { continue }
+        $name = [string]$entry.Name
+        if ("$($entry.State)" -eq "Unloaded") {
+            $details = [ordered]@{ Base = [string]$entry.Base; Size = [string]$entry.Size; FoundBy = [string]$entry.FoundBy }
+            $own = Get-MemoryEntryTime -Value $entry.Time -LatestUtc $AcquisitionEndUtc.AddDays(1)
+            if ($null -eq $own.TimeUtc -and $own.Text) { $details["UnloadTime"] = $own.Text }
+            $row = Add-DbgEngEntryRow -Source $Source -EventType "DriverUnload" -Description "Kernel module unloaded: $name" -Details (Format-DbgEngDetails $details) `
+                -Time $entry.Time -CaptureTimeUtc $CaptureTimeUtc -AcquisitionEndUtc $AcquisitionEndUtc -DumpPath $DumpPath
+        }
+        else {
+            $details = [ordered]@{ Path = [string]$entry.Path; Base = [string]$entry.Base; Size = [string]$entry.Size; FoundBy = [string]$entry.FoundBy }
+            if ($entry.DriverObject) { $details["DriverObject"] = [string]$entry.DriverObject }
+            if ($entry.Anomaly) { $details["Anomaly"] = [string]$entry.Anomaly }
+            $row = Add-DbgEngEntryRow -Source $Source -Description "Kernel module in memory: $name" -Details (Format-DbgEngDetails $details) `
+                -CaptureTimeUtc $CaptureTimeUtc -AcquisitionEndUtc $AcquisitionEndUtc -DumpPath $DumpPath
+        }
+        if ($row.Timed) { $timed++ } else { $snapshot++ }
+    }
+    return (New-DbgEngRowCounts -Timed $timed -Snapshot $snapshot)
 }
 
-# Memory-Handles rows. Not built yet.
+# Memory-Handles rows (lib\memory\TimelineDbgEng.Handles.ps1's Handle
+# entries: the useful subset of the handles), Snapshot rows at the capture
+# time, User the holder's token SID: "Handle in memory: <Type> <target>
+# (PID: n, Process: <holder>)", Details "PID=n | ProcessCreated=.. |
+# Type=Process|Thread|File|Key|Mutant | Handle=0x.. | Access=0x<mask> |
+# Target=<process, path, key or name>[ | TargetPID=n | TargetProcess=<name> |
+# TargetCreated=..][ | TargetTID=n][ | Handles=n][ | Anomaly=..]". PID= and
+# ProcessCreated= are the holder's (option C of the findings report).
 function Add-DbgEngHandleRows {
     param([object[]]$Entries, [string]$Source, [datetime]$CaptureTimeUtc, [datetime]$AcquisitionEndUtc, [string]$DumpPath)
-    $null = $Entries, $Source, $CaptureTimeUtc, $AcquisitionEndUtc, $DumpPath
-    return (New-DbgEngRowCounts)
+    $snapshot = 0
+    foreach ($entry in @($Entries)) {
+        if ($null -eq $entry) { continue }
+        $details = [ordered]@{
+            PID = [string]$entry.Pid; ProcessCreated = [string]$entry.ProcessCreated; Type = [string]$entry.Type; Handle = [string]$entry.Handle
+            Access = [string]$entry.Access; Target = [string]$entry.Target
+        }
+        if ("$($entry.TargetPid)" -ne "") {
+            $details["TargetPID"] = [string]$entry.TargetPid
+            $details["TargetProcess"] = [string]$entry.TargetProcess
+            $details["TargetCreated"] = [string]$entry.TargetCreated
+        }
+        if ("$($entry.TargetTid)" -ne "") { $details["TargetTID"] = [string]$entry.TargetTid }
+        if ("$($entry.Handles)" -ne "") { $details["Handles"] = [string]$entry.Handles }
+        if ($entry.Anomaly) { $details["Anomaly"] = [string]$entry.Anomaly }
+        $description = "Handle in memory: $($entry.Type) $($entry.Target) (PID: $($entry.Pid), Process: $($entry.Process))"
+        $row = Add-DbgEngEntryRow -Source $Source -Description $description -User ([string]$entry.User) -Details (Format-DbgEngDetails $details) `
+            -CaptureTimeUtc $CaptureTimeUtc -AcquisitionEndUtc $AcquisitionEndUtc -DumpPath $DumpPath
+        if (-not $row.Timed) { $snapshot++ }
+    }
+    return (New-DbgEngRowCounts -Snapshot $snapshot)
 }
 
 # --- WP4: registry hives in memory (item g) ---------------------------------------------
