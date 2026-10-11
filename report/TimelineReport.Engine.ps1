@@ -965,7 +965,8 @@ namespace TimelineReport
         }
 
         // A source the builder's Memory parser writes (Volatility 3 on the
-        // memory dump): Memory-Processes, Memory-Network, Memory-CommandLine,
+        // memory dump, or Microsoft's debugger engine on a Windows ARM64
+        // dump): Memory-Processes, Memory-Network, Memory-CommandLine,
         // Memory-Services
         public static bool IsMemorySource(string source)
         {
@@ -1227,7 +1228,9 @@ namespace TimelineReport
             // and the recorded 100-ns time is compared to its own floored second.
             if (dumpTicks % TimeSpan.TicksPerSecond == 0) return dumpTicks == FloorToSecond(recordedTicks);
             // A build that keeps the sub-second part: allow ~1 ms (the rounding
-            // Volatility applies, 100 ns to microseconds)
+            // Volatility applies, 100 ns to microseconds; Microsoft's debugger
+            // engine, for Windows ARM64 dumps, gives the 100-ns time, which the
+            // timeline keeps to the millisecond)
             long d = dumpTicks - recordedTicks;
             long tolerance = TimeSpan.TicksPerMillisecond + 100;
             return d >= -tolerance && d <= tolerance;
@@ -3316,6 +3319,9 @@ function Read-ReportEngineBuilderLog {
         # A memory dump of the collection that the run did not analyze: what
         # and why ("" when there is none, or it was analyzed)
         MemoryDumpNotAnalyzed = ""
+        # A Windows ARM64 dump read with Microsoft's debugger engine: the
+        # dump and what was read from it ("" when there is none)
+        MemoryDumpEngine = ""
     }
     $text = Read-ReportEngineLogText $Path
     if ($null -eq $text) { return $info }
@@ -3340,6 +3346,7 @@ function Read-ReportEngineBuilderLog {
         elseif ($line -match '^\[[^\]]*\]\s+User column: (\d+) SID\(s\) not named') { $info.UnnamedSids = [int]$Matches[1] }
         elseif (-not $info.ExaminedComputerName -and $line -match '^\[[^\]]*\]\s+Examined computer name \(SYSTEM hive\): (.+?)\s*$') { $info.ExaminedComputerName = $Matches[1] }
         elseif (-not $info.MemoryDumpNotAnalyzed -and $line -match '^\[[^\]]*\]\s+Memory dump not analyzed: (.+?)\s*$') { $info.MemoryDumpNotAnalyzed = $Matches[1] }
+        elseif (-not $info.MemoryDumpEngine -and $line -match '^\[[^\]]*\]\s+Memory dump analyzed with the Windows debugger engine: (.+?)\s*$') { $info.MemoryDumpEngine = $Matches[1] }
     }
     $info.ProblemLines = $problems.ToArray()
     $info.MissingInputFiles = [Math]::Max($missingLogged, $missingBanner)
@@ -3350,9 +3357,11 @@ function Read-ReportEngineBuilderLog {
 # The builder's "Memory dump not analyzed: <what> -- <why>" text, split for
 # the report: What (the dump and its size), Why (the reason, then advice
 # after "; ") and Short (the reason alone, without asides in parentheses).
-# Older builders wrote "<what>: <why>" or "<what>, but <why>", and worded
-# the ARM64 reason "a Windows ARM64 dump, which Volatility 3 cannot
-# analyze": that is reworded the current way.
+# Older builders wrote "<what>: <why>" or "<what>, but <why>", and could not
+# analyze Windows ARM64 dumps at all ("a Windows ARM64 dump, which
+# Volatility 3 cannot analyze", later "Volatility 3 cannot read Windows
+# ARM64 dumps; examine it in WinDbg"): for -ReportOnly on such a timeline,
+# that reason says the timeline can be built again to analyze the dump.
 function Split-ReportEngineMemoryDumpText {
     param([string]$Text)
     $what = "$Text".Trim()
@@ -3361,7 +3370,9 @@ function Split-ReportEngineMemoryDumpText {
     if ($what -match '^(.+) -- (.+)$') { $what = $Matches[1]; $why = $Matches[2] }
     elseif ($what -match '^(.+?\)?)(?::\s+|,\s+but\s+)(.+)$') { $what = $Matches[1]; $why = $Matches[2] }
     $why = $why.Trim().TrimEnd('.').Trim()
-    if ($why -match '^a Windows ARM64 dump\b.*\bVolatility 3 cannot analyze\b') { $why = "Volatility 3 cannot read Windows ARM64 dumps; examine it in WinDbg" }
+    if ($why -match '^a Windows ARM64 dump\b.*\bVolatility 3 cannot analyze\b' -or $why -match '^Volatility 3 cannot read Windows ARM64 dumps\b') {
+        $why = "the builder that made this timeline could not analyze Windows ARM64 dumps; build the timeline again to analyze it with the Windows debugger engine"
+    }
     $short = ($why -split ';')[0] -replace '\s*\([^()]*\)', ''
     return [PSCustomObject]@{ What = $what.Trim(); Why = $why; Short = $short.Trim() }
 }
@@ -3702,9 +3713,10 @@ function New-ReportModel {
     }
     # The builder logs "Memory dump not analyzed: <what> -- <why>" for a dump
     # of the collection that it found (or that collection_manifest.csv
-    # lists) but did not analyze: Windows ARM64, skipped at its prompt, no
-    # Volatility 3, or not found. The note names the dump and says why (and
-    # what to do); the caveat gives the reason only.
+    # lists) but did not analyze: skipped at its prompt, no Volatility 3, no
+    # debugger engine or kernel symbol file for a Windows ARM64 dump, or not
+    # found. The note names the dump and says why (and what to do); the
+    # caveat gives the reason only.
     $memoryDump = $null
     if ($builderLog.MemoryDumpNotAnalyzed) {
         $memoryDump = Split-ReportEngineMemoryDumpText $builderLog.MemoryDumpNotAnalyzed
@@ -3712,6 +3724,11 @@ function New-ReportModel {
         if ($memoryDump.Why) { $noteText += " -- $($memoryDump.Why)" }
         $notes.Add("$noteText.")
     }
+    # A Windows ARM64 dump read with Microsoft's debugger engine ("Memory
+    # dump analyzed with the Windows debugger engine: <dump> -- processes and
+    # command lines only; ..."): what was read, and (the caveat) what was not
+    $memoryEngine = "$($builderLog.MemoryDumpEngine)".Trim()
+    if ($memoryEngine) { $notes.Add("Memory dump analyzed with the Windows debugger engine: $($memoryEngine.TrimEnd('.')).") }
     # The collector's own processes in the memory dump, left out of the rules
     $memoryRowsPresent = @($stats.Sources | Where-Object { $_.Source -like "Memory-*" }).Count -gt 0
     $collectorRecorded = ($null -ne $CollectorRows -and [bool]$CollectorRows.Recorded -and [bool]$CollectorRows.HasMemoryRows)
@@ -3792,6 +3809,14 @@ function New-ReportModel {
         # (not "exists": the reason can be that it was not found)
         $reason = if ($memoryDump.Short) { " ($($memoryDump.Short))" } else { "" }
         $caveats.Add("A memory dump of this collection was not analyzed$reason, so the programs, network connections and command lines in memory are not in this report.")
+    }
+    if ($memoryEngine) {
+        if ($memoryEngine -match '\bprocesses only\b') {
+            $caveats.Add("The memory dump is a Windows ARM64 dump, read with the Windows debugger engine: only its processes are in this report, not its command lines (they could not be read), network connections or services.")
+        }
+        else {
+            $caveats.Add("The memory dump is a Windows ARM64 dump, read with the Windows debugger engine: only its processes and command lines are in this report, not its network connections or services.")
+        }
     }
     if ($builderLog.StartDate -or $builderLog.EndDate) {
         $range = @(@($builderLog.StartDate, $builderLog.EndDate) | Where-Object { $_ }) -join " to "

@@ -644,6 +644,92 @@ try {
         Write-TestResult -Succeeded ($editRun.ExitCode -eq 0 -and $editLead -and $editNote -and $editLog -and $editHtml.Contains("Check whether collection_info.json was altered after the collection.")) -Message "collector: an entry added to collection_info.json for the attacker's process is rejected (its lead stays, the 6 collector processes are still left out) and the log, the model and report.html say to check whether the file was altered (exit $($editRun.ExitCode))"
     }
 
+    # --- 2d. A Windows ARM64 dump, read with Microsoft's debugger engine: a
+    # copy of the builder (with report\ beside it) whose debugger engine
+    # helper (memory\TimelineDbgEng.ps1) returns canned entries instead of
+    # reading the dump, run with -MemoryDumpPath on a synthetic ARM64 crash
+    # dump header. The builder's own path is real: the engine lookup, the
+    # helper in a PowerShell process of its own, its output read back, the
+    # rows (the same entries as the memory run of 2b), the log line the
+    # report reads. The report gets the "analyzed with the Windows debugger
+    # engine" note and caveat (not the "not analyzed" ones), the memory-only
+    # lead still says "Captured in the memory dump", and -ReportOnly keeps
+    # them ---
+    $armBuilderDir = Join-Path $workDir "arm64-builder"
+    New-Item -ItemType Directory -Path (Join-Path $armBuilderDir "memory") | Out-Null
+    Copy-Item -LiteralPath (Join-Path $builderDir "report") -Destination (Join-Path $armBuilderDir "report") -Recurse
+    Copy-Item -LiteralPath $builder -Destination (Join-Path $armBuilderDir "timeline-builder.ps1")
+    $helperText = [System.IO.File]::ReadAllText((Join-Path $builderDir "memory\TimelineDbgEng.ps1"))
+    $helperAnchor = "function Read-DbgEngDump {"
+    $cannedHelper = @'
+function Read-DbgEngDump {
+    param([string]$DumpPath, [string]$EngineFolder, [string[]]$EngineDlls, [string]$SymbolCache, [string]$JobFolder)
+    Write-DbgEngLog "  Kernel symbols: (canned for the test)"
+    $result = New-DbgEngResult
+    $result.Processes = @([PSCustomObject]@{ PID = [long]4321; PPID = [long]3000; ImageFileName = "fixture-stage."; Offset = "0xffffa00000001000"; Threads = [long]3; SessionId = [long]1; CreateTime = "2026-03-02T11:30:00.1234567+00:00"; ExitTime = $null })
+    $result.CommandLines = @(
+        [PSCustomObject]@{ PID = [long]4321; Process = "fixture-stage.exe"; Args = '"C:\Users\Public\fixture-stage.exe" -connect 203.0.113.7' },
+        [PSCustomObject]@{ PID = [long]4400; Process = "fixture-invoice.exe"; Args = "C:\Users\alice\Downloads\fixture-invoice.exe /quiet" }
+    )
+    $result.SessionIds = 1
+    return $result
+}
+
+function Read-DbgEngDumpReal {
+'@
+    $helperAnchorFound = ([regex]::Matches($helperText, [regex]::Escape($helperAnchor))).Count -eq 1
+    if (-not $helperAnchorFound) { Write-TestResult -Succeeded $false -Message "the debugger engine helper has no single Read-DbgEngDump to replace for the ARM64 run" }
+    else {
+        [System.IO.File]::WriteAllText((Join-Path $armBuilderDir "memory\TimelineDbgEng.ps1"), $helperText.Replace($helperAnchor, $cannedHelper))
+        $armDump = Join-Path $workDir "arm64 memory.dmp"
+        $armBytes = New-Object byte[] 0x2000
+        [Array]::Copy([System.Text.Encoding]::ASCII.GetBytes("PAGEDU64"), 0, $armBytes, 0, 8)
+        [Array]::Copy([BitConverter]::GetBytes([uint32]0xAA64), 0, $armBytes, 0x30, 4)
+        $armCapture = [datetime]::new(2026, 3, 2, 12, 3, 0, [System.DateTimeKind]::Utc)
+        [Array]::Copy([BitConverter]::GetBytes([long]$armCapture.ToFileTimeUtc()), 0, $armBytes, 0xFA8, 8)
+        [System.IO.File]::WriteAllBytes($armDump, $armBytes)
+        [System.IO.File]::SetLastWriteTimeUtc($armDump, $armCapture.AddMinutes(2))
+        $armRunDir = Join-Path $workDir "arm64-run"
+        New-Item -ItemType Directory -Path $armRunDir | Out-Null
+        $savedBuilder3 = $builder
+        try {
+            $builder = Join-Path $armBuilderDir "timeline-builder.ps1"
+            Write-Host "Running the builder copy with a Windows ARM64 memory dump ..."
+            $armRun = Invoke-TimelineBuilder -Arguments @("-InputPath", $collection, "-Sources", "Persistence,PowerShellHistory,Memory", "-MemoryDumpPath", $armDump,
+                "-OutputFile", (Join-Path $armRunDir "timeline.csv"), "-Viewer", "None")
+        }
+        finally { $builder = $savedBuilder3 }
+        $armRows = @()
+        if (Test-Path -LiteralPath (Join-Path $armRunDir "timeline.csv")) { $armRows = @(Import-Csv -LiteralPath (Join-Path $armRunDir "timeline.csv")) }
+        $analyzedLine = "Memory dump analyzed with the Windows debugger engine: arm64 memory.dmp (8192 bytes) -- processes and command lines only; network connections and services are not read from Windows ARM64 dumps."
+        $armWarnings = @($armRun.Output | Where-Object { $_ -match 'WARNING:' -and $_ -match 'memory|debugger|engine|symbol|report|finding|rule|workbook|PDF' -and -not ($_ -match 'PDF not created' -and -not $edge) })
+        $armLogged = @($armRun.Output | Where-Object { $_.EndsWith("  $analyzedLine") }).Count -eq 1 -and @($armRun.Output | Where-Object { $_ -match '  Debugger engine: dbgeng\.dll \S+ from .+ \(part of Windows\)$' }).Count -eq 1 -and
+            @($armRun.Output | Where-Object { $_ -match 'Kernel symbols: \(canned for the test\)$' }).Count -eq 1
+        if ($armRun.ExitCode -ne 0 -or @($armRows | Where-Object { $_.Source -eq "Memory-Processes" }).Count -ne 1 -or @($armRows | Where-Object { $_.Source -eq "Memory-CommandLine" }).Count -ne 2 -or $armWarnings.Count -gt 0 -or -not $armLogged) {
+            Write-TestResult -Succeeded $false -Message "the ARM64 run did not exit with 0, log the engine and the helper's line and add the dump's rows without a memory or report warning (exit code $($armRun.ExitCode)) $($armWarnings -join ' / ')"
+            $armRun.Output | Select-Object -Last 30 | ForEach-Object { Write-Host "  | $_" }
+        }
+        else { Write-TestResult -Succeeded $true -Message "the ARM64 run: the engine and the helper's log line, the 'analyzed with the Windows debugger engine' line, one pslist and two cmdline rows" }
+        $armCaveat = "The memory dump is a Windows ARM64 dump, read with the Windows debugger engine: only its processes and command lines are in this report, not its network connections or services."
+        foreach ($pass in @("ARM64 run", "ARM64 run, -ReportOnly")) {
+            if ($pass -like "*-ReportOnly") {
+                # -ReportOnly reads the run's log next to the timeline (with
+                # -OutputFile it stayed in the copy's reports\timeline_<time>\)
+                $armLog = @(Get-ChildItem -LiteralPath (Join-Path $armBuilderDir "reports") -Filter "timeline_builder_log.txt" -Recurse -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1)
+                if ($armLog.Count -eq 1) { Copy-Item -LiteralPath $armLog[0].FullName -Destination (Join-Path $armRunDir "timeline_builder_log.txt") }
+                else { Write-TestResult -Succeeded $false -Message "the ARM64 run's timeline_builder_log.txt was not found under the copy's reports\" }
+                $armRebuild = Invoke-TimelineBuilder -Arguments @("-ReportOnly", $armRunDir, "-Viewer", "None")
+                if ($armRebuild.ExitCode -ne 0 -or $armRebuild.Errors.Count -gt 0) { Write-TestResult -Succeeded $false -Message "-ReportOnly on the ARM64 run did not exit with 0 (exit code $($armRebuild.ExitCode)) $($armRebuild.Errors -join ' / ')" }
+            }
+            $armModel = $null
+            if (Test-Path -LiteralPath (Join-Path $armRunDir "report-model.json")) { $armModel = Get-Content -LiteralPath (Join-Path $armRunDir "report-model.json") -Raw | ConvertFrom-Json }
+            $armNotes = @($armModel.Coverage.Notes | Where-Object { $_ -match '^Memory dump' })
+            $armCaveats = @($armModel.Caveats | Where-Object { $_ -match 'memory dump' })
+            Write-TestResult -Succeeded ($armModel -and ($armNotes -join " / ") -ceq $analyzedLine -and ($armCaveats -join " / ") -ceq $armCaveat) -Message "${pass}: report-model.json has the 'analyzed with the Windows debugger engine' note and the ARM64 caveat, no 'not analyzed' note or caveat ($($armNotes -join ' / ') | $($armCaveats -join ' / '))"
+            Test-MemoryOnlyLead -Folder $armRunDir -Label $pass
+        }
+    }
+
     # --- 3. -ReportOnly with another rules file, workbook left alone ---
     $xlsxHashBefore = $null
     if (Test-Path -LiteralPath $xlsxPath) { $xlsxHashBefore = (Get-FileHash -LiteralPath $xlsxPath).Hash }
