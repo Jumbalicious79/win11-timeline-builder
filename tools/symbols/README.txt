@@ -5,8 +5,10 @@ The timeline builder reads Windows ARM64 memory dumps with Microsoft's
 debugger engine (Volatility 3 cannot read Windows ARM64 memory). The engine
 needs the symbol file (PDB) of the exact Windows kernel in the dump to find
 its processes. The builder downloads that one file the first time it
-analyzes a dump of a Windows build and keeps it here, so later runs -- and
-other dumps of the same Windows build -- need no internet access.
+analyzes a dump of a Windows kernel version and keeps it here, so later
+runs -- and other dumps of the same kernel version -- need no internet
+access. Most monthly Windows updates bring a new kernel version, and with
+it one more file.
 Everything in this folder except this README is ignored by git and never
 committed.
 
@@ -22,7 +24,7 @@ LAYOUT
   <ID> its GUID (32 hex digits) and age (hex), read from the kernel image
   in the dump. This is the layout of a symbol server's downstream store, so
   WinDbg can use this folder as its cache too (below). About 10 MB per
-  Windows build (9.7 MB for build 26100 on ARM64).
+  kernel version (9.7 MB for build 26100 on ARM64).
 
 
 WHERE IT COMES FROM
@@ -34,12 +36,13 @@ WHERE IT COMES FROM
   Only this one file is downloaded, and only for an ARM64 memory dump that
   is analyzed. The request is the only thing that leaves the computer, and
   it names only that file: the kernel's file name and its GUID and age,
-  which are the same for every computer running that Windows build.
+  which are the same for every computer running that kernel version.
   Nothing else about the dump, the collection or the examined computer is
-  sent. Like any web request it comes from your public IP address and
-  carries PowerShell's user agent (the analysis computer's Windows and
-  PowerShell versions). The system's proxy settings are used; a proxy that
-  needs a sign-in is not supported.
+  sent. Like any web request it comes from your public IP address. Its
+  user agent is fixed, "Microsoft-Symbol-Server/10.0.0.0" (the one
+  Microsoft's own symbol client sends), so it does not carry the analysis
+  computer's Windows or PowerShell version or its language. The system's
+  proxy settings are used; a proxy that needs a sign-in is not supported.
 
   The debugger engine itself never contacts a symbol server: its symbol
   path is a local folder, and _NT_SYMBOL_PATH is ignored.
@@ -48,7 +51,12 @@ WHERE IT COMES FROM
   7.00") and kept only when the debugger engine accepts it for the kernel
   in the dump (dbghelp loads a symbol file only when its GUID and age are
   the kernel's). A file here that does not match is deleted and downloaded
-  again.
+  again. When the engine does not accept a file it has just downloaded,
+  the internet is not the problem (and a copy of the same file would be
+  refused too): the engine may be too old for the dump, or the file was
+  damaged on the way. The dump is reported as not analyzed with that
+  reason; a newer engine can be put in tools\dbgeng\ (see the README
+  there).
 
 
 WITHOUT INTERNET ACCESS
@@ -63,7 +71,9 @@ WITHOUT INTERNET ACCESS
     builder again.
 
   If this folder cannot be written (a read-only drive), the file goes to
-  the run's work folder instead and is downloaded again next time.
+  the run's work folder instead and is downloaded again next time. When
+  the work folder cannot be written either, the dump is reported as not
+  analyzed with that reason (no folder for the file).
 
 
 WINDBG

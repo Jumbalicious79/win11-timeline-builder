@@ -19060,7 +19060,8 @@ if ($Sources -notcontains "Memory") {
                 Write-Host "  Memory analysis adds the processes (parent, start time, session," -ForegroundColor White
                 Write-Host "  threads) and their command lines from the RAM dump. Network" -ForegroundColor White
                 Write-Host "  connections and services are not read from ARM64 dumps." -ForegroundColor White
-                Write-Host "  Takes under a minute. Once per Windows build it downloads the kernel's" -ForegroundColor DarkGray
+                Write-Host "  Takes under a minute. The first time for each Windows kernel version" -ForegroundColor DarkGray
+                Write-Host "  (most Windows updates bring a new one) it downloads the kernel's" -ForegroundColor DarkGray
                 Write-Host "  symbol file (about 10 MB) from Microsoft's symbol server into" -ForegroundColor DarkGray
                 Write-Host "  tools\symbols\; the request names only that file (see README.txt)." -ForegroundColor DarkGray
             }

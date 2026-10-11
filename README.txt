@@ -247,10 +247,10 @@ tools\symbols\, where later runs find it.
   #15). A dump from a Windows ARM64 computer is offered too: Volatility 3
   cannot read ARM64 memory, so the builder reads it with Microsoft's
   debugger engine (part of Windows) -- the processes and their command
-  lines, not network connections or services. The first ARM64 dump of a
-  Windows build needs internet access once, for the kernel's symbol file
-  (about 10 MB, kept in tools\symbols\; see "Windows kernel symbols").
-  When the manifest lists a dump the builder cannot find or use, it
+  lines, not network connections or services. The first ARM64 dump of
+  each Windows kernel version needs internet access once, for the kernel's
+  symbol file (about 10 MB, kept in tools\symbols\; see "Windows kernel
+  symbols"). When the manifest lists a dump the builder cannot find or use, it
   says what to do: connect the drive, or copy the dump next to the zip
   under the name it gives (<zip name>_memory_dump.dmp or .raw), then run
   the .bat again. A dump that is found (or listed) but not analyzed --
@@ -465,18 +465,21 @@ installed as PowerShell modules -- no manual installation needed.
               (<name> is ntkrnlmp.pdb on current Windows; <ID> is the
               file's GUID and age, read from the kernel image in the dump)
   Size:       About 10 MB (9.7 MB for build 26100 on ARM64)
-  Cached at:  tools\symbols\<name>\<ID>\<name>, once per Windows build: the
-              dumps of a computer share it until Windows is updated
+  Cached at:  tools\symbols\<name>\<ID>\<name>, once per Windows kernel
+              version: the dumps of a computer share it until a Windows
+              update brings a new kernel (most monthly updates do)
   Privacy:    The request is the only thing that leaves the computer, and
               it names only that symbol file: the kernel's file name and
               its GUID and age, which are the same for every computer
-              running that Windows build. Nothing else about the dump,
+              running that kernel version. Nothing else about the dump,
               the collection or the examined computer is sent. Like any
-              web request it comes from your public IP address, and it
-              carries PowerShell's user agent (the analysis computer's
-              Windows and PowerShell versions). The debugger engine itself
-              never contacts a symbol server: its symbol path is a local
-              folder, and _NT_SYMBOL_PATH is ignored.
+              web request it comes from your public IP address. Its user
+              agent is fixed, "Microsoft-Symbol-Server/10.0.0.0" (the one
+              Microsoft's own symbol client sends), so it does not carry
+              the analysis computer's Windows or PowerShell version or its
+              language. The debugger engine itself never contacts a symbol
+              server: its symbol path is a local folder, and
+              _NT_SYMBOL_PATH is ignored.
   Proxy:      The system's proxy settings (as Internet Explorer/Edge use
               them); a proxy that needs a sign-in is not supported.
   Offline:    Without internet access the dump is reported as not analyzed,
@@ -486,7 +489,17 @@ installed as PowerShell modules -- no manual installation needed.
   Integrity:  The download is checked (size, the PDB signature) and kept
               only when the debugger engine accepts it for the kernel in
               the dump (the same GUID and age); a cached file that does
-              not match is deleted and downloaded again.
+              not match is deleted and downloaded again. When the engine
+              does not accept a file it has just downloaded, the internet
+              is not the problem: the engine may be too old for the dump
+              (or the file was damaged on the way). The dump is reported
+              as not analyzed with that reason, and a newer engine can be
+              put in tools\dbgeng\ (see "Microsoft debugger engine" under
+              Optional Tools).
+  No folder:  When neither tools\symbols\ nor the run's work folder can be
+              written, the dump is reported as not analyzed with that
+              reason: make tools\symbols\ writable, or give a -WorkDir
+              that can be written.
   Deleting:   tools\symbols\ can be deleted at any time (it is downloaded
               again when needed). WinDbg can use the same folder:
               -y "srv*<builder>\tools\symbols*https://msdl.microsoft.com/download/symbols"
@@ -530,7 +543,7 @@ The script creates a timestamped report folder next to the script:
       sqlite3\                       -- Auto-downloaded, cached
       TimelineExplorer\              -- Auto-downloaded on first use, cached
       symbols\                       -- Windows kernel symbols for ARM64
-                                        dumps, downloaded once per build
+                                        dumps, once per kernel version
 
 The report files are written next to the timeline: with -OutputFile, in
 that file's folder (the builder log stays in reports\timeline_<timestamp>\).
@@ -2061,8 +2074,8 @@ Opt-in only -- not included in default Sources. Add "Memory" to -Sources to enab
 Without it, the builder offers to analyze a dump it finds when vol.exe is
 in tools\ (for a Windows ARM64 dump: when the debugger engine is there,
 which is part of Windows; the offer says what it reads, how long it takes
-and that the kernel's symbol file is downloaded once per Windows build);
-the offer shows the dump's full path when it is outside the
+and that the kernel's symbol file is downloaded once per Windows kernel
+version); the offer shows the dump's full path when it is outside the
 collection, and says when collection_manifest.csv gave the place (and the
 path it lists, when the drive has another letter now). When no dump is
 found and the manifest lists one, the offer step says what became of it
@@ -2149,9 +2162,11 @@ of WinDbg -- instead:
   - Kernel symbols: the engine needs the symbol file of the dump's exact
     Windows kernel. The builder reads its name and ID from the kernel image
     in the dump and takes the file from tools\symbols\, or downloads it once
-    per Windows build from Microsoft's symbol server (about 10 MB; see
-    "Windows kernel symbols"). Without internet access, the log names the
-    URL and where to copy the file.
+    per Windows kernel version from Microsoft's symbol server (about 10 MB;
+    see "Windows kernel symbols"). Without internet access, the log names
+    the URL and where to copy the file; when the engine does not accept the
+    file it downloaded, or no folder for it can be written, the reason says
+    so instead.
   - Time: about 3 seconds for an 8 GB dump, plus the download the first
     time (about 15 seconds) and starting the engine.
   - The log: "Windows ARM64 dump: analyzing it with Microsoft's debugger
@@ -2183,6 +2198,13 @@ of WinDbg -- instead:
       the Windows kernel symbol file could not be downloaded from
         Microsoft's symbol server (<error>); connect to the internet and run
         the builder again, or see "Windows kernel symbols" in README.txt
+      the Windows debugger engine did not accept the kernel symbol file
+        from Microsoft's symbol server (this engine may be too old for the
+        dump); put a newer engine in tools\dbgeng\ and run the builder
+        again, see "Microsoft debugger engine" in README.txt
+      no folder for the Windows kernel symbol file could be written
+        (<error>); make tools\symbols\ next to the builder writable, or use
+        a -WorkDir that can be written, and run the builder again
       the Windows debugger engine listed no processes in it (<the engine's
         error>)
       the Windows debugger engine stopped (<error>, or an exit code such as
@@ -2715,15 +2737,16 @@ selects it.
   - Windows ARM64 memory dumps -- Read with Microsoft's debugger engine,
     they give the processes and their command lines only: no network
     connections and no services (see "ARM64 memory dumps" under parser
-    #15). The first ARM64 dump of each Windows build needs internet access
-    once, for the kernel's symbol file (or a copy of it placed in
-    tools\symbols\ by hand; the log says where); without it the dump is
-    reported as not analyzed. A command line that is paged out of memory,
-    or of a process that has exited, has no row (Volatility writes a "not
-    valid" text there). The Windows debugger engine that comes with older
-    Windows versions is not tested with Windows 11 ARM64 dumps: if it
-    cannot read one, the reason is in the log and the report, and a newer
-    engine can be put in tools\dbgeng\ (see Optional Tools). An x64
+    #15). The first ARM64 dump of each Windows kernel version needs
+    internet access once, for the kernel's symbol file (or a copy of it
+    placed in tools\symbols\ by hand; the log says where); without it the
+    dump is reported as not analyzed. A command line that is paged out of
+    memory, or of a process that has exited, has no row (Volatility writes
+    a "not valid" text there). The Windows debugger engine that comes with
+    older Windows versions is not tested with Windows 11 ARM64 dumps: if it
+    cannot read one (or does not accept its kernel symbol file), the reason
+    is in the log and the report, and a newer engine can be put in
+    tools\dbgeng\ (see Optional Tools). An x64
     PowerShell cannot load an ARM64 engine: on an ARM64 computer run the
     builder from the ARM64 PowerShell (Run-TimelineBuilder.bat does).
 
@@ -2859,8 +2882,8 @@ selects it.
     the findings report is written as report.html only
   - Internet connection on first run (to install ImportExcel module and
     auto-download sqlite3.exe; Timeline Explorer downloaded on first use
-    if selected) and, once per Windows build, for an ARM64 memory dump's
-    kernel symbol file. After that, cached copies are used offline.
+    if selected) and, once per Windows kernel version, for an ARM64 memory
+    dump's kernel symbol file. After that, cached copies are used offline.
 
 
 ## Third-Party Dependencies (Auto-Downloaded)
@@ -2921,7 +2944,7 @@ parsing is skipped, and the timeline CSV can be opened manually.
   Author:     Microsoft
   Source:     https://msdl.microsoft.com/download/symbols (Microsoft's
               public symbol server)
-  Cached at:  tools\symbols\ (once per Windows build)
+  Cached at:  tools\symbols\ (once per Windows kernel version)
   Size:       About 10 MB
   Used by:    Parser #15 (Memory Dump), Windows ARM64 dumps only -- opt-in.
               What the request sends, and what happens offline: see
@@ -2982,7 +3005,7 @@ parsing is skipped, and the timeline CSV can be opened manually.
   Needed:     Nothing to install: dbgeng.dll, dbghelp.dll and dbgmodel.dll
               are part of Windows (C:\Windows\System32), and the builder uses
               them. The kernel's symbol file is downloaded once per Windows
-              build (see "Windows kernel symbols").
+              kernel version (see "Windows kernel symbols").
   Optional:   tools\dbgeng\<arch>\, a newer engine from Microsoft's NuGet
               package, for an older Windows whose own engine cannot read a
               dump of a newer one. <arch> is the processor architecture of the
@@ -3334,19 +3357,24 @@ parsing is skipped, and the timeline CSV can be opened manually.
   download with a stub (the exact URL and path, the cache reused, an HTML
   page, a short file and no network refused with nothing left, a stale
   download of an earlier run deleted, another run's file kept, a cache
-  that cannot be written); "(pdb symbols)"; names and command lines read
-  from a fake memory map (CR, LF, tab, quotes, |, non-ASCII, 32,767
-  characters, NUL, an odd length, an unpaired surrogate, empty, no PEB,
-  paged out, another process's address space). A whole analysis on canned
-  dx output (146 processes on two pages with bad items, a duplicate and the
-  idle process; one unreadable session id) goes through the builder's
-  protocol reader into the rows: the edge rows exactly, 146 pslist and 141
-  cmdline rows, the log lines, the same under de-DE, the symbol file
-  reused, a damaged cached file downloaded again, no internet (the reason
-  and the offline advice), a process query that fails (the engine's error
-  in the reason), the session query's fallback, command lines that cannot
-  be read (the processes only), a dump that cannot be opened, an error
-  while reading (the session always closed). The helper as a process of
+  that cannot be made or whose files cannot be written, no folder at all,
+  a ; in the path; the real download function's request with a stand-in
+  for Invoke-WebRequest: the URL, the file and the fixed user agent
+  Microsoft-Symbol-Server/10.0.0.0); "(pdb symbols)"; names and command
+  lines read from a fake memory map (CR, LF, tab, quotes, |, non-ASCII,
+  32,767 characters, NUL, an odd length, an unpaired surrogate, empty, no
+  PEB, paged out, another process's address space). A whole analysis on
+  canned dx output (146 processes on two pages with bad items, a duplicate
+  and the idle process; one unreadable session id) goes through the
+  builder's protocol reader into the rows: the edge rows exactly, 146
+  pslist and 141 cmdline rows, the log lines, the same under de-DE, the
+  symbol file reused, a damaged cached file downloaded again, no internet
+  (the reason and the offline advice), a downloaded file the engine does
+  not accept and no folder for it (each its own reason, neither with the
+  offline or internet advice), a process query that fails (the engine's
+  error in the reason), the session query's fallback, command lines that
+  cannot be read (the processes only), a dump that cannot be opened, an
+  error while reading (the session always closed). The helper as a process of
   its own: the real helper on a fake ARM64 dump (the engine of Windows
   cannot open it), canned entries with every kind of character through the
   pipe, arguments with spaces, [ ], non-ASCII and a trailing backslash, a
@@ -3786,7 +3814,8 @@ needs esentutl, it writes entries to this machine's Application event log
 One-time actions (first run only):
   - Installs ImportExcel PowerShell module (CurrentUser scope)
   - Writes the Windows kernel symbol file into tools\symbols\ the first time
-    an ARM64 memory dump of a Windows build is analyzed (kept for later runs)
+    an ARM64 memory dump of a new Windows kernel version is analyzed (kept
+    for later runs)
 
 Temporary actions (all cleaned up automatically, also after an error or Ctrl+C):
   - Extracts a collection zip (browse mode, or a .zip as -InputPath) into the

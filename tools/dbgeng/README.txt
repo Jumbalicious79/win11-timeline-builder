@@ -10,8 +10,9 @@ the builder uses that one: NOTHING HAS TO BE PUT IN THIS FOLDER.
 This folder is for a newer copy of the engine, from Microsoft's NuGet
 package, for an analysis computer whose own engine cannot read a dump of a
 newer Windows (an older Windows 10, for example: the log and the findings
-report then say the engine could not open the dump, or listed no
-processes in it). Everything in this folder except this README is ignored
+report then say the engine could not open the dump, did not accept the
+kernel symbol file from Microsoft's symbol server, or listed no processes
+in it). Everything in this folder except this README is ignored
 by git and never committed; the DLLs are Microsoft's and are not
 redistributed with this repository.
 

@@ -1004,7 +1004,8 @@ try {
         "  Memory analysis adds the processes (parent, start time, session,",
         "  threads) and their command lines from the RAM dump. Network",
         "  connections and services are not read from ARM64 dumps.",
-        "  Takes under a minute. Once per Windows build it downloads the kernel's",
+        "  Takes under a minute. The first time for each Windows kernel version",
+        "  (most Windows updates bring a new one) it downloads the kernel's",
         "  symbol file (about 10 MB) from Microsoft's symbol server into",
         "  tools\symbols\; the request names only that file (see README.txt).",
         "  [1] Yes -- analyze memory dump (recommended for IR)"
@@ -1529,7 +1530,7 @@ try {
         $script:downloadBody = $case.Body
         $file = Get-KernelSymbolFile -Name "ntkrnlmp.pdb" -Key $kernelKey -CacheRoot $cacheRoot -Fallback (Join-Path $engineDir "fallback")
         $leftFiles = @(Get-ChildItem -LiteralPath $cacheRoot -Recurse -File -Force -ErrorAction SilentlyContinue).Count
-        Assert-Equal -Name "Get-KernelSymbolFile, a download that fails ($($case.Body)): the short error, no file left" -Expected "|$($case.Error)|0" -Actual "$($file.Path)|$($file.Error)|$leftFiles"
+        Assert-Equal -Name "Get-KernelSymbolFile, a download that fails ($($case.Body)): the short error, the kind Download, no file left" -Expected "|$($case.Error)|Download|0" -Actual "$($file.Path)|$($file.Error)|$($file.ErrorKind)|$leftFiles"
     }
     Remove-Item -LiteralPath $cacheRoot -Recurse -Force
     $script:downloadBody = "raced"
@@ -1541,7 +1542,40 @@ try {
     $script:logFile = Join-Path $workDir "engine-fallback.log"
     $file = Get-KernelSymbolFile -Name "ntkrnlmp.pdb" -Key $kernelKey -CacheRoot $fileAsRoot -Fallback (Join-Path $engineDir "fallback")
     $fallbackLogged = (Get-TestLog).Contains('  tools\symbols\ cannot be written (')
-    Assert-Equal -Name "Get-KernelSymbolFile: a cache that cannot be written: the work folder's fallback, and the log line" -Expected "$(Join-Path $engineDir "fallback\ntkrnlmp.pdb\$kernelKey\ntkrnlmp.pdb")|True|True" -Actual "$($file.Path)|$($file.Downloaded)|$fallbackLogged"
+    Assert-Equal -Name "Get-KernelSymbolFile: a cache that cannot be written: the work folder's fallback, and the log line" -Expected "$(Join-Path $engineDir "fallback\ntkrnlmp.pdb\$kernelKey\ntkrnlmp.pdb")|True|True|" -Actual "$($file.Path)|$($file.Downloaded)|$fallbackLogged|$($file.ErrorKind)"
+    # A cache folder that can be made but not written (the download's own
+    # file name taken by a folder): the work folder, not a failed download
+    $lockedRoot = Join-Path $engineDir "locked cache"
+    $lockedFolder = Join-Path $lockedRoot "ntkrnlmp.pdb\$kernelKey"
+    [void][System.IO.Directory]::CreateDirectory((Join-Path $lockedFolder "ntkrnlmp.pdb.$PID.download"))
+    $script:logFile = Join-Path $workDir "engine-locked.log"
+    $script:downloads.Clear()
+    $file = Get-KernelSymbolFile -Name "ntkrnlmp.pdb" -Key $kernelKey -CacheRoot $lockedRoot -Fallback (Join-Path $engineDir "fallback 2")
+    $lockedLogged = (Get-TestLog).Contains('  tools\symbols\ cannot be written (')
+    Assert-Equal -Name "Get-KernelSymbolFile: a cache folder whose files cannot be written: the work folder's fallback, the log line, one download" -Expected "$(Join-Path $engineDir "fallback 2\ntkrnlmp.pdb\$kernelKey\ntkrnlmp.pdb")|True||True|1" -Actual "$($file.Path)|$($file.Downloaded)|$($file.ErrorKind)|$lockedLogged|$($script:downloads.Count)"
+    # Neither the cache nor the work folder can be written: the kind Folder,
+    # nothing downloaded
+    $fileAsFallback = Join-Path $engineDir "fallback-is-a-file"
+    [System.IO.File]::WriteAllText($fileAsFallback, "x")
+    $script:downloads.Clear()
+    $file = Get-KernelSymbolFile -Name "ntkrnlmp.pdb" -Key $kernelKey -CacheRoot $fileAsRoot -Fallback $fileAsFallback
+    Assert-Equal -Name "Get-KernelSymbolFile: no folder can be written: the kind Folder, an error, nothing downloaded" -Expected "|Folder|True|0" -Actual "$($file.Path)|$($file.ErrorKind)|$([bool]$file.Error)|$($script:downloads.Count)"
+    $semicolonFile = Get-KernelSymbolFile -Name "ntkrnlmp.pdb" -Key $kernelKey -CacheRoot (Join-Path $engineDir "a;b") -Fallback (Join-Path $engineDir "c;d")
+    Assert-Equal -Name "Get-KernelSymbolFile: a ; in both paths: the kind Folder, said in words (the short error turns a ; into a ,)" -Expected "Folder|the work folder's path has a semicolon in it" -Actual "$($semicolonFile.ErrorKind)|$($semicolonFile.Error)"
+
+    # The real download function, with a stand-in for Invoke-WebRequest: the
+    # URL, the file, and a fixed user agent (symsrv's), so the request names
+    # nothing of the analysis computer (PowerShell's own user agent has its
+    # Windows and PowerShell versions and its language)
+    $script:webRequest = ""
+    Set-Item -LiteralPath function:Invoke-WebRequest -Value {
+        [CmdletBinding()]
+        param([string]$Uri, [string]$OutFile, [switch]$UseBasicParsing, [string]$UserAgent, [int]$TimeoutSec, [int]$MaximumRedirection)
+        $script:webRequest = "$Uri|$OutFile|$UserAgent|$UseBasicParsing|$TimeoutSec|$MaximumRedirection"
+    }
+    try { & $realFunctions["Save-KernelSymbolDownload"] -Url $expectedUrl -Path "C:\x\ntkrnlmp.pdb.1.download" }
+    finally { Remove-Item -LiteralPath function:Invoke-WebRequest }
+    Assert-Equal -Name "Save-KernelSymbolDownload: the URL, the file and a fixed user agent (Microsoft-Symbol-Server/10.0.0.0)" -Expected "$expectedUrl|C:\x\ntkrnlmp.pdb.1.download|Microsoft-Symbol-Server/10.0.0.0|True|120|5" -Actual $script:webRequest
 
     ${function:Invoke-DbgEngCommand} = { param([string]$Command) if ($Command -eq "lm m nt") { return $script:lmOutput }; return "" }
     $script:lmOutput = "start             end                 module name`nfffff803``5c600000 fffff803``5da4f000   nt         (pdb symbols)          c:\x\ntkrnlmp.pdb`n"
@@ -1736,7 +1770,9 @@ try {
         $script:downloads.Add($Url)
         if ($script:offline) { throw "No such host is known. (msdl.microsoft.com:443)" }
         $bytes = New-Object byte[] (100KB)
-        [Array]::Copy([System.Text.Encoding]::ASCII.GetBytes("Microsoft C/C++ MSF 7.00`r`nGOODPDB"), $bytes, 33)
+        # -not GOODPDB: a symbol file the engine does not accept
+        $text = if ($script:notAccepted) { "Microsoft C/C++ MSF 7.00`r`nOTHERPDB" } else { "Microsoft C/C++ MSF 7.00`r`nGOODPDB" }
+        [Array]::Copy([System.Text.Encoding]::ASCII.GetBytes($text), $bytes, $text.Length)
         [System.IO.File]::WriteAllBytes($Path, $bytes)
     }
     $engineDump = "D:\Cases\Fall $([char]0x00E9) [2]\TriageCollection_2026-10-11_00-08_memory_dump.dmp"
@@ -1826,6 +1862,27 @@ try {
     $script:offline = $false
     $offlineReason = "the Windows kernel symbol file could not be downloaded from Microsoft's symbol server (No such host is known. [msdl.microsoft.com:443]); connect to the internet and run the builder again, or see ""Windows kernel symbols"" in README.txt"
     Assert-Equal -Name "debugger engine, no internet: the reason, the offline advice, no rows, no partial file, the session closed" -Expected "$offlineReason|True|0|0|1|1" -Actual "$($offlineRun.Result.Reason)|$($offlineRun.Log.Contains("  To analyze it without internet access here, download $expectedUrl on another computer and copy it to $cachedFile, then run the builder again."))|$($offlineRun.Rows.Count)|$(@(Get-ChildItem -LiteralPath $symbolRoot -Recurse -File -Force -ErrorAction SilentlyContinue).Count)|$($offlineRun.Opened)|$($offlineRun.Closed)"
+
+    # The download works but the engine does not accept the file: a newer
+    # engine is the advice, not internet access or a copy of the same file
+    Remove-Item -LiteralPath $symbolRoot -Recurse -Force -ErrorAction SilentlyContinue
+    $script:notAccepted = $true
+    $notAcceptedRun = Invoke-TestEngineRun
+    $script:notAccepted = $false
+    $notAcceptedReason = "the Windows debugger engine did not accept the kernel symbol file from Microsoft's symbol server (this engine may be too old for the dump); put a newer engine in tools\dbgeng\ and run the builder again, see ""Microsoft debugger engine"" in README.txt"
+    $notAcceptedWarning = "WARNING:   The Windows debugger engine did not accept the kernel symbol file that Microsoft's symbol server sent for this dump, and it was deleted. This engine may be too old for the dump, or the file was damaged on the way: put a newer engine in tools\dbgeng\ (see ""Microsoft debugger engine"" in README.txt) and run the builder again."
+    Assert-Equal -Name "debugger engine, a symbol file the engine does not accept: the reason and the warning name a newer engine, no offline or internet advice, one download, the file deleted, no rows" -Expected "$notAcceptedReason|True|False|1|0|0|1" -Actual "$($notAcceptedRun.Result.Reason)|$($notAcceptedRun.Log.Contains($notAcceptedWarning))|$($notAcceptedRun.Log.Contains('without internet access') -or $notAcceptedRun.Log.Contains('connect to the internet'))|$($notAcceptedRun.Downloads)|$($notAcceptedRun.Rows.Count)|$(@(Get-ChildItem -LiteralPath $symbolRoot -Recurse -File -Force -ErrorAction SilentlyContinue).Count)|$($notAcceptedRun.Closed)"
+
+    # No folder for the symbol file can be written: that is the reason, not
+    # internet access
+    # (the function: drive changes the function itself, also from a child
+    # scope: put back right after)
+    $realSymbolFile = ${function:Get-KernelSymbolFile}
+    ${function:Get-KernelSymbolFile} = { [PSCustomObject]@{ Path = ""; Folder = ""; Downloaded = $false; Url = $expectedUrl; Error = "Access to the path 'X' is denied"; ErrorKind = "Folder" } }
+    try { $folderRun = Invoke-TestEngineRun }
+    finally { ${function:Get-KernelSymbolFile} = $realSymbolFile }
+    $folderReason = "no folder for the Windows kernel symbol file could be written (Access to the path 'X' is denied); make tools\symbols\ next to the builder writable, or use a -WorkDir that can be written, and run the builder again"
+    Assert-Equal -Name "debugger engine, no folder for the symbol file can be written: the reason and the log line name the folders, no offline or internet advice, no rows" -Expected "$folderReason|True|False|0|1" -Actual "$($folderRun.Result.Reason)|$($folderRun.Log.Contains("  Neither tools\symbols\ nor the work folder can be written (Access to the path 'X' is denied), so the kernel symbol file has nowhere to go."))|$($folderRun.Log.Contains('without internet access') -or $folderRun.Log.Contains('connect to the internet'))|$($folderRun.Rows.Count)|$($folderRun.Closed)"
 
     # The process query fails as a whole (the engine's own text): the reason
     # names it; the session query fails: the token's session ids

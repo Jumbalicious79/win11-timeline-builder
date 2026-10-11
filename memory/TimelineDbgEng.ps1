@@ -595,13 +595,16 @@ function Get-KernelSymbolInfo {
 # Downloads one file (the tests put their own function in its place):
 # Microsoft's symbol server only, HTTPS, the system's proxy settings, no
 # progress bar (it slows Windows PowerShell's download down many times
-# over). The only network access of the builder's memory analysis.
+# over). The only network access of the builder's memory analysis. The
+# user agent is fixed, the one Microsoft's own symbol client (symsrv)
+# sends, the same on every computer: PowerShell's own would name the
+# analysis computer's Windows and PowerShell versions and its language.
 function Save-KernelSymbolDownload {
     param([string]$Url, [string]$Path)
     $ProgressPreference = "SilentlyContinue"
     try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 }
     catch { Write-Verbose "Could not enable TLS 1.2: $($_.Exception.Message)" }
-    Invoke-WebRequest -Uri $Url -OutFile $Path -UseBasicParsing -TimeoutSec 120 -MaximumRedirection 5 -ErrorAction Stop
+    Invoke-WebRequest -Uri $Url -OutFile $Path -UseBasicParsing -UserAgent "Microsoft-Symbol-Server/10.0.0.0" -TimeoutSec 120 -MaximumRedirection 5 -ErrorAction Stop
 }
 
 # The message of an error: of the innermost exception (a .NET method's own
@@ -634,11 +637,12 @@ function Get-DbgEngShortError {
 # (<name>.<PID>.download: two runs at once do not share it), is checked
 # (size, the PDB signature) and only then gets the final name; a file that
 # another run put there first is kept. Returns Path, Folder, Downloaded,
-# Url, Error.
+# Url, Error and ErrorKind (Folder: neither folder can be made or written,
+# Download: the download failed or was not a symbol file).
 function Get-KernelSymbolFile {
     param([string]$Name, [string]$Key, [string]$CacheRoot, [string]$Fallback)
     $url = "https://msdl.microsoft.com/download/symbols/$Name/$Key/$Name"
-    $result = [PSCustomObject]@{ Path = ""; Folder = ""; Downloaded = $false; Url = $url; Error = "" }
+    $result = [PSCustomObject]@{ Path = ""; Folder = ""; Downloaded = $false; Url = $url; Error = ""; ErrorKind = "" }
     $folder = Join-Path $CacheRoot "$Name\$Key"
     $path = Join-Path $folder $Name
     if ((Test-Path -LiteralPath $path -PathType Leaf) -and (Get-Item -LiteralPath $path -Force).Length -gt 0) {
@@ -646,21 +650,29 @@ function Get-KernelSymbolFile {
         $result.Folder = $folder
         return $result
     }
+    # The folder, and the download's own file (empty for now: a folder
+    # that can be made but not written is found here, not as a failed
+    # download)
+    $partial = "$path.$PID.download"
     try {
         # A symbol path cannot hold a ";" (it separates its folders)
-        if ($folder.Contains(";")) { throw "the path has a ; in it" }
+        if ($folder.Contains(";")) { throw "the path has a semicolon in it" }
         [void][System.IO.Directory]::CreateDirectory($folder)
+        [System.IO.File]::WriteAllBytes($partial, (New-Object byte[] 0))
     }
     catch {
         Write-DbgEngLog "  tools\symbols\ cannot be written ($(Get-DbgEngShortError (Get-DbgEngErrorText $_))): the symbol file goes to the work folder and is downloaded again next time."
         $folder = Join-Path $Fallback "$Name\$Key"
         $path = Join-Path $folder $Name
+        $partial = "$path.$PID.download"
         try {
-            if ($folder.Contains(";")) { throw "the work folder's path has a ; in it" }
+            if ($folder.Contains(";")) { throw "the work folder's path has a semicolon in it" }
             [void][System.IO.Directory]::CreateDirectory($folder)
+            [System.IO.File]::WriteAllBytes($partial, (New-Object byte[] 0))
         }
         catch {
             $result.Error = Get-DbgEngShortError (Get-DbgEngErrorText $_)
+            $result.ErrorKind = "Folder"
             return $result
         }
     }
@@ -668,7 +680,6 @@ function Get-KernelSymbolFile {
     foreach ($stale in @(Get-ChildItem -LiteralPath $folder -Filter "*.download" -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTimeUtc -lt [datetime]::UtcNow.AddDays(-1) })) {
         Remove-Item -LiteralPath $stale.FullName -Force -ErrorAction SilentlyContinue
     }
-    $partial = "$path.$PID.download"
     Write-DbgEngLog "  Downloading the Windows kernel symbol file (about 10 MB) from Microsoft's symbol server: $url"
     $timer = [System.Diagnostics.Stopwatch]::StartNew()
     try {
@@ -689,6 +700,7 @@ function Get-KernelSymbolFile {
     catch {
         Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
         $result.Error = Get-DbgEngShortError (Get-DbgEngErrorText $_)
+        $result.ErrorKind = "Download"
         return $result
     }
     $megabytes = ([math]::Round((Get-Item -LiteralPath $path -Force).Length / 1MB, 1)).ToString([System.Globalization.CultureInfo]::InvariantCulture)
@@ -794,20 +806,38 @@ function Read-DbgEngDump {
         if (-not $symbols.Error -and -not (Use-KernelSymbols -Session $session -Folder $symbols.Folder)) {
             # A cached copy that does not match (damaged): once more from the server
             Remove-Item -LiteralPath $symbols.Path -Force -ErrorAction SilentlyContinue
-            if ($symbols.Downloaded) { $symbols.Error = "the downloaded file does not match the dump" }
+            if ($symbols.Downloaded) { $symbols.ErrorKind = "NotAccepted" }
             else {
                 Write-DbgEngLog -Warning "  The cached kernel symbol file does not match the dump and was deleted; downloading it again."
                 $symbols = Get-KernelSymbolFile -Name $kernel.Name -Key $kernel.Key -CacheRoot $SymbolCache -Fallback $fallback
                 if (-not $symbols.Error -and -not (Use-KernelSymbols -Session $session -Folder $symbols.Folder)) {
                     Remove-Item -LiteralPath $symbols.Path -Force -ErrorAction SilentlyContinue
-                    $symbols.Error = "the downloaded file does not match the dump"
+                    $symbols.ErrorKind = "NotAccepted"
                 }
             }
         }
-        if ($symbols.Error) {
-            Write-DbgEngLog "  To analyze it without internet access here, download $($symbols.Url) on another computer and copy it to $(Join-Path $SymbolCache "$($kernel.Name)\$($kernel.Key)\$($kernel.Name)"), then run the builder again."
-            $result.Reason = "the Windows kernel symbol file could not be downloaded from Microsoft's symbol server ($($symbols.Error)); connect to the internet and run the builder again, or see ""Windows kernel symbols"" in README.txt"
-            return $result
+        # Why there are no symbols, and what helps: another engine when this
+        # one did not accept the file the server sent (the internet worked,
+        # and the same file would be refused again), a folder that can be
+        # written, or internet access
+        $symbolProblem = $symbols.ErrorKind
+        if (-not $symbolProblem -and $symbols.Error) { $symbolProblem = "Download" }
+        switch ($symbolProblem) {
+            "NotAccepted" {
+                Write-DbgEngLog -Warning "  The Windows debugger engine did not accept the kernel symbol file that Microsoft's symbol server sent for this dump, and it was deleted. This engine may be too old for the dump, or the file was damaged on the way: put a newer engine in tools\dbgeng\ (see ""Microsoft debugger engine"" in README.txt) and run the builder again."
+                $result.Reason = "the Windows debugger engine did not accept the kernel symbol file from Microsoft's symbol server (this engine may be too old for the dump); put a newer engine in tools\dbgeng\ and run the builder again, see ""Microsoft debugger engine"" in README.txt"
+                return $result
+            }
+            "Folder" {
+                Write-DbgEngLog "  Neither tools\symbols\ nor the work folder can be written ($($symbols.Error)), so the kernel symbol file has nowhere to go."
+                $result.Reason = "no folder for the Windows kernel symbol file could be written ($($symbols.Error)); make tools\symbols\ next to the builder writable, or use a -WorkDir that can be written, and run the builder again"
+                return $result
+            }
+            "Download" {
+                Write-DbgEngLog "  To analyze it without internet access here, download $($symbols.Url) on another computer and copy it to $(Join-Path $SymbolCache "$($kernel.Name)\$($kernel.Key)\$($kernel.Name)"), then run the builder again."
+                $result.Reason = "the Windows kernel symbol file could not be downloaded from Microsoft's symbol server ($($symbols.Error)); connect to the internet and run the builder again, or see ""Windows kernel symbols"" in README.txt"
+                return $result
+            }
         }
 
         # Processes (windows.pslist)
