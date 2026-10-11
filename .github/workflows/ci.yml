@@ -162,6 +162,11 @@ jobs:
         if: ${{ !cancelled() }}
         run: ./tests/Test-ConsoleMode.ps1
 
+      # The viewer menu at the end of a run (stand-ins: nothing is opened)
+      - name: Run viewer menu test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-ViewerMenu.ps1
+
   analyze:
     name: PSScriptAnalyzer
     runs-on: windows-latest

@@ -54,9 +54,11 @@ param(
     [ValidateRange(0, 36500)]
     [int]$MftDays = 7,
 
-    # Viewer to open at the end without asking (for scripts and automation)
+    # Viewer to open at the end without asking (for scripts and automation):
+    # ExcelAndReport (the workbook and the findings report together), Excel,
+    # TimelineExplorer, Both (Excel and Timeline Explorer), Report or None
     [Parameter(Mandatory = $false)]
-    [ValidateSet("Excel", "TimelineExplorer", "Both", "Report", "None")]
+    [ValidateSet("ExcelAndReport", "Excel", "TimelineExplorer", "Both", "Report", "None")]
     [string]$Viewer,
 
     # CSV only: don't generate timeline.xlsx (ImportExcel isn't needed)
@@ -1618,17 +1620,37 @@ function Get-TimelineExplorer {
 
 # --- Let the user choose how to view the results ---
 # -Choice is -Viewer (empty: ask with a menu). -ReportPath is report.pdf, or
-# report.html when no PDF was made (empty: no report).
+# report.html when no PDF was made (empty: no report). The first choice
+# opens the workbook and the findings report together; choices that do not
+# apply (no workbook, no report) are left out and the rest renumbered.
+# Excel is started first, then the report; neither is waited for, and one
+# that cannot be started is logged and does not stop the other.
 function Invoke-TimelineViewer {
     param([string]$Choice, [string]$CsvPath, [string]$XlsxPath, [bool]$XlsxAvailable, [string]$ReportPath)
     if ($Choice) {
         # -Viewer given: no menu (scripts, automation, tests)
         $selectedAction = switch ($Choice) {
+            "ExcelAndReport"   { "excelreport" }
             "Excel"            { "excel" }
             "TimelineExplorer" { "te" }
             "Both"             { "both" }
             "Report"           { "report" }
             default            { "none" }
+        }
+        # Excel and the report: open what was made, and say what was not
+        if ($selectedAction -eq "excelreport") {
+            if (-not $XlsxAvailable -and -not $ReportPath) {
+                Log-Warning "  -Viewer ${Choice}: no Excel file was generated and no findings report was written, so nothing is opened."
+                $selectedAction = "none"
+            }
+            elseif (-not $XlsxAvailable) {
+                Log-Warning "  -Viewer ${Choice}: no Excel file was generated, so only the findings report is opened."
+                $selectedAction = "report"
+            }
+            elseif (-not $ReportPath) {
+                Log-Warning "  -Viewer ${Choice}: no findings report was written, so only Excel is opened."
+                $selectedAction = "excel"
+            }
         }
         if (($selectedAction -eq "excel" -or $selectedAction -eq "both") -and -not $XlsxAvailable) {
             Log-Warning "  -Viewer ${Choice}: no Excel file was generated, so Excel is not opened."
@@ -1649,10 +1671,20 @@ function Invoke-TimelineViewer {
         Write-Host ""
 
         $menuOptions = @()
+        $reportKind = if ($ReportPath -match '\.pdf$') { "PDF" } else { "HTML" }
+
+        # Both files made: the workbook and the report together come first
+        if ($XlsxAvailable -and $ReportPath) {
+            $menuOptions += @{ Key = "1"; Label = "Excel + findings report"; Action = "excelreport" }
+            Write-Host "  [1] Excel + findings report -- the color-coded workbook and the" -ForegroundColor Green
+            Write-Host "       findings report ($reportKind), opened together (recommended)" -ForegroundColor DarkGray
+        }
 
         if ($XlsxAvailable) {
-            $menuOptions += @{ Key = "1"; Label = "Excel (color-coded .xlsx)"; Action = "excel" }
-            Write-Host "  [1] Excel -- rows pre-colored by EventType, ready to analyze" -ForegroundColor Green
+            $excelOptionNum = $menuOptions.Count + 1
+            $excelColor = if ($excelOptionNum -eq 1) { "Green" } else { "White" }
+            $menuOptions += @{ Key = "$excelOptionNum"; Label = "Excel (color-coded .xlsx)"; Action = "excel" }
+            Write-Host "  [$excelOptionNum] Excel -- rows pre-colored by EventType, ready to analyze" -ForegroundColor $excelColor
             Write-Host "       (Logon=Green, Execution=Orange, Persistence=Red, Network=Blue, etc.)" -ForegroundColor DarkGray
         }
 
@@ -1661,15 +1693,16 @@ function Invoke-TimelineViewer {
         Write-Host "  [$teOptionNum] Timeline Explorer -- powerful forensic CSV viewer (no colors," -ForegroundColor White
         Write-Host "       requires manual conditional formatting setup per session)" -ForegroundColor DarkGray
 
+        # -Viewer Both; named for what it opens, so that it is not taken for
+        # the first choice (Excel and the report)
         if ($XlsxAvailable) {
             $bothOptionNum = $menuOptions.Count + 1
-            $menuOptions += @{ Key = "$bothOptionNum"; Label = "Both"; Action = "both" }
-            Write-Host "  [$bothOptionNum] Both -- open Excel (colored) and Timeline Explorer side by side" -ForegroundColor White
+            $menuOptions += @{ Key = "$bothOptionNum"; Label = "Excel + Timeline Explorer"; Action = "both" }
+            Write-Host "  [$bothOptionNum] Excel + Timeline Explorer -- open both side by side" -ForegroundColor White
         }
 
         if ($ReportPath) {
             $reportOptionNum = $menuOptions.Count + 1
-            $reportKind = if ($ReportPath -match '\.pdf$') { "PDF" } else { "HTML" }
             $menuOptions += @{ Key = "$reportOptionNum"; Label = "Open report"; Action = "report" }
             Write-Host "  [$reportOptionNum] Open report -- the findings report ($reportKind): leads to review," -ForegroundColor White
             Write-Host "       each with its timeline rows (plain-English summary first)" -ForegroundColor DarkGray
@@ -1681,7 +1714,7 @@ function Invoke-TimelineViewer {
         Write-Host ""
 
         # The number of options changes (no Excel without a workbook, no
-        # Open report without a report), so a wrong number says so. At the
+        # report choice without a report), so a wrong number says so. At the
         # end of redirected input (Read-Host returns $null) nothing is opened.
         $maxOption = $menuOptions.Count
         do {
@@ -1695,8 +1728,10 @@ function Invoke-TimelineViewer {
         Log "  Viewer selection: $($($menuOptions | Where-Object { $_.Key -eq $viewerChoice }).Label)"
     }
 
-    # --- Launch selected viewer(s) ---
-    if ($selectedAction -eq "excel" -or $selectedAction -eq "both") {
+    # --- Launch selected viewer(s): Excel first, then the report. Each is
+    # started without waiting, in its own try/catch, so one that fails does
+    # not stop the other ---
+    if ($selectedAction -eq "excel" -or $selectedAction -eq "both" -or $selectedAction -eq "excelreport") {
         Log ""
         Log "--- Opening Color-Coded Timeline in Excel ---"
         try {
@@ -1732,7 +1767,7 @@ function Invoke-TimelineViewer {
         }
     }
 
-    if ($selectedAction -eq "report") {
+    if ($selectedAction -eq "report" -or $selectedAction -eq "excelreport") {
         Log ""
         Log "--- Opening the Findings Report ---"
         try {
