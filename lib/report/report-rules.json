@@ -1151,12 +1151,12 @@
         { "eventType": "^(?:Execution|ProcessCreation)$", "details": "EncodedCommand=\\S" },
         { "eventType": "^(?:Execution|ProcessCreation)$", "description": "(?:powershell|pwsh)[^|\\r\\n]*?[\\s\"'][-/](?:e|ec|en[a-z]*)\\s+['\"]?[A-Za-z0-9+/]{20,}" },
         { "eventType": "^(?:Execution|ProcessCreation)$", "details": "(?:powershell|pwsh)[^|\\r\\n]*?[\\s\"'][-/](?:e|ec|en[a-z]*)\\s+['\"]?[A-Za-z0-9+/]{20,}" },
-        { "source": "^Memory-CommandLine$", "details": "(?:powershell|pwsh)[^|\\r\\n]*?[\\s\"'][-/](?:e|ec|en[a-z]*)\\s+['\"]?[A-Za-z0-9+/]{20,}" }
+        { "source": "^Memory-(?:CommandLine|ConsoleHistory)$", "details": "(?:powershell|pwsh)[^|\\r\\n]*?[\\s\"'][-/](?:e|ec|en[a-z]*)\\s+['\"]?[A-Za-z0-9+/]{20,}" }
       ],
       "groupBy": "rule",
-      "_anyOf": "Execution and process-creation rows, plus the command lines of a memory dump (Memory-CommandLine, EventType Snapshot at the dump's capture time). Other Snapshot rows (a task or service as listed at collection time) are definitions, not runs.",
+      "_anyOf": "Execution and process-creation rows, plus the command lines of a memory dump (Memory-CommandLine) and the commands typed in its console windows (Memory-ConsoleHistory, Args=), both EventType Snapshot at the dump's capture time. Other Snapshot rows (a task or service as listed at collection time) are definitions, not runs.",
       "why": "PowerShell was run with its command hidden as encoded text. This is common in attacks to obscure what the command does, though admins and installers use it too.",
-      "technical": "A PowerShell invocation with -EncodedCommand or any abbreviation of it (-e, -ec, -en, -enc, ...) followed by base64, in a PowerShell 400 event (the builder decodes it into the EncodedCommand detail), a process-creation event (4688, Sysmon 1), the PSReadLine history, the Run dialog, or a process command line read from a memory dump (a Memory-CommandLine row, read by Volatility 3's windows.cmdline or, for a Windows ARM64 dump, by the Windows debugger engine: a Snapshot row at the dump's capture time).",
+      "technical": "A PowerShell invocation with -EncodedCommand or any abbreviation of it (-e, -ec, -en, -enc, ...) followed by base64, in a PowerShell 400 event (the builder decodes it into the EncodedCommand detail), a process-creation event (4688, Sysmon 1), the PSReadLine history, the Run dialog, a process command line read from a memory dump (a Memory-CommandLine row, read by Volatility 3's windows.cmdline or, for a Windows ARM64 dump, by the Windows debugger engine: a Snapshot row at the dump's capture time), or a command typed in a console window and kept in the console host's memory (a Memory-ConsoleHistory row of a Windows ARM64 dump, the command in Args=: a Snapshot row at the dump's capture time).",
       "nextSteps": "Read the decoded command. Judge it by what it actually does, not by the encoding alone.",
       "falsePositives": "Microsoft tooling, CI systems, and many installers use -EncodedCommand for ordinary tasks.",
       "references": ["MITRE ATT&CK T1059.001", "MITRE ATT&CK T1027"],
@@ -1173,12 +1173,12 @@
         { "eventType": "^(?:Execution|ProcessCreation)$", "description": "^(?=.*\\b(?:iex|invoke-expression)\\b).*(?:\\b{{list:downloadCradle}}|\\b(?:curl|wget)(?:\\.exe)?\\s)" },
         { "eventType": "^(?:Execution|ProcessCreation)$", "description": "\\b{{list:downloadCradle}}|\\b(?:curl|wget)(?:\\.exe)?\\s", "details": "\\b(?:iex|invoke-expression)\\b" },
         { "eventType": "^(?:Execution|ProcessCreation)$", "details": "\\b{{list:downloadCradle}}|\\b(?:curl|wget)(?:\\.exe)?\\s", "description": "\\b(?:iex|invoke-expression)\\b" },
-        { "source": "^Memory-CommandLine$", "details": "^(?=.*\\b(?:iex|invoke-expression)\\b).*(?:\\b{{list:downloadCradle}}|\\b(?:curl|wget)(?:\\.exe)?\\s)" }
+        { "source": "^Memory-(?:CommandLine|ConsoleHistory)$", "details": "^(?=.*\\b(?:iex|invoke-expression)\\b).*(?:\\b{{list:downloadCradle}}|\\b(?:curl|wget)(?:\\.exe)?\\s)" }
       ],
       "groupBy": "rule",
-      "_anyOf": "High needs a download method and Invoke-Expression (iex) in the same row; a download alone is EXEC-PS-DOWNLOAD-FILE (Medium). Memory-CommandLine rows (a memory dump's command lines) are Snapshot rows, so they have a branch of their own.",
+      "_anyOf": "High needs a download method and Invoke-Expression (iex) in the same row; a download alone is EXEC-PS-DOWNLOAD-FILE (Medium). Memory-CommandLine rows (a memory dump's command lines) and Memory-ConsoleHistory rows (commands typed in its console windows) are Snapshot rows, so they have a branch of their own.",
       "why": "A command downloaded code from the internet and ran it straight away. That pattern is how a lot of malware gets its next stage onto the machine, including fake 'paste this into Run' prompts.",
-      "technical": "A command line, script block, PSReadLine line, Run-dialog entry or process command line read from a memory dump (a Memory-CommandLine row, read by Volatility 3's windows.cmdline or, for a Windows ARM64 dump, by the Windows debugger engine: a Snapshot row at the dump's capture time) with a download method (DownloadString, Invoke-WebRequest/iwr, Invoke-RestMethod/irm, Net.WebClient, curl, ...) and Invoke-Expression (iex).",
+      "technical": "A command line, script block, PSReadLine line, Run-dialog entry, process command line read from a memory dump (a Memory-CommandLine row, read by Volatility 3's windows.cmdline or, for a Windows ARM64 dump, by the Windows debugger engine: a Snapshot row at the dump's capture time) or command typed in a console window and kept in the console host's memory (a Memory-ConsoleHistory row of a Windows ARM64 dump, the command in Args=) with a download method (DownloadString, Invoke-WebRequest/iwr, Invoke-RestMethod/irm, Net.WebClient, curl, ...) and Invoke-Expression (iex).",
       "nextSteps": "Find the URL fetched and what the downloaded code did; check for files, tasks or connections created right after.",
       "falsePositives": "Some package-manager installers (for example Chocolatey's) are started this way.",
       "references": ["MITRE ATT&CK T1059.001", "MITRE ATT&CK T1105", "MITRE ATT&CK T1204.004"],
@@ -1196,12 +1196,12 @@
       "anyOf": [
         { "eventType": "^(?:Execution|ProcessCreation)$", "details": "\\b{{list:downloadCradle}}" },
         { "eventType": "^(?:Execution|ProcessCreation)$", "description": "\\b{{list:downloadCradle}}" },
-        { "source": "^Memory-CommandLine$", "details": "\\b{{list:downloadCradle}}" }
+        { "source": "^Memory-(?:CommandLine|ConsoleHistory)$", "details": "\\b{{list:downloadCradle}}" }
       ],
       "groupBy": "rule",
       "_match": "Rows that also run the download (iex) are EXEC-PS-DOWNLOAD; certutil/bitsadmin with a URL are EXEC-LOLBIN-URL.",
       "why": "A command downloaded a file from the internet with a scripting method. Attackers fetch their tools this way, but so do many admin scripts.",
-      "technical": "A command line, script block, PSReadLine line, Run-dialog entry or process command line read from a memory dump (a Memory-CommandLine row, read by Volatility 3's windows.cmdline or, for a Windows ARM64 dump, by the Windows debugger engine: a Snapshot row at the dump's capture time) with a download method (DownloadString, DownloadFile, Invoke-WebRequest/iwr, Invoke-RestMethod/irm, Net.WebClient, Start-BitsTransfer) and no Invoke-Expression.",
+      "technical": "A command line, script block, PSReadLine line, Run-dialog entry, process command line read from a memory dump (a Memory-CommandLine row, read by Volatility 3's windows.cmdline or, for a Windows ARM64 dump, by the Windows debugger engine: a Snapshot row at the dump's capture time) or command typed in a console window and kept in the console host's memory (a Memory-ConsoleHistory row of a Windows ARM64 dump, the command in Args=) with a download method (DownloadString, DownloadFile, Invoke-WebRequest/iwr, Invoke-RestMethod/irm, Net.WebClient, Start-BitsTransfer) and no Invoke-Expression.",
       "nextSteps": "Find the URL and the file saved, and whether that file then ran.",
       "falsePositives": "Setup, update and monitoring scripts download files routinely.",
       "references": ["MITRE ATT&CK T1105"],
@@ -1216,11 +1216,11 @@
       "anyOf": [
         { "eventType": "^(?:Execution|ProcessCreation)$", "description": "\\b(?:{{list:lolbins}}|msiexec)(?:\\.exe)?\\b[^|\\r\\n]*?\\bhttps?://" },
         { "eventType": "^(?:Execution|ProcessCreation)$", "details": "\\b(?:{{list:lolbins}}|msiexec)(?:\\.exe)?\\b[^|\\r\\n]*?\\bhttps?://" },
-        { "source": "^Memory-CommandLine$", "details": "\\b(?:{{list:lolbins}}|msiexec)(?:\\.exe)?\\b[^|\\r\\n]*?\\bhttps?://" }
+        { "source": "^Memory-(?:CommandLine|ConsoleHistory)$", "details": "\\b(?:{{list:lolbins}}|msiexec)(?:\\.exe)?\\b[^|\\r\\n]*?\\bhttps?://" }
       ],
       "groupBy": "rule",
       "why": "A built-in Windows program such as mshta, rundll32, regsvr32 or certutil was told to load something from a web address. Attackers use these trusted programs to fetch and run code, for example through fake 'press Win+R and paste' prompts.",
-      "technical": "A command line, script block, PSReadLine line, Run-dialog (RunMRU) entry or process command line read from a memory dump (a Memory-CommandLine row, read by Volatility 3's windows.cmdline or, for a Windows ARM64 dump, by the Windows debugger engine: a Snapshot row at the dump's capture time) in which a LOLBin (mshta, rundll32, regsvr32, certutil, bitsadmin, msiexec and others in the lolbins list) is followed by an http(s) URL. rundll32 url.dll/ieframe.dll URL handlers, which open links in the browser, are left out.",
+      "technical": "A command line, script block, PSReadLine line, Run-dialog (RunMRU) entry, process command line read from a memory dump (a Memory-CommandLine row, read by Volatility 3's windows.cmdline or, for a Windows ARM64 dump, by the Windows debugger engine: a Snapshot row at the dump's capture time) or command typed in a console window and kept in the console host's memory (a Memory-ConsoleHistory row of a Windows ARM64 dump, the command in Args=) in which a LOLBin (mshta, rundll32, regsvr32, certutil, bitsadmin, msiexec and others in the lolbins list) is followed by an http(s) URL. rundll32 url.dll/ieframe.dll URL handlers, which open links in the browser, are left out.",
       "nextSteps": "Find the URL and what it served, and look for processes, files and connections right after.",
       "falsePositives": "Some installers run msiexec or certutil against a vendor URL.",
       "references": ["MITRE ATT&CK T1218", "MITRE ATT&CK T1105", "MITRE ATT&CK T1204.004"],
@@ -1236,12 +1236,12 @@
         { "eventType": "^(?:Execution|ProcessCreation|Snapshot)$", "details": "{{list:amsiBypass}}" },
         { "eventType": "^(?:Execution|ProcessCreation)$", "details": "\\b{{list:credTools}}" },
         { "eventType": "^(?:Execution|ProcessCreation)$", "description": "\\b{{list:credTools}}" },
-        { "source": "^Memory-CommandLine$", "details": "\\b{{list:credTools}}" }
+        { "source": "^Memory-(?:CommandLine|ConsoleHistory)$", "details": "\\b{{list:credTools}}" }
       ],
       "groupBy": "rule",
-      "_anyOf": "The amsiBypass list is used ONCE in this file: Defender's AMSI can block a second expansion of it. So its branch takes every Snapshot row (memory-dump command lines, and also a task, service or startup command listed at collection time) instead of having a Memory-CommandLine branch of its own.",
+      "_anyOf": "The amsiBypass list is used ONCE in this file: Defender's AMSI can block a second expansion of it. So its branch takes every Snapshot row (memory-dump command lines and console history, and also a task, service or startup command listed at collection time) instead of having a Memory-CommandLine or Memory-ConsoleHistory branch of its own.",
       "why": "A command was seen that disables antivirus script scanning, or that steals passwords from memory. Both are strong signs of an attack rather than administration.",
-      "technical": "A command line (4688, Sysmon 1), script block, command history entry or process command line read from a memory dump (a Memory-CommandLine row, read by Volatility 3's windows.cmdline or, for a Windows ARM64 dump, by the Windows debugger engine: a Snapshot row at the dump's capture time) matching a known AMSI-bypass pattern or a known credential-dumping function. An AMSI-bypass pattern in a command listed at collection time (a task, service or startup entry: a Snapshot row) is flagged too. Sysmon image-load rows are not checked: loading a DLL is not a command.",
+      "technical": "A command line (4688, Sysmon 1), script block, command history entry, process command line read from a memory dump (a Memory-CommandLine row, read by Volatility 3's windows.cmdline or, for a Windows ARM64 dump, by the Windows debugger engine: a Snapshot row at the dump's capture time) or command typed in a console window and kept in the console host's memory (a Memory-ConsoleHistory row of a Windows ARM64 dump, the command in Args=) matching a known AMSI-bypass pattern or a known credential-dumping function. An AMSI-bypass pattern in a command listed at collection time (a task, service or startup entry: a Snapshot row) is flagged too. Sysmon image-load rows are not checked: loading a DLL is not a command.",
       "nextSteps": "Read the full command, and check for antivirus detections or credential access around the same time.",
       "falsePositives": "Offensive-security training and red-team material contain these patterns.",
       "references": ["MITRE ATT&CK T1562.001", "MITRE ATT&CK T1003"],
@@ -1256,11 +1256,11 @@
       "anyOf": [
         { "eventType": "^(?:Execution|ProcessCreation)$", "details": "\\b(?:Set|Add)-MpPreference\\b[^|\\r\\n]*?-(?:Disable\\w+(?::|\\s+)\\$?(?:true|1)\\b|Exclusion(?:Path|Process|Extension|IpAddress)\\b)" },
         { "eventType": "^(?:Execution|ProcessCreation)$", "description": "\\b(?:Set|Add)-MpPreference\\b[^|\\r\\n]*?-(?:Disable\\w+(?::|\\s+)\\$?(?:true|1)\\b|Exclusion(?:Path|Process|Extension|IpAddress)\\b)" },
-        { "source": "^Memory-CommandLine$", "details": "\\b(?:Set|Add)-MpPreference\\b[^|\\r\\n]*?-(?:Disable\\w+(?::|\\s+)\\$?(?:true|1)\\b|Exclusion(?:Path|Process|Extension|IpAddress)\\b)" }
+        { "source": "^Memory-(?:CommandLine|ConsoleHistory)$", "details": "\\b(?:Set|Add)-MpPreference\\b[^|\\r\\n]*?-(?:Disable\\w+(?::|\\s+)\\$?(?:true|1)\\b|Exclusion(?:Path|Process|Extension|IpAddress)\\b)" }
       ],
       "groupBy": "rule",
       "why": "A command was seen that switches off Microsoft Defender protection or tells it to ignore a folder, program or file type. Attackers do this right before running their tools.",
-      "technical": "Set-MpPreference or Add-MpPreference with a -Disable... switch set to true, or with an -Exclusion... parameter, in a command line, script block, command history or process command line read from a memory dump (a Memory-CommandLine row, read by Volatility 3's windows.cmdline or, for a Windows ARM64 dump, by the Windows debugger engine: a Snapshot row at the dump's capture time).",
+      "technical": "Set-MpPreference or Add-MpPreference with a -Disable... switch set to true, or with an -Exclusion... parameter, in a command line, script block, command history, process command line read from a memory dump (a Memory-CommandLine row, read by Volatility 3's windows.cmdline or, for a Windows ARM64 dump, by the Windows debugger engine: a Snapshot row at the dump's capture time) or command typed in a console window and kept in the console host's memory (a Memory-ConsoleHistory row of a Windows ARM64 dump, the command in Args=).",
       "nextSteps": "Read the full command and who ran it, and check the matching Defender configuration events (5001, 5007) and what ran afterwards.",
       "falsePositives": "Deployment and developer scripts add exclusions; the triage collector adds one for its own output folder while it runs (that script block may be logged).",
       "references": ["MITRE ATT&CK T1562.001"],

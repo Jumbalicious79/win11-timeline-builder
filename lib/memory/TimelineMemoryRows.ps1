@@ -293,11 +293,35 @@ function Add-DbgEngRunValueRows {
 
 # --- WP5: console command history (item h) -----------------------------------------------
 
-# Memory-ConsoleHistory rows. Not built yet.
+# Memory-ConsoleHistory rows: one Snapshot row at the capture time per
+# command of a console host's history (lib\memory\TimelineDbgEng.Console.ps1;
+# a command has no time of its own). Description "Console command in memory:
+# <program> (conhost PID: n)"; Details "PID=<console host> |
+# ProcessCreated=<its create time> | App=<program> | ClientPID=<n or empty> |
+# Index=<0 = oldest> | HistoryCount=n | FoundBy=ConsoleHistoryList |
+# Args=<command>": the command last, so text typed in it (which may hold
+# " | Key=") never comes before the console host's own PID= and
+# ProcessCreated=, by which the findings report leaves the collector's own
+# console out. The User column: the console host's token SID. An entry
+# without a command adds no row.
 function Add-DbgEngConsoleRows {
     param([object[]]$Entries, [string]$Source, [datetime]$CaptureTimeUtc, [datetime]$AcquisitionEndUtc, [string]$DumpPath)
-    $null = $Entries, $Source, $CaptureTimeUtc, $AcquisitionEndUtc, $DumpPath
-    return (New-DbgEngRowCounts)
+    $snapshot = 0
+    foreach ($entry in @($Entries)) {
+        if ($null -eq $entry) { continue }
+        $command = [string]$entry.Command
+        if (-not $command) { continue }
+        $app = [string]$entry.App
+        $appText = if ($app) { $app } else { "unknown program" }
+        $details = Format-DbgEngDetails ([ordered]@{
+                PID = [string]$entry.PID; ProcessCreated = [string]$entry.ProcessCreated; App = $app; ClientPID = [string]$entry.ClientPID
+                Index = [string]$entry.Index; HistoryCount = [string]$entry.HistoryCount; FoundBy = [string]$entry.FoundBy; Args = $command
+            })
+        $null = Add-DbgEngEntryRow -Source $Source -EventType "Snapshot" -Description "Console command in memory: $appText (conhost PID: $($entry.PID))" -User ([string]$entry.User) `
+            -Details $details -Time "" -CaptureTimeUtc $CaptureTimeUtc -AcquisitionEndUtc $AcquisitionEndUtc -DumpPath $DumpPath
+        $snapshot++
+    }
+    return (New-DbgEngRowCounts -Snapshot $snapshot)
 }
 
 # --- WP6: network connections (item i) ----------------------------------------------------

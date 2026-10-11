@@ -2295,7 +2295,49 @@ of WinDbg -- instead:
         values, the Services key; Source Memory-Registry. SAM and SECURITY
         are listed by name only, never read. Not built yet.
       Console history (Console): commands typed in console windows; Source
-        Memory-ConsoleHistory. Not built yet.
+        Memory-ConsoleHistory (lib\memory\TimelineDbgEng.Console.ps1).
+        Every console host (conhost.exe, and OpenConsole.exe) keeps one
+        command history per program that used the console window: what
+        was typed at a cmd.exe prompt, an answer to "set /p", a line read
+        by any console program. Commands typed at a PowerShell prompt are
+        not kept there (PSReadLine keeps them, and the builder reads its
+        ConsoleHost_history.txt), nor is the text shown in the window.
+        No symbol file describes these structures: their layout is that of
+        Microsoft's open-source console code (github.com/microsoft/terminal,
+        src\host\history.h and src\server\ProcessHandle.h), confirmed on
+        Windows 11 ARM64 dumps. The list is found in the console host's
+        writable image data (the image base from the process's PEB, the
+        PE section table) and taken only when its nodes form a closed ring
+        with consistent back links and plausible histories. A console host
+        whose image header or PEB is not in the dump gets the list's offset
+        (and image base) from another console host, checked the same way.
+        When no console host whose data is all in the dump has such a list,
+        the area is not read ("the console's command history was not found
+        where this Windows version is known to keep it"), never wrong rows.
+        One Snapshot row per command at the dump's capture time (a command
+        has no time of its own):
+          Console command in memory: <program> (conhost PID: <n>)
+          PID=<console host> | ProcessCreated=<its create time> |
+          App=<program the command was typed into> | ClientPID=<its
+          process ID, or empty> | Index=<0 = oldest> | HistoryCount=<n> |
+          FoundBy=ConsoleHistoryList | Args=<the command>
+        The User column is the console host's token SID (when the process
+        users are read). ClientPID is given only while the program is
+        attached to the console and is a process of the dump with that
+        program name. The command comes last, so text typed in it never
+        stands before the console host's own PID= and ProcessCreated=, by
+        which the findings report leaves the collector's own console out
+        (option C). The log line counts the console hosts, lists,
+        histories, attached and confirmed clients and commands, and what
+        was not in the dump; a console host whose history was not in the
+        dump (paged out, or the console had closed) makes the area partly
+        read, with a "Memory dump coverage" note. About 0.1 s for an 8 GB
+        dump. The command-content rules (EXEC-PS-ENCODED,
+        EXEC-PS-DOWNLOAD, EXEC-PS-DOWNLOAD-FILE, EXEC-LOLBIN-URL,
+        EXEC-PS-AMSI-CRED, EXEC-DEFENDER-TAMPER-CMD) read these rows as
+        they read the memory command lines; the rules that key on program
+        names and paths (EXEC-STAGING, EXEC-HACKTOOL-RAN, INITIAL-EMAIL-*)
+        do not.
       Services (Services): the service control manager's list, as
         Volatility's windows.svcscan; Source Memory-Services. Not built yet.
       Network connections (Network): TCP connections, listeners and UDP
@@ -3611,6 +3653,21 @@ parsing is skipped, and the timeline CSV can be opened manually.
   tests\MemoryTestKit.ps1 (no dump in CI). While an area is not built yet,
   its test checks only that the area reports "not read (not built yet)" and
   that its rows functions add no rows.
+  Test-MemoryConsole.ps1 builds console hosts in a sparse memory map as
+  Microsoft's console code lays them out (a PE section table, the list of
+  histories in the writable data, history nodes, strings in place and
+  behind pointers, the record of an attached client) and checks: the
+  commands oldest first, decoys that are not lists left out, a client
+  process ID only when the dump has that process with that program name, a
+  console host without its image header or PEB (the offset and image base
+  from another host), a list page, a command or a whole address space not
+  in the dump (counted, partly read, the note says why), two lists in one
+  host, no list at all (not read), no PEB in the kernel's symbols, no
+  console host, the time limit, OpenConsole.exe; then the E lines read back
+  by the builder, the rows (Snapshot at the capture time, Details with the
+  command last, the report's DetailParser reading the console host's own
+  PID= even when the command holds " | PID="), and the six command-content
+  rules taking Memory-ConsoleHistory rows in report-rules.json.
 
   tests\MemoryTestKit.ps1 -- what these tests share (dot-sourced): it loads
   the helper's and the area files' functions (and with -Builder the
