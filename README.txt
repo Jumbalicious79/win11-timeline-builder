@@ -755,7 +755,12 @@ gets it):
     SID stays in Details as UserSID=<SID>, unless a Details field already
     holds it (for example BAM's SID=, the firewall's ModifyingUser= or a
     scheduled task's UserId=). A SID with no name is left as it is; the
-    log lists such SIDs.
+    log lists such SIDs. For a SID neither of them names, the account name
+    a Windows ARM64 memory dump's logon sessions hold is used (the process
+    rows' LogonAccount=, put in this same form; a SID whose processes name
+    two different accounts gets none), so a run with only -Sources Memory
+    still names the dump's user accounts; the log then has a "User column:
+    N account name(s) from the memory dump's logon sessions" line.
   - The built-in accounts are NT AUTHORITY\SYSTEM (also for SYSTEM,
     LocalSystem and S-1-5-18), NT AUTHORITY\LOCAL SERVICE and NT
     AUTHORITY\NETWORK SERVICE, and Window Manager\DWM-n and Font Driver
@@ -1371,7 +1376,12 @@ once more.
   but they do not catch a variable that hides the folder name
   (%PUBLIC%\x.vbs), a short (8.3) name (\DOWNLO~1\), forward slashes
   (C:/Users/Public/...) or a caret-split cmd path; a run from one of those
-  forms is not flagged.
+  forms is not flagged. On a Windows ARM64 dump, EXEC-STAGING also flags a
+  process row (Memory-Processes) whose ImagePath= -- the kernel's own
+  record of the program file the process was started from, which the
+  process cannot change -- is in one of those folders, keyed by the
+  process name, so its process and command line rows are one lead; its
+  CurrentDirectory= or PebImagePath= in the folder does not count.
 
   Where the shipped rules differ from the rule plan, on purpose:
     - EXEC-STAGING leaves out Temp folders (the plan's R13 lists them):
@@ -2164,7 +2174,9 @@ of WinDbg -- instead:
     is ended after 15 minutes, and the dump is reported as not analyzed.
   - What is read (the same rows as Volatility's plugins, Source
     Memory-Processes and Memory-CommandLine):
-      processes, as windows.pslist: PID, parent PID, name, threads, session
+      processes, as windows.pslist: PID, parent PID, name (the full file
+        name and much more when the ProcessDetails area read them, see
+        "Process users and paths" below), threads, session
         and the exact create time (to 100 ns; the timeline keeps
         milliseconds); exited processes still in the list are listed too
         (Threads=0). System, smss.exe and the other processes without a
@@ -2278,9 +2290,91 @@ of WinDbg -- instead:
       Memory dump coverage: <area> -- <what could not be read>
     The areas, in the order they run (each is described here when it is
     built; until then the log says "not read (not built yet)"):
-      Process users and paths (ProcessDetails): the user, integrity level
-        and elevation of each process from its token, its full program
-        path and current folder. Not built yet.
+      Process users and paths (ProcessDetails; lib\memory\
+        TimelineDbgEng.Tokens.ps1 and TimelineDbgEng.ImagePaths.ps1): for
+        each process, its token and where its program is. No rows of its
+        own: the Memory-Processes and Memory-CommandLine rows get more.
+          The token (EPROCESS.Token), read whole from kernel memory, where
+          a live copy does not change it: its user (the User column of
+          both rows: the SID, which the User pass names, see "User
+          column" above), its integrity level, its elevation and its
+          enabled privileges; the logon session it belongs to gives the
+          account name ("<Authority>\<Account>") and whether it is half of
+          a split token (an administrator's UAC token pair). Only offsets
+          from the kernel's symbol file are used, plus the fixed meaning
+          of a few bits (the token's filtered, UIAccess and LowBox flags,
+          two group attributes and the privilege numbers of the Windows
+          SDK headers). A token is used only when its pointers are kernel
+          addresses, it has at most 1024 groups and its SIDs are SIDs
+          (revision 1, at most 15 sub-authorities); a logon session only
+          when its logon id is the token's. What fails is counted, never
+          guessed.
+          The program: the kernel's own record of the file the process
+          was started from (EPROCESS.SeAuditProcessCreationInfo,
+          "\Device\HarddiskVolume3\Windows\System32\svchost.exe"), the
+          image's file object as a cross-check, and the process's own PEB
+          (its ImagePathName and current folder, in its own memory, which
+          it can change). The volume's device name becomes its drive
+          letter as the processes show it: a process whose PEB path
+          ("C:\...") and kernel path are the same after the drive and the
+          device teaches the pair; a device two drive letters were learned
+          for (or the other way round) keeps its device name. The process
+          name on both rows becomes the full file name (Windows keeps only
+          the first 14 characters in EPROCESS.ImageFileName, and Volatility
+          shows those) when the short name starts the kernel's file name.
+        Memory-Processes rows get, after the fields they had (Threads=,
+        SessionId=, CreateTime=, FoundBy=, TableId=, Anomaly=), each when
+        it was read:
+          Integrity=System|High|Medium|Low|Untrusted (also MediumPlus,
+            Protected, or the RID in hex)
+          Elevation=Default|Full|Limited  Default: no linked token; Full
+            and Limited: the elevated and the filtered half of an
+            administrator's token
+          Elevated=Yes|No  Yes for Full, or Default with the Administrators
+            group enabled (SYSTEM)
+          AdminGroup=Enabled|DenyOnly|Absent (Disabled when the group is
+            there but neither)
+          TokenSession=<n>  LogonId=0x<the token's logon session id>
+          AppContainer=Yes, UIAccess=Yes  only when set
+          Protection=PPL-<signer>|PP-<signer>  a protected process
+            (PPL-Antimalware, PP-WinTcb, ...)
+          Privileges=<the enabled ones of SeDebugPrivilege, SeTcbPrivilege,
+            SeLoadDriverPrivilege, SeCreateTokenPrivilege,
+            SeAssignPrimaryTokenPrivilege, SeBackupPrivilege,
+            SeRestorePrivilege, SeTakeOwnershipPrivilege>  (SeImpersonate
+            is left out: every service has it)
+          LogonAccount=<Authority>\<Account>  ImagePath=<the kernel's
+            program path, with its drive letter>  CurrentDirectory=<path>
+          PebImagePath=<path>  only when the PEB's path differs from
+            ImagePath (a \??\ prefix and case aside): \SystemRoot\ forms,
+            a path through a junction, an 8.3 name
+        Three more Anomaly= tokens, joined with the process scan's:
+          ImageNameChanged  the short name in memory does not start the
+            kernel's file name: a name changed in memory (ASCII names with
+            a program path only; System and the minimal processes are not
+            judged). The row keeps the short name.
+          PebImageNameMismatch  the PEB's file name differs from the
+            kernel's (a folder-only difference, 8.3 names and an
+            unreadable PEB are never judged)
+          SystemChildOfUser  a SYSTEM (or System-integrity) process whose
+            parent, by PPID, is in the dump, was created before it and had
+            not ended, and runs as a user account at Medium or lower
+        Rules: ACCESS-SYSTEM-CHILD-OF-USER (High), INTEG-PROCESS-NAME-
+        CHANGED (High), INTEG-PROCESS-PEB-MISMATCH (Medium), on those
+        tokens, and ACCESS-DEBUG-PRIV-USER (Info, a user account's process
+        with SeDebugPrivilege enabled); EXEC-STAGING also reads ImagePath=.
+        On the three real ARM64 collections the first three had no hit;
+        the Info rule had the collector's own PowerShell and DumpIt (left
+        out where collection_info.json records them) and elevated programs
+        of the computer's user. The collector's processes read as High,
+        Full, elevated.
+        The log: a counts line ("ProcessDetails: processes 195, tokens read
+        195, logon sessions read 195, kernel paths read 192, full names
+        longer than the short name 46, ..., ImageNameChanged 0, ...") and,
+        when something could not be read, the coverage line ("Memory dump
+        coverage: process users and paths -- the PEB of 7 processes could
+        not be read, as when a process has ended or its memory was paged
+        out"). Under a second for an 8 GB dump (0.1-0.2 s measured).
       DLLs (Modules): each process's DLLs from the loader's lists and the
         image mappings, with mapped-but-unlinked ones; Source
         Memory-Modules. Not built yet.
@@ -3603,6 +3697,24 @@ parsing is skipped, and the timeline CSV can be opened manually.
   back by the builder, bad E, AREA and END lines; the builder's process
   merge, User and ExtraDetails on the four Volatility-shaped row kinds,
   the rows of the areas' entries, and the "analyzed with" and coverage texts.
+
+  tests\Test-MemoryTokens.ps1 -- the ProcessDetails area (users and
+  paths of the processes of a Windows ARM64 dump) on synthetic memory
+  through tests\MemoryTestKit.ps1, with the kernel's types as canned "dt -v"
+  output: tokens with their groups, privileges and logon sessions (SYSTEM,
+  the two halves of an administrator's split token, an AppContainer with
+  UIAccess, a protected process), the kernel's and the PEB's program paths,
+  the device-to-drive map (and a device with two drive letters), the three
+  anomalies with their near misses (a reused PID, an elevated parent,
+  non-ASCII and 8.3 names, System, a minimal process, a junction,
+  \SystemRoot\), every guard (no token, a token not in the dump, too many
+  groups, a SID that is not one, a logon session of another logon id, an
+  address space that is gone), the time cap and missing symbols. Then the
+  builder's side: the entries through the protocol onto the process and
+  command line rows (full names, User, the Details fields in their order,
+  anomalies joined), two processes of one PID, and the logon sessions'
+  account names as fallback names for the User column (ProfileList and
+  bam_entries.csv win, a SID with two accounts gets none).
 
   tests\Test-MemoryTokens.ps1, Test-MemoryModules.ps1,
   Test-MemoryKernelObjects.ps1, Test-MemoryRegistry.ps1,

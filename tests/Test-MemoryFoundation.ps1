@@ -301,6 +301,14 @@ $why = $script:DbgEngCompileProblems["Modules"]
     $script:rawPass = New-Object System.IO.MemoryStream
     $realModules = ${function:Invoke-DbgEngModulesArea}; $realPrivate = ${function:Invoke-DbgEngPrivateCodeArea}; $realDrivers = ${function:Invoke-DbgEngDriversArea}
     $realRaw = ${function:Start-DbgEngRawPass}; $realJoins = ${function:Invoke-DbgEngJoins}
+    # The areas this check does not stand in for answer as their stubs did
+    # ("not built yet"): a built area is checked by its own test, and its
+    # real reading needs types this check's stand-in engine does not have
+    $stubbedAreas = @{}
+    foreach ($stubName in @("ProcessDetails", "Handles", "Registry", "Services", "Network")) {
+        $stubbedAreas[$stubName] = (Get-Item -LiteralPath "function:Invoke-DbgEng${stubName}Area").ScriptBlock
+        Set-Item -LiteralPath "function:script:Invoke-DbgEng${stubName}Area" -Value { param($Context, $Area) $null = $Context; $Area.SetNotRead("not built yet") }
+    }
     try {
         ${function:Invoke-DbgEngModulesArea} = { param($Context, $Area) $script:areaOrder.Add("Modules:$($Context.Processes.Count):$($Context.RawPass -ne $null)"); [void]$Area.Add("Module").Set("PID", $Context.Processes[0].Pid).Set("ProcessCreated", $Context.Processes[0].CreatedText); $Area.Coverage.Count("modules", 1); $Area.Coverage.Note("1 process's loader list could not be read") }
         ${function:Invoke-DbgEngPrivateCodeArea} = { param($Context, $Area) $null = $Context; [void]$Area.Add("PrivateCode").Set("PID", "1"); throw "boom: after one entry" }
@@ -313,6 +321,7 @@ $why = $script:DbgEngCompileProblems["Modules"]
     finally {
         ${function:Invoke-DbgEngModulesArea} = $realModules; ${function:Invoke-DbgEngPrivateCodeArea} = $realPrivate; ${function:Invoke-DbgEngDriversArea} = $realDrivers
         ${function:Start-DbgEngRawPass} = $realRaw; ${function:Invoke-DbgEngJoins} = $realJoins
+        foreach ($stubName in @($stubbedAreas.Keys)) { Set-Item -LiteralPath "function:script:Invoke-DbgEng${stubName}Area" -Value $stubbedAreas[$stubName] }
         $script:DbgEngFileProblems = @{}
     }
     $summary = @($run.Areas | ForEach-Object { "$($_.Name)=$($_.State)/$($_.Rows)/$($_.Note)" })

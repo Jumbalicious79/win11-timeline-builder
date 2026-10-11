@@ -224,21 +224,121 @@ function Get-DbgEngCoverageTexts {
 
 # --- WP1: process details (items a and b) ---------------------------------------------
 
-# Sets what the Proc entries say on the process (P) and command line (C)
-# entries before their rows are made: .User (the token's SID), .ExtraDetails
-# (appended to Details), and the full name and anomalies. Not built yet.
+# The fields of a Proc entry (lib\memory\TimelineDbgEng.Tokens.ps1) that go
+# into Details of a Memory-Processes row, in their order: the token's first,
+# then those whose values can hold spaces (Get-DbgEngProcessDetailsText)
+function Get-DbgEngProcessDetailKeys {
+    return @("Integrity", "Elevation", "Elevated", "AdminGroup", "TokenSession", "LogonId", "AppContainer", "UIAccess", "Protection", "Privileges",
+        "LogonAccount", "ImagePath", "CurrentDirectory", "PebImagePath")
+}
+
+# A field of an entry as text ("" when it has none)
+function Get-DbgEngEntryField {
+    param($Entry, [string]$Name)
+    if ($null -eq $Entry -or -not $Entry.PSObject.Properties[$Name]) { return "" }
+    return [string]$Entry.$Name
+}
+
+# What a Proc entry adds to its Memory-Processes row's Details (space style,
+# as the rest of that row): "Integrity=System Elevation=Default ...
+# LogonAccount=<Authority>\<Account> ImagePath=<path> CurrentDirectory=<path>
+# [PebImagePath=<path>]", each field only when the helper read it
+function Get-DbgEngProcessDetailsText {
+    param($Proc)
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($key in @(Get-DbgEngProcessDetailKeys)) {
+        $value = Get-DbgEngEntryField -Entry $Proc -Name $key
+        if ($value) { $parts.Add("$key=$value") }
+    }
+    return ($parts.ToArray() -join " ")
+}
+
+# Sets what the Proc entries say (Merge-DbgEngProcessEntries put each on its
+# P entry as .Proc) on the process (P) and command line (C) entries before
+# their rows are made:
+#   P: .User (the token's user SID), .ExtraDetails (Get-DbgEngProcessDetailsText),
+#      .ImageFileName the full file name (FullName) when the helper read it
+#      (EPROCESS.ImageFileName keeps 14 characters), .Anomaly the scan's
+#      tokens and the helper's (ImageNameChanged, PebImageNameMismatch,
+#      SystemChildOfUser), comma-separated
+#   C: .User and .Process (the full name) of its process: the P entry of the
+#      same PID and short name (several such entries: only when they agree)
+# Entries without a Proc entry are left as they are (Volatility's, a helper
+# whose ProcessDetails area was not read).
 function Set-DbgEngProcessRowFields {
     param([object[]]$Processes, [object[]]$CommandLines)
-    $null = $Processes, $CommandLines
+    $byPid = @{}
+    foreach ($process in @($Processes)) {
+        if ($null -eq $process -or -not $process.PSObject.Properties["Proc"] -or $null -eq $process.Proc) { continue }
+        $proc = $process.Proc
+        $short = [string]$process.ImageFileName
+        $user = (Get-DbgEngEntryField -Entry $proc -Name "User").Trim()
+        $full = Get-DbgEngEntryField -Entry $proc -Name "FullName"
+        if ($user) { $process | Add-Member -NotePropertyName "User" -NotePropertyValue $user -Force }
+        $extra = Get-DbgEngProcessDetailsText -Proc $proc
+        if ($extra) { $process | Add-Member -NotePropertyName "ExtraDetails" -NotePropertyValue $extra -Force }
+        if ($full) { $process.ImageFileName = $full }
+        $added = Get-DbgEngEntryField -Entry $proc -Name "Anomaly"
+        if ($added) {
+            $tokens = New-Object System.Collections.Generic.List[string]
+            foreach ($token in @("$($process.Anomaly)" -split ',') + @($added -split ',')) {
+                $t = $token.Trim()
+                if ($t -and -not $tokens.Contains($t)) { $tokens.Add($t) }
+            }
+            $process | Add-Member -NotePropertyName "Anomaly" -NotePropertyValue ($tokens.ToArray() -join ",") -Force
+        }
+        $key = "$($process.PID)"
+        if (-not $byPid.ContainsKey($key)) { $byPid[$key] = New-Object System.Collections.Generic.List[object] }
+        $byPid[$key].Add([PSCustomObject]@{ Short = $short; Full = $(if ($full) { $full } else { $short }); User = $user })
+    }
+    foreach ($commandLine in @($CommandLines)) {
+        if ($null -eq $commandLine) { continue }
+        $key = "$($commandLine.PID)"
+        if (-not $byPid.ContainsKey($key)) { continue }
+        $same = @($byPid[$key] | Where-Object { $_.Short -ceq [string]$commandLine.Process })
+        if ($same.Count -eq 0) { continue }
+        $fulls = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+        $users = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+        foreach ($candidate in $same) { [void]$fulls.Add($candidate.Full); [void]$users.Add($candidate.User) }
+        if ($fulls.Count -ne 1 -or $users.Count -ne 1) { continue }
+        $commandLine.Process = $same[0].Full
+        if ($same[0].User) { $commandLine | Add-Member -NotePropertyName "User" -NotePropertyValue $same[0].User -Force }
+    }
 }
 
 # Account names the dump's logon sessions hold, registered as fallback
 # names for the User column (Add-TimelineSidName without -ProfileList, so
-# ProfileList and bam still win). -Entries: kind -> entries of this run's
-# dump (empty when none was analyzed). Not built yet.
+# the SOFTWARE hive's ProfileList and bam_entries.csv still win). -Entries:
+# kind -> entries of this run's dump (empty when none was analyzed). A
+# Proc entry gives its token's user SID (User) and its logon session's
+# "<Authority>\<Account>" (LogonAccount), in the User column's one form
+# (ConvertTo-TimelineUserName: the examined computer's own name as the
+# authority is dropped). Only local, domain and Entra ID accounts
+# (S-1-5-21-..., S-1-12-1-...); a SID whose processes name two different
+# accounts is left out (a logon session of another account than the
+# token's user cannot name it).
 function Register-DbgEngLogonNames {
     param([System.Collections.IDictionary]$Entries)
-    $null = $Entries
+    if ($null -eq $Entries -or -not $Entries.Contains("Proc")) { return }
+    $context = Get-TimelineUserContext
+    $machines = @($context.MachineNames)
+    $names = [ordered]@{}
+    foreach ($entry in (ConvertTo-DbgEngEntryArray $Entries["Proc"])) {
+        $sid = (Get-DbgEngEntryField -Entry $entry -Name "User").Trim()
+        $account = (Get-DbgEngEntryField -Entry $entry -Name "LogonAccount").Trim()
+        if (-not $account -or $sid -notmatch '^S-1-(5-21|12-1)(-\d+)+$') { continue }
+        $name = ConvertTo-TimelineUserName -Value $account -SidNames @{} -MachineNames $machines
+        if (-not $name) { continue }
+        if (-not $names.Contains($sid)) { $names[$sid] = $name }
+        elseif ($names[$sid] -cne $name) { $names[$sid] = "" }
+    }
+    $used = 0
+    foreach ($sid in @($names.Keys)) {
+        if (-not $names[$sid]) { continue }
+        if (-not $context.ProfileSids.ContainsKey($sid) -and -not $context.BamSids.ContainsKey($sid)) { $used++ }
+        Add-TimelineSidName -Sid $sid -Name $names[$sid]
+    }
+    if ($used -gt 0) { Log "  User column: $used account name(s) from the memory dump's logon sessions, for SIDs that ProfileList and bam_entries.csv do not name" }
 }
 
 # --- WP2: DLLs and executable private memory (items c and f) ---------------------------
