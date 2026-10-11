@@ -878,7 +878,8 @@ once more.
                            description and details, user -- at most 15 on
                            the card: the rows that raised the severity and
                            the earliest ("Showing 15 of the 59 rows of this
-                           lead" when there are more). findings.csv and the
+                           lead" when there are more; the latest for a rule
+                           with "evidence": "latest"). findings.csv and the
                            Findings sheet list up to the rule's limit
                            (maxEvidence), and the Finding column tags all
     In Excel: ...          where to find every row of the finding
@@ -1030,6 +1031,7 @@ once more.
         "why": "...", "technical": "...", "nextSteps": "...",
         "falsePositives": "...", "references": ["MITRE ATT&CK T1204.002"],
         "maxEvidence": 40,                     evidence rows listed (25)
+        "evidence": "latest",                  which rows ("earliest")
         "maxFindings": 5,                      separate leads at most (20)
         "activityTime": false,                 times are file times (true)
         "enabled": true                        false turns the rule off
@@ -1066,6 +1068,12 @@ once more.
   the finding to escalate.severity and is added to its evidence.
   maxEvidence (default 25): the evidence rows findings.csv and the
   Findings sheet list per finding (the card prints at most 15 of them).
+  evidence (default "earliest"): which of the rule's rows those are, after
+  any that raised the severity: "earliest", or "latest" for a rule whose
+  newest rows matter most (FS-WINDOWS-UPDATE lists the latest 40 installs,
+  the ones nearest the collection, not the oldest a long System log still
+  holds). The summary line then says "latest N rows listed", the card
+  prints the latest, and Appendix A's row list ends with the last rows.
   maxFindings (default 20; 0 = no limit): at most this many separate leads
   from the rule. When there are more groups (one per attacking address of
   a password-spraying run, say), the escalated ones and those with the most
@@ -1082,6 +1090,10 @@ once more.
   collector added its own exclusion during the collection", or "... added
   this exclusion": a Defender Exclusions key's last-write time); a lead
   with only such rows is also not flagged as from during the collection.
+  Only a Registry-DefenderExclusions row whose last Details field is the
+  builder's Time= note counts: the same words anywhere else (an exclusion
+  path, a service's image path, a command line) are text whoever made that
+  data chose, and change nothing.
   Members whose names start with "_", and "comment" and "notes", are
   comments. Any other unknown member, a bad regular expression or an
   unknown list stops the report with an error that names the rule and the
@@ -1096,9 +1108,13 @@ once more.
       on the finding and in the log but never flagged. The collector's own
       temporary Defender exclusion of its output folder
       (TriageCollection_<date>_<time>) is allowlisted this way when it is
-      added or removed (Defender Operational 5007, MPLog, and the
-      registry row the builder labels); an exclusion of such a folder that
-      is still in effect after a collection is listed.
+      added or removed (Defender Operational 5007, MPLog); the registry
+      row the builder labels as the collector's own is a Snapshot row,
+      which the antivirus-exclusion rules do not match. An exclusion of
+      such a folder that is still in effect after a collection is listed,
+      also the collector's own when collection_log.txt says it could not
+      remove it. No allowlist entry matches a free piece of text such as
+      "triage collector": an exclusion's path is chosen by whoever adds it.
     - A rule you don't want: "enabled": false.
     - A noisy rule: narrow its match, add a threshold, group it differently
       or lower its severity. Keep your copy of the file outside the
@@ -1141,8 +1157,18 @@ once more.
       not on a timeline from an older builder, which has no such details
       and is counted by the extension lists alone. .lock counts (some
       ransomware appends it; git renames its lock files away from .lock).
+      Not counted either: a rename that only drops a temporary suffix
+      (ExtChanged=removed: a finished download "photo.jpg.part" ->
+      "photo.jpg", ExifTool's "IMG.JPG_exiftool_tmp" -> "IMG.JPG", a sync
+      tool's or editor's atomic save), and ExifTool's backups
+      ("<name>.<ext>_original", made for every file it edits). The
+      trade-off: ransomware that writes "<name>.<new ext>.tmp" and then
+      drops ".tmp" is missed, and so is ransomware that gives each file a
+      different extension (each extension is its own group).
       FS-WINDOWS-UPDATE (Info) lists the Windows updates installed, for
-      comparing times.
+      comparing times: the latest 40 (evidence "latest"), so the ones
+      nearest the collection are listed also when the System log holds
+      more.
     - Not expressible with the current rule engine, so not flagged: a
       task deleted soon after it was created (R7), a timestomped file that
       also ran (R14 High), a security service stop "near a finding" (R15:
@@ -1653,8 +1679,13 @@ Parses $UsnJrnl_$J.txt exported by the triage collector:
     Details get what the file was renamed from and whether the extension
     or the folder changed:
         Reason=Rename: new name | ExtChanged=yes | Moved=no | From=report.docx
-    ExtChanged: the text after the last dot differs (case does not count;
-    "notes" -> "notes.txt" and "HEAD.lock" -> "HEAD" count as changed).
+    ExtChanged: "yes" when the text after the last dot differs (case does
+    not count; "notes" -> "notes.txt" counts as changed); "removed" when
+    the change only dropped a suffix that followed a "." or "_" (the old
+    name is the new one plus that suffix: "photo.jpg.part" -> "photo.jpg",
+    "IMG.JPG_exiftool_tmp" -> "IMG.JPG", "HEAD.lock" -> "HEAD"), as a
+    finished download or an atomic save does ("q.docx.ZXCRYT" ->
+    "q.docx.ZXCRY" has no separator and stays "yes"); "no" otherwise.
     Moved: the parent folder's File ID changed. A rename whose old-name
     record is older than the journal, or a USN text export without the
     File ID columns, keeps only Reason=. The descriptions are unchanged.
@@ -2578,7 +2609,10 @@ parsing is skipped, and the timeline CSV can be opened manually.
                other device paths) and usb_storage_devices.csv
     usn\       UsnJournal -- a synthetic fsutil export: renames paired by
                File ID (an appended, swapped, added and removed extension,
-               a servicing move to another folder, a file renamed twice, a
+               a dropped temporary suffix after a "." or "_" -- ".part",
+               "_exiftool_tmp", ".lock": ExtChanged=removed -- and a
+               shortened extension with no separator, still "yes", a
+               servicing move to another folder, a file renamed twice, a
                case-only change, interleaved records), a rename whose
                old-name record is missing, and a line without the File ID
                columns
@@ -2934,10 +2968,16 @@ parsing is skipped, and the timeline CSV can be opened manually.
   one short phrase and does not say the dump exists (it may not have been
   found). threshold.distinct counts distinct values (records of one file
   once; a row without the value on its own) and lists each value once in
-  the evidence first. A Defender Exclusions row whose time the collector
+  the evidence first. "evidence": "latest" lists the latest rows after the
+  one that raised the severity, and findings.csv says "latest N rows
+  listed"; with the shipped rules, FS-WINDOWS-UPDATE lists the newest of
+  52 installs and not the oldest; an unknown "evidence" value is a
+  rules-file error. A Defender Exclusions row whose time the collector
   caused must not set a lead's last time or the flagged-activity window;
   a lead with only such rows keeps them, is not dated by activity and is
-  not "during the collection". A lead seen only in
+  not "during the collection". The collector's words in an exclusion
+  path, in a service's image path or on a row of another source must not
+  do that: such a lead stays dated by its own time and in the window. A lead seen only in
   Snapshot rows from during the collection (a task listed then) must be
   CapturedDuringCollection, not DuringCollection; a lead whose rows all
   come from the memory dump must be MemoryOnly, never
@@ -2960,7 +3000,13 @@ parsing is skipped, and the timeline CSV can be opened manually.
   Moved= details: Windows servicing bursts that must not count as
   ransomware -- hash-named WinSxS temporary names, same-name .dll moves,
   .cdf-ms transacted renames, files moved or renamed with their extension,
-  34 files written as 102 records -- and ransomware bursts that must, with
+  34 files written as 102 records -- other bulk renames that must not
+  either -- ExifTool's "<name>.<ext>_original" backups, finished downloads
+  ("photo.jpg.part" -> "photo.jpg") and temporary copies made permanent
+  ("_exiftool_tmp" dropped), both ExtChanged=removed -- the triage
+  collector's own temporary exclusion (a Snapshot row) not flagged, while
+  its exclusion left in place after a collection and a path that merely
+  contains "Triage Collector" are -- and ransomware bursts that must, with
   an appended, swapped, 16-character or .lock extension, also from an
   older timeline), each tagged with the
   rules it must (HIT) or must not (MISS) trigger, or with KEY <rule>

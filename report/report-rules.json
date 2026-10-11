@@ -15,7 +15,8 @@
     "stagingExec": ["\\Downloads\\", "\\Users\\Public\\", "\\PerfLogs\\", "\\$Recycle.Bin\\"],
     "execExt": [".exe", ".scr", ".com", ".pif", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".jse", ".wsf", ".hta"],
     "downloadRiskyExt": [".scr", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".jse", ".wsf", ".hta", ".iso", ".img", ".vhd", ".vhdx", ".lnk", ".one", ".jar"],
-    "benignRenameExt": ["tmp", "temp", "log", "journal", "txt", "json", "xml", "dat", "bak", "old", "part", "partial", "crdownload", "download", "ps1", "psm1", "psd1", "yml", "yaml", "md", "ini", "db", "etl", "odl", "wer", "cache", "pyc", "map", "bin", "dll", "exe", "sys", "drv", "ocx", "cpl", "efi", "mui", "mun", "cat", "mum", "manifest", "cdf-ms", "inf", "pnf", "ps1xml", "cdxml", "tlb", "winmd", "msi", "msp", "cab", "nls"],    "emailOrigins": ["Content.Outlook", "\\Olk\\Attachments"],
+    "benignRenameExt": ["tmp", "temp", "log", "journal", "txt", "json", "xml", "dat", "bak", "old", "part", "partial", "crdownload", "download", "ps1", "psm1", "psd1", "yml", "yaml", "md", "ini", "db", "etl", "odl", "wer", "cache", "pyc", "map", "bin", "dll", "exe", "sys", "drv", "ocx", "cpl", "efi", "mui", "mun", "cat", "mum", "manifest", "cdf-ms", "inf", "pnf", "ps1xml", "cdxml", "tlb", "winmd", "msi", "msp", "cab", "nls"],
+    "emailOrigins": ["Content.Outlook", "\\Olk\\Attachments"],
     "securityServiceNames": ["Microsoft Defender", "Windows Defender", "Windows Security", "Security Center", "Sysmon", "CrowdStrike", "SentinelOne", "Sentinel Agent", "Carbon Black", "Cb Defense", "Cylance", "Cortex XDR", "Sophos", "Symantec", "Trellix", "McAfee", "ESET", "Kaspersky", "Bitdefender", "Malwarebytes", "Trend Micro", "Webroot", "Elastic Agent", "Elastic Endpoint", "Tanium", "Huntress"],
     "securityServiceKeys": ["WinDefend", "Sense", "WdNisSvc", "WdFilter", "WdBoot", "SecurityHealthService", "wscsvc", "mpssvc", "Sysmon", "Sysmon64", "CSFalconService", "CSAgent", "SentinelAgent", "CbDefense", "CylanceSvc", "cyserver", "SAVService", "SepMasterService", "ekrn", "AVP", "MBAMService", "xagt", "TaniumClient", "elastic-agent", "ElasticEndpoint"]
   },
@@ -1176,18 +1177,18 @@
       "title": "Many files were renamed to one extension at once: {{group}}",
       "category": "FileSystem",
       "severity": "High",
-      "match": { "source": "^UsnJournal$", "description": "^USN renamed to: (?![0-9a-f]{32}_|\\$\\$).*(?<key>\\.[A-Za-z0-9_-]{2,24})$", "notDescription": "\\.(?:{{list:benignRenameExt}})$" },
+      "match": { "source": "^UsnJournal$", "description": "^USN renamed to: (?![0-9a-f]{32}_|\\$\\$).*(?<key>\\.[A-Za-z0-9_-]{2,24})$", "notDescription": "\\.(?:{{list:benignRenameExt}})$|_original$" },
       "anyOf": [
         { "details": "^Reason=[^=]* \\| ExtChanged=yes \\| Moved=no \\| From=" },
-        { "notDetails": " \\| ExtChanged=(?:yes|no) \\| Moved=(?:yes|no) \\| From=" }
+        { "notDetails": " \\| ExtChanged=(?:yes|no|removed) \\| Moved=(?:yes|no) \\| From=" }
       ],
-      "_match": "A Windows update (TrustedInstaller/TiWorker) moves thousands of system files through WinSxS\\Temp (InFlight, PendingDeletes), CbsTemp and WinSxS\\FileMaps within seconds. Those renames keep the file's own extension (.dll, .exe, .cat, .ps1xml, .cdf-ms, ...: benignRenameExt) or use the servicing stack's temporary names (<32 hex>_<name>, $$<name>), so they are not counted. Ransomware renames to one new extension of its own. The key is the new extension with its dot, up to 24 characters (some families use long ones). 'lock' is not in benignRenameExt: some ransomware appends .lock, while git renames its lock files away from .lock (two real journals had 0 renames to .lock and 66 from it).",
-      "_anyOf": "The builder pairs each rename's old-name and new-name USN records by File ID and adds ' | ExtChanged=yes|no | Moved=yes|no | From=<old name>' to the new-name rows. Counted: renames in the same folder that changed the extension (appended, swapped or added). Rows without those details (a timeline from an older builder, or a rename whose old-name record is older than the journal) are counted by the extension lists alone. From= comes last and [^=]* cannot pass an '=', so a file name cannot fake the flags.",
+      "_match": "A Windows update (TrustedInstaller/TiWorker) moves thousands of system files through WinSxS\\Temp (InFlight, PendingDeletes), CbsTemp and WinSxS\\FileMaps within seconds. Those renames keep the file's own extension (.dll, .exe, .cat, .ps1xml, .cdf-ms, ...: benignRenameExt) or use the servicing stack's temporary names (<32 hex>_<name>, $$<name>), so they are not counted. Nor are ExifTool's backups: it renames every file it edits to '<name>.<ext>_original' (_original$). Ransomware renames to one new extension of its own. The key is the new extension with its dot, up to 24 characters (some families use long ones). 'lock' is not in benignRenameExt: some ransomware appends .lock, while git renames its lock files away from .lock (two real journals had 0 renames to .lock and 66 from it).",
+      "_anyOf": "The builder pairs each rename's old-name and new-name USN records by File ID and adds ' | ExtChanged=yes|no|removed | Moved=yes|no | From=<old name>' to the new-name rows. Counted: renames in the same folder that appended, swapped or added an extension (ExtChanged=yes). Not counted: renames that only drop a suffix after a '.' or '_' (ExtChanged=removed: 'photo.jpg.part' -> 'photo.jpg', 'IMG.JPG_exiftool_tmp' -> 'IMG.JPG', 'x.NEF.xmp.Ab12Cd' -> 'x.NEF.xmp'), as finished downloads, sync tools and atomic saves do; the trade-off is that ransomware writing '<name>.<new ext>.tmp' and then dropping '.tmp' is missed. Rows without those details (a timeline from an older builder, or a rename whose old-name record is older than the journal) are counted by the extension lists alone. From= comes last and [^=]* cannot pass an '=', so a file name cannot fake the flags.",
       "groupBy": "capture",
       "threshold": { "count": 50, "windowMinutes": 10, "distinct": "description" },
       "_threshold": "Files, not USN records: a rename writes two or three 'renamed to' records ('Rename: new name', with 'Security change', and '| Close'), all with the same description, so each new name counts once.",
       "why": "A large number of files were renamed to the same new extension in a few minutes. That is what ransomware does as it encrypts files.",
-      "technical": "50 or more files renamed to one new extension within ten minutes, each file counted once (by its new name; a rename writes two or three USN records). Counted: renames in the same folder that changed the extension (ExtChanged=yes and Moved=no in Details); on a timeline from an older builder, which has no such details, every rename to that extension. Not counted: renames to temporary, log and backup extensions or to Windows binary and servicing file types (.dll, .exe, .sys, .cat, .mum, .manifest, .cdf-ms, .mui, ...), and the Windows servicing stack's temporary names (<32 hex digits>_<name>, $$<name>): a Windows update renames and moves thousands of those in seconds.",
+      "technical": "50 or more files renamed to one new extension within ten minutes, each file counted once (by its new name; a rename writes two or three USN records). Counted: renames in the same folder that appended, swapped or added an extension (ExtChanged=yes and Moved=no in Details); on a timeline from an older builder, which has no such details, every rename to that extension. Not counted: renames that only drop a temporary suffix (ExtChanged=removed, such as a finished download 'photo.jpg.part' -> 'photo.jpg'), ExifTool's backups (<name>.<ext>_original), renames to temporary, log and backup extensions or to Windows binary and servicing file types (.dll, .exe, .sys, .cat, .mum, .manifest, .cdf-ms, .mui, ...), and the Windows servicing stack's temporary names (<32 hex digits>_<name>, $$<name>): a Windows update renames and moves thousands of those in seconds.",
       "nextSteps": "Check the old names (From= in Details) and the folders affected, and look for the program that did the renaming and any ransom note.",
       "falsePositives": "Bulk file conversions, backups and some software updates can rename many files. Compare the time with Windows Update installs (System log: 'Windows Update installation started' and 'Windows Update installed' rows, WindowsUpdateClient 43 and 19) and TrustedInstaller/TiWorker runs.",
       "references": ["MITRE ATT&CK T1486"],
@@ -1202,10 +1203,12 @@
       "groupBy": "rule",
       "_match": "Context for file-system leads, never a lead: WindowsUpdateClient 19 (installed) for updates with a KB number. Defender's security intelligence updates (several a day) and Microsoft Store app updates (no KB number) are left out; installation started (43), failed (20) and download (44) rows stay in the timeline.",
       "why": "Windows Update installed updates in this period. While an update installs, Windows renames, moves and replaces thousands of system files and restarts, so file-system activity at those times may be the update.",
-      "technical": "System log, Microsoft-Windows-WindowsUpdateClient event 19 (installed) for updates with a KB number, other than Defender's security intelligence updates. The timeline also has the installation started (43), failed (20) and download started (44) rows.",
+      "technical": "System log, Microsoft-Windows-WindowsUpdateClient event 19 (installed) for updates with a KB number, other than Defender's security intelligence updates. The latest 40 installs are listed (the ones nearest the collection); the Finding column of the Timeline sheet tags them all. The timeline also has the installation started (43), failed (20) and download started (44) rows.",
       "nextSteps": "Compare the times of file-system leads (many files renamed at once, for example) with these installs, the 'installation started' row before each and the restart after it.",
       "falsePositives": "Context only, not a lead.",
-      "maxEvidence": 40
+      "maxEvidence": 40,
+      "evidence": "latest",
+      "_evidence": "A System log keeps months of installs (monthly cumulative, .NET, Defender platform and MSRT updates pass 40 in under a year); the ones that explain file-system activity are the newest, so the latest rows are listed, not the earliest."
     },
     {
       "id": "FS-LSASS-DUMP",
@@ -1236,17 +1239,8 @@
       "maxEvidence": 20
     }
   ],
+  "_allowlist": "The triage collector's own temporary exclusion in the registry needs no entry: the builder writes it as a Snapshot row, which the AV-EXCLUSION rules (SecurityAlert rows) do not match. Its row is a SecurityAlert only when collection_log.txt says the collector could not remove the exclusion, and that one is listed. No entry matches a free substring such as 'triage collector': an exclusion path is chosen by whoever adds it.",
   "allowlist": [
-    {
-      "ruleId": "AV-EXCLUSION",
-      "match": { "description": "triage collector" },
-      "reason": "The triage collector adds a temporary Defender exclusion for its own output folder while it runs; the builder labels its registry row, so it is not attacker activity."
-    },
-    {
-      "ruleId": "AV-EXCLUSION-HIGH",
-      "match": { "description": "triage collector" },
-      "reason": "The triage collector's own labelled temporary exclusion is not attacker activity."
-    },
     {
       "ruleId": "AV-EXCLUSION",
       "match": { "description": "^Defender exclusion (?:added|removed|changed) \\((?:Paths?|TemporaryPaths)\\): .*\\\\TriageCollection_\\d{4}-\\d{2}-\\d{2}_\\d{2}-\\d{2}\\\\?$" },

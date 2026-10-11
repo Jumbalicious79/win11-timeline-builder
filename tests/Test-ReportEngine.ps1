@@ -429,7 +429,27 @@ try {
     $exclusionModel = New-ReportModel -Rows $exclusionRows -Findings $exclusionLeads -CollectionInfo $exclusionInfo
     Assert-Equal "$(Format-TestUtc $exclusionModel.LeadSpan.FirstUtc)|$(Format-TestUtc $exclusionModel.LeadSpan.LastUtc)|$($exclusionModel.LeadSpan.FileTimeLeads)" "2026-05-01 10:00:00|2026-05-02 09:00:00|1" -Message "the flagged-activity window does not reach the collector's own key write at the collection start"
     $collectorOwn = "Type=Paths | Exclusion=D:\TriageCollection_2026-05-09_07-00 | Time=Exclusions\Paths key last write (when the triage collector added this exclusion)"
-    Assert-Equal "$([TimelineReport.Engine]::IsCollectorCausedTime($collectorOwn))|$([TimelineReport.Engine]::IsCollectorCausedTime($collectorNote))|$([TimelineReport.Engine]::IsCollectorCausedTime('Time=Exclusions\Paths key last write (key last changed; this exclusion may be older)'))" "True|True|False" -Message "IsCollectorCausedTime: the collector's own exclusion row and the rows it re-dated, not a plain key last write"
+    $exclusionSource = "Registry-DefenderExclusions"
+    Assert-Equal "$([TimelineReport.Engine]::IsCollectorCausedTime($exclusionSource, $collectorOwn))|$([TimelineReport.Engine]::IsCollectorCausedTime($exclusionSource, "Type=Paths | Exclusion=C:\Tools | $collectorNote"))|$([TimelineReport.Engine]::IsCollectorCausedTime($exclusionSource, 'Type=Paths | Exclusion=C:\Tools | Time=Exclusions\Paths key last write (key last changed; this exclusion may be older)'))" "True|True|False" -Message "IsCollectorCausedTime: the collector's own exclusion row and the rows it re-dated, not a plain key last write"
+    # The collector's words only count as the builder writes them: on a
+    # Registry-DefenderExclusions row, in its last Details field (Time=).
+    # Elsewhere they are text whoever made the row's data chose (an
+    # exclusion path, a service's image path, a command line), which must
+    # not take a lead out of the activity window
+    $inPath = "Type=Paths | Exclusion=C:\Drop (when the triage collector added this exclusion) | Time=Exclusions\Paths key last write (key last changed; this exclusion may be older)"
+    $inImagePath = "EventID=7045 | ImagePath=C:\Drop\svc.exe -note ""when the triage collector added this exclusion"" | StartType=demand start"
+    $otherSource = "EventID=5007 | Time=Exclusions\Paths key last write (when the triage collector added this exclusion)"
+    Assert-Equal "$([TimelineReport.Engine]::IsCollectorCausedTime($exclusionSource, $inPath))|$([TimelineReport.Engine]::IsCollectorCausedTime('System.evtx', $inImagePath))|$([TimelineReport.Engine]::IsCollectorCausedTime($exclusionSource, $inImagePath))|$([TimelineReport.Engine]::IsCollectorCausedTime('Microsoft-Windows-Windows Defender%4Operational.evtx', $otherSource))|$([TimelineReport.Engine]::IsCollectorCausedTime($exclusionSource, ''))" "False|False|False|False|False" -Message "IsCollectorCausedTime: the collector's words in an exclusion path, in another field, or on a row of another source are not the builder's time note"
+    $spoofRulesPath = Join-Path $workDir "spoof-rules.json"
+    New-TestTextFile $spoofRulesPath '{ "schemaVersion": 1, "rules": [ { "id": "SVC", "title": "Service {{group}}", "category": "Persistence", "severity": "High", "match": { "description": "^New service installed: (?<key>\\S+)" }, "groupBy": "capture", "why": "w" }, { "id": "EXCL", "title": "Exclusion", "category": "Antivirus", "severity": "Medium", "match": { "description": "^Defender exclusion in effect" }, "why": "w" } ] }'
+    $spoofRows = @(
+        @{ Timestamp = "2026-05-08 07:00:00.000"; Source = "System.evtx"; EventType = "ServiceChange"; Description = "Event log service started"; User = ""; Details = "EventID=6005" },
+        @{ Timestamp = "2026-05-09 12:00:04.000"; Source = "System.evtx"; EventType = "ServiceChange"; Description = "New service installed: DropSvc"; User = ""; Details = $inImagePath },
+        @{ Timestamp = "2026-05-09 12:00:05.000"; Source = $exclusionSource; EventType = "SecurityAlert"; Description = "Defender exclusion in effect (Paths): C:\Drop (when the triage collector added this exclusion)"; User = ""; Details = $inPath })
+    $spoofLeads = @(Invoke-ReportRules -Rows $spoofRows -Rules (Import-ReportRules -Path $spoofRulesPath) -CollectionInfo @{ CollectionStartUtc = "2026-05-09T13:00:00Z" })
+    Assert-Equal (@($spoofLeads | Sort-Object RuleId | ForEach-Object { "$($_.RuleId)|$($_.ActivityTime)|$($_.TimesCollectorCaused)|$(Format-TestUtc $_.LastSeenUtc)" }) -join " / ") "EXCL|True|False|2026-05-09 12:00:05 / SVC|True|False|2026-05-09 12:00:04" -Message "a service whose image path, or an exclusion whose path, holds the collector's words stays dated by its own time and in the activity window"
+    $spoofModel = New-ReportModel -Rows $spoofRows -Findings $spoofLeads -CollectionInfo @{ CollectionStartUtc = "2026-05-09T13:00:00Z" }
+    Assert-Equal "$(Format-TestUtc $spoofModel.LeadSpan.FirstUtc)|$(Format-TestUtc $spoofModel.LeadSpan.LastUtc)|$($spoofModel.LeadSpan.FileTimeLeads)" "2026-05-09 12:00:04|2026-05-09 12:00:05|0" -Message "those leads set the flagged-activity window"
 
     # threshold.distinct: count distinct values (one renamed file writes
     # two or three USN records with the same description), and list the
@@ -454,6 +474,27 @@ try {
     Assert-Equal "$($files.Count)|$(@($files | ForEach-Object { $_.Count }) -join ',')|$(@($files.Evidence | ForEach-Object { $_.Description }) -join ',')" "1|8|renamed: g1.x,renamed: g2.x,renamed: g3.x,renamed: g4.x" -Message "threshold.distinct ""description"": 9 records of 3 files stay below 4 files, 8 records of 4 files (one name in another case) reach it; the evidence lists each file once first"
     Assert-Equal "$($records.Count)|$(@($records | ForEach-Object { $_.Count }) -join ',')" "1|17" -Message "without distinct, the same rows count as records (9 and 8 records reach 4)"
     Assert-Equal "$($byKey.Count)|$(@($byKey | ForEach-Object { $_.Count }) -join ',')|$($distinctImported.Rules[2].Threshold.Distinct)" "1|4|detail:From" -Message "threshold.distinct ""detail:From"": a.txt twice counts once, a row without From counts on its own (3 values)"
+
+    # "evidence": "latest": after the rows that raised the severity, the
+    # latest rule rows are the evidence (installs nearest the collection),
+    # not the earliest; findings.csv says so. The default stays "earliest"
+    $latestRulesPath = Join-Path $workDir "latest-rules.json"
+    New-TestTextFile $latestRulesPath '{ "schemaVersion": 1, "rules": [ { "id": "NEW", "title": "Latest", "category": "Other", "severity": "Info", "match": { "description": "^installed: " }, "maxEvidence": 3, "evidence": "latest", "escalate": { "severity": "Medium", "withinMinutes": 1, "match": { "description": "^failed: " } }, "why": "w" }, { "id": "OLD", "title": "Earliest", "category": "Other", "severity": "Info", "match": { "description": "^installed: " }, "maxEvidence": 3, "evidence": "earliest", "why": "w" } ] }'
+    $latestRows = New-Object System.Collections.Generic.List[object]
+    foreach ($n in 1..6) {
+        $latestRows.Add(@{ Timestamp = "2026-06-0$n 10:00:00.000"; Source = "System.evtx"; EventType = "Installation"; Description = "installed: KB$n"; User = ""; Details = "EventID=19" })
+        if ($n -eq 1) { $latestRows.Add(@{ Timestamp = "2026-06-01 10:00:30.000"; Source = "System.evtx"; EventType = "Installation"; Description = "failed: KB0"; User = ""; Details = "EventID=20" }) }
+    }
+    $latestImported = Import-ReportRules -Path $latestRulesPath
+    $latestLeads = @(Invoke-ReportRules -Rows $latestRows -Rules $latestImported)
+    $newest = @($latestLeads | Where-Object { $_.RuleId -eq "NEW" })[0]
+    $oldest = @($latestLeads | Where-Object { $_.RuleId -eq "OLD" })[0]
+    Assert-Equal "$(@($newest.Evidence | ForEach-Object { $_.Description }) -join ',')|$($newest.EvidenceLatest)|$($newest.EvidenceTruncated)|$($newest.Severity)" "failed: KB0,installed: KB5,installed: KB6|True|True|Medium" -Message "evidence latest: the row that raised the severity, then the latest rows (KB5, KB6), not KB1"
+    Assert-Equal "$(@($oldest.Evidence | ForEach-Object { $_.Description }) -join ',')|$($oldest.EvidenceLatest)" "installed: KB1,installed: KB2,installed: KB3|False" -Message "evidence earliest (the default): the earliest rows"
+    $latestCsv = Join-Path $workDir "latest-findings.csv"
+    Export-ReportFindingsCsv -Findings $latestLeads -Path $latestCsv
+    $latestSummary = @(Import-Csv -LiteralPath $latestCsv | Where-Object { -not $_.RowNumber } | ForEach-Object { "$($_.RuleId):$(if ($_.Description -match '; (latest|first) 3 rows listed') { $Matches[1] })" }) | Sort-Object
+    Assert-Equal ($latestSummary -join ",") "NEW:latest,OLD:first" -Message "findings.csv: the summary says which rows are listed (latest or first)"
 
     # A pattern that keeps timing out stops its rule after a few timeouts
     # instead of costing the timeout on every row; other rules still run
@@ -507,6 +548,8 @@ try {
         @(('{ "schemaVersion": 1, "rules": [ { ' + $rule + ', "match": { "description": "x" } } ], "allowlist": [ { "ruleId": "*", "match": { "user": "(" }, "reason": "r" } ] }'), @("allowlist[0] (ruleId '*')", "match.user", "invalid regular expression")),
         @(('{ "schemaVersion": 1, "rules": [ { ' + $rule + ', "match": { "description": "x" }, "maxFindings": 1 } ] }'), @("rule 'BAD-1'", ".maxFindings", "0 (no limit) or a whole number from 2")),
         @(('{ "schemaVersion": 1, "rules": [ { ' + $rule + ', "match": { "description": "x" }, "activityTime": "no" } ] }'), @("rule 'BAD-1'", ".activityTime", "true or false")),
+        @(('{ "schemaVersion": 1, "rules": [ { ' + $rule + ', "match": { "description": "x" }, "evidence": "newest" } ] }'), @("rule 'BAD-1'", ".evidence", """earliest"" or ""latest""", "'newest'")),
+        @(('{ "schemaVersion": 1, "rules": [ { ' + $rule + ', "match": { "description": "x" }, "evidence": 1 } ] }'), @("rule 'BAD-1'", ".evidence", """earliest"" or ""latest""")),
         @('{ "schemaVersion": 1, "rules": [ ] }', @("invalid.json", "rules", "non-empty array")),
         @('{ "schemaVersion": 1, "rule": [ ] }', @("invalid.json", "unknown field 'rule'"))
     )
@@ -602,6 +645,16 @@ try {
         }
     }
     Assert-Equal "$(@($shippedErrors).Count)|$(@($shipped.Rules).Count -gt 40)|$($emptyConditions -join ',')" "0|True|" -Message "report-rules.json: imports with no error, and no compiled condition is empty"
+
+    # FS-WINDOWS-UPDATE lists the latest installs: with more than its 40, the
+    # update installed just before the collection is listed, the oldest not
+    $updateRows = @(foreach ($n in 0..51) {
+            $kb = "KB50{0:D5}" -f (10000 + $n)
+            @{ Timestamp = ([datetime]"2024-01-05").AddDays(14 * $n).ToString("yyyy-MM-dd", [System.Globalization.CultureInfo]::InvariantCulture) + " 05:38:07.000"; Source = "System.evtx"; EventType = "Installation"; Description = "Windows Update installed: 20xx-xx Cumulative Update ($kb)"; User = ""; Details = "EventID=19 | KB=$kb" }
+        })
+    $updateLead = @(Invoke-ReportRules -Rows $updateRows -Rules $shipped | Where-Object { $_.RuleId -eq "FS-WINDOWS-UPDATE" })
+    $updateKbs = @($updateLead.Evidence | ForEach-Object { if ($_.Description -match '\((KB\d+)\)$') { $Matches[1] } })
+    Assert-Equal "$($updateLead.Count)|$(@($updateLead.Evidence).Count)|$($updateKbs -contains 'KB5010051')|$($updateKbs -contains 'KB5010000')|$($updateKbs[0])" "1|40|True|False|KB5010012" -Message "FS-WINDOWS-UPDATE: of 52 installs, the latest 40 are listed (the newest, KB5010051, is; the oldest is not)"
 
     # =========================================================
     # findings.csv (written before the model, which hashes it)
@@ -825,8 +878,8 @@ try {
     $memoryCases = @(
         @("ARM64", "T_memory_dump.dmp (7.99 GB) -- Volatility 3 cannot read Windows ARM64 dumps; examine it in WinDbg.", $arm64Note, $arm64Caveat),
         @("ARM64, older builder", "T_memory_dump.dmp (7.99 GB): a Windows ARM64 dump, which Volatility 3 cannot analyze; examine it in WinDbg.", $arm64Note, $arm64Caveat),
-        @("not found", "the one collection_manifest.csv lists (7.99 GB) -- it was not found (or not usable) next to the collection or where the collector saved it.",
-            "Memory dump not analyzed: the one collection_manifest.csv lists (7.99 GB) -- it was not found (or not usable) next to the collection or where the collector saved it.", $missingCaveat),
+        @("not found", "the dump listed in collection_manifest.csv (7.99 GB) -- it was not found (or not usable) next to the collection or where the collector saved it.",
+            "Memory dump not analyzed: the dump listed in collection_manifest.csv (7.99 GB) -- it was not found (or not usable) next to the collection or where the collector saved it.", $missingCaveat),
         @("not found, older builder", "collection_manifest.csv lists one (7.99 GB), but it was not found (or not usable) next to the collection or where the collector saved it.",
             "Memory dump not analyzed: collection_manifest.csv lists one (7.99 GB) -- it was not found (or not usable) next to the collection or where the collector saved it.", $missingCaveat),
         @("skipped", "T_memory_dump.dmp (7.99 GB) -- skipped at the memory prompt; run the builder again and answer 1 to analyze it.",

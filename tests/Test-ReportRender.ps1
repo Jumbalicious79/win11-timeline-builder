@@ -341,6 +341,18 @@ try {
     Write-TestResult -Succeeded ($hostile.Contains("collection_log.txt) was not available, so problems during the collection are unknown") -and -not $hostile.Contains("logged no errors")) -Message "a missing collector log is not reported as a collection without errors"
     Write-TestResult -Succeeded ($hostile.Contains(">Lead about</td>") -and -not $hostile.Contains("{{group}}")) -Message "Appendix B shows rule titles without the {{group}} placeholder"
     Write-TestResult -Succeeded ($hostile.Contains("2001, 2002, 2003 +27 more")) -Message "the leads index counts every row of a lead after the first ones, not only evidence rows"
+    # A rule that lists its latest rows ("evidence": "latest"): the card
+    # prints the row that raised the severity and the latest rows, and the
+    # row lists end with the last ones
+    $finding.EvidenceLatest = $true
+    Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath -NoFileHashes
+    $latestHtml = [System.IO.File]::ReadAllText($memoryHtmlPath)
+    $latestCardStart = $latestHtml.IndexOf('id="finding-F001"')
+    $latestCard = $latestHtml.Substring($latestCardStart, $latestHtml.IndexOf('</article>', $latestCardStart) - $latestCardStart)
+    $latestPrinted = @([regex]::Matches($latestCard, '<td class="num mono">(\d+)</td>') | ForEach-Object { $_.Groups[1].Value })
+    Write-TestResult -Succeeded ($latestPrinted.Count -eq 15 -and $latestPrinted -contains "2020" -and $latestPrinted -contains "2006" -and $latestPrinted -notcontains "2005" -and $latestPrinted -notcontains "2001" -and
+        $latestCard.Contains("Showing 15 of the 30 rows of this lead (the latest, and the rows that raised its severity).") -and $latestHtml.Contains("+27 earlier, 2018, 2019, 2020")) -Message "evidence latest: the card prints the latest rows and says so, and the leads index ends with the last rows ($($latestPrinted -join ','))"
+    $finding.EvidenceLatest = $false
     # A lead dated only by a scheduled task's author-supplied date: left out
     # of the window like file times, with its own wording
     $fileTimed.TimesAuthorSupplied = $true
@@ -360,7 +372,7 @@ try {
     Write-TestResult -Succeeded ($collectorSummary.Contains("(plus 1 lead dated by times the collector itself set, which do not show when the activity happened)") -and -not $collectorSummary.Contains("<b>2020-01-01") -and
         $collectorDated.Contains("Dated only by a registry key&#39;s last-write time that the triage collector itself set during the collection: the activity is older") -and -not $collectorDated.Contains("Dated by file times")) -Message "a lead dated only by a time the collector set is left out of the activity window, and its card and the summary say so"
     $fileTimed.TimesCollectorCaused = $false
-    $memoryModel.Coverage.CollectorErrors =[ordered]@{ Available = $true; Count = 0; WarningCount = 1; Lines = @("[2026-10-08 14:20:00] WARNING: Could not copy BBI") }
+    $memoryModel.Coverage.CollectorErrors = [ordered]@{ Available = $true; Count = 0; WarningCount = 1; Lines = @("[2026-10-08 14:20:00] WARNING: Could not copy BBI") }
     Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath -NoFileHashes
     $warned = [System.IO.File]::ReadAllText($memoryHtmlPath)
     Write-TestResult -Succeeded ($warned.Contains("The collector logged 0 errors and 1 warning.") -and $warned.Contains("WARNING: Could not copy BBI")) -Message "collector warnings are counted as warnings, not errors"

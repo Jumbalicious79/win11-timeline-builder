@@ -903,20 +903,19 @@ namespace TimelineReport
         // ("Exclusions\Paths key last write, when the triage collector added
         // its own exclusion during the collection; this exclusion is older")
         // and on the collector's own row ("... (when the triage collector
-        // added this exclusion)")
-        public static readonly string[] CollectorTimeMarks = new string[] {
-            "when the triage collector added its own exclusion during the collection",
-            "when the triage collector added this exclusion"
-        };
+        // added this exclusion)"). Only the builder's Registry-DefenderExclusions
+        // rows carry it, as their last Details field (Time=); the same words
+        // anywhere else (an exclusion path, a command line, a service's image
+        // path: text whoever made it chose) do not count.
+        public const string CollectorTimeSource = "Registry-DefenderExclusions";
+        static readonly Regex CollectorTimeField = new Regex(
+            @"(?:^|\| )Time=Exclusions\\[^|]* key last write(?:, when the triage collector added its own exclusion during the collection; this exclusion is older| \(when the triage collector added this exclusion\))$",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
-        public static bool IsCollectorCausedTime(string details)
+        public static bool IsCollectorCausedTime(string source, string details)
         {
-            if (string.IsNullOrEmpty(details)) return false;
-            foreach (string mark in CollectorTimeMarks)
-            {
-                if (details.IndexOf(mark, StringComparison.OrdinalIgnoreCase) >= 0) return true;
-            }
-            return false;
+            if (string.IsNullOrEmpty(details) || !string.Equals(source, CollectorTimeSource, StringComparison.OrdinalIgnoreCase)) return false;
+            return CollectorTimeField.IsMatch(details);
         }
 
         // A source the builder's Memory parser writes (Volatility 3 on the
@@ -949,6 +948,15 @@ namespace TimelineReport
         // second row of one (a renamed file once, not once per USN record)
         public static void Summarize(RowTable t, GroupResult g, int maxEvidence, KeySpec distinct)
         {
+            Summarize(t, g, maxEvidence, distinct, false);
+        }
+
+        // As above; latest (the rule's "evidence": "latest"): after the
+        // escalation rows, the evidence takes the latest rule rows instead
+        // of the earliest (installs nearest the collection, not the oldest
+        // ones a long log still holds)
+        public static void Summarize(RowTable t, GroupResult g, int maxEvidence, KeySpec distinct, bool latest)
+        {
             List<int> all = new List<int>(g.Rows.Count + g.EscalationRows.Count);
             all.AddRange(g.Rows);
             all.AddRange(g.EscalationRows);
@@ -959,6 +967,8 @@ namespace TimelineReport
             int snapshotType = Array.IndexOf(t.EventTypes, "Snapshot");
             bool[] memorySource = new bool[t.Sources.Length];
             for (int s = 0; s < memorySource.Length; s++) memorySource[s] = IsMemorySource(t.Sources[s]);
+            bool[] collectorTimeSource = new bool[t.Sources.Length];
+            for (int s = 0; s < collectorTimeSource.Length; s++) collectorTimeSource[s] = string.Equals(t.Sources[s], CollectorTimeSource, StringComparison.OrdinalIgnoreCase);
             bool snapshotOnly = all.Count > 0;
             bool memoryOnly = all.Count > 0;
             long first = -1;
@@ -979,7 +989,7 @@ namespace TimelineReport
                     if (tk > authorLast) authorLast = tk;
                     continue;
                 }
-                if (IsCollectorCausedTime(t.Details[r]))
+                if (collectorTimeSource[t.SourceId[r]] && IsCollectorCausedTime(t.Sources[t.SourceId[r]], t.Details[r]))
                 {
                     if (collectorFirst < 0 || tk < collectorFirst) collectorFirst = tk;
                     if (tk > collectorLast) collectorLast = tk;
@@ -1016,6 +1026,11 @@ namespace TimelineReport
             for (int e = 0; e < escalation.Count && picked.Count < maxEvidence; e++) picked.Add(escalation[e]);
             List<int> own = new List<int>(g.Rows);
             own.Sort();
+            if (latest)
+            {
+                // The latest rule rows: walk the timeline order backwards
+                own.Reverse();
+            }
             if (distinct != null)
             {
                 // First the earliest row of each distinct value, then the rest
@@ -1807,7 +1822,7 @@ function Import-ReportRules {
         throw (Format-ReportEngineRuleError -File $file -Where "rules" -Problem "must be a non-empty array of rules")
     }
     $ruleFields = @("id", "title", "category", "severity", "match", "anyOf", "groupBy", "threshold", "escalate", "why",
-        "technical", "nextSteps", "falsePositives", "references", "maxEvidence", "maxFindings", "activityTime", "enabled", "comment", "notes")
+        "technical", "nextSteps", "falsePositives", "references", "maxEvidence", "evidence", "maxFindings", "activityTime", "enabled", "comment", "notes")
     $rules = New-Object System.Collections.Generic.List[object]
     $ruleIds = @{}
     for ($n = 0; $n -lt $rulesJson.Count; $n++) {
@@ -1854,6 +1869,15 @@ function Import-ReportRules {
         if ($null -eq $maxEvidence) { $maxEvidence = 25 }
         if (-not (Test-ReportEngineInteger $maxEvidence) -or [int]$maxEvidence -lt 1 -or [int]$maxEvidence -gt 10000) {
             throw (Format-ReportEngineRuleError -File $file -Where "$where.maxEvidence" -Problem "must be a whole number from 1 to 10000")
+        }
+        # evidence: which rule rows the maxEvidence are, after the rows that
+        # raised the severity: "earliest" (the default) or "latest" (a rule
+        # whose newest rows matter most, such as the updates installed
+        # nearest the collection)
+        $evidenceOrder = Get-ReportEngineMember $ruleJson "evidence"
+        if ($null -eq $evidenceOrder) { $evidenceOrder = "earliest" }
+        if (-not ($evidenceOrder -is [string]) -or @("earliest", "latest") -notcontains $evidenceOrder) {
+            throw (Format-ReportEngineRuleError -File $file -Where "$where.evidence" -Problem "must be ""earliest"" or ""latest"" (found '$evidenceOrder')")
         }
         # maxFindings: at most this many findings from the rule; the groups
         # beyond it fold into one roll-up finding (0 = no limit)
@@ -1957,6 +1981,7 @@ function Import-ReportRules {
             Threshold      = $threshold
             Escalate       = $escalate
             MaxEvidence    = [int]$maxEvidence
+            EvidenceLatest = ($evidenceOrder -eq "latest")
             MaxFindings    = [int]$maxFindings
             ActivityTime   = $activityTime
             Enabled        = $enabled
@@ -2134,7 +2159,7 @@ function Invoke-ReportRules {
         $groupsBeforeFold = $result.Groups.Count
         [TimelineReport.Engine]::Fold($table, $result, $rule.MaxFindings)
         foreach ($group in $result.Groups) {
-            [TimelineReport.Engine]::Summarize($table, $group, $rule.MaxEvidence, $rule.Compiled.ThresholdDistinct)
+            [TimelineReport.Engine]::Summarize($table, $group, $rule.MaxEvidence, $rule.Compiled.ThresholdDistinct, [bool]$rule.EvidenceLatest)
             $severity = $rule.Severity
             $escalated = $group.EscalationRows.Count -gt 0
             if ($escalated -and (Get-ReportEngineSeverityRank $rule.Escalate.Severity) -gt (Get-ReportEngineSeverityRank $severity)) {
@@ -2190,6 +2215,9 @@ function Invoke-ReportRules {
                 LastSeenUtc              = ConvertFrom-ReportEngineTicks $group.LastTicks
                 Evidence                 = [object[]]$evidence
                 EvidenceTruncated        = $group.AllRows.Length -gt $group.EvidenceRows.Length
+                # The rule's "evidence": "latest": the evidence is the latest
+                # rows (after any that raised the severity), not the earliest
+                EvidenceLatest           = [bool]$rule.EvidenceLatest
                 Escalated                = $escalated
                 AllowlistedCount         = $group.Allowlisted
                 BaseSeverity             = $rule.Severity
@@ -2287,7 +2315,7 @@ function Export-ReportFindingsCsv {
             $summary = "Summary: $($finding.Count) matching row(s), $first to $last UTC"
             if ($finding.GroupKey) { $summary += "; group: $($finding.GroupKey)" }
             if ($finding.Escalated) { $summary += "; escalated by $($finding.EscalationCount) related row(s)" }
-            if ($finding.EvidenceTruncated) { $summary += "; first $(@($finding.Evidence).Count) rows listed" }
+            if ($finding.EvidenceTruncated) { $summary += "; $(if ($finding.EvidenceLatest) { 'latest' } else { 'first' }) $(@($finding.Evidence).Count) rows listed" }
             if ($finding.AllowlistedCount) { $summary += "; $($finding.AllowlistedCount) allowlisted row(s) not counted" }
             if ($finding.MemoryOnly) { $summary += "; $script:ReportMemoryOnlyNote" }
             $lead = @($finding.Id, $finding.Severity, $finding.RuleId, $finding.Title, $finding.Category)

@@ -757,7 +757,7 @@ try {
         Write-NoMemoryDumpToOffer
         $log = (Get-TestLog) -replace '(?m)^\[[0-9: -]+\] ', ''
         # The last line is the one the findings report reads (Coverage.Notes)
-        $expected = "No memory dump to offer: $($case.Note).`r`n  To have it analyzed, $($case.Remedy), then run the builder again.`r`n  Memory dump not analyzed: the one collection_manifest.csv lists$($case.Size) -- it was not found (or not usable) next to the collection or where the collector saved it."
+        $expected = "No memory dump to offer: $($case.Note).`r`n  To have it analyzed, $($case.Remedy), then run the builder again.`r`n  Memory dump not analyzed: the dump listed in collection_manifest.csv$($case.Size) -- it was not found (or not usable) next to the collection or where the collector saved it."
         if ($case.Name -like "no *") { $expected = "" }
         Assert-Equal -Name "offer step without a dump, $($case.Name): $(if ($expected) { 'what the manifest lists, how to have the dump analyzed, and the line for the report' } else { 'nothing logged' })" -Expected "$expected|False" -Actual "$($log.Trim())|$($log.Contains('-MemoryDumpPath'))"
     }
@@ -774,7 +774,7 @@ try {
     $log = ((Get-TestLog) -replace '(?m)^\[[0-9: -]+\] ', '').Trim()
     $expected = "No memory dump to offer: collection_manifest.csv lists one in the collection (Memory\memory_dump.dmp), which the collector moves next to the zip as ${nameArm}_memory_dump.dmp when it zips the collection.`r`n" +
         "  The collection is from a Windows ARM64 computer, so the dump does not need to be copied here.`r`n" +
-        "  Memory dump not analyzed: the one collection_manifest.csv lists (7.99 GB) -- Volatility 3 cannot read Windows ARM64 dumps; examine it in WinDbg."
+        "  Memory dump not analyzed: the dump listed in collection_manifest.csv (7.99 GB) -- Volatility 3 cannot read Windows ARM64 dumps; examine it in WinDbg."
     Assert-Equal -Name "offer step without a dump, an ARM64 collection: no copy advice, WinDbg named once, and the line for the report (the size as the collector gives it)" -Expected $expected -Actual $log
     # The size in that line: bytes under 100 MB, else GB with two decimals
     # (as the memory prompt and the collector's summary give it)

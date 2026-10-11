@@ -1297,7 +1297,7 @@ function Add-TimelineReportWorkbookSheets {
         $summary = "$($finding.Count) matching row(s), $first to $last UTC"
         if ($finding.GroupKey) { $summary += "; group: $($finding.GroupKey)" }
         if ($finding.Escalated) { $summary += "; severity raised by $($finding.EscalationCount) related row(s)" }
-        if ($rowNumbers.Count -gt $evidence.Count) { $summary += "; the first $($evidence.Count) of $($rowNumbers.Count) rows are listed (filter the Finding column of the Timeline sheet for all)" }
+        if ($rowNumbers.Count -gt $evidence.Count) { $summary += "; the $(if ($finding.EvidenceLatest) { 'latest' } else { 'first' }) $($evidence.Count) of $($rowNumbers.Count) rows are listed (filter the Finding column of the Timeline sheet for all)" }
         if ($finding.AllowlistedCount) { $summary += "; $($finding.AllowlistedCount) allowlisted row(s) not counted" }
         # Every row from the memory dump: the engine's note, "Captured in the memory dump"
         if ($finding.MemoryOnly) { $summary += "; $($finding.MemoryOnlyNote)" }
@@ -12489,7 +12489,8 @@ function Parse-UsnJournal {
                 # A rename writes a "Rename: old name" record, then one or more
                 # "Rename: new name" records (the last with "| Close") for the
                 # same File ID. Each new-name row gets what it was renamed from,
-                # whether the extension changed and whether the parent folder
+                # whether the extension changed (yes, no, or removed: only a
+                # temporary suffix dropped) and whether the parent folder
                 # changed (Moved): ransomware renames in place to a new
                 # extension; Windows servicing moves files between folders with
                 # their names. Paired before the date filter and the ring
@@ -12510,6 +12511,16 @@ function Parse-UsnJournal {
                             $oldExt = if ($oldDot -ge 0) { $oldName.Substring($oldDot + 1) } else { "" }
                             $newExt = if ($newDot -ge 0) { $newName.Substring($newDot + 1) } else { "" }
                             $extChanged = if ([string]::Equals($oldExt, $newExt, [System.StringComparison]::OrdinalIgnoreCase)) { "no" } else { "yes" }
+                            # "removed": only a suffix after a '.' or '_' was dropped
+                            # ("photo.jpg.part" -> "photo.jpg", "IMG.JPG_exiftool_tmp"
+                            # -> "IMG.JPG"): a finished download or atomic save, not
+                            # ransomware's new extension. The separator is required:
+                            # ".ZXCRYT" -> ".ZXCRY" stays "yes".
+                            if ($extChanged -eq "yes" -and $oldName.Length -gt $newName.Length -and
+                                $oldName.StartsWith($newName, [System.StringComparison]::OrdinalIgnoreCase) -and
+                                ($oldName[$newName.Length] -eq [char]'.' -or $oldName[$newName.Length] -eq [char]'_')) {
+                                $extChanged = "removed"
+                            }
                             $moved = if ($from[1] -ceq $m.Groups[5].Value) { "no" } else { "yes" }
                             # From= last: a file name cannot fake the two flags before it
                             $renameInfo = " | ExtChanged=$extChanged | Moved=$moved | From=$oldName"
@@ -12580,7 +12591,7 @@ function Parse-UsnJournal {
             elseif ($reason -match "Security change") { $desc = "USN security changed: $fileName" }
             elseif ($reason -match "Basic info change") { $desc = "USN attr changed: $fileName" }
 
-            # A paired rename's new-name row: " | ExtChanged=yes|no | Moved=yes|no | From=<old name>"
+            # A paired rename's new-name row: " | ExtChanged=yes|no|removed | Moved=yes|no | From=<old name>"
             Add-TimelineEntry -Timestamp $ts -Source "UsnJournal" -EventType "FileAccess" `
                 -Description $desc -Details "Reason=$reason$renameInfo" `
                 -Artifact "UsnJournal" -RawPath $usnFile.FullName
@@ -16900,12 +16911,12 @@ function Write-NoMemoryDumpToOffer {
         # Copying the dump next to the zip would not help: it is not offered
         Log "No memory dump to offer: $($notFound.Note)."
         Log "  The collection is from a Windows ARM64 computer, so the dump does not need to be copied here."
-        Write-MemoryDumpNotAnalyzed -What "the one collection_manifest.csv lists$($sizeText)" -Why (Get-MemoryDumpArm64Reason)
+        Write-MemoryDumpNotAnalyzed -What "the dump listed in collection_manifest.csv$($sizeText)" -Why (Get-MemoryDumpArm64Reason)
     }
     else {
         Log "No memory dump to offer: $($notFound.Note)."
         Log "  To have it analyzed, $($notFound.Remedy), then run the builder again."
-        Write-MemoryDumpNotAnalyzed -What "the one collection_manifest.csv lists$($sizeText)" -Why "it was not found (or not usable) next to the collection or where the collector saved it"
+        Write-MemoryDumpNotAnalyzed -What "the dump listed in collection_manifest.csv$($sizeText)" -Why "it was not found (or not usable) next to the collection or where the collector saved it"
     }
     Log ""
 }
