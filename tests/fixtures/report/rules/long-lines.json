@@ -1,0 +1,20 @@
+{
+  "_comment": "Crafted memory command lines for tests\\Test-ReportRules.ps1. Each row is a Memory-CommandLine Snapshot row whose Args is prefix + unit repeated 'repeat' times + suffix: about 32,000 characters, the Windows command-line limit, and an attacker controls the command line of their own process. A pattern that backtracks badly on one is stopped after 2 seconds per row, and a rule whose patterns are stopped 3 times reports nothing at all, so its unrelated leads are lost. The test checks that no rule times out on these rows, that every case row is flagged exactly as without them, and that the run stays fast.",
+  "repeat": 8000,
+  "rows": [
+    { "process": "rundll32.exe", "prefix": "rundll32.exe \"C:\\Users\\Public\\", "unit": "a ,\\", "suffix": "" },
+    { "process": "rundll32.exe", "prefix": "rundll32.exe \"C:\\Users\\u\\AppData\\Local\\Microsoft\\Windows\\INetCache\\Content.Outlook\\AB12\\", "unit": "a ,\\", "suffix": "" },
+    { "process": "regsvr32.exe", "prefix": "regsvr32.exe /s \"C:\\Users\\Public\\", "unit": "a ,\\", "suffix": "" },
+    { "process": "regsvr32.exe", "prefix": "regsvr32.exe /s /i:\"C:\\Users\\Public\\", "unit": "a ,\\", "suffix": "" },
+    { "process": "regsvr32.exe", "prefix": "regsvr32.exe /s \"C:\\Users\\u\\AppData\\Local\\Microsoft\\Olk\\Attachments\\x\\", "unit": "a ,\\", "suffix": "" },
+    { "process": "powershell.exe", "prefix": "powershell.exe -c \"& 'x", "unit": ";aaa", "suffix": "" },
+    { "process": "powershell.exe", "prefix": "powershell.exe -c \"", "unit": "{aaa", "suffix": "" },
+    { "process": "powershell.exe", "prefix": "powershell.exe -c \"", "unit": "; ; ", "suffix": "" },
+    { "process": "powershell.exe", "prefix": "powershell.exe -c \"& 'C:\\Users\\Public\\", "unit": "a;& ", "suffix": "" },
+    { "process": "powershell.exe", "prefix": "powershell.exe", "unit": "    ", "suffix": "x;C:\\Users\\Public\\a" },
+    { "process": "powershell.exe", "prefix": "powershell.exe -File \"C:\\Users\\Public\\", "unit": "a \\", "suffix": "" },
+    { "process": "cmd.exe", "prefix": "cmd.exe /c \"C:\\Users\\Public\\", "unit": "a \\", "suffix": "" },
+    { "process": "wscript.exe", "prefix": "wscript.exe \"C:\\Users\\Public\\", "unit": "a \\", "suffix": "" },
+    { "process": "mshta.exe", "prefix": "mshta.exe \"C:\\Users\\Public\\", "unit": "a \\", "suffix": "" }
+  ]
+}

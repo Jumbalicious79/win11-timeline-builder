@@ -823,6 +823,13 @@ function Add-ReportHtmlFinding {
     if ([bool](Get-ReportHtmlField $Finding "MemoryOnly")) {
         $flags.Add('<span class="flag">Captured in the memory dump</span>')
     }
+    # An older (or unrecognized) collection could not tell the collector's own
+    # processes apart, or a recognized one could not identify this process
+    # exactly (a launcher that was not recorded): a memory-only lead from
+    # during the collection may be the collector
+    if ([bool](Get-ReportHtmlField $Finding "CollectorSuspect")) {
+        $flags.Add('<span class="flag">This process was seen only in the memory dump during the collection, and the collector&#39;s own process IDs do not identify it (this collection does not record them, or they were not all recognized in the memory dump): check that it is not the triage collector, its launcher or the memory capture tool</span>')
+    }
     if ([bool](Get-ReportHtmlField $Finding "DuringCollection")) {
         $flags.Add('<span class="flag">Every row is from during the collection: this may be the collector&#39;s own activity</span>')
     }
@@ -999,6 +1006,16 @@ function Add-ReportHtmlSummary {
         $bulk = Get-ReportHtmlBulkSpan -Activity $Context.Activity
         if ($bulk) { $spanText += "; 99% of the rows fall between " + $bulk.First + " and " + $bulk.Last }
         $facts.Add(@("Time span covered", $spanText.Trim()))
+    }
+    # The collector's own processes in the memory dump, left unflagged
+    $collectorCoverage = Get-ReportHtmlField $Context.Coverage "CollectorProcesses"
+    $collectorSummary = ConvertTo-ReportHtmlText (Get-ReportHtmlField $collectorCoverage "Summary")
+    if ([bool](Get-ReportHtmlField $collectorCoverage "Recorded") -and $collectorSummary) {
+        # Built first: in @("a", "b" + "c") the comma binds before the plus
+        $collectorFact = $collectorSummary + " &ndash; listed under Evidence coverage"
+        $outsideFact = [int](ConvertTo-ReportHtmlNumber (Get-ReportHtmlField $collectorCoverage "OutsideTree"))
+        if ($outsideFact -gt 0) { $collectorFact += "; collection_info.json lists " + $outsideFact + " process(es) the collector would not have recorded that way: check whether it was altered" }
+        $facts.Add(@("Collector processes", $collectorFact))
     }
     if ([bool](Get-ReportHtmlField $collection "SecretsIncluded")) {
         $facts.Add(@("Sensitive material", "This collection includes credential material (made with -IncludeSecrets). Store and share it as sensitive."))
@@ -1270,6 +1287,70 @@ function Add-ReportHtmlCoverage {
         }
     }
     else { $null = $Builder.AppendLine('<p class="empty">The collector logged no errors or warnings.</p>') }
+
+    # The collector's own processes in the memory dump, left out of the rules.
+    # Shown only when the collection recorded its process ids and the timeline
+    # has memory rows (a Summary is then set); older models have no field.
+    $collectorCoverage = Get-ReportHtmlField $coverage "CollectorProcesses"
+    $collectorSummary = ConvertTo-ReportHtmlText (Get-ReportHtmlField $collectorCoverage "Summary")
+    if ([bool](Get-ReportHtmlField $collectorCoverage "Recorded") -and $collectorSummary) {
+        $processes = Get-ReportHtmlList $collectorCoverage "Processes"
+        $null = $Builder.AppendLine('<h3>The collector&#39;s own processes (not flagged)</h3>')
+        if ($processes.Count -gt 0) {
+            $null = $Builder.AppendLine('<p>' + $collectorSummary + '. They are recognized by the process ID, name and start time recorded in collection_info.json, and the processes they started during the collection; their rows stay in the timeline but the rules do not check them. Memory network and service rows of these processes are kept and checked.</p>')
+        }
+        else {
+            $null = $Builder.AppendLine('<p>' + $collectorSummary + '. The collector recorded its own process IDs in collection_info.json, but its PowerShell process could not be recognized in the memory dump (see below), so the rules check its processes like any other, and a lead seen only in the memory dump during the collection is marked on its card as possibly the collector.</p>')
+        }
+        # Entries the collector would not have written: a sign of an edit
+        $outsideTree = [int](ConvertTo-ReportHtmlNumber (Get-ReportHtmlField $collectorCoverage "OutsideTree"))
+        if ($outsideTree -gt 0) {
+            $null = $Builder.AppendLine('<p class="incomplete">collection_info.json lists ' + $outsideTree + ' process(es) the collector would not have recorded that way (marked below). They were not left out. Check whether collection_info.json was altered after the collection.</p>')
+        }
+        if ($processes.Count -gt 0) {
+            $null = $Builder.AppendLine('<table><colgroup><col style="width:12%"><col style="width:8%"><col style="width:9%"><col style="width:17%"><col style="width:17%"><col style="width:17%"><col style="width:20%"></colgroup>')
+            $null = $Builder.AppendLine('<thead><tr><th>' + $Context.RowHeading + 's</th><th class="num">PID</th><th class="num">Parent PID</th><th>Name</th><th>Started (UTC)</th><th>Recognized as</th><th>Command line</th></tr></thead><tbody>')
+            foreach ($proc in @($processes | Select-Object -First 50)) {
+                # Get-ReportHtmlList returns its array as one pipeline object:
+                # loop over it, do not pipe it
+                $rowNumbers = @(foreach ($rowNumber in (Get-ReportHtmlList $proc "RowNumbers")) { [string]([long](ConvertTo-ReportHtmlNumber $rowNumber)) })
+                # Process IDs as the timeline and the log write them (no
+                # thousands separator), so they can be searched for there
+                $null = $Builder.AppendLine('<tr><td class="mono">' + (ConvertTo-ReportHtmlText (($rowNumbers | Select-Object -First 10) -join ", ") -MaxLength 120) +
+                    '</td><td class="num">' + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $proc "Pid")) +
+                    '</td><td class="num">' + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $proc "ParentPid")) +
+                    '</td><td>' + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $proc "Name") -MaxLength 120) +
+                    '</td><td class="mono">' + (Format-ReportHtmlTime (Get-ReportHtmlField $proc "CreateTimeUtc") "yyyy-MM-dd HH:mm:ss") +
+                    '</td><td>' + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $proc "How") -MaxLength 120) +
+                    '</td><td class="mono">' + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $proc "CommandLine") -MaxLength 200) + '</td></tr>')
+            }
+            $null = $Builder.AppendLine('</tbody></table>')
+            if ($processes.Count -gt 50) { $null = $Builder.AppendLine('<p class="small muted">The first 50 of ' + $processes.Count + ' are listed.</p>') }
+        }
+        $collectorNotes = New-Object System.Collections.Generic.List[string]
+        foreach ($mismatch in (Get-ReportHtmlList $collectorCoverage "Mismatched")) {
+            $entry = "PID " + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $mismatch "Pid")) + " (" + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $mismatch "Name") -MaxLength 120) + ")"
+            $role = ConvertTo-ReportHtmlText (Get-ReportHtmlField $mismatch "Role") -MaxLength 60
+            if ($role) { $entry += " as " + $role }
+            $dumpName = ConvertTo-ReportHtmlText (Get-ReportHtmlField $mismatch "DumpName") -MaxLength 120
+            $text = "collection_info.json lists " + $entry
+            if ($dumpName) { $text += " and the memory dump has " + $dumpName + " with that id" }
+            $text += ": " + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $mismatch "Reason")) + ", so it was not left out."
+            if ([bool](Get-ReportHtmlField $mismatch "OutsideTree")) { $text = '<strong>Not written by the collector that way:</strong> ' + $text }
+            $collectorNotes.Add($text)
+        }
+        foreach ($missing in (Get-ReportHtmlList $collectorCoverage "NotInDump")) {
+            $collectorNotes.Add("The collector recorded PID " + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $missing "Pid")) + " (" + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $missing "Name") -MaxLength 120) + "), which the memory dump does not have.")
+        }
+        if ($collectorNotes.Count -gt 0) {
+            # At most 50 here; report-model.json and the builder log have them all
+            $null = $Builder.AppendLine('<ul class="plain small">')
+            foreach ($note in @($collectorNotes | Select-Object -First 50)) { $null = $Builder.AppendLine('<li>' + $note + '</li>') }
+            $null = $Builder.AppendLine('</ul>')
+            if ($collectorNotes.Count -gt 50) { $null = $Builder.AppendLine('<p class="small muted">The first 50 of ' + $collectorNotes.Count + ' are listed; report-model.json and the builder log list them all.</p>') }
+        }
+    }
+
     $noteList = Get-ReportHtmlList $coverage "Notes"
     $notes = @($noteList | ForEach-Object { ConvertTo-ReportHtmlText $_ } | Where-Object { $_ })
     if ($notes.Count -gt 0) {
