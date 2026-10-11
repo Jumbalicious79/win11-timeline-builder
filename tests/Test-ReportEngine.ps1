@@ -936,6 +936,21 @@ try {
         $colons = @(@($engineNotes) + @($engineCaveats) | Where-Object { ([regex]::Matches($_, ':\s')).Count -gt 1 })
         Assert-Equal "$($engineNotes -join ' / ')|$($engineCaveats -join ' / ')|$($colons.Count)" "Memory dump analyzed with the Windows debugger engine: $($case[1])|$($case[2])|0" -Message "an ARM64 dump read with the Windows debugger engine ($($case[0])): the note says what was read, the caveat what is not in the report, no 'not analyzed' note or caveat, no double colon"
     }
+    # The builder's "Memory dump process list" warning (the ways it finds
+    # the processes of an ARM64 dump disagreed: memory copied while Windows
+    # ran): a note of its own after the engine's, with how many each way
+    # found; the warning is counted with the builder's others. Without the
+    # line, no such note.
+    $processListText = "the kernel's list of processes was inconsistent in 1 place, as when memory is copied while Windows runs and processes start or end during the copy. 192 processes were found, 191 of them by all three ways (walking the kernel's process list forwards, walking it backwards, and its process ID table), 1 missed by walking backwards. The debugger engine's own process list (dx @`$cursession.Processes in WinDbg) has 183 entries and stops at the first inconsistent link."
+    $processListLog = Join-Path $workDir "process_list_builder_log.txt"
+    New-TestTextFile $processListLog ("[2026-02-02 01:00:00] === Windows 11 Forensic Timeline Builder Started ===`r`n" +
+        "[2026-02-02 01:00:06] WARNING:   Memory dump process list: $processListText`r`n" +
+        "[2026-02-02 01:00:09]   Memory dump analyzed with the Windows debugger engine: $($engineCases[0][1])`r`n")
+    $processListModel = New-ReportModel -Rows $userRows -BuilderLogPath $processListLog
+    $processListNotes = @($processListModel.Coverage.Notes | Where-Object { $_ -match '^Memory dump' })
+    $processListColons = @($processListNotes | Where-Object { ([regex]::Matches($_, ':\s')).Count -gt 1 })
+    Assert-Equal "$($processListNotes -join ' / ')|$($processListColons.Count)|$($processListModel.Coverage.BuilderWarnings.Count)" "Memory dump analyzed with the Windows debugger engine: $($engineCases[0][1]) / Memory dump process list: $processListText|0|1" -Message "an ARM64 dump whose process list was inconsistent: the builder's warning as a note of its own after the engine's, one colon, the warning counted"
+    Assert-Equal "$(@($engineModel.Coverage.Notes | Where-Object { $_ -match '^Memory dump process list' }).Count)" "0" -Message "no 'Memory dump process list' line: no such note"
 
     # =========================================================
     # report-model.json

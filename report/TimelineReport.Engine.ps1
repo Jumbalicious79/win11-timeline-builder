@@ -3322,6 +3322,10 @@ function Read-ReportEngineBuilderLog {
         # A Windows ARM64 dump read with Microsoft's debugger engine: the
         # dump and what was read from it ("" when there is none)
         MemoryDumpEngine = ""
+        # Its process list, when the ways of finding the processes disagreed
+        # (a dump copied while Windows ran): how many each way found ("" when
+        # they agreed)
+        MemoryDumpProcessList = ""
     }
     $text = Read-ReportEngineLogText $Path
     if ($null -eq $text) { return $info }
@@ -3347,6 +3351,7 @@ function Read-ReportEngineBuilderLog {
         elseif (-not $info.ExaminedComputerName -and $line -match '^\[[^\]]*\]\s+Examined computer name \(SYSTEM hive\): (.+?)\s*$') { $info.ExaminedComputerName = $Matches[1] }
         elseif (-not $info.MemoryDumpNotAnalyzed -and $line -match '^\[[^\]]*\]\s+Memory dump not analyzed: (.+?)\s*$') { $info.MemoryDumpNotAnalyzed = $Matches[1] }
         elseif (-not $info.MemoryDumpEngine -and $line -match '^\[[^\]]*\]\s+Memory dump analyzed with the Windows debugger engine: (.+?)\s*$') { $info.MemoryDumpEngine = $Matches[1] }
+        elseif (-not $info.MemoryDumpProcessList -and $line -match '^\[[^\]]*\]\s+(?:WARNING:\s+)?Memory dump process list: (.+?)\s*$') { $info.MemoryDumpProcessList = $Matches[1] }
     }
     $info.ProblemLines = $problems.ToArray()
     $info.MissingInputFiles = [Math]::Max($missingLogged, $missingBanner)
@@ -3729,6 +3734,12 @@ function New-ReportModel {
     # command lines only; ..."): what was read, and (the caveat) what was not
     $memoryEngine = "$($builderLog.MemoryDumpEngine)".Trim()
     if ($memoryEngine) { $notes.Add("Memory dump analyzed with the Windows debugger engine: $($memoryEngine.TrimEnd('.')).") }
+    # Its process list, when the ways the builder finds the processes
+    # disagreed ("Memory dump process list: ..."; a dump copied while
+    # Windows ran): how many each way found, for the analyst to judge the
+    # dump's process rows
+    $memoryProcessList = "$($builderLog.MemoryDumpProcessList)".Trim()
+    if ($memoryProcessList) { $notes.Add("Memory dump process list: $($memoryProcessList.TrimEnd('.')).") }
     # The collector's own processes in the memory dump, left out of the rules
     $memoryRowsPresent = @($stats.Sources | Where-Object { $_.Source -like "Memory-*" }).Count -gt 0
     $collectorRecorded = ($null -ne $CollectorRows -and [bool]$CollectorRows.Recorded -and [bool]$CollectorRows.HasMemoryRows)

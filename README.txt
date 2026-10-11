@@ -901,7 +901,8 @@ once more.
      no 4104 script blocks, no Sysmon, the USN journal's span, ...),
      collector errors and warnings (or that the collector's log is
      missing), notes (among them a memory dump of the collection that was
-     not analyzed, and why, or what was read from a Windows ARM64 dump),
+     not analyzed, and why, or what was read from a Windows ARM64 dump and,
+     when the ways of finding its processes disagreed, how many each found),
      and the Integrity leads
   3  Antivirus verdicts       4  Access       5  Persistence
   6  Execution                7  Initial access       8  File system
@@ -2149,7 +2150,55 @@ of WinDbg -- instead:
       processes, as windows.pslist: PID, parent PID, name, threads, session
         and the exact create time (to 100 ns; the timeline keeps
         milliseconds); exited processes still in the list are listed too
-        (Threads=0). System and smss.exe have no session, as with Volatility.
+        (Threads=0). System, smss.exe and the other processes without a
+        session have none (an empty SessionId), as with Volatility; the
+        others have the session id of their session space when the kernel's
+        symbols describe it, else that of their process token (the symbols
+        of Windows 11 24H2 on ARM64 have no _MM_SESSION_SPACE), decided for
+        each process.
+      How the processes are found: in the kernel's own structures, three
+        ways -- its process list (nt!PsActiveProcessHead, then each
+        EPROCESS's ActiveProcessLinks) walked forwards, the same list walked
+        backwards, and its process ID table (nt!PspCidTable, which holds
+        every process and thread by its ID) -- and every process that any of
+        them found is listed, once. Each process's fields are read from its
+        EPROCESS at the offsets the kernel's symbol file gives (the engine's
+        dt command); an entry that is not a process (memory that was
+        reused) is never listed. Why: DumpIt copies memory while Windows
+        runs, so a process that starts or ends during the copy can leave the
+        list inconsistent (an entry whose link back does not point to the
+        entry before it). The debugger engine's own process list
+        (dx @$cursession.Processes, what WinDbg shows) ends at the first
+        such link, and Windows adds new processes at the end of the list:
+        that list missed the newest processes, the collector's own among
+        them (two real dumps: 183 of 192 and 168 of 175 processes, one of
+        the 168 a row made of reused memory). The walks go on past an
+        inconsistent link and count it; the process ID table does not use
+        the list at all.
+      The log says what each way found ("Processes found: 192; the kernel's
+        process list walked forwards 192 (1 inconsistent link), backwards
+        191 (1 inconsistent link), in its process ID table 192, in the
+        debugger engine's own list 183"). When the ways disagree, it has a
+        warning that the findings report shows as an Evidence coverage
+        note, so an analyst can judge the dump's process rows:
+          Memory dump process list: the kernel's list of processes was
+            inconsistent in 1 place, as when memory is copied while Windows
+            runs and processes start or end during the copy. 192 processes
+            were found, 191 of them by all three ways (walking the kernel's
+            process list forwards, walking it backwards, and its process ID
+            table), 1 missed by walking backwards. The debugger engine's own
+            process list (dx @$cursession.Processes in WinDbg) has 183
+            entries and stops at the first inconsistent link.
+        ("8 missed by walking forwards" when the forward walk stopped at
+        memory that was reused, "1 only in the process ID table" for a
+        process that was being created). A process found by fewer ways is
+        listed all the same: it can be one that ended during the copy (its
+        exit time is set), as Volatility's windows.pslist would show it too.
+        When the kernel's symbols do not describe these structures (the log
+        says why), the debugger engine's own list is used instead, with a
+        warning; when that list reports itself corrupted ("corrupted linked
+        list"), the "Memory dump process list" warning says that the newest
+        processes can be missing.
       command lines, as windows.cmdline: read from each process's own
         memory exactly as stored (quotes, tabs, line breaks, any
         character). None for the kernel's own processes (System, Registry,
@@ -2171,7 +2220,9 @@ of WinDbg -- instead:
     time (about 15 seconds) and starting the engine.
   - The log: "Windows ARM64 dump: analyzing it with Microsoft's debugger
     engine", the engine ("Debugger engine: dbgeng.dll <version> from
-    <folder> (part of Windows)"), the symbol file, the counts
+    <folder> (part of Windows)"), the symbol file, what each way found
+    ("Processes found: ...", and the "Memory dump process list" warning
+    when they disagree, see above), the counts
     ("Processes (windows.pslist rows): N entries (T timed, S snapshot);
     session ids for K" and "Command lines (windows.cmdline rows): M
     entries; none for A kernel process(es) without a PEB, U not readable
@@ -2214,7 +2265,11 @@ of WinDbg -- instead:
     the builder does not read:
       kdARM64.exe -z "D:\Cases\TriageCollection_2026-10-11_00-08_memory_dump.dmp" -y "srv*C:\Tools\win11-timeline-builder\tools\symbols*https://msdl.microsoft.com/download/symbols"
     then, at its kd> prompt: !process 0 0 (processes), lm (modules), !handle
-    (handles), dx @$cursession.Processes, and q to quit. kdARM64.exe is the
+    (handles), dx @$cursession.Processes, and q to quit. In a dump copied
+    while Windows ran, WinDbg's own process list can end early ("WARNING:
+    corrupted linked list found"): the builder's rows and its "Memory dump
+    process list" note then have processes WinDbg does not list (see "How
+    the processes are found" above). kdARM64.exe is the
     command-line debugger of the WinDbg app (winget install Microsoft.WinDbg;
     see Microsoft's WinDbg documentation for where it is installed), or use
     kd.exe of Debugging Tools for Windows (Windows SDK), Debuggers\arm64\
@@ -3347,10 +3402,12 @@ parsing is skipped, and the timeline CSV can be opened manually.
   file and releases the file, refuses a second engine folder in the same
   process); the dx text parser (the echo, quoted values, engine errors and
   damaged rows as bad items, a backtick in an index, a query that fails as
-  a whole with the engine's own error text, an empty list); paging (100
-  items a page, bad items counted, the item cap, a failing page); the
-  queries (paged, tagged, no "!" command among everything the helper
-  sends, no attacker-tool name of report-rules.json in the helper); the
+  a whole with the engine's own error text, an empty list, the engine's
+  "corrupted linked list" warning kept once); paging (100 items a page,
+  bad items counted, the item cap, a failing page); the queries (paged,
+  tagged, -1 for a process without a session in both session queries, no
+  "!" command among everything the helper sends, no attacker-tool name of
+  report-rules.json in the helper); the
   kernel's symbol file name and key from a fake kernel image, and every
   refusal (no MZ, e_lfanew, PE32, the debug directory, no RSDS record, a
   path or another name, age 0, "? nt" not resolved); the symbol cache and
@@ -3363,18 +3420,42 @@ parsing is skipped, and the timeline CSV can be opened manually.
   Microsoft-Symbol-Server/10.0.0.0); "(pdb symbols)"; names and command
   lines read from a fake memory map (CR, LF, tab, quotes, |, non-ASCII,
   32,767 characters, NUL, an odd length, an unpaired surrogate, empty, no
-  PEB, paged out, another process's address space). A whole analysis on
-  canned dx output (146 processes on two pages with bad items, a duplicate
-  and the idle process; one unreadable session id) goes through the
-  builder's protocol reader into the rows: the edge rows exactly, 146
-  pslist and 141 cmdline rows, the log lines, the same under de-DE, the
-  symbol file reused, a damaged cached file downloaded again, no internet
-  (the reason and the offline advice), a downloaded file the engine does
-  not accept and no folder for it (each its own reason, neither with the
-  offline or internet advice), a process query that fails (the engine's
-  error in the reason), the session query's fallback, command lines that
-  cannot be read (the processes only), a dump that cannot be opened, an
-  error while reading (the session always closed). The helper as a process of
+  PEB, paged out, another process's address space). A whole analysis on a
+  fake kernel -- 146 processes, each an EPROCESS at the offsets of a canned
+  "dt -v nt!_EPROCESS", in a process list and a level-1 process ID table
+  with threads and an entry of another process's ID among them, with
+  tokens and session spaces -- goes through the builder's protocol reader
+  into the rows: the edge rows exactly (no session for System, Registry and
+  smss.exe, session 0 and 1 from the token, none for a token that is not
+  in the dump), 146 pslist and 141 cmdline rows, the log lines (what each
+  way found, no warning), the structures read (dt, the list head, the
+  process ID table, the engine's own list counted once, its dx pages not
+  read), the same under de-DE. Memory copied while Windows ran: a process
+  that ended during the copy (a stale link forwards to it; still in the
+  process ID table) gives every row of the consistent dump and its own,
+  the counts and the "Memory dump process list" warning, which the
+  findings report's log reader reads back; a link forwards into reused
+  memory (the forward walk stops; the backward walk and the table find
+  the rest; no row of the reused memory); a list that loops and a process
+  only in the process ID table (each process once); symbols with
+  _MM_SESSION_SPACE (its ids, the token's where a session space is not in
+  the dump); no process ID table in the symbols (both walks, no warning);
+  the note's wording without the table; the layout's refusals (fields of
+  another type named) and a capped walk. The same 146 processes as canned
+  dx output (two pages with bad items, a duplicate and the idle process;
+  one unreadable session id) for the debugger engine's own list, used when
+  the symbols do not describe the process structure: the same rows, the
+  warning, its "corrupted linked list" as the report's warning, a process
+  query that fails (the engine's error in the reason), session ids decided
+  for each process (the session query failing as a whole, or giving only
+  the processes without a session, as the symbols of Windows 11 24H2 on
+  ARM64 do: the token's for the others). Then the symbol file reused, a
+  damaged cached file downloaded again, no internet (the reason and the
+  offline advice), a downloaded file the engine does not accept and no
+  folder for it (each its own reason, neither with the offline or internet
+  advice), command lines that cannot be read (the processes only), a dump
+  that cannot be opened, an error while reading (the session always
+  closed). The helper as a process of
   its own: the real helper on a fake ARM64 dump (the engine of Windows
   cannot open it), canned entries with every kind of character through the
   pipe, arguments with spaces, [ ], non-ASCII and a trailing backslash, a
@@ -3474,7 +3555,10 @@ parsing is skipped, and the timeline CSV can be opened manually.
   read with the debugger engine (its "analyzed with the Windows debugger
   engine" line, also "processes only") gives that note and a caveat that
   its network connections and services are not in the report, with no
-  "not analyzed" note or caveat. threshold.distinct counts distinct values (records of one file
+  "not analyzed" note or caveat; its "Memory dump process list" warning (the
+  ways of finding the processes disagreed) gives a note of its own after
+  that one, with one colon, and no such line no such note.
+  threshold.distinct counts distinct values (records of one file
   once; a row without the value on its own) and lists each value once in
   the evidence first. "evidence": "latest" lists the latest rows after the
   one that raised the severity, and findings.csv says "latest N rows

@@ -12,9 +12,11 @@
 # What it does: loads the engine by full path, opens the dump read-only
 # where it is (nothing is copied), reads the kernel's symbol file ID from
 # the dump, takes that one file from the symbol cache (tools\symbols\) or
-# downloads it from Microsoft's symbol server, loads it, lists the
-# processes with dx queries and reads each process's name and command line
-# from memory. The engine never gets a symbol server of its own: its symbol
+# downloads it from Microsoft's symbol server, loads it, finds the
+# processes in the kernel's own structures (its process list walked both
+# ways and its process ID table; see "Processes: the kernel's own
+# structures" below) and reads each process's fields and command line from
+# memory. The engine never gets a symbol server of its own: its symbol
 # path is a local folder, and _NT_SYMBOL_PATH is ignored.
 #
 # Output: protocol lines on stdout, "TBDBG|<kind>|..." (log lines, the
@@ -456,9 +458,13 @@ function ConvertFrom-DbgEngNumber {
 # has no "[0x..]". A query that fails as a whole gives no item and no echo,
 # only an "Error: ..." line: QueryError keeps it (or, without such a line
 # and without the echo, the first line there is), so the reason can say why.
+# The engine's own "WARNING: ..." lines (such as "WARNING: corrupted linked
+# list found" for a process list it could not follow to its end) are kept
+# in Warnings, each once.
 function ConvertFrom-DbgEngDxRows {
     param([string]$Text, [string]$Tag, [int]$FieldCount)
     $rows = New-Object System.Collections.Generic.List[object]
+    $warnings = New-Object System.Collections.Generic.List[string]
     $items = 0
     $bad = 0
     $firstBad = ""
@@ -481,6 +487,7 @@ function ConvertFrom-DbgEngDxRows {
         $trimmed = $line.Trim()
         if (-not $trimmed) { continue }
         if ($trimmed.StartsWith('@$')) { $echoed = $true }
+        elseif ($trimmed -match '^WARNING:') { if (-not $warnings.Contains($trimmed)) { $warnings.Add($trimmed) } }
         elseif (-not $errorLine -and $trimmed -match '^Error\b') { $errorLine = $trimmed }
         elseif (-not $otherLine) { $otherLine = $trimmed }
     }
@@ -489,20 +496,23 @@ function ConvertFrom-DbgEngDxRows {
         if ($errorLine) { $queryError = $errorLine }
         elseif (-not $echoed) {
             $queryError = $otherLine
+            if (-not $queryError -and $warnings.Count -gt 0) { $queryError = $warnings[0] }
             if (-not $queryError) { $queryError = "Error: no output" }
         }
     }
-    return [PSCustomObject]@{ Items = $items; Rows = $rows.ToArray(); Bad = $bad; FirstBad = $firstBad; QueryError = $queryError }
+    return [PSCustomObject]@{ Items = $items; Rows = $rows.ToArray(); Bad = $bad; FirstBad = $firstBad; QueryError = $queryError; Warnings = $warnings.ToArray() }
 }
 
 # Runs a dx query page by page (dx shows at most 100 items of a list):
 # -Template has {0} for the number of items to skip. Stops at the first
 # page with fewer than 100 items, at a query that fails as a whole
 # (QueryError), or after -MaxItems (a process list that loops in a damaged
-# dump). Returns Rows, Items, Bad, FirstBad, QueryError, Capped.
+# dump). Returns Rows, Items, Bad, FirstBad, QueryError, Capped and
+# Warnings (the engine's warnings of every page, each once).
 function Get-DbgEngDxPages {
     param($Session, [string]$Template, [string]$Tag, [int]$FieldCount, [int]$MaxItems = 20000)
     $rows = New-Object System.Collections.Generic.List[object]
+    $warnings = New-Object System.Collections.Generic.List[string]
     $items = 0
     $bad = 0
     $firstBad = ""
@@ -511,6 +521,7 @@ function Get-DbgEngDxPages {
     for ($skip = 0; ; $skip += 100) {
         if ($skip -ge $MaxItems) { $capped = $true; break }
         $page = ConvertFrom-DbgEngDxRows -Text (Invoke-DbgEngCommand -Session $Session -Command ($Template -f $skip)) -Tag $Tag -FieldCount $FieldCount
+        foreach ($warning in $page.Warnings) { if (-not $warnings.Contains($warning)) { $warnings.Add($warning) } }
         if ($page.QueryError) { $queryError = $page.QueryError; break }
         foreach ($row in $page.Rows) { $rows.Add($row) }
         $items += $page.Items
@@ -518,15 +529,19 @@ function Get-DbgEngDxPages {
         if (-not $firstBad) { $firstBad = $page.FirstBad }
         if ($page.Items -lt 100) { break }
     }
-    return [PSCustomObject]@{ Rows = $rows.ToArray(); Items = $items; Bad = $bad; FirstBad = $firstBad; QueryError = $queryError; Capped = $capped }
+    return [PSCustomObject]@{ Rows = $rows.ToArray(); Items = $items; Bad = $bad; FirstBad = $firstBad; QueryError = $queryError; Capped = $capped; Warnings = $warnings.ToArray() }
 }
 
-# The dx queries ({0}: items to skip). Every field but the tag is a number;
-# each query reads only fields of the process's kernel object, which is
-# always in a complete dump. The session id is a query of its own, so a
-# process whose session cannot be read is still listed; when no session id
-# can be read that way, the process token's session id is used. None of
-# them is an extension ("!") command: those are never sent.
+# The dx queries of the debugger engine's own process list, used only when
+# the kernel's symbols do not describe its process structures ({0}: items
+# to skip). Every field but the tag is a number; each query reads only
+# fields of the process's kernel object, which is always in a complete
+# dump. The session id is a query of its own, so a process whose session
+# cannot be read is still listed: -1 for a process without a session
+# (EPROCESS.Session is 0: System, smss.exe), else the session space's id,
+# or (TokenSession, for each process the first query gave none) the
+# process token's. None of them is an extension ("!") command: those are
+# never sent.
 function Get-DbgEngQuery {
     param([ValidateSet("Process", "Session", "TokenSession")][string]$Name)
     $start = 'dx -r1 @$cursession.Processes.Skip({0}).Take(100).Select(p => '
@@ -539,28 +554,36 @@ function Get-DbgEngQuery {
             return $start + '"TBS|" + ' + $address + ' + "|" + (((unsigned __int64)p.KernelObject.Session) == 0 ? (__int64)-1 : (__int64)((nt!_MM_SESSION_SPACE*)p.KernelObject.Session)->SessionId).ToDisplayString("d"))'
         }
         "TokenSession" {
-            return $start + '"TBS|" + ' + $address + ' + "|" + ((__int64)((nt!_TOKEN*)(p.KernelObject.Token.Value & ~0xf))->SessionId).ToDisplayString("d"))'
+            return $start + '"TBS|" + ' + $address + ' + "|" + (((unsigned __int64)p.KernelObject.Session) == 0 ? (__int64)-1 : (__int64)((nt!_TOKEN*)(p.KernelObject.Token.Value & ~0xf))->SessionId).ToDisplayString("d"))'
         }
     }
 }
 
 # --- Kernel symbols -------------------------------------------------------------
 
+# The address of a kernel symbol, as the engine evaluates it ("? nt",
+# "? nt!PsActiveProcessHead": an engine command, not an extension); 0 when
+# the engine cannot resolve the name. Kernel addresses are never
+# PowerShell hex literals (0xFFFF... is a negative Int64): they are parsed
+# with [Convert]::ToUInt64 and offsets added as [uint64].
+function Get-DbgEngSymbolAddress {
+    param($Session, [string]$Name)
+    $evaluated = Invoke-DbgEngCommand -Session $Session -Command "? $Name" -TimeoutSeconds 60
+    if ("$evaluated" -match '=\s*([0-9a-fA-F]{8})`?([0-9a-fA-F]{8})') { return [Convert]::ToUInt64($Matches[1] + $Matches[2], 16) }
+    return [uint64]0
+}
+
 # The kernel's symbol file name and its symbol server key, from the
 # CodeView (RSDS) record of the kernel image in the dump: Name, Key (GUID as
 # 32 hex digits, then the age in hex, as Microsoft's symbol server names
 # it), or Error. Everything comes from the examined computer's memory, so it
 # is checked strictly: only the kernel's own symbol file names are accepted,
-# which keeps the download request to the kernel's name and ID. Kernel
-# addresses are never PowerShell hex literals (0xFFFF... is a negative
-# Int64): they are parsed with [Convert]::ToUInt64 and offsets added as
-# [uint64].
+# which keeps the download request to the kernel's name and ID.
 function Get-KernelSymbolInfo {
     param($Session)
     $fail = { param($why) [PSCustomObject]@{ Name = ""; Key = ""; Error = $why } }
-    $evaluated = Invoke-DbgEngCommand -Session $Session -Command "? nt" -TimeoutSeconds 60
-    if ($evaluated -notmatch '=\s*([0-9a-fA-F]{8})`?([0-9a-fA-F]{8})') { return (& $fail "the kernel was not found in the dump") }
-    $base = [Convert]::ToUInt64($Matches[1] + $Matches[2], 16)
+    $base = Get-DbgEngSymbolAddress -Session $Session -Name "nt"
+    if ($base -eq 0) { return (& $fail "the kernel was not found in the dump") }
     $header = Read-DbgEngVirtual -Session $Session -Process 0 -Address $base -Count 0x1000
     if ($header.Length -lt 0x200 -or $header[0] -ne 0x4D -or $header[1] -ne 0x5A) { return (& $fail "the kernel image header is not in the dump") }
     $pe = [BitConverter]::ToInt32($header, 0x3C)
@@ -725,14 +748,20 @@ function Use-KernelSymbols {
 # --- Processes and command lines -------------------------------------------------
 
 # EPROCESS.ImageFileName (15 bytes) as Volatility reads it: up to the
-# first NUL, UTF-8 (an invalid byte becomes U+FFFD). "" when unreadable.
+# first NUL, UTF-8 (an invalid byte becomes U+FFFD)
+function ConvertFrom-DbgEngImageFileName {
+    param([byte[]]$Bytes)
+    if (-not $Bytes -or $Bytes.Length -eq 0) { return "" }
+    $end = [Array]::IndexOf($Bytes, [byte]0)
+    if ($end -lt 0) { $end = $Bytes.Length }
+    return [System.Text.Encoding]::UTF8.GetString($Bytes, 0, $end)
+}
+
+# The same, read at its address: "" when unreadable
 function Read-DbgEngImageFileName {
     param($Session, [uint64]$Address)
     if ($Address -eq 0) { return "" }
-    $bytes = Read-DbgEngVirtual -Session $Session -Process 0 -Address $Address -Count 15
-    $end = [Array]::IndexOf($bytes, [byte]0)
-    if ($end -lt 0) { $end = $bytes.Length }
-    return [System.Text.Encoding]::UTF8.GetString($bytes, 0, $end)
+    return (ConvertFrom-DbgEngImageFileName (Read-DbgEngVirtual -Session $Session -Process 0 -Address $Address -Count 15))
 }
 
 # A process's command line as Volatility's windows.cmdline reads it: the
@@ -778,6 +807,559 @@ function ConvertFrom-DbgEngFileTime {
     if ($null -eq $FileTime -or $FileTime -le 0) { return $null }
     if ($FileTime -gt [datetime]::MaxValue.ToFileTimeUtc()) { return "$FileTime" }
     return [datetime]::FromFileTimeUtc($FileTime).ToString("yyyy-MM-ddTHH:mm:ss.fffffff+00:00", [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+# --- Processes: the kernel's own structures --------------------------------------
+# The debugger engine's own list of processes (dx @$cursession.Processes,
+# what WinDbg shows) walks the kernel's process list (nt!PsActiveProcessHead,
+# then EPROCESS.ActiveProcessLinks) forwards and ends at the first entry
+# whose link back does not point to the entry before it ("WARNING:
+# corrupted linked list found"). A dump made while Windows runs (DumpIt)
+# copies memory page by page, and a process that starts or ends during the
+# copy can leave such an entry. Windows adds new processes at the end of
+# the list, so that list missed the newest processes, the collector's own
+# among them. The helper therefore finds the processes itself, three ways,
+# and lists each process that any of them found, once: the list walked
+# forwards and backwards (an inconsistent link is counted, not an end) and
+# the kernel's process ID table (nt!PspCidTable, which holds every process
+# and thread by its ID). Each process's fields are read from its EPROCESS
+# at the offsets the kernel's symbol file gives ("dt"). When the symbols do
+# not describe those structures, the engine's own list is used (dx
+# queries), and the log says so. When the ways disagree, the log has a
+# warning that the findings report shows as a coverage note ("Memory dump
+# process list: ...").
+
+# A kernel address that a link or pointer of the kernel's structures can
+# hold: its top byte all ones (the kernel half of a 48-bit or 57-bit
+# address space) and 8-byte aligned. A link into user memory, or a small
+# number such as 0x10001 (a field of memory that was reused), is not one.
+function Test-DbgEngKernelAddress {
+    param([uint64]$Address)
+    return (($Address -shr 56) -eq 0xFF -and ($Address -band 7) -eq 0)
+}
+
+# The fields of one kernel type as the engine's "dt -v nt!<type>" shows them
+# (an engine command, not an extension): Size (bytes; 0 when not shown),
+# Offsets (field name -> offset; of fields of the same name, the first),
+# Types (field name -> its type text) and Bits (field name -> @(position,
+# width) of a bitfield). No fields: the symbols do not have the type
+# ("Symbol nt!<type> not found.").
+function Get-DbgEngTypeLayout {
+    param($Session, [string]$TypeName)
+    $layout = [PSCustomObject]@{ Size = 0; Offsets = @{}; Types = @{}; Bits = @{} }
+    $text = Invoke-DbgEngCommand -Session $Session -Command "dt -v nt!$TypeName" -TimeoutSeconds 60
+    foreach ($line in ("$text" -split "\r?\n")) {
+        if ($line -match '^(?:struct|union) (\S+), \d+ elements?, 0x([0-9a-fA-F]+) bytes') {
+            if ($Matches[1] -ceq $TypeName) { $layout.Size = [Convert]::ToInt32($Matches[2], 16) }
+            continue
+        }
+        if ($line -notmatch '^\s+\+0x([0-9a-fA-F]+) (\w+)\s*: (.+?)\s*$') { continue }
+        $offset = [Convert]::ToInt32($Matches[1], 16)
+        $name = $Matches[2]
+        $type = $Matches[3]
+        if ($layout.Offsets.ContainsKey($name)) { continue }
+        $layout.Offsets[$name] = $offset
+        $layout.Types[$name] = $type
+        if ($type -match '^Bitfield Pos (\d+), (\d+) Bits?$') { $layout.Bits[$name] = @([int]$Matches[1], [int]$Matches[2]) }
+    }
+    return $layout
+}
+
+# What the process scan reads, from the kernel's symbols:
+#   Offsets, ProcessSize  the EPROCESS fields the rows need and its size
+#                         (its first byte is the dispatcher header's type,
+#                         3 for a process)
+#   ListHead              nt!PsActiveProcessHead
+#   TokenSessionId        _TOKEN.SessionId (-1: none), and TokenRefMask, the
+#                         reference count bits of EPROCESS.Token (_EX_FAST_REF)
+#   MmSessionId           _MM_SESSION_SPACE.SessionId (-1: the symbols do not
+#                         have that type, as those of Windows 11 24H2 on ARM64)
+#   CidTable, TableCode, EntrySize, PointerPosition, PointerWidth
+#                         nt!PspCidTable, _HANDLE_TABLE.TableCode and
+#                         _HANDLE_TABLE_ENTRY (its size; ObjectPointerBits)
+# Error: why the scan cannot be made (the debugger engine's own list is
+# used instead); CidError: why the process ID table cannot be read (the
+# list is still walked both ways).
+function Get-DbgEngKernelLayout {
+    param($Session)
+    $layout = [PSCustomObject]@{
+        Error = ""; CidError = ""; Offsets = @{}; ProcessSize = 0; ListHead = [uint64]0
+        TokenSessionId = -1; TokenRefMask = [uint64]15; MmSessionId = -1
+        CidTable = [uint64]0; TableCode = 0; EntrySize = 0; PointerPosition = 0; PointerWidth = 0
+    }
+    $process = Get-DbgEngTypeLayout -Session $Session -TypeName "_EPROCESS"
+    if ($process.Offsets.Count -eq 0) { $layout.Error = "the kernel's symbols do not describe its process structure _EPROCESS"; return $layout }
+    # Each field the scan reads, and the type it must have
+    $expected = [ordered]@{
+        Pcb = '^struct _KPROCESS\b'; UniqueProcessId = '^Ptr64\b'; ActiveProcessLinks = '^struct _LIST_ENTRY\b'
+        InheritedFromUniqueProcessId = '^Ptr64\b'; CreateTime = '^union _LARGE_INTEGER\b'; ExitTime = '^union _LARGE_INTEGER\b'
+        ImageFileName = '^\[15\] UChar$'; ActiveThreads = '^Uint4B$'; Peb = '^Ptr64\b'; Token = '^struct _EX_FAST_REF\b'; Session = '^Ptr64\b'
+    }
+    $missing = @($expected.Keys | Where-Object { -not $process.Offsets.ContainsKey($_) -or $process.Types[$_] -notmatch $expected[$_] })
+    if ($missing.Count -gt 0) { $layout.Error = "the kernel's symbols do not give _EPROCESS.$($missing -join ', _EPROCESS.') as expected"; return $layout }
+    $last = 0
+    foreach ($name in $expected.Keys) { $last = [Math]::Max($last, [int]$process.Offsets[$name]) }
+    if ($process.Offsets["Pcb"] -ne 0 -or $process.Size -lt $last + 16 -or $process.Size -gt 0x4000) {
+        $layout.Error = "the kernel's process structure _EPROCESS has a layout the builder does not read"
+        return $layout
+    }
+    foreach ($name in $expected.Keys) { $layout.Offsets[$name] = [int]$process.Offsets[$name] }
+    $layout.ProcessSize = $process.Size
+    $layout.ListHead = Get-DbgEngSymbolAddress -Session $Session -Name "nt!PsActiveProcessHead"
+    if (-not (Test-DbgEngKernelAddress $layout.ListHead)) { $layout.Error = "nt!PsActiveProcessHead is not in the kernel's symbols"; return $layout }
+    # Session ids: of the session space when the symbols describe it, else
+    # of the process token
+    $token = Get-DbgEngTypeLayout -Session $Session -TypeName "_TOKEN"
+    if ($token.Offsets.ContainsKey("SessionId") -and $token.Types["SessionId"] -eq "Uint4B") { $layout.TokenSessionId = [int]$token.Offsets["SessionId"] }
+    $fastRef = Get-DbgEngTypeLayout -Session $Session -TypeName "_EX_FAST_REF"
+    if ($fastRef.Bits.ContainsKey("RefCnt") -and $fastRef.Bits["RefCnt"][0] -eq 0 -and $fastRef.Bits["RefCnt"][1] -ge 1 -and $fastRef.Bits["RefCnt"][1] -le 15) {
+        $layout.TokenRefMask = [uint64](([uint64]1 -shl $fastRef.Bits["RefCnt"][1]) - [uint64]1)
+    }
+    $space = Get-DbgEngTypeLayout -Session $Session -TypeName "_MM_SESSION_SPACE"
+    if ($space.Offsets.ContainsKey("SessionId") -and $space.Types["SessionId"] -eq "Uint4B") { $layout.MmSessionId = [int]$space.Offsets["SessionId"] }
+    # The process ID table
+    $layout.CidTable = Get-DbgEngSymbolAddress -Session $Session -Name "nt!PspCidTable"
+    $table = Get-DbgEngTypeLayout -Session $Session -TypeName "_HANDLE_TABLE"
+    $entry = Get-DbgEngTypeLayout -Session $Session -TypeName "_HANDLE_TABLE_ENTRY"
+    if (-not (Test-DbgEngKernelAddress $layout.CidTable)) { $layout.CidError = "nt!PspCidTable is not in the kernel's symbols" }
+    elseif (-not $table.Offsets.ContainsKey("TableCode") -or $table.Types["TableCode"] -ne "Uint8B") { $layout.CidError = "the kernel's symbols do not give _HANDLE_TABLE.TableCode" }
+    elseif ($entry.Size -ne 16 -or -not $entry.Bits.ContainsKey("ObjectPointerBits")) { $layout.CidError = "the kernel's symbols do not give _HANDLE_TABLE_ENTRY.ObjectPointerBits as expected" }
+    else {
+        $position = [int]$entry.Bits["ObjectPointerBits"][0]
+        $width = [int]$entry.Bits["ObjectPointerBits"][1]
+        if ($width -lt 32 -or $width -gt 60 -or $position + $width -gt 64) { $layout.CidError = "the kernel's process ID table has a layout the builder does not read" }
+        else {
+            $layout.TableCode = [int]$table.Offsets["TableCode"]
+            $layout.EntrySize = 16
+            $layout.PointerPosition = $position
+            $layout.PointerWidth = $width
+        }
+    }
+    return $layout
+}
+
+# The EPROCESS at an address when it is one: its bytes (the structure's
+# size), else $null: not in the dump, its dispatcher header's type is not 3
+# (a process object; memory that was reused is not taken for a process),
+# or its process ID is not a multiple of 4 below 2^32. -Cache (address ->
+# bytes or $null) keeps every answer, so the walks and the process ID table
+# read each address once.
+function Get-DbgEngProcessBlock {
+    param($Session, $Layout, [uint64]$Address, $Cache)
+    if ($Cache.ContainsKey($Address)) {
+        $cached = $Cache[$Address]
+        if ($null -eq $cached) { return $null }
+        return , $cached
+    }
+    $block = $null
+    if (Test-DbgEngKernelAddress $Address) {
+        $bytes = Read-DbgEngVirtual -Session $Session -Process 0 -Address $Address -Count $Layout.ProcessSize
+        if ($bytes.Length -eq $Layout.ProcessSize -and $bytes[0] -eq 3) {
+            $procId = [BitConverter]::ToUInt64($bytes, $Layout.Offsets["UniqueProcessId"])
+            if ($procId -lt [uint64]4294967296 -and ($procId -band 3) -eq 0) { $block = $bytes }
+        }
+    }
+    $Cache[$Address] = $block
+    if ($null -eq $block) { return $null }
+    return , $block
+}
+
+# The kernel's process list walked from its head (nt!PsActiveProcessHead)
+# through ActiveProcessLinks: forwards (Flink), or with -Backward (Blink).
+# An entry whose link back does not point to the entry before it is
+# counted (Mismatches) and the walk goes on. The walk ends at the head
+# (Complete), or, Stop saying why, at a link that is not a kernel address,
+# a link to an entry already walked, an entry that is not a process
+# (Broken: the list itself is damaged there) or after -MaxEntries (Capped).
+# Entries: the EPROCESS addresses in walk order.
+function Invoke-DbgEngProcessWalk {
+    param($Session, $Layout, $Cache, [switch]$Backward, [int]$MaxEntries = 20000)
+    $result = [PSCustomObject]@{
+        Entries = (New-Object 'System.Collections.Generic.List[uint64]'); Mismatches = 0; Complete = $false; Broken = $false; Capped = $false; Stop = ""
+    }
+    $links = [int]$Layout.Offsets["ActiveProcessLinks"]
+    $nextField = 0
+    $backField = 8
+    if ($Backward) { $nextField = 8; $backField = 0 }
+    $head = [uint64]$Layout.ListHead
+    $headBytes = Read-DbgEngVirtual -Session $Session -Process 0 -Address $head -Count 16
+    if ($headBytes.Length -lt 16) { $result.Stop = "the list head is not in the dump"; return $result }
+    $seen = New-Object 'System.Collections.Generic.HashSet[uint64]'
+    $previous = $head
+    $link = [BitConverter]::ToUInt64($headBytes, $nextField)
+    while ($true) {
+        if ($link -eq $head) { $result.Complete = $true; break }
+        if ($result.Entries.Count -ge $MaxEntries) { $result.Capped = $true; $result.Stop = "the first $MaxEntries entries"; break }
+        $result.Broken = $true
+        if (-not (Test-DbgEngKernelAddress $link)) { $result.Stop = "a link that is not a kernel address"; break }
+        if (-not $seen.Add($link)) { $result.Stop = "a link to an entry already walked"; break }
+        $address = $link - [uint64]$links
+        $block = Get-DbgEngProcessBlock -Session $Session -Layout $Layout -Address $address -Cache $Cache
+        if ($null -eq $block) { $result.Stop = "an entry that is not a process"; break }
+        $result.Broken = $false
+        if ([BitConverter]::ToUInt64($block, $links + $backField) -ne $previous) { $result.Mismatches++ }
+        $result.Entries.Add($address)
+        $previous = $link
+        $link = [BitConverter]::ToUInt64($block, $links + $nextField)
+    }
+    return $result
+}
+
+# The non-zero kernel addresses in a page of 512 pointers (a level of the
+# process ID table): @(index, address) each; $null when the page is not in
+# the dump
+function Get-DbgEngTablePointers {
+    param($Session, [uint64]$Address)
+    $page = Read-DbgEngVirtual -Session $Session -Process 0 -Address $Address -Count 4096
+    if ($page.Length -lt 4096) { return $null }
+    $pointers = New-Object System.Collections.Generic.List[object]
+    for ($i = 0; $i -lt 512; $i++) {
+        $value = [BitConverter]::ToUInt64($page, $i * 8)
+        if ($value -ne 0 -and (Test-DbgEngKernelAddress $value)) { $pointers.Add(@($i, $value)) }
+    }
+    return , $pointers.ToArray()
+}
+
+# The processes in the kernel's process ID table (nt!PspCidTable: a handle
+# table of every process and thread, by ID). The low 2 bits of its
+# TableCode are its levels: 0, one page of entries; 1, a page of pointers to
+# such pages; 2, two levels of pointer pages. A 4 KB page holds 256
+# entries of 16 bytes, entry k of page n for ID (n * 256 + k) * 4, and an
+# entry's object is ObjectPointerBits shifted left by 4 and sign-extended
+# (a kernel address). Of the objects, the processes (dispatcher type 3; a
+# thread's is 6) whose process ID is the entry's ID are kept. Entries:
+# EPROCESS addresses in ID order; Error: why the table could not be read;
+# UnreadablePages: pages of entries not in the dump.
+function Get-DbgEngCidProcesses {
+    param($Session, $Layout, $Cache, [int]$MaxPages = 4096)
+    $result = [PSCustomObject]@{ Entries = (New-Object 'System.Collections.Generic.List[uint64]'); Error = ""; UnreadablePages = 0 }
+    $pointer = Read-DbgEngVirtual -Session $Session -Process 0 -Address $Layout.CidTable -Count 8
+    $code = $null
+    if ($pointer.Length -eq 8) {
+        $table = [BitConverter]::ToUInt64($pointer, 0)
+        if (Test-DbgEngKernelAddress $table) {
+            $codeBytes = Read-DbgEngVirtual -Session $Session -Process 0 -Address ($table + [uint64]$Layout.TableCode) -Count 8
+            if ($codeBytes.Length -eq 8) { $code = [BitConverter]::ToUInt64($codeBytes, 0) }
+        }
+    }
+    if ($null -eq $code) { $result.Error = "it is not in the dump"; return $result }
+    $level = [int]($code -band 3)
+    $base = $code -band (-bnot [uint64]3)
+    # The pages of entries, each with its place in the table
+    $pages = New-Object System.Collections.Generic.List[object]
+    if ($level -eq 0) { $pages.Add(@(0, $base)) }
+    elseif ($level -le 2) {
+        $top = Get-DbgEngTablePointers -Session $Session -Address $base
+        if ($null -eq $top) { $result.Error = "it is not in the dump"; return $result }
+        foreach ($item in $top) {
+            if ($level -eq 1) { $pages.Add($item); continue }
+            $middle = Get-DbgEngTablePointers -Session $Session -Address $item[1]
+            if ($null -eq $middle) { $result.UnreadablePages++; continue }
+            foreach ($leaf in $middle) { $pages.Add(@(([long]$item[0] * 512 + $leaf[0]), $leaf[1])) }
+        }
+    }
+    else { $result.Error = "it has a layout the builder does not read (level $level)"; return $result }
+    if ($pages.Count -gt $MaxPages) { $result.Error = "it has more than $MaxPages pages (a damaged dump?)"; return $result }
+    $perPage = [int](4096 / $Layout.EntrySize)
+    $mask = [uint64](([uint64]1 -shl $Layout.PointerWidth) - [uint64]1)
+    $signBit = [uint64]1 -shl ($Layout.PointerWidth + 3)
+    $extend = -bnot [uint64](([uint64]1 -shl ($Layout.PointerWidth + 4)) - [uint64]1)
+    $position = [int]$Layout.PointerPosition
+    $pidOffset = [int]$Layout.Offsets["UniqueProcessId"]
+    foreach ($page in $pages) {
+        $bytes = Read-DbgEngVirtual -Session $Session -Process 0 -Address $page[1] -Count 4096
+        if ($bytes.Length -lt 4096) { $result.UnreadablePages++; continue }
+        $first = [long]$page[0] * $perPage
+        for ($k = 0; $k -lt $perPage; $k++) {
+            $bits = ([BitConverter]::ToUInt64($bytes, $k * $Layout.EntrySize) -shr $position) -band $mask
+            if ($bits -eq 0) { continue }
+            $object = $bits -shl 4
+            if (($object -band $signBit) -ne 0) { $object = $object -bor $extend }
+            if (-not $Cache.ContainsKey($object)) {
+                # A thread (most entries): one byte, its type
+                $type = Read-DbgEngVirtual -Session $Session -Process 0 -Address $object -Count 1
+                if ($type.Length -ne 1 -or $type[0] -ne 3) { $Cache[$object] = $null; continue }
+            }
+            $block = Get-DbgEngProcessBlock -Session $Session -Layout $Layout -Address $object -Cache $Cache
+            if ($null -ne $block -and [BitConverter]::ToUInt64($block, $pidOffset) -eq [uint64](($first + $k) * 4)) { $result.Entries.Add($object) }
+        }
+    }
+    if ($pages.Count -gt 0 -and $result.UnreadablePages -ge $pages.Count) { $result.Error = "its pages are not in the dump" }
+    return $result
+}
+
+# The processes the walks and the process ID table found, each once (by
+# its EPROCESS address): in the forward walk's order, then those the
+# forward walk missed that the backward walk found (in list order), then
+# those only the process ID table has (in ID order). Addresses, and Methods:
+# for each, the ways that found it (1 forward, 2 backward, 4 the process
+# ID table, added).
+function Join-DbgEngProcessSets {
+    param($Forward, $Backward, $Cid)
+    $methods = New-Object 'System.Collections.Generic.Dictionary[uint64,int]'
+    $order = New-Object 'System.Collections.Generic.List[uint64]'
+    $backwardInListOrder = @($Backward)
+    [Array]::Reverse($backwardInListOrder)
+    foreach ($set in @(@(1, @($Forward)), @(2, $backwardInListOrder), @(4, @($Cid)))) {
+        foreach ($address in $set[1]) {
+            $key = [uint64]$address
+            if (-not $methods.ContainsKey($key)) {
+                $methods[$key] = 0
+                $order.Add($key)
+            }
+            $methods[$key] = $methods[$key] -bor $set[0]
+        }
+    }
+    return [PSCustomObject]@{ Addresses = $order.ToArray(); Methods = [int[]]@($order | ForEach-Object { $methods[$_] }) }
+}
+
+# The debugger engine's own list of processes, as WinDbg's
+# dx @$cursession.Processes shows it (the idle process left out), to
+# compare with the scan: Count (-1 when not read) and Corrupt (the engine
+# reported "corrupted linked list": its list ends there)
+function Get-DbgEngEngineProcessCount {
+    param($Session)
+    $result = [PSCustomObject]@{ Count = [long]-1; Corrupt = $false }
+    $text = Invoke-DbgEngCommand -Session $Session -Command 'dx @$cursession.Processes.Where(p => p.Id != 0).Count()' -TimeoutSeconds 120
+    foreach ($line in ("$text" -split "\r?\n")) {
+        if ($line -match '\.Count\(\)\s*:\s*0x([0-9a-fA-F]+)\s*$') { $result.Count = [Convert]::ToInt64($Matches[1], 16) }
+        elseif ($line -match '\.Count\(\)\s*:\s*(\d+)\s*$') { $result.Count = [long]$Matches[1] }
+        elseif ($line -match '^\s*WARNING:.*corrupted linked list') { $result.Corrupt = $true }
+    }
+    return $result
+}
+
+# "1 process" or "2 processes": a count and the word for it
+function Format-DbgEngCount {
+    param([long]$Count, [string]$One, [string]$Many)
+    if ($Count -eq 1) { return "1 $One" }
+    return "$Count $Many"
+}
+
+# What the log says about the process scan. Info: what each way found
+# (always logged). Note: for an analyst to judge the dump when the ways
+# disagree, the list was inconsistent, or the debugger engine's own list
+# has another count ("" when all agree): the warning "Memory dump process
+# list: <note>", which the findings report shows as a coverage note. It
+# has no ": " (the report's notes have one colon). -Methods: the ways that
+# found each process (Join-DbgEngProcessSets); -EngineCount: the engine's
+# own list (-1: not read); -EngineCorrupt: it reported a corrupted list.
+function Get-DbgEngScanText {
+    param($Forward, $Backward, $Cid, [int[]]$Methods, [long]$EngineCount = -1, [bool]$EngineCorrupt = $false)
+    $walkText = {
+        param($walk)
+        $parts = @()
+        if ($walk.Mismatches -gt 0) { $parts += (Format-DbgEngCount -Count $walk.Mismatches -One "inconsistent link" -Many "inconsistent links") }
+        if ($walk.Stop) { $parts += "stopped at $($walk.Stop)" }
+        $text = "$($walk.Entries.Count)"
+        if ($parts.Count -gt 0) { $text += " ($($parts -join ', '))" }
+        return $text
+    }
+    $total = @($Methods).Count
+    $info = "    Processes found: $total; the kernel's process list walked forwards $(& $walkText $Forward), backwards $(& $walkText $Backward)"
+    if ($Cid.Error) { $info += ", its process ID table not read [$($Cid.Error)]" }
+    else {
+        $info += ", in its process ID table $($Cid.Entries.Count)"
+        if ($Cid.UnreadablePages -gt 0) { $info += " ($(Format-DbgEngCount -Count $Cid.UnreadablePages -One 'page' -Many 'pages') of it not in the dump)" }
+    }
+    if ($EngineCount -ge 0) { $info += ", in the debugger engine's own list $EngineCount" }
+
+    # How many processes each combination of ways found
+    $all = 3
+    if (-not $Cid.Error) { $all = 7 }
+    $counts = @{}
+    foreach ($way in @($Methods)) { $counts[[int]$way] = 1 + [int]$counts[[int]$way] }
+    $places = 0
+    foreach ($walk in @($Forward, $Backward)) { $places = [Math]::Max($places, [int]$walk.Mismatches + [int][bool]$walk.Broken) }
+    $partial = @($counts.Keys | Where-Object { $_ -ne $all })
+    $engineDiffers = $EngineCount -ge 0 -and ($EngineCount -ne $total -or $EngineCorrupt)
+    if ($places -eq 0 -and $partial.Count -eq 0 -and -not $engineDiffers) { return [PSCustomObject]@{ Info = $info; Note = "" } }
+
+    $sentences = New-Object System.Collections.Generic.List[string]
+    if ($places -gt 0) {
+        $sentences.Add("the kernel's list of processes was inconsistent in $(Format-DbgEngCount -Count $places -One 'place' -Many 'places'), as when memory is copied while Windows runs and processes start or end during the copy.")
+    }
+    $only = @{ 1 = "only by walking forwards"; 2 = "only by walking backwards"; 4 = "only in the process ID table" }
+    $missed = @{ 1 = "missed by walking forwards"; 2 = "missed by walking backwards"; 4 = "not in the process ID table" }
+    $ways = if ($all -eq 7) { "all three ways (walking the kernel's process list forwards, walking it backwards, and its process ID table)" } else { "both walks of the kernel's process list" }
+    $found = "$(Format-DbgEngCount -Count $total -One 'process was' -Many 'processes were') found, $([int]$counts[$all]) of them by $ways"
+    foreach ($signature in @($partial | Sort-Object -Property @{ Expression = { $counts[$_] }; Descending = $true }, @{ Expression = { $_ } })) {
+        $phrase = $only[$signature]
+        if (-not $phrase) { $phrase = $missed[$all - $signature] }
+        $found += ", $($counts[$signature]) $phrase"
+    }
+    $sentences.Add("$found.")
+    if ($Cid.Error) { $sentences.Add("The process ID table could not be read [$($Cid.Error)].") }
+    if ($engineDiffers) {
+        $engineText = "The debugger engine's own process list (dx @`$cursession.Processes in WinDbg) has $(Format-DbgEngCount -Count $EngineCount -One 'entry' -Many 'entries')"
+        if ($EngineCorrupt) { $engineText += " and stops at the first inconsistent link" }
+        $sentences.Add("$engineText.")
+    }
+    return [PSCustomObject]@{ Info = $info; Note = ($sentences -join " ") }
+}
+
+# The session id of a process (its EPROCESS bytes): none when
+# EPROCESS.Session is 0 (System, smss.exe and the other processes
+# Volatility gives N/A), else the session space's id when the symbols
+# describe it (_MM_SESSION_SPACE), else the process token's. Decided for
+# each process: an id that cannot be read one way is read the other way;
+# none when neither can be read (a process whose token is already gone).
+function Get-DbgEngProcessSessionId {
+    param($Session, $Layout, [byte[]]$Block)
+    $space = [BitConverter]::ToUInt64($Block, $Layout.Offsets["Session"])
+    if ($space -eq 0) { return $null }
+    if ($Layout.MmSessionId -ge 0 -and (Test-DbgEngKernelAddress $space)) {
+        $bytes = Read-DbgEngVirtual -Session $Session -Process 0 -Address ($space + [uint64]$Layout.MmSessionId) -Count 4
+        if ($bytes.Length -eq 4) { return [long][BitConverter]::ToUInt32($bytes, 0) }
+    }
+    if ($Layout.TokenSessionId -ge 0) {
+        $token = [BitConverter]::ToUInt64($Block, $Layout.Offsets["Token"]) -band (-bnot $Layout.TokenRefMask)
+        if (Test-DbgEngKernelAddress $token) {
+            $bytes = Read-DbgEngVirtual -Session $Session -Process 0 -Address ($token + [uint64]$Layout.TokenSessionId) -Count 4
+            if ($bytes.Length -eq 4) { return [long][BitConverter]::ToUInt32($bytes, 0) }
+        }
+    }
+    return $null
+}
+
+# One windows.pslist entry from an EPROCESS's bytes, with the property
+# names of Volatility's JSON
+function ConvertFrom-DbgEngProcessBlock {
+    param($Session, $Layout, [uint64]$Address, [byte[]]$Block)
+    $o = $Layout.Offsets
+    $name = New-Object byte[] 15
+    [Array]::Copy($Block, [int]$o["ImageFileName"], $name, 0, 15)
+    return [PSCustomObject]@{
+        PID = [long][BitConverter]::ToUInt64($Block, $o["UniqueProcessId"]); PPID = [BitConverter]::ToInt64($Block, $o["InheritedFromUniqueProcessId"])
+        ImageFileName = (ConvertFrom-DbgEngImageFileName $name); Offset = "0x$($Address.ToString('x'))"
+        Threads = [long][BitConverter]::ToUInt32($Block, $o["ActiveThreads"]); SessionId = (Get-DbgEngProcessSessionId -Session $Session -Layout $Layout -Block $Block)
+        CreateTime = (ConvertFrom-DbgEngFileTime ([BitConverter]::ToInt64($Block, $o["CreateTime"]))); ExitTime = (ConvertFrom-DbgEngFileTime ([BitConverter]::ToInt64($Block, $o["ExitTime"])))
+    }
+}
+
+# The processes from the kernel's own structures (a layout without Error):
+# Processes (windows.pslist entries), Pebs (@(EPROCESS, PEB) of each, for
+# its command line), Capped; logs what each way found and, when they
+# disagree, the warning the findings report shows. Processes is empty when
+# nothing was found.
+function Read-DbgEngScannedProcesses {
+    param($Session, $Layout)
+    $cache = New-Object 'System.Collections.Generic.Dictionary[uint64,object]'
+    $forward = Invoke-DbgEngProcessWalk -Session $Session -Layout $Layout -Cache $cache
+    $backward = Invoke-DbgEngProcessWalk -Session $Session -Layout $Layout -Cache $cache -Backward
+    if ($Layout.CidError) { $cid = [PSCustomObject]@{ Entries = @(); Error = $Layout.CidError; UnreadablePages = 0 } }
+    else { $cid = Get-DbgEngCidProcesses -Session $Session -Layout $Layout -Cache $cache }
+    $joined = Join-DbgEngProcessSets -Forward $forward.Entries -Backward $backward.Entries -Cid $cid.Entries
+    $processes = New-Object System.Collections.Generic.List[object]
+    $pebs = New-Object System.Collections.Generic.List[object]
+    $methods = New-Object System.Collections.Generic.List[int]
+    for ($i = 0; $i -lt $joined.Addresses.Count; $i++) {
+        $address = $joined.Addresses[$i]
+        $block = [byte[]]$cache[$address]
+        # The idle process (PID 0) is not in the kernel's process list
+        # that windows.pslist walks
+        if ([BitConverter]::ToUInt64($block, $Layout.Offsets["UniqueProcessId"]) -eq 0) { continue }
+        $processes.Add((ConvertFrom-DbgEngProcessBlock -Session $Session -Layout $Layout -Address $address -Block $block))
+        $pebs.Add(@($address, [BitConverter]::ToUInt64($block, $Layout.Offsets["Peb"])))
+        $methods.Add($joined.Methods[$i])
+    }
+    $engine = [PSCustomObject]@{ Count = [long]-1; Corrupt = $false }
+    try { $engine = Get-DbgEngEngineProcessCount -Session $Session }
+    catch { Write-DbgEngLog "    The debugger engine's own process list could not be counted: $(Get-DbgEngShortError (Get-DbgEngErrorText $_))" }
+    $text = Get-DbgEngScanText -Forward $forward -Backward $backward -Cid $cid -Methods $methods.ToArray() -EngineCount $engine.Count -EngineCorrupt $engine.Corrupt
+    Write-DbgEngLog $text.Info
+    if ($text.Note) { Write-DbgEngLog -Warning "  Memory dump process list: $($text.Note)" }
+    $capped = $forward.Capped -or $backward.Capped
+    if ($capped) { Write-DbgEngLog -Warning "  The kernel's process list did not end after 20000 entries (a damaged dump?): the first 20000 each way are used." }
+    return [PSCustomObject]@{ Processes = $processes.ToArray(); Pebs = $pebs.ToArray(); Capped = $capped; BadItems = 0 }
+}
+
+# The processes from the debugger engine's own list (dx queries), when the
+# kernel's symbols do not describe its process structures: Processes,
+# Pebs, Capped, BadItems (list items that could not be read), and Why
+# (why nothing was listed). The engine's list ends at the first
+# inconsistent link of a dump copied while Windows ran; the engine says so
+# ("corrupted linked list"), and so does the log, with the warning the
+# findings report shows.
+function Read-DbgEngEngineProcesses {
+    param($Session)
+    $found = [PSCustomObject]@{ Processes = @(); Pebs = @(); Capped = $false; BadItems = 0; Why = "" }
+    $list = Get-DbgEngDxPages -Session $Session -Template (Get-DbgEngQuery Process) -Tag "TBP" -FieldCount 8
+    if ($list.Rows.Count -eq 0) {
+        $found.Why = $list.QueryError
+        if (-not $found.Why) { $found.Why = $list.FirstBad }
+        return $found
+    }
+    if ($list.QueryError) { Write-DbgEngLog -Warning "  The process list stopped after $($list.Items) entries: $(Get-DbgEngShortError $list.QueryError)" }
+    if ($list.Capped) { Write-DbgEngLog -Warning "  The process list did not end after 20000 entries (a damaged dump?): the first 20000 are used." }
+    $found.Capped = $list.Capped
+    $seen = @{}
+    $processes = New-Object System.Collections.Generic.List[object]
+    $pebs = New-Object System.Collections.Generic.List[object]
+    $malformed = $list.Bad
+    foreach ($row in $list.Rows) {
+        $eprocess = ConvertFrom-DbgEngNumber $row[0] -Hex
+        $procId = ConvertFrom-DbgEngNumber $row[1]
+        $peb = ConvertFrom-DbgEngNumber $row[6] -Hex
+        $nameAddress = ConvertFrom-DbgEngNumber $row[7] -Hex
+        if ($null -eq $eprocess -or $null -eq $procId -or $null -eq $peb -or $null -eq $nameAddress) { $malformed++; continue }
+        # Memory that was reused, taken for a process at a damaged link: no
+        # process ID is negative, past 2^32 or not a multiple of 4
+        if ($procId -lt 0 -or $procId -ge 4294967296 -or $procId % 4 -ne 0) { $malformed++; continue }
+        if ($seen.ContainsKey("$eprocess")) { continue }   # a list that loops
+        $seen["$eprocess"] = $true
+        # The idle process (PID 0) is not in the kernel's process list
+        # that windows.pslist walks
+        if ($procId -eq 0) { continue }
+        $processes.Add([PSCustomObject]@{
+                PID = $procId; PPID = (ConvertFrom-DbgEngNumber $row[2]); ImageFileName = (Read-DbgEngImageFileName -Session $Session -Address $nameAddress)
+                Offset = "0x$($eprocess.ToString('x'))"; Threads = (ConvertFrom-DbgEngNumber $row[5]); SessionId = $null
+                CreateTime = (ConvertFrom-DbgEngFileTime (ConvertFrom-DbgEngNumber $row[3])); ExitTime = (ConvertFrom-DbgEngFileTime (ConvertFrom-DbgEngNumber $row[4]))
+            })
+        $pebs.Add(@($eprocess, $peb))
+    }
+    $found.BadItems = $malformed
+    # The engine's warnings: a corrupted list (the processes after the
+    # break, the newest, are missing) for the findings report; others as
+    # they are
+    foreach ($warning in @($list.Warnings)) {
+        if ($warning -match 'corrupted linked list') {
+            Write-DbgEngLog -Warning "  Memory dump process list: the debugger engine found the kernel's list of processes inconsistent (corrupted linked list), as when memory is copied while Windows runs and processes start or end during the copy, and lists only the $($processes.Count) processes before that place, so the newest processes can be missing. The kernel's own process structures could not be read to find them."
+        }
+        else { Write-DbgEngLog "    The debugger engine warned: $(Get-DbgEngShortError ($warning -replace '^WARNING:\s*', ''))" }
+    }
+    # Session ids, decided for each process: -1 (no session) or the session
+    # space's id, else the process token's (Get-DbgEngQuery)
+    $sessions = @{}
+    try {
+        $spaceList = Get-DbgEngDxPages -Session $Session -Template (Get-DbgEngQuery Session) -Tag "TBS" -FieldCount 2
+        foreach ($row in $spaceList.Rows) {
+            $key = ConvertFrom-DbgEngNumber $row[0] -Hex
+            $id = ConvertFrom-DbgEngNumber $row[1]
+            if ($null -ne $key -and $null -ne $id -and $id -ge -1) { $sessions["$key"] = $id }
+        }
+        $missing = @($pebs | Where-Object { -not $sessions.ContainsKey("$($_[0])") }).Count
+        if ($missing -gt 0) {
+            $why = $spaceList.QueryError
+            if (-not $why) { $why = $spaceList.FirstBad }
+            if (-not $why) { $why = "none read" }
+            Write-DbgEngLog "    Session ids: $(Get-DbgEngShortError $why); the token's session id is used for $missing process(es)"
+            $tokenList = Get-DbgEngDxPages -Session $Session -Template (Get-DbgEngQuery TokenSession) -Tag "TBS" -FieldCount 2
+            foreach ($row in $tokenList.Rows) {
+                $key = ConvertFrom-DbgEngNumber $row[0] -Hex
+                $id = ConvertFrom-DbgEngNumber $row[1]
+                if ($null -ne $key -and $null -ne $id -and $id -ge -1 -and -not $sessions.ContainsKey("$key")) { $sessions["$key"] = $id }
+            }
+        }
+    }
+    catch { Write-DbgEngLog -Warning "  The session ids could not be read: $(Get-DbgEngShortError (Get-DbgEngErrorText $_))" }
+    for ($i = 0; $i -lt $processes.Count; $i++) {
+        $key = "$($pebs[$i][0])"
+        if ($sessions.ContainsKey($key) -and $sessions[$key] -ge 0) { $processes[$i].SessionId = $sessions[$key] }
+    }
+    $found.Processes = $processes.ToArray()
+    $found.Pebs = $pebs.ToArray()
+    return $found
 }
 
 # The dump's processes and command lines (New-DbgEngResult). Nothing read:
@@ -840,66 +1422,31 @@ function Read-DbgEngDump {
             }
         }
 
-        # Processes (windows.pslist)
-        $list = Get-DbgEngDxPages -Session $session -Template (Get-DbgEngQuery Process) -Tag "TBP" -FieldCount 8
-        if ($list.Rows.Count -eq 0) {
-            $why = $list.QueryError
-            if (-not $why) { $why = $list.FirstBad }
-            $whyText = if ($why) { " ($(Get-DbgEngShortError $why))" } else { "" }
-            $result.Reason = "the Windows debugger engine listed no processes in it$whyText"
-            return $result
-        }
-        if ($list.QueryError) { Write-DbgEngLog -Warning "  The process list stopped after $($list.Items) entries: $(Get-DbgEngShortError $list.QueryError)" }
-        if ($list.Capped) { Write-DbgEngLog -Warning "  The process list did not end after 20000 entries (a damaged dump?): the first 20000 are used." }
-        $result.Capped = $list.Capped
-        # Session ids: of the session space (no session for System and
-        # smss.exe, as Volatility gives it), else of the process token
-        $sessions = @{}
-        $sessionList = $null
-        try {
-            $sessionList = Get-DbgEngDxPages -Session $session -Template (Get-DbgEngQuery Session) -Tag "TBS" -FieldCount 2
-            if ($sessionList.Rows.Count -eq 0) {
-                $why = $sessionList.QueryError
-                if (-not $why) { $why = $sessionList.FirstBad }
-                if (-not $why) { $why = "none read" }
-                Write-DbgEngLog "    Session ids: $(Get-DbgEngShortError $why); the token's session id is used instead"
-                $sessionList = Get-DbgEngDxPages -Session $session -Template (Get-DbgEngQuery TokenSession) -Tag "TBS" -FieldCount 2
+        # Processes (windows.pslist): from the kernel's own structures, or,
+        # when its symbols do not describe them, the debugger engine's list
+        $layout = Get-DbgEngKernelLayout -Session $session
+        $found = $null
+        if (-not $layout.Error) {
+            $found = Read-DbgEngScannedProcesses -Session $session -Layout $layout
+            if (@($found.Processes).Count -eq 0) {
+                $layout.Error = "no process was found in them"
+                $found = $null
             }
         }
-        catch { Write-DbgEngLog -Warning "  The session ids could not be read: $(Get-DbgEngShortError (Get-DbgEngErrorText $_))" }
-        if ($sessionList) {
-            foreach ($row in $sessionList.Rows) {
-                $key = ConvertFrom-DbgEngNumber $row[0] -Hex
-                $id = ConvertFrom-DbgEngNumber $row[1]
-                if ($null -ne $key -and $null -ne $id -and $id -ge 0) { $sessions["$key"] = $id }
+        if (-not $found) {
+            Write-DbgEngLog -Warning "  The kernel's own process structures could not be read ($($layout.Error)): the debugger engine's own process list is used, which misses the newest processes when the list changed while the memory was copied."
+            $found = Read-DbgEngEngineProcesses -Session $session
+            if (@($found.Processes).Count -eq 0) {
+                $whyText = if ($found.Why) { " ($(Get-DbgEngShortError $found.Why))" } else { "" }
+                $result.Reason = "the Windows debugger engine listed no processes in it$whyText"
+                return $result
             }
         }
-        $seen = @{}
-        $processes = New-Object System.Collections.Generic.List[object]
-        $pebs = New-Object System.Collections.Generic.List[object]
-        $malformed = $list.Bad
-        foreach ($row in $list.Rows) {
-            $eprocess = ConvertFrom-DbgEngNumber $row[0] -Hex
-            $procId = ConvertFrom-DbgEngNumber $row[1]
-            $peb = ConvertFrom-DbgEngNumber $row[6] -Hex
-            $nameAddress = ConvertFrom-DbgEngNumber $row[7] -Hex
-            if ($null -eq $eprocess -or $null -eq $procId -or $null -eq $peb -or $null -eq $nameAddress) { $malformed++; continue }
-            if ($seen.ContainsKey("$eprocess")) { continue }   # a list that loops
-            $seen["$eprocess"] = $true
-            # The idle process (PID 0) is not in the kernel's process list
-            # that windows.pslist walks
-            if ($procId -eq 0) { continue }
-            $sessionId = $null
-            if ($sessions.ContainsKey("$eprocess")) { $sessionId = $sessions["$eprocess"] }
-            $processes.Add([PSCustomObject]@{
-                    PID = $procId; PPID = (ConvertFrom-DbgEngNumber $row[2]); ImageFileName = (Read-DbgEngImageFileName -Session $session -Address $nameAddress)
-                    Offset = "0x$($eprocess.ToString('x'))"; Threads = (ConvertFrom-DbgEngNumber $row[5]); SessionId = $sessionId
-                    CreateTime = (ConvertFrom-DbgEngFileTime (ConvertFrom-DbgEngNumber $row[3])); ExitTime = (ConvertFrom-DbgEngFileTime (ConvertFrom-DbgEngNumber $row[4]))
-                })
-            $pebs.Add(@($eprocess, $peb))
-        }
-        $result.Processes = $processes.ToArray()
-        $result.BadItems = $malformed
+        $processes = @($found.Processes)
+        $pebs = @($found.Pebs)
+        $result.Processes = $processes
+        $result.BadItems = $found.BadItems
+        $result.Capped = $found.Capped
         $result.SessionIds = @($processes | Where-Object { $null -ne $_.SessionId }).Count
 
         # Command lines (windows.cmdline), from each process's own memory
