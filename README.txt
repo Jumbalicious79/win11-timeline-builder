@@ -32,10 +32,16 @@ Required directory structure:
       Run-TimelineBuilder.bat
       report\                     <-- findings report rules and renderer
                                       (needed for report.pdf)
+      memory\                     <-- the debugger engine helper (Windows
+                                      ARM64 memory dumps)
       reports\                    <-- timelines save here
       tools\                      <-- auto-downloaded on first run
         sqlite3\                  <-- browser history parser
         TimelineExplorer\         <-- forensic CSV viewer
+        dbgeng\                   <-- optional: Microsoft's debugger engine
+                                      DLLs for ARM64 dumps
+        symbols\                  <-- auto-downloaded: Windows kernel
+                                      symbols for ARM64 dumps
 
   (Copy each repository folder whole; the lists show the main parts.)
 
@@ -114,8 +120,13 @@ Both tools are designed to live side-by-side on a USB drive:
       timeline-builder.ps1
       Run-TimelineBuilder.bat
       report\                     <-- findings report rules and renderer
+      memory\                     <-- the debugger engine helper (ARM64 dumps)
       tools\                      <-- auto-downloaded: sqlite3, Timeline Explorer
         volatility3\              <-- optional: vol.exe for memory analysis
+        dbgeng\                   <-- optional: Microsoft's debugger engine
+                                      DLLs for ARM64 dumps
+        symbols\                  <-- auto-downloaded: Windows kernel
+                                      symbols for ARM64 dumps
       reports\                    <-- timelines save here
 
   Copy both repository folders whole (the list shows the main parts).
@@ -126,7 +137,11 @@ and cached in the tools\ directory for future use. For memory capture and
 analysis, extract Magnet DumpIt into the collector's tools\dumpit\ and
 Volatility 3 into the builder's tools\volatility3\. Both folders are in the
 repos with a README.txt explaining where to get the tool; the tools
-themselves are never committed.
+themselves are never committed. A memory dump from a Windows ARM64 computer
+needs no Volatility 3: the builder reads it with Microsoft's debugger engine,
+which is part of Windows, and the first time it analyzes a dump of a Windows
+build it downloads that kernel's symbol file (about 10 MB) into
+tools\symbols\, where later runs find it.
 
 
 ## Quick Start
@@ -225,16 +240,20 @@ themselves are never committed.
   saved it, and a drive that has another letter now (e.g. a USB drive on
   the analysis machine) is searched under its new letter. With
   Volatility 3 in tools\, the builder offers to analyze it (see parser
-  #15). When the manifest lists a dump the builder cannot find or use, it
+  #15). A dump from a Windows ARM64 computer is offered too: Volatility 3
+  cannot read ARM64 memory, so the builder reads it with Microsoft's
+  debugger engine (part of Windows) -- the processes and their command
+  lines, not network connections or services. The first ARM64 dump of a
+  Windows build needs internet access once, for the kernel's symbol file
+  (about 10 MB, kept in tools\symbols\; see "Windows kernel symbols").
+  When the manifest lists a dump the builder cannot find or use, it
   says what to do: connect the drive, or copy the dump next to the zip
   under the name it gives (<zip name>_memory_dump.dmp or .raw), then run
-  the .bat again. A dump from a Windows ARM64 computer is never offered:
-  Volatility 3 cannot analyze ARM64 memory (open the dump in WinDbg), and
-  for an ARM64 collection (its systeminfo.txt says so) the builder does not
-  ask for the dump to be copied. A dump that is found (or listed) but not
-  analyzed -- ARM64, answered 2 at the prompt, no vol.exe, not found -- is
-  named in the findings report's Evidence coverage notes, with the reason,
-  and in its "What this report can't tell you" box.
+  the .bat again. A dump that is found (or listed) but not analyzed --
+  answered 2 at the prompt, no vol.exe, no kernel symbol file for an ARM64
+  dump, not found -- is named in the findings report's Evidence coverage
+  notes, with the reason, and in its "What this report can't tell you"
+  box; so is what an ARM64 dump does not give.
 
 ### PowerShell (Admin)
 
@@ -301,10 +320,13 @@ themselves are never committed.
                   Browser, ScheduledTasks, Services, Network, USB, Persistence,
                   UsnJournal, Amcache, PowerShellHistory, SystemInfo,
                   AntiVirus, Email, SRUM, Memory
-                  Note: Memory is opt-in. Requires Volatility 3 in tools\ and
-                  a memory dump where the collector saved it (also on
-                  another drive), in or next to the collection, or
-                  -MemoryDumpPath (see parser #15). Adds 5-30 minutes.
+                  Note: Memory is opt-in. Requires a memory dump where the
+                  collector saved it (also on another drive), in or next
+                  to the collection, or -MemoryDumpPath, and Volatility 3
+                  in tools\ for an x64 or x86 dump; a Windows ARM64 dump
+                  is read with Microsoft's debugger engine (part of
+                  Windows; see parser #15). Adds 5-30 minutes with
+                  Volatility 3, under a minute for an ARM64 dump.
   -Keywords       Strings to flag in the timeline, as an array or a
                   comma-separated string ("mimikatz,psexec"). Spaces around
                   each keyword are trimmed and empty items ignored. Matching is
@@ -424,6 +446,44 @@ installed as PowerShell modules -- no manual installation needed.
 
   Eric Zimmerman's tools: https://ericzimmerman.github.io/
 
+### Windows kernel symbols (for ARM64 memory dumps)
+  Purpose:    Microsoft's debugger engine needs the symbol file (PDB) of
+              the exact Windows kernel in a Windows ARM64 memory dump to
+              find its processes (parser #15). Downloaded only when such a
+              dump is analyzed, and only that one file.
+  Source:     https://msdl.microsoft.com/download/symbols (Microsoft's
+              public symbol server), as
+              https://msdl.microsoft.com/download/symbols/<name>/<ID>/<name>
+              (<name> is ntkrnlmp.pdb on current Windows; <ID> is the
+              file's GUID and age, read from the kernel image in the dump)
+  Size:       About 10 MB (9.7 MB for build 26100 on ARM64)
+  Cached at:  tools\symbols\<name>\<ID>\<name>, once per Windows build: the
+              dumps of a computer share it until Windows is updated
+  Privacy:    The request is the only thing that leaves the computer, and
+              it names only that symbol file: the kernel's file name and
+              its GUID and age, which are the same for every computer
+              running that Windows build. Nothing else about the dump,
+              the collection or the examined computer is sent. Like any
+              web request it comes from your public IP address, and it
+              carries PowerShell's user agent (the analysis computer's
+              Windows and PowerShell versions). The debugger engine itself
+              never contacts a symbol server: its symbol path is a local
+              folder, and _NT_SYMBOL_PATH is ignored.
+  Proxy:      The system's proxy settings (as Internet Explorer/Edge use
+              them); a proxy that needs a sign-in is not supported.
+  Offline:    Without internet access the dump is reported as not analyzed,
+              and the log names the URL and the path: download the file on
+              another computer, copy it to that path under tools\symbols\,
+              and run the builder again.
+  Integrity:  The download is checked (size, the PDB signature) and kept
+              only when the debugger engine accepts it for the kernel in
+              the dump (the same GUID and age); a cached file that does
+              not match is deleted and downloaded again.
+  Deleting:   tools\symbols\ can be deleted at any time (it is downloaded
+              again when needed). WinDbg can use the same folder:
+              -y "srv*<builder>\tools\symbols*https://msdl.microsoft.com/download/symbols"
+  More:       tools\symbols\README.txt
+
 All downloads happen once. On subsequent runs, cached copies are reused.
 Download zips are deleted from %TEMP% after extraction; the work folder
 (extracted collection, scratch copies) is deleted at the end of every run.
@@ -454,9 +514,15 @@ The script creates a timestamped report folder next to the script:
       report-rules.json              -- The findings report's rules (data)
       TimelineReport.Engine.ps1      -- Rules engine and report model
       TimelineReport.Render.ps1      -- report.html and report.pdf
+    memory\
+      TimelineDbgEng.ps1             -- Reads Windows ARM64 memory dumps with
+                                        Microsoft's debugger engine (run in a
+                                        PowerShell process of its own)
     tools\
       sqlite3\                       -- Auto-downloaded, cached
       TimelineExplorer\              -- Auto-downloaded on first use, cached
+      symbols\                       -- Windows kernel symbols for ARM64
+                                        dumps, downloaded once per build
 
 The report files are written next to the timeline: with -OutputFile, in
 that file's folder (the builder log stays in reports\timeline_<timestamp>\).
@@ -473,7 +539,9 @@ See "Findings Report".
       in\                            -- the extracted collection zip
       scratch\                       -- copies for reg load, sqlite3 and
                                         the SRUM reader, Volatility 3
-                                        output
+                                        output, and the debugger engine's
+                                        empty symbol and extension folders
+                                        (dbgeng\, for an ARM64 dump)
 
   It is deleted at the end of every run, also after an error or Ctrl+C. A
   folder left by a run that was killed (window closed, crash) is deleted by
@@ -609,7 +677,8 @@ gets it):
   - SRUM: the last hourly SRUM record of each UTC day
   - Defender DetectionHistory and quarantine entries: the times stored in
     the files
-  - Memory dump (Volatility 3): process creation and connection times kept
+  - Memory dump (Volatility 3, or the Windows debugger engine for a Windows
+    ARM64 dump): process creation and connection times kept
     in memory; rows without one get the capture time (the SystemTime in the
     header of a 64-bit crash dump, else the dump file's last-write time; see
     "Snapshot rows" and parser #15)
@@ -811,7 +880,8 @@ once more.
      no 4104 script blocks, no Sysmon, the USN journal's span, ...),
      collector errors and warnings (or that the collector's log is
      missing), notes (among them a memory dump of the collection that was
-     not analyzed, and why), and the Integrity leads
+     not analyzed, and why, or what was read from a Windows ARM64 dump),
+     and the Integrity leads
   3  Antivirus verdicts       4  Access       5  Persistence
   6  Execution                7  Initial access       8  File system
      (and "Other leads" when a rule uses another category)
@@ -903,7 +973,8 @@ once more.
 
   A lead whose rows all come from the memory dump -- the Memory-Processes,
   Memory-Network, Memory-CommandLine and Memory-Services rows the Memory
-  parser reads with Volatility 3, whatever their event type -- says
+  parser reads with Volatility 3 (or the Windows debugger engine, for a
+  Windows ARM64 dump), whatever their event type -- says
   exactly that: "Captured in the memory dump". Its rows are the state when
   the dump was taken (stamped with the dump's capture time) unless the dump
   records a time of its own, such as a process's creation time. The note
@@ -997,7 +1068,9 @@ once more.
   and checked -- no rule reads them, and a stale socket can belong to an
   earlier process that reused the PID. Volatility 3's pslist reports a
   process's create time cut to the whole second, so the recorded 100-ns start
-  time is matched against its own second. A typical double-click records
+  time is matched against its own second. The Windows debugger engine (a
+  Windows ARM64 dump) gives the full 100-ns create time, which the timeline
+  keeps to the millisecond: it is matched within that millisecond. A typical double-click records
   about four processes (PowerShell, cmd, conhost, DumpIt) plus any
   short-lived children still listed by pslist (csc.exe/cvtres.exe from
   Add-Type, systeminfo.exe); with Windows Terminal as the default terminal a
@@ -1923,9 +1996,10 @@ Parses command history:
     stores no per-command times; all commands get the time of the history
     file's last write (when the last command was added)
 
-### 15. Memory Dump (opt-in, requires Volatility 3)
-Analyzes memory dumps captured by the triage collector using Volatility 3:
-the crash dump from DumpIt (<collection>_memory_dump.dmp) or a raw image
+### 15. Memory Dump (opt-in; Volatility 3, or Microsoft's debugger engine for Windows ARM64 dumps)
+Analyzes memory dumps captured by the triage collector using Volatility 3
+(Windows ARM64 dumps: Microsoft's debugger engine, see "ARM64 memory dumps"
+below): the crash dump from DumpIt (<collection>_memory_dump.dmp) or a raw image
 (<collection>_memory_dump.raw). The collector saves it next to the zip, as
 it is too large to zip, or on another drive (its -MemoryOutputPath, or the
 drive picked at its memory prompt: <drive>\TriageMemory\). The dump is
@@ -1977,7 +2051,10 @@ looked for in this order:
   the manifest's SHA-256 for it.
 Opt-in only -- not included in default Sources. Add "Memory" to -Sources to enable.
 Without it, the builder offers to analyze a dump it finds when vol.exe is
-in tools\; the offer shows the dump's full path when it is outside the
+in tools\ (for a Windows ARM64 dump: when the debugger engine is there,
+which is part of Windows; the offer says what it reads, how long it takes
+and that the kernel's symbol file is downloaded once per Windows build);
+the offer shows the dump's full path when it is outside the
 collection, and says when collection_manifest.csv gave the place (and the
 path it lists, when the drive has another letter now). When no dump is
 found and the manifest lists one, the offer step says what became of it
@@ -1988,21 +2065,21 @@ collection folder, next to the folder under its name), then run the
 builder again. With Memory in -Sources, the parser's warning says the
 same (also for a collection whose manifest lists no dump) and adds
 -MemoryDumpPath.
-Requires vol.exe in tools\volatility3\ (see tools\volatility3\README.txt).
-Windows ARM64 dumps are detected from the dump header and skipped:
-Volatility 3 analyzes Intel x86/x64 Windows memory only (use WinDbg). When
-no dump is found for a collection whose systeminfo.txt says ARM64, the
-offer step says so instead of asking for the dump to be copied next to
-the zip. A dump of the collection that is found or listed but not
-analyzed (ARM64, answered 2 at the prompt, no vol.exe, not found) gets a
-log line "Memory dump not analyzed: <dump> (<size>) -- <reason>[; <what
-to do>]", for example "... -- Volatility 3 cannot read Windows ARM64
-dumps; examine it in WinDbg." The findings report shows that line in its
-Evidence coverage notes, and the reason alone in its caveat ("A memory
-dump of this collection was not analyzed (Volatility 3 cannot read Windows
-ARM64 dumps), so the programs, network connections and command lines in
-memory are not in this report."). -ReportOnly reads the older wording
-("<dump> (<size>): <reason>") the same way.
+Requires vol.exe in tools\volatility3\ (see tools\volatility3\README.txt)
+for an x64 or x86 dump. Volatility 3 analyzes Intel x86/x64 Windows memory
+only: a Windows ARM64 dump (detected from the dump header) is read with
+Microsoft's debugger engine instead -- its processes and command lines, the
+same rows as below (see "ARM64 memory dumps"). A dump of the collection
+that is found or listed but not analyzed (answered 2 at the prompt, no
+vol.exe, an ARM64 dump the debugger engine could not read, not found) gets
+a log line "Memory dump not analyzed: <dump> (<size>) -- <reason>[; <what
+to do>]", for example "... -- skipped at the memory prompt; run the
+builder again and answer 1 to analyze it." The findings report shows that
+line in its Evidence coverage notes, and the reason alone in its caveat ("A
+memory dump of this collection was not analyzed (skipped at the memory
+prompt), so the programs, network connections and command lines in memory
+are not in this report."). -ReportOnly reads the older wording ("<dump>
+(<size>): <reason>") the same way.
   - windows.pslist: Running processes with creation timestamps, PIDs, parent
     PIDs (ProcessCreation at the creation time)
   - windows.netscan: Network connections with protocol, addresses, ports,
@@ -2027,6 +2104,97 @@ header)" or "(dump file last-write time)", and per plugin "windows.pslist:
 N entries (T timed, S snapshot)". The Source column distinguishes memory
 rows (Memory-Processes, Memory-Network, Memory-CommandLine,
 Memory-Services).
+
+### ARM64 memory dumps (Windows debugger engine)
+Volatility 3 cannot read Windows ARM64 memory (it has no ARM64 support for
+Windows). For a dump whose header says ARM64 (DumpIt on a Windows on Arm
+computer), the Memory parser uses Microsoft's debugger engine -- the engine
+of WinDbg -- instead:
+  - The engine: dbgeng.dll with dbghelp.dll and dbgmodel.dll, part of
+    Windows (C:\Windows\System32), so nothing has to be installed.
+    tools\dbgeng\<arm64|amd64|x86>\ (the processor architecture of the
+    PowerShell that runs the builder) may hold a newer copy from
+    Microsoft's NuGet package (see "Microsoft debugger engine" under
+    Optional Tools); it is used only when dbgeng.dll, dbghelp.dll and
+    dbgmodel.dll are there and every DLL in that folder (subfolders too) has
+    a valid signature from Microsoft, otherwise the log has a warning and
+    the engine of Windows is used. The DLLs are always loaded by their full
+    path, never searched for. The builder runs the engine in a PowerShell
+    process of its own (memory\TimelineDbgEng.ps1), so a damaged dump that
+    crashes or hangs the engine cannot stop the builder: that process is
+    ended after 15 minutes, and the dump is reported as not analyzed.
+  - What is read (the same rows as Volatility's plugins, Source
+    Memory-Processes and Memory-CommandLine):
+      processes, as windows.pslist: PID, parent PID, name, threads, session
+        and the exact create time (to 100 ns; the timeline keeps
+        milliseconds); exited processes still in the list are listed too
+        (Threads=0). System and smss.exe have no session, as with Volatility.
+      command lines, as windows.cmdline: read from each process's own
+        memory exactly as stored (quotes, tabs, line breaks, any
+        character). None for the kernel's own processes (System, Registry,
+        Memory Compression: no PEB), and none for a process whose command
+        line is paged out of memory or that has exited -- where Volatility
+        writes "Required memory at ... is not valid", this writes no row.
+  - What is not read: network connections and services (Volatility's
+    netscan and svcscan). No free tool reads those from Windows ARM64
+    memory except MemProcFS, which the builder does not use.
+  - Kernel symbols: the engine needs the symbol file of the dump's exact
+    Windows kernel. The builder reads its name and ID from the kernel image
+    in the dump and takes the file from tools\symbols\, or downloads it once
+    per Windows build from Microsoft's symbol server (about 10 MB; see
+    "Windows kernel symbols"). Without internet access, the log names the
+    URL and where to copy the file.
+  - Time: about 3 seconds for an 8 GB dump, plus the download the first
+    time (about 15 seconds) and starting the engine.
+  - The log: "Windows ARM64 dump: analyzing it with Microsoft's debugger
+    engine", the engine ("Debugger engine: dbgeng.dll <version> from
+    <folder> (part of Windows)"), the symbol file, the counts
+    ("Processes (windows.pslist rows): N entries (T timed, S snapshot);
+    session ids for K" and "Command lines (windows.cmdline rows): M
+    entries; none for A kernel process(es) without a PEB, U not readable
+    (paged out or exited), E empty"), then the line the findings report
+    reads:
+      Memory dump analyzed with the Windows debugger engine: <dump> (<size>)
+        -- processes and command lines only; network connections and
+        services are not read from Windows ARM64 dumps.
+    ("processes only, its command lines could not be read [<why>]" when
+    the command lines failed). The report shows it as an Evidence coverage
+    note, and its caveat says "The memory dump is a Windows ARM64 dump, read
+    with the Windows debugger engine: only its processes and command lines
+    are in this report, not its network connections or services."
+  - When it is not analyzed, the "Memory dump not analyzed" line gives one
+    of these reasons:
+      the Windows debugger engine (dbgeng.dll) is not in <folder>; see
+        "ARM64 memory dumps" in README.txt
+      the debugger engine helper memory\TimelineDbgEng.ps1 is missing, an
+        antivirus may have removed it; copy the whole
+        win11-timeline-builder folder again
+      the Windows debugger engine could not open it (<error>)
+      <what is wrong with the kernel image> (the Windows debugger engine
+        needs the kernel's symbol file)
+      the Windows kernel symbol file could not be downloaded from
+        Microsoft's symbol server (<error>); connect to the internet and run
+        the builder again, or see "Windows kernel symbols" in README.txt
+      the Windows debugger engine listed no processes in it (<the engine's
+        error>)
+      the Windows debugger engine stopped (<error>, or an exit code such as
+        0xC0000005), or did not finish within 15 minutes
+  - More with WinDbg: the log ends with a command for the dump with the
+    builder's symbol cache, for handles, drivers and other kernel objects
+    the builder does not read:
+      kdARM64.exe -z "D:\Cases\TriageCollection_2026-10-11_00-08_memory_dump.dmp" -y "srv*C:\Tools\win11-timeline-builder\tools\symbols*https://msdl.microsoft.com/download/symbols"
+    then, at its kd> prompt: !process 0 0 (processes), lm (modules), !handle
+    (handles), dx @$cursession.Processes, and q to quit. kdARM64.exe is the
+    command-line debugger of the WinDbg app (winget install Microsoft.WinDbg;
+    see Microsoft's WinDbg documentation for where it is installed), or use
+    kd.exe of Debugging Tools for Windows (Windows SDK), Debuggers\arm64\
+    on an ARM64 computer or Debuggers\x64\ on an x64 one, with the same
+    options. Opening the dump in the WinDbg app works too.
+  - -ReportOnly on a timeline from an older builder, which could not
+    analyze ARM64 dumps ("Volatility 3 cannot read Windows ARM64 dumps;
+    examine it in WinDbg"): its note and caveat say "the builder that made
+    this timeline could not analyze Windows ARM64 dumps; build the timeline
+    again to analyze it with the Windows debugger engine".
 
 ### 16. System Info
 Parses systeminfo.txt and the firewall rule list:
@@ -2501,6 +2669,21 @@ Timeline Explorer at the same time.
     does not keep the file's dates (most copies do) gives the time of the
     copy instead.
 
+  - Windows ARM64 memory dumps -- Read with Microsoft's debugger engine,
+    they give the processes and their command lines only: no network
+    connections and no services (see "ARM64 memory dumps" under parser
+    #15). The first ARM64 dump of each Windows build needs internet access
+    once, for the kernel's symbol file (or a copy of it placed in
+    tools\symbols\ by hand; the log says where); without it the dump is
+    reported as not analyzed. A command line that is paged out of memory,
+    or of a process that has exited, has no row (Volatility writes a "not
+    valid" text there). The Windows debugger engine that comes with older
+    Windows versions is not tested with Windows 11 ARM64 dumps: if it
+    cannot read one, the reason is in the log and the report, and a newer
+    engine can be put in tools\dbgeng\ (see Optional Tools). An x64
+    PowerShell cannot load an ARM64 engine: on an ARM64 computer run the
+    builder from the ARM64 PowerShell (Run-TimelineBuilder.bat does).
+
   - Memory dump on another drive -- collection_manifest.csv records where
     the collector saved the dump as a path on the machine that ran the
     collector (e.g. D:\TriageMemory\<collection>_memory_dump.dmp). The
@@ -2633,7 +2816,8 @@ Timeline Explorer at the same time.
     the findings report is written as report.html only
   - Internet connection on first run (to install ImportExcel module and
     auto-download sqlite3.exe; Timeline Explorer downloaded on first use
-    if selected). After first run, cached copies are used offline.
+    if selected) and, once per Windows build, for an ARM64 memory dump's
+    kernel symbol file. After that, cached copies are used offline.
 
 
 ## Third-Party Dependencies (Auto-Downloaded)
@@ -2708,7 +2892,7 @@ parsing is skipped, and the timeline CSV can be opened manually.
        tools\volatility3\vol.exe exists (x64 build; runs under emulation
        on Windows on ARM)
     Volatility 3 analyzes Intel x86/x64 Windows memory only; ARM64 dumps
-    are skipped with a note.
+    are read with Microsoft's debugger engine instead (see below).
 
   The Memory parser is opt-in. Add "Memory" to -Sources to enable it.
   If vol.exe is not found, the parser logs download instructions and skips.
@@ -2732,6 +2916,37 @@ parsing is skipped, and the timeline CSV can be opened manually.
   processes and connections without a valid time of their own (see parser
   #15). Volatility's JSON output goes to the work folder's scratch\ and is
   deleted after each plugin.
+
+### Microsoft debugger engine (ARM64 memory dumps)
+  Purpose:    Reads Windows ARM64 memory dumps (processes and command lines),
+              which Volatility 3 cannot read (parser #15, "ARM64 memory
+              dumps")
+  Author:     Microsoft (the engine of WinDbg)
+  Needed:     Nothing to install: dbgeng.dll, dbghelp.dll and dbgmodel.dll
+              are part of Windows (C:\Windows\System32), and the builder uses
+              them. The kernel's symbol file is downloaded once per Windows
+              build (see "Windows kernel symbols").
+  Optional:   tools\dbgeng\<arch>\, a newer engine from Microsoft's NuGet
+              package, for an older Windows whose own engine cannot read a
+              dump of a newer one. <arch> is the processor architecture of the
+              PowerShell that runs the builder: arm64, amd64 or x86.
+  Setup (details: tools\dbgeng\README.txt):
+    1. Open https://www.nuget.org/packages/Microsoft.Debugging.Platform.DbgEng
+       and choose "Download package" (a .nupkg file; rename it to .zip)
+    2. Copy every file of its content\<arch>\ folder (dbgeng.dll,
+       dbghelp.dll, dbgmodel.dll, dbgcore.dll, msdia140.dll, ...) into
+       win11-timeline-builder\tools\dbgeng\<arch>\
+    The symbol server package (Microsoft.Debugging.Platform.SymSrv) is not
+    needed: the builder downloads the one symbol file itself, and the engine
+    never gets a symbol server.
+  Signature:  The folder is used only when dbgeng.dll, dbghelp.dll and
+              dbgmodel.dll are in it and every DLL in it (subfolders too)
+              has a valid Authenticode signature from Microsoft (the builder
+              runs as Administrator). Otherwise the log warns, naming the
+              file, and the engine of Windows is used.
+  License:    Microsoft's license for the package (Windows SDK terms); not
+              redistributed with this repo
+  Used by:    Parser #15 (Memory Dump), Windows ARM64 dumps only -- opt-in
 
 
 ## Tests
@@ -3004,18 +3219,25 @@ parsing is skipped, and the timeline CSV can be opened manually.
   zip or folder); only the parser, run with -Sources ...,Memory from
   PowerShell, names -MemoryDumpPath, and the offer step says nothing for a
   collection whose manifest lists no dump. The offer step also logs the
-  "Memory dump not analyzed" line the findings report reads; for a
-  collection from a Windows ARM64 computer (its systeminfo.txt) it gives
-  no copy advice and names WinDbg; the dump of a zip whose top folder was
-  renamed is named after the folder's original name. It runs the offer
-  itself (the builder's block for a run without Memory in -Sources, as
-  from the .bat) on a zip with its dump next to it: an ARM64 dump is not
-  offered, no vol.exe, answer 2, the end of redirected input (as 2), an
-  invalid answer and then 1 (asked again); each dump that is not analyzed
-  gets the "Memory dump not analyzed" line, which the findings report's
-  own log reader must read back, with the size the prompt shows (bytes,
-  or GB with two decimals), and WinDbg is named once. The Memory parser
-  gives that line too (ARM64, no vol.exe). Then it
+  "Memory dump not analyzed" line the findings report reads, also for a
+  collection from a Windows ARM64 computer (the same copy advice); the dump
+  of a zip whose top folder was renamed is named after the folder's
+  original name. It runs the offer itself (the builder's block for a run
+  without Memory in -Sources, as from the .bat) on a zip with its dump
+  next to it: an ARM64 dump is offered with Microsoft's debugger engine
+  (what it reads and what not, the time, the one-time symbol download;
+  also without vol.exe, which is not looked for; an engine in tools\dbgeng
+  named) and not offered without an engine, no vol.exe for an x64 dump,
+  answer 2, the end of redirected input (as 2), an invalid answer and then
+  1 (asked again); each dump that is not analyzed gets the "Memory dump
+  not analyzed" line, which the findings report's own log reader must read
+  back, with the size the prompt shows (bytes, or GB with two decimals).
+  The Memory parser gives that line too (no vol.exe; an ARM64 dump the
+  debugger engine could not read), and for an ARM64 dump it read the
+  "analyzed with the Windows debugger engine" line (also "processes
+  only"), read back by the report's log reader, and the WinDbg command
+  (kdARM64.exe -z ... -y srv*<tools\symbols>*...), with no Volatility 3.
+  Then it
   reads synthetic dump headers: the architecture and the capture time
   (64-bit SystemTime used; zero, before 1980, more than a day after the
   last write, cut off, 32-bit and raw fall back to the last-write time;
@@ -3032,6 +3254,47 @@ parsing is skipped, and the timeline CSV can be opened manually.
   run on an x64 dump: the rows at the header's capture time (not the
   file's last write), the counts per plugin in the log, and the warning
   for a plugin without output. Volatility 3 is not run; no admin needed.
+  The debugger engine for Windows ARM64 dumps (memory\TimelineDbgEng.ps1,
+  its functions loaded from its syntax tree; the two functions it shares
+  with the builder must be the same): the architecture folder name;
+  Find-DbgEngine (System32; copies of System32's catalog-signed DLLs in
+  tools\dbgeng\<arch>\ used, in their load order; an unsigned DLL in a
+  subfolder or a missing dbghelp.dll refused with a warning naming it; no
+  dbgeng.dll; another architecture); the C# host on the computer's own
+  engine (it compiles, loads dbgeng.dll by full path, runs a command, gives
+  the output of a failing one, throws for a fake ARM64 dump and a missing
+  file and releases the file, refuses a second engine folder in the same
+  process); the dx text parser (the echo, quoted values, engine errors and
+  damaged rows as bad items, a backtick in an index, a query that fails as
+  a whole with the engine's own error text, an empty list); paging (100
+  items a page, bad items counted, the item cap, a failing page); the
+  queries (paged, tagged, no "!" command among everything the helper
+  sends, no attacker-tool name of report-rules.json in the helper); the
+  kernel's symbol file name and key from a fake kernel image, and every
+  refusal (no MZ, e_lfanew, PE32, the debug directory, no RSDS record, a
+  path or another name, age 0, "? nt" not resolved); the symbol cache and
+  download with a stub (the exact URL and path, the cache reused, an HTML
+  page, a short file and no network refused with nothing left, a stale
+  download of an earlier run deleted, another run's file kept, a cache
+  that cannot be written); "(pdb symbols)"; names and command lines read
+  from a fake memory map (CR, LF, tab, quotes, |, non-ASCII, 32,767
+  characters, NUL, an odd length, an unpaired surrogate, empty, no PEB,
+  paged out, another process's address space). A whole analysis on canned
+  dx output (146 processes on two pages with bad items, a duplicate and the
+  idle process; one unreadable session id) goes through the builder's
+  protocol reader into the rows: the edge rows exactly, 146 pslist and 141
+  cmdline rows, the log lines, the same under de-DE, the symbol file
+  reused, a damaged cached file downloaded again, no internet (the reason
+  and the offline advice), a process query that fails (the engine's error
+  in the reason), the session query's fallback, command lines that cannot
+  be read (the processes only), a dump that cannot be opened, an error
+  while reading (the session always closed). The helper as a process of
+  its own: the real helper on a fake ARM64 dump (the engine of Windows
+  cannot open it), canned entries with every kind of character through the
+  pipe, arguments with spaces, [ ], non-ASCII and a trailing backslash, a
+  crash (exit code 0xC0000005), an error (its message), a hang (ended after
+  the time limit), output without its end, no helper, no engine. Nothing
+  is downloaded; no real dump is opened.
 
   tests\Test-ShimCacheParser.ps1 -- loads the builder's functions and runs
   the PowerShellHistory parser (which also reads BAM and the ShimCache) on
@@ -3106,7 +3369,12 @@ parsing is skipped, and the timeline CSV can be opened manually.
   line, in the current and the older wording) in the notes, with the
   reason and advice after one colon, and a caveat that gives the reason as
   one short phrase and does not say the dump exists (it may not have been
-  found). threshold.distinct counts distinct values (records of one file
+  found); a log of a builder that could not analyze Windows ARM64 dumps
+  says the timeline can be built again for that, and a Windows ARM64 dump
+  read with the debugger engine (its "analyzed with the Windows debugger
+  engine" line, also "processes only") gives that note and a caveat that
+  its network connections and services are not in the report, with no
+  "not analyzed" note or caveat. threshold.distinct counts distinct values (records of one file
   once; a row without the value on its own) and lists each value once in
   the evidence first. "evidence": "latest" lists the latest rows after the
   one that raised the severity, and findings.csv says "latest N rows
@@ -3267,7 +3535,14 @@ parsing is skipped, and the timeline CSV can be opened manually.
   are flagged again and the older-collector note appears; and a copy whose
   collection_info.json also lists the attacker's process as a Child: it is
   not left out, and the builder log, report-model.json and report.html say
-  to check whether collection_info.json was altered; -ReportOnly with -ReportRules
+  to check whether collection_info.json was altered; a copy of the builder
+  whose debugger engine helper (memory\TimelineDbgEng.ps1) returns canned
+  entries, run with -MemoryDumpPath on a synthetic Windows ARM64 dump
+  header (the engine lookup, the helper in a process of its own and its
+  output are real): the engine and the "analyzed with the Windows debugger
+  engine" lines, the rows, the note and caveat in report-model.json, the
+  memory-only lead "Captured in the memory dump", also after -ReportOnly;
+  -ReportOnly with -ReportRules
   and -NoExcel
   (the workbook is called stale; -WorkDir and -MemoryDumpPath are ignored
   with one warning), a missing rules file, -NoReport, -ReportOnly in a
@@ -3358,6 +3633,12 @@ parsing is skipped, and the timeline CSV can be opened manually.
                        to report.pdf (a temporary profile folder in %TEMP%,
                        deleted afterwards; no network access is needed).
 
+  dbgeng.dll,          Microsoft's debugger engine (with dbghelp.dll and
+  dbghelp.dll,         dbgmodel.dll in C:\Windows\System32) reads Windows
+  dbgmodel.dll         ARM64 memory dumps: the processes and their command
+                       lines (parser #15). Loaded by full path in a
+                       PowerShell process of its own (memory\TimelineDbgEng.ps1).
+
   PowerShell cmdlets   Import-Csv, Export-Csv, Expand-Archive,
                        Invoke-WebRequest, ConvertFrom-Json.
 
@@ -3403,6 +3684,11 @@ parsing is skipped, and the timeline CSV can be opened manually.
                        used by the Memory parser to analyze RAM dumps.
                        https://github.com/volatilityfoundation/volatility3
 
+  Microsoft Debugging  The debugger engine of WinDbg (dbgeng.dll, part of
+  Tools for Windows    Windows) reads Windows ARM64 memory dumps, with the
+                       kernel symbols of Microsoft's public symbol server.
+                       https://learn.microsoft.com/windows-hardware/drivers/debugger/
+
   log2timeline/plaso   The timeline-building concept and CSV output format are
                        inspired by the plaso/log2timeline project, the gold
                        standard for forensic super-timelines.
@@ -3426,6 +3712,8 @@ needs esentutl, it writes entries to this machine's Application event log
 
 One-time actions (first run only):
   - Installs ImportExcel PowerShell module (CurrentUser scope)
+  - Writes the Windows kernel symbol file into tools\symbols\ the first time
+    an ARM64 memory dump of a Windows build is analyzed (kept for later runs)
 
 Temporary actions (all cleaned up automatically, also after an error or Ctrl+C):
   - Extracts a collection zip (browse mode, or a .zip as -InputPath) into the
@@ -3441,6 +3729,12 @@ Temporary actions (all cleaned up automatically, also after an error or Ctrl+C):
     made writable) -- deleted after processing
   - Writes Volatility 3's JSON output (Memory parser) into the work folder
     -- deleted after each plugin
+  - For a Windows ARM64 memory dump: runs memory\TimelineDbgEng.ps1 in a
+    PowerShell process of its own, with empty symbol and extension folders
+    in the work folder (scratch\dbgeng\; the kernel symbol file too when
+    tools\symbols\ cannot be written) -- deleted after the analysis; the
+    process is ended if it is still running after 15 minutes or when the
+    run stops
   - Downloads zip files to %TEMP% (first run) -- deleted after extraction
   - Gives Microsoft Edge a temporary profile folder,
     %TEMP%\timeline-report-edge-<id>, to print report.pdf -- deleted after

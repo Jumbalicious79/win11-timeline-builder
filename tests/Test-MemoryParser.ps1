@@ -38,17 +38,41 @@
 # collection folder under its name, or connect the drive it was saved to;
 # only Parse-Memory (-Sources ...,Memory) also names -MemoryDumpPath. The
 # offer step also logs the "Memory dump not analyzed" line the findings
-# report reads; for a collection from a Windows ARM64 computer
-# (systeminfo.txt) it gives no copy advice and names WinDbg; the dump of a
-# renamed collection folder is named after the folder's original name.
+# report reads, also for a collection from a Windows ARM64 computer (the
+# same copy advice: its dump is analyzed too); the dump of a renamed
+# collection folder is named after the folder's original name.
 # The size in that line (bytes, or GB with two decimals). The offer itself
 # (the builder's block for a run without Memory in -Sources, as from the
-# .bat) on a zip with its dump next to it: an ARM64 dump is not offered, no
-# vol.exe, answer 2, the end of redirected input (as 2), an invalid answer
+# .bat) on a zip with its dump next to it: an ARM64 dump is offered with
+# Microsoft's debugger engine (also without vol.exe; the engine in
+# tools\dbgeng named), not offered without the engine, no vol.exe for an
+# x64 dump, answer 2, the end of redirected input (as 2), an invalid answer
 # then 1 (asked again); each dump not analyzed gets the "Memory dump not
 # analyzed" line, read back by the findings report's log reader
-# (TimelineReport.Engine.ps1), with the size the prompt shows; WinDbg is
-# named once. Parse-Memory gives that line too (ARM64, no vol.exe).
+# (TimelineReport.Engine.ps1), with the size the prompt shows. Parse-Memory
+# gives that line too (no vol.exe; an ARM64 dump the engine could not
+# read), and for an ARM64 dump that was read the "analyzed with the Windows
+# debugger engine" line (also processes only), the WinDbg command, and no
+# Volatility 3.
+# The debugger engine path for Windows ARM64 dumps, with the helper's
+# functions (memory\TimelineDbgEng.ps1) loaded from its syntax tree: the
+# architecture folder, Find-DbgEngine (System32; copies of System32's DLLs
+# in tools\dbgeng\<arch>\ accepted, an unsigned DLL in a subfolder or a
+# missing DLL refused with a warning, no engine), the C# host on the
+# runner's own engine (it compiles, loads by full path, runs a command,
+# throws for a fake and a missing dump and lets the file go, refuses a
+# second engine folder), the dx text parser (echo, quotes, engine errors,
+# a query that fails as a whole), paging (100-item pages, the item cap),
+# the queries (paged, no "!" command, no attacker-tool name of
+# report-rules.json in the helper), the kernel's symbol file ID from a fake
+# kernel image (and every refusal), the symbol cache and download (a stub:
+# nothing is downloaded), reading names and command lines from a fake
+# memory map, and a whole analysis on canned dx output through the
+# builder's protocol reader and Add-MemoryPluginRows (rows, counts, log
+# lines, de-DE, cache reuse, offline, a damaged cached file, a failing
+# process query, the session fallback). Real helper processes: the real
+# helper on a fake dump, canned entries with every kind of character, a
+# crash, an error, a hang (ended), output without its end, no helper.
 # Then the dump header (Get-MemoryDumpInfo) on synthetic headers: the
 # architecture and the capture time (DUMP_HEADER64.SystemTime; zero,
 # implausible, 32-bit and raw fall back to the file's last-write time),
@@ -125,6 +149,17 @@ ${function:Get-MemoryDumpDriveRoots} = { return $script:testDriveRoots }
 # The XML-invalid character filter used by Add-TimelineEntry
 $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
         @('$script:xmlInvalidPattern', '$script:xmlInvalidRegex') -contains $node.Left.Extent.Text }, $false) |
+    ForEach-Object { . ([scriptblock]::Create($_.Extent.Text)) }
+# The builder's tools\ folder (its $PSScriptRoot, which a function made
+# from text has not): a folder of the test ($script:testToolsFolder)
+$script:testToolsFolder = Join-Path ([System.IO.Path]::GetTempPath()) "memory-parser-test-tools"
+${function:Get-BuilderToolsFolder} = { return $script:testToolsFolder }
+$script:dbgEngTimeoutSeconds = 900
+# The findings report's own log reader (TimelineReport.Engine.ps1): the
+# lines the Memory parser writes for the report must read back
+$engineAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Split-Path $builder -Parent) "report\TimelineReport.Engine.ps1"), [ref]$null, [ref]$null)
+$engineAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        @('Read-ReportEngineLogText', 'Read-ReportEngineBuilderLog') -contains $node.Name }, $false) |
     ForEach-Object { . ([scriptblock]::Create($_.Extent.Text)) }
 
 # A small file (the content does not matter to Find-MemoryDump), with its folders
@@ -214,9 +249,14 @@ function Invoke-FindMemoryDump {
     return [PSCustomObject]@{ Path = "$found"; Log = (Get-TestLog) }
 }
 
+# The log file's text, read with the encoding the builder's Log functions
+# (Add-Content) wrote it in: the ANSI code page in Windows PowerShell, UTF-8
+# in PowerShell 7 (paths with non-ASCII characters)
 function Get-TestLog {
     if (-not (Test-Path -LiteralPath $script:logFile)) { return "" }
-    return [System.IO.File]::ReadAllText($script:logFile)
+    $text = Get-Content -LiteralPath $script:logFile -Raw
+    if ($null -eq $text) { return "" }
+    return $text
 }
 
 # A synthetic memory dump header: the signature, the machine type at 0x30
@@ -283,17 +323,28 @@ function Get-TestOfferAnswer {
 # answered with -Answers. Returns the console text (Write-Host and the log
 # lines), the log file's text, -Sources afterwards and the prompts shown.
 function Invoke-TestMemoryOffer {
-    param([string]$Collection, [string]$Zip, [switch]$NoVol, [string[]]$Answers = @())
+    param([string]$Collection, [string]$Zip, [switch]$NoVol, [switch]$NoEngine, [string]$EngineSource = "Windows", [string[]]$Answers = @())
     Set-TestRunState -Collection $Collection -Zip $Zip
     $script:offerAnswers = New-Object System.Collections.Queue
     foreach ($answer in $Answers) { $script:offerAnswers.Enqueue($answer) }
     $script:offerPrompts = 0
     $script:offerNoVol = [bool]$NoVol
+    $script:offerNoEngine = [bool]$NoEngine
+    $script:offerEngineSource = $EngineSource
+    $script:offerVolCalls = 0
     Set-Alias -Name Read-Host -Value Get-TestOfferAnswer
-    function Find-VolatilityExe { if ($script:offerNoVol) { return $null }; return "C:\stub\tools\volatility3\vol.exe" }
+    function Find-VolatilityExe { $script:offerVolCalls++; if ($script:offerNoVol) { return $null }; return "C:\stub\tools\volatility3\vol.exe" }
+    # Microsoft's debugger engine for an ARM64 dump: the one of Windows, one
+    # in tools\dbgeng\<arch>\ (-EngineSource), or none (-NoEngine)
+    function Find-DbgEngine {
+        if ($script:offerNoEngine) { return [PSCustomObject]@{ Path = ""; Folder = ""; Source = ""; Version = ""; Dlls = @(); Warning = ""; Reason = "the Windows debugger engine (dbgeng.dll) is not in C:\stub\System32" } }
+        $folder = "C:\stub\System32"
+        if ($script:offerEngineSource -ne "Windows") { $folder = "C:\stub\$($script:offerEngineSource)" }
+        return [PSCustomObject]@{ Path = "$folder\dbgeng.dll"; Folder = $folder; Source = $script:offerEngineSource; Version = "10.0.26100.1"; Dlls = @("dbgeng.dll"); Warning = ""; Reason = "" }
+    }
     $Sources = @("USB")
     $console = @(. $offerFile 6>&1 | ForEach-Object { "$_" })
-    return [PSCustomObject]@{ Console = ($console -join "`n"); Log = (Get-TestLog); Sources = ($Sources -join ","); Prompts = $script:offerPrompts }
+    return [PSCustomObject]@{ Console = ($console -join "`n"); Log = (Get-TestLog); Sources = ($Sources -join ","); Prompts = $script:offerPrompts; VolCalls = $script:offerVolCalls }
 }
 
 # Synthetic collection names, as the collector makes them (TriageCollection_<time>)
@@ -331,6 +382,7 @@ $testHash = "0123456789ABCDEF" * 4             # synthetic SHA-256
 $missingWarning = "-MemoryDumpPath is not an existing file:"
 
 $workDir = Join-Path ([System.IO.Path]::GetTempPath()) ("memory-parser-test-" + [guid]::NewGuid().ToString("N"))
+$script:testToolsFolder = Join-Path $workDir "builder tools $([char]0x00E9)\tools"
 $pushed = $false
 try {
     Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
@@ -761,9 +813,8 @@ try {
         if ($case.Name -like "no *") { $expected = "" }
         Assert-Equal -Name "offer step without a dump, $($case.Name): $(if ($expected) { 'what the manifest lists, how to have the dump analyzed, and the line for the report' } else { 'nothing logged' })" -Expected "$expected|False" -Actual "$($log.Trim())|$($log.Contains('-MemoryDumpPath'))"
     }
-    # A collection from a Windows ARM64 computer (systeminfo.txt): copying
-    # the dump would not help (Volatility 3 cannot analyze ARM64 memory), so
-    # there is no copy advice, and WinDbg is named
+    # A collection from a Windows ARM64 computer (systeminfo.txt): its dump
+    # is analyzed too (Microsoft's debugger engine), so the same copy advice
     $nameArm = "TriageCollection_2025-06-19_07-45"
     $collectionArm = Join-Path $reports $nameArm
     New-TestManifestCollection -Path $collectionArm -CollectedAt "$origReports\$nameArm" -DumpDest "$origReports\$nameArm\Memory\memory_dump.dmp" -DumpRel "Memory\memory_dump.dmp" -DumpSize "8583323648"
@@ -773,9 +824,9 @@ try {
     Write-NoMemoryDumpToOffer
     $log = ((Get-TestLog) -replace '(?m)^\[[0-9: -]+\] ', '').Trim()
     $expected = "No memory dump to offer: collection_manifest.csv lists one in the collection (Memory\memory_dump.dmp), which the collector moves next to the zip as ${nameArm}_memory_dump.dmp when it zips the collection.`r`n" +
-        "  The collection is from a Windows ARM64 computer, so the dump does not need to be copied here.`r`n" +
-        "  Memory dump not analyzed: the dump listed in collection_manifest.csv (7.99 GB) -- Volatility 3 cannot read Windows ARM64 dumps; examine it in WinDbg."
-    Assert-Equal -Name "offer step without a dump, an ARM64 collection: no copy advice, WinDbg named once, and the line for the report (the size as the collector gives it)" -Expected $expected -Actual $log
+        "  To have it analyzed, copy the dump to $(Join-Path $reports "${nameArm}_memory_dump.dmp") (collection_manifest.csv lists 8583323648 bytes), then run the builder again.`r`n" +
+        "  Memory dump not analyzed: the dump listed in collection_manifest.csv (7.99 GB) -- it was not found (or not usable) next to the collection or where the collector saved it."
+    Assert-Equal -Name "offer step without a dump, an ARM64 collection: the copy advice like any other, and the line for the report (the size as the collector gives it)" -Expected $expected -Actual $log
     # The size in that line: bytes under 100 MB, else GB with two decimals
     # (as the memory prompt and the collector's summary give it)
     Assert-Equal -Name "dump size text: bytes, GB with two decimals, nothing for no size" -Expected " (8192 bytes)| (7.99 GB)| (32 GB)| (0.1 GB)||" -Actual "$(Get-MemoryDumpSizeText -Bytes 8192)|$(Get-MemoryDumpSizeText -Bytes 8583323648)|$(Get-MemoryDumpSizeText -Bytes 34359738368)|$(Get-MemoryDumpSizeText -Bytes 104857600)|$(Get-MemoryDumpSizeText -Bytes '')|$(Get-MemoryDumpSizeText -Bytes 'n/a')"
@@ -841,17 +892,50 @@ try {
     Assert-Equal -Name "dump header: read while another program has the dump open for writing" -Expected "x64|$fromHeader" -Actual (Format-DumpInfo $openInfo)
     Assert-Equal -Name "dump header: a missing file gives Unknown and no time" -Expected "Unknown|||" -Actual (Format-DumpInfo (Get-MemoryDumpInfo -Path (Join-Path $headerDir "missing.dmp")))
 
-    # Parse-Memory logs the dump time (an ARM64 dump: it stops before
-    # looking for Volatility 3)
+    # Parse-Memory logs the dump time. An ARM64 dump goes to Microsoft's
+    # debugger engine (Invoke-DbgEngMemoryAnalysis, a stub here; the engine
+    # itself is tested below), never to Volatility 3: the line the findings
+    # report reads ("analyzed with the Windows debugger engine", or "not
+    # analyzed" with the engine's reason), and the WinDbg command
     $armDump = Join-Path $workDir "dumps [7]\${nameC}_memory_dump.dmp"
     New-TestDump -Path $armDump -Machine 0xAA64 -SystemTime $captureFileTime -LastWriteUtc $endUtc
-    Set-TestRunState -Collection (Join-Path $reports $nameC) -DumpPath $armDump
-    Parse-Memory | Out-Null
-    $log = Get-TestLog
-    Assert-Equal -Name "Parse-Memory: the dump time from the header is logged" -Expected "True|True" -Actual "$($log.Contains("Found memory dump: $armDump (0 GB, ARM64)"))|$($log.Contains("Dump time: $captureText UTC (crash dump header)"))"
-    # ... and the line the findings report reads (Coverage.Notes), WinDbg
-    # named once
-    Assert-Equal -Name "Parse-Memory, an ARM64 dump: the 'Memory dump not analyzed' line for the report, WinDbg named once" -Expected "True|1" -Actual "$($log.Contains("  Memory dump not analyzed: ${nameC}_memory_dump.dmp (8192 bytes) -- Volatility 3 cannot read Windows ARM64 dumps; examine it in WinDbg."))|$(([regex]::Matches($log, 'WinDbg')).Count)"
+    $realEngineAnalysis = ${function:Invoke-DbgEngMemoryAnalysis}
+    $realFindVolatility = ${function:Find-VolatilityExe}
+    ${function:Invoke-DbgEngMemoryAnalysis} = { param([string]$DumpPath) $script:engineCalls++; $script:engineDump = $DumpPath; return $script:engineStub }
+    ${function:Find-VolatilityExe} = { $script:volCalls++; return $null }
+    $armCases = @(
+        @{ Name = "read"; Stub = [PSCustomObject]@{ Entries = 5; Processes = 3; CommandLines = 2; Reason = ""; PartialReason = "" }
+            Line = "  Memory dump analyzed with the Windows debugger engine: ${nameC}_memory_dump.dmp (8192 bytes) -- processes and command lines only; network connections and services are not read from Windows ARM64 dumps."
+            Complete = "  Memory analysis complete: 5 entries from 0 GB dump"; NotAnalyzed = "" },
+        @{ Name = "processes only"; Stub = [PSCustomObject]@{ Entries = 3; Processes = 3; CommandLines = 0; Reason = ""; PartialReason = "its command lines could not be read [boom]" }
+            Line = "  Memory dump analyzed with the Windows debugger engine: ${nameC}_memory_dump.dmp (8192 bytes) -- processes only, its command lines could not be read [boom]; network connections and services are not read from Windows ARM64 dumps."
+            Complete = "  Memory analysis complete: 3 entries from 0 GB dump"; NotAnalyzed = "" },
+        @{ Name = "not read"; Stub = [PSCustomObject]@{ Entries = 0; Processes = 0; CommandLines = 0; Reason = "the Windows debugger engine listed no processes in it (Error - Unable to find type '_EPROCESS *' for cast)"; PartialReason = "" }
+            Line = "WARNING:   Memory analysis skipped: the Windows debugger engine listed no processes in it (Error - Unable to find type '_EPROCESS *' for cast)."
+            Complete = ""; NotAnalyzed = "${nameC}_memory_dump.dmp (8192 bytes) -- the Windows debugger engine listed no processes in it (Error - Unable to find type '_EPROCESS *' for cast)." }
+    )
+    try {
+        foreach ($case in $armCases) {
+            $script:engineStub = $case.Stub
+            $script:engineCalls = 0
+            $script:volCalls = 0
+            Set-TestRunState -Collection (Join-Path $reports $nameC) -DumpPath $armDump
+            Parse-Memory | Out-Null
+            $log = Get-TestLog
+            $readBack = Read-ReportEngineBuilderLog -Path $script:logFile
+            $expectedEngineLine = ""
+            if ($case.Complete) { $expectedEngineLine = $case.Line.Substring("  Memory dump analyzed with the Windows debugger engine: ".Length) }
+            $winDbgLine = "  For more (handles, drivers and other kernel objects), open the dump in WinDbg; its command-line debugger, with the builder's symbol cache: $(Get-DbgEngWinDbgCommand -DumpPath $armDump)"
+            Assert-Equal -Name "Parse-Memory, an ARM64 dump ($($case.Name)): the dump time, the debugger engine (not Volatility 3) on the dump, the line for the report, read back, and the WinDbg command" -Expected "True|True|True|1|$armDump|0|True|True|True|$expectedEngineLine|$($case.NotAnalyzed)|True" `
+                -Actual "$($log.Contains("Found memory dump: $armDump (0 GB, ARM64)"))|$($log.Contains("Dump time: $captureText UTC (crash dump header)"))|$($log.Contains("  Windows ARM64 dump: analyzing it with Microsoft's debugger engine (Volatility 3 cannot read ARM64 memory)"))|$($script:engineCalls)|$($script:engineDump)|$($script:volCalls)|$($log.Contains($case.Line))|$(-not $case.Complete -or $log.Contains($case.Complete))|$($log.Contains($winDbgLine))|$($readBack.MemoryDumpEngine)|$($readBack.MemoryDumpNotAnalyzed)|$($log.Contains('Memory parsing complete.'))"
+        }
+        Assert-Equal -Name "the WinDbg command: kdARM64.exe on ARM64 (kd.exe on another architecture), the dump and the builder's symbol cache with Microsoft's symbol server" -Expected "kdARM64.exe -z `"$armDump`" -y `"srv*$($script:testToolsFolder)\symbols*https://msdl.microsoft.com/download/symbols`"|kd.exe -z" `
+            -Actual "$(Get-DbgEngWinDbgCommand -DumpPath $armDump -ProcessArchitecture ARM64)|$((Get-DbgEngWinDbgCommand -DumpPath $armDump -ProcessArchitecture AMD64).Substring(0, 9))"
+    }
+    finally {
+        ${function:Invoke-DbgEngMemoryAnalysis} = $realEngineAnalysis
+        ${function:Find-VolatilityExe} = $realFindVolatility
+    }
     # An x64 dump without Volatility 3 in tools\: the download hint and the
     # line for the report. The hint names the builder's folder
     # ($PSScriptRoot), which a function made from text has not: this
@@ -873,19 +957,27 @@ try {
     # another drive (collection_manifest.csv)
     New-TestDump -Path $driveK -Machine 0xAA64 -SystemTime $captureFileTime -LastWriteUtc $endUtc
     New-TestManifestCollection -Path (Join-Path $reports $nameK) -CollectedAt "$origReports\$nameK" -DumpDest $driveK -DumpSize "8192"
-    Set-TestRunState -Collection (Join-Path $reports $nameK)
-    Parse-Memory | Out-Null
-    $log = Get-TestLog
+    $script:engineStub = $armCases[0].Stub
+    ${function:Invoke-DbgEngMemoryAnalysis} = { param([string]$DumpPath) $script:engineCalls++; $script:engineDump = $DumpPath; return $script:engineStub }
+    try {
+        Set-TestRunState -Collection (Join-Path $reports $nameK)
+        Parse-Memory | Out-Null
+        $log = Get-TestLog
+    }
+    finally { ${function:Invoke-DbgEngMemoryAnalysis} = $realEngineAnalysis }
     Assert-Equal -Name "Parse-Memory: the dump where the collector saved it, by collection_manifest.csv" -Expected "True|True|True" -Actual "$($log.Contains("$foundNotice $driveK (8192 bytes, as listed)."))|$($log.Contains("Found memory dump: $driveK (0 GB, ARM64)"))|$($log.Contains("Dump time: $captureText UTC (crash dump header)"))"
 
     # --- The memory dump offer (Run-TimelineBuilder.bat's path) ---------------
     # The builder's top-level block that runs when Memory is not in -Sources
     # (as with the .bat), on a zipped collection with its dump next to the
-    # zip: an ARM64 dump is not offered, no vol.exe, answer 2, the end of
-    # redirected input (as 2), and an invalid answer then 1. Each dump that
-    # is not analyzed gets the "Memory dump not analyzed" line, which the
-    # findings report's own log reader (TimelineReport.Engine.ps1) must read
-    # back for Coverage.Notes; the prompt shows the size that line gives.
+    # zip: an ARM64 dump is offered with Microsoft's debugger engine (also
+    # without vol.exe, which is not looked for; the engine in tools\dbgeng
+    # named), and not offered without it; for an x64 dump no vol.exe, answer
+    # 2, the end of redirected input (as 2), and an invalid answer then 1.
+    # Each dump that is not analyzed gets the "Memory dump not analyzed"
+    # line, which the findings report's own log reader
+    # (TimelineReport.Engine.ps1) must read back for Coverage.Notes; the
+    # prompt shows the size that line gives.
     Write-Host "Testing the memory dump offer ..."
     $offerAsts = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.IfStatementAst] -and
                 $node.Clauses[0].Item1.Extent.Text -eq '$Sources -notcontains "Memory"' }, $false))
@@ -894,10 +986,6 @@ try {
     # vol.exe hint) is set
     $offerFile = Join-Path $workDir "memory-offer.ps1"
     [System.IO.File]::WriteAllText($offerFile, $offerAsts[0].Extent.Text)
-    $engineAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Split-Path $builder -Parent) "report\TimelineReport.Engine.ps1"), [ref]$null, [ref]$null)
-    $engineAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-            @('Read-ReportEngineLogText', 'Read-ReportEngineBuilderLog') -contains $node.Name }, $false) |
-        ForEach-Object { . ([scriptblock]::Create($_.Extent.Text)) }
     $offerReports = Join-Path $workDir "offer"
     $nameOfferArm = "TriageCollection_2025-06-02_12-50"
     $nameOfferX64 = "TriageCollection_2025-06-01_13-10"
@@ -909,30 +997,51 @@ try {
     $offerX64Dump = Join-Path $offerReports "${nameOfferX64}_memory_dump.dmp"
     New-TestDump -Path $offerArmDump -Machine 0xAA64 -SystemTime $captureFileTime -LastWriteUtc $endUtc
     New-TestDump -Path $offerX64Dump -SystemTime $captureFileTime -LastWriteUtc $endUtc
+    # What the prompt says for an ARM64 dump: what reads it, what it adds and
+    # what not, the time and the one-time symbol download
+    $engineLines = @(
+        "  A Windows ARM64 dump: Volatility 3 cannot read it, so the builder uses",
+        "  Memory analysis adds the processes (parent, start time, session,",
+        "  threads) and their command lines from the RAM dump. Network",
+        "  connections and services are not read from ARM64 dumps.",
+        "  Takes under a minute. Once per Windows build it downloads the kernel's",
+        "  symbol file (about 10 MB) from Microsoft's symbol server into",
+        "  tools\symbols\; the request names only that file (see README.txt).",
+        "  [1] Yes -- analyze memory dump (recommended for IR)"
+    )
+    $armSkipped = "${nameOfferArm}_memory_dump.dmp (8192 bytes) -- skipped at the memory prompt; run the builder again and answer 1 to analyze it."
     $offerCases = @(
-        @{ Name = "an ARM64 dump: not offered"; Collection = $nameOfferArm; Answers = @(); Prompts = 0; Sources = "USB"
-            Lines = @("Memory dump detected: $offerArmDump (Windows ARM64)")
-            NotAnalyzed = "${nameOfferArm}_memory_dump.dmp (8192 bytes) -- Volatility 3 cannot read Windows ARM64 dumps; examine it in WinDbg." },
-        @{ Name = "no vol.exe: not offered"; Collection = $nameOfferX64; NoVol = $true; Answers = @(); Prompts = 0; Sources = "USB"
+        @{ Name = "an ARM64 dump: offered with the debugger engine of Windows, answer 2"; Collection = $nameOfferArm; Answers = @("2"); Prompts = 1; Sources = "USB"; VolCalls = 0
+            Lines = @("  Found: $offerArmDump (8192 bytes)", "  Microsoft's debugger engine (dbgeng.dll, part of Windows).") + $engineLines + @("Memory analysis skipped (answer 2 at the memory prompt).")
+            NotAnalyzed = $armSkipped },
+        @{ Name = "an ARM64 dump without vol.exe: offered (Volatility 3 not looked for), answer 1"; Collection = $nameOfferArm; NoVol = $true; Answers = @("1"); Prompts = 1; Sources = "USB,Memory"; VolCalls = 0
+            Lines = @("  Found: $offerArmDump (8192 bytes)", "Memory analysis enabled.") + $engineLines; NotAnalyzed = "" },
+        @{ Name = "an ARM64 dump, the engine in tools\dbgeng: offered, the folder named"; Collection = $nameOfferArm; EngineSource = "tools\dbgeng\arm64"; Answers = @("2"); Prompts = 1; Sources = "USB"; VolCalls = 0
+            Lines = @("  Microsoft's debugger engine (dbgeng.dll in tools\dbgeng\arm64\)."); NotAnalyzed = $armSkipped },
+        @{ Name = "an ARM64 dump without the debugger engine: not offered"; Collection = $nameOfferArm; NoEngine = $true; Answers = @(); Prompts = 0; Sources = "USB"; VolCalls = 0
+            Lines = @("Memory dump detected ($offerArmDump, Windows ARM64) but Microsoft's debugger engine is not available: the Windows debugger engine (dbgeng.dll) is not in C:\stub\System32.")
+            NotAnalyzed = "${nameOfferArm}_memory_dump.dmp (8192 bytes) -- the Windows debugger engine (dbgeng.dll) is not in C:\stub\System32; see ""ARM64 memory dumps"" in README.txt." },
+        @{ Name = "no vol.exe: not offered"; Collection = $nameOfferX64; NoVol = $true; Answers = @(); Prompts = 0; Sources = "USB"; VolCalls = 1
             Lines = @("Memory dump detected ($offerX64Dump) but Volatility 3 not found in tools\ directory.")
             NotAnalyzed = "${nameOfferX64}_memory_dump.dmp (8192 bytes) -- Volatility 3 (vol.exe) is not in the builder's tools\volatility3\ folder." },
-        @{ Name = "answer 2"; Collection = $nameOfferX64; Answers = @("2"); Prompts = 1; Sources = "USB"
-            Lines = @("  Found: $offerX64Dump (8192 bytes)", "Memory analysis skipped (answer 2 at the memory prompt).")
+        @{ Name = "answer 2"; Collection = $nameOfferX64; Answers = @("2"); Prompts = 1; Sources = "USB"; VolCalls = 1
+            Lines = @("  Found: $offerX64Dump (8192 bytes)", "  Volatility 3 is available in tools\", "Memory analysis skipped (answer 2 at the memory prompt).")
             NotAnalyzed = "${nameOfferX64}_memory_dump.dmp (8192 bytes) -- skipped at the memory prompt; run the builder again and answer 1 to analyze it." },
-        @{ Name = "the end of redirected input: as 2"; Collection = $nameOfferX64; Answers = @(); Prompts = 1; Sources = "USB"
+        @{ Name = "the end of redirected input: as 2"; Collection = $nameOfferX64; Answers = @(); Prompts = 1; Sources = "USB"; VolCalls = 1
             Lines = @("Memory analysis skipped (answer 2 at the memory prompt).")
             NotAnalyzed = "${nameOfferX64}_memory_dump.dmp (8192 bytes) -- skipped at the memory prompt; run the builder again and answer 1 to analyze it." },
-        @{ Name = "an invalid answer, then 1: asked again, then analyzed"; Collection = $nameOfferX64; Answers = @("x", "1"); Prompts = 2; Sources = "USB,Memory"
+        @{ Name = "an invalid answer, then 1: asked again, then analyzed"; Collection = $nameOfferX64; Answers = @("x", "1"); Prompts = 2; Sources = "USB,Memory"; VolCalls = 1
             Lines = @("  Found: $offerX64Dump (8192 bytes)", "Memory analysis enabled."); NotAnalyzed = "" }
     )
     foreach ($case in $offerCases) {
-        $offer = Invoke-TestMemoryOffer -Collection (Join-Path $extracted $case.Collection) -Zip (Join-Path $offerReports "$($case.Collection).zip") -NoVol:([bool]$case.NoVol) -Answers $case.Answers
+        $engineSource = "Windows"
+        if ($case.EngineSource) { $engineSource = $case.EngineSource }
+        $offer = Invoke-TestMemoryOffer -Collection (Join-Path $extracted $case.Collection) -Zip (Join-Path $offerReports "$($case.Collection).zip") -NoVol:([bool]$case.NoVol) -NoEngine:([bool]$case.NoEngine) -EngineSource $engineSource -Answers $case.Answers
         $missingLines = @($case.Lines | Where-Object { -not $offer.Console.Contains($_) })
         $readBack = (Read-ReportEngineBuilderLog -Path $script:logFile).MemoryDumpNotAnalyzed
         $logged = @(([regex]::Matches($offer.Log, '(?m)^\[[^\]]+\]   Memory dump not analyzed: (.+?)\r?$')) | ForEach-Object { $_.Groups[1].Value })
-        Assert-Equal -Name "memory dump offer, $($case.Name): prompts, -Sources, the console lines, the 'Memory dump not analyzed' line read back by the report" -Expected "$($case.Prompts)|$($case.Sources)||$($case.NotAnalyzed)|$($case.NotAnalyzed)|$(if ($case.NotAnalyzed) { 1 } else { 0 })" -Actual "$($offer.Prompts)|$($offer.Sources)|$($missingLines -join ' / ')|$($logged -join ' / ')|$readBack|$(([regex]::Matches($offer.Console, 'Memory dump not analyzed')).Count)"
+        Assert-Equal -Name "memory dump offer, $($case.Name): prompts, -Sources, the console lines, the 'Memory dump not analyzed' line read back by the report, Volatility 3 looked for" -Expected "$($case.Prompts)|$($case.Sources)||$($case.NotAnalyzed)|$($case.NotAnalyzed)|$(if ($case.NotAnalyzed) { 1 } else { 0 })|$($case.VolCalls)" -Actual "$($offer.Prompts)|$($offer.Sources)|$($missingLines -join ' / ')|$($logged -join ' / ')|$readBack|$(([regex]::Matches($offer.Console, 'Memory dump not analyzed')).Count)|$($offer.VolCalls)"
     }
-    Assert-Equal -Name "memory dump offer, an ARM64 dump: WinDbg named once" -Expected 1 -Actual ([regex]::Matches((Invoke-TestMemoryOffer -Collection (Join-Path $extracted $nameOfferArm) -Zip (Join-Path $offerReports "$nameOfferArm.zip")).Console, 'WinDbg')).Count
 
     # --- Rows from Volatility output ------------------------------------------
     # Volatility 3's JSON renderer writes times as ISO 8601 in UTC and absent
@@ -1122,6 +1231,735 @@ try {
     )
     $missingLog = @($expectedLog | Where-Object { -not $log.Contains($_) })
     Assert-Equal -Name "Parse-Memory: the dump time, the counts per plugin and the netscan warning are logged, the scratch folder is left empty" -Expected "|0" -Actual "$($missingLog -join ' / ')|$left"
+
+    # --- Windows ARM64 dumps: Microsoft's debugger engine ---------------------
+    Write-Host "Testing the debugger engine path for Windows ARM64 dumps ..."
+    $workerPath = Join-Path (Split-Path $builder -Parent) "memory\TimelineDbgEng.ps1"
+    $workerErrors = $null
+    $workerAst = [System.Management.Automation.Language.Parser]::ParseFile($workerPath, [ref]$null, [ref]$workerErrors)
+    Assert-Equal -Name "debugger engine helper: memory\TimelineDbgEng.ps1 parses" -Expected 0 -Actual @($workerErrors).Count
+    $workerFunctions = @($workerAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false))
+    foreach ($shared in @("Get-DbgEngShortError", "Get-DbgEngErrorText")) {
+        $sharedBodies = @(@($functionAsts) + $workerFunctions | Where-Object { $_.Name -eq $shared } | ForEach-Object { $_.Body.Extent.Text })
+        Assert-Equal -Name "${shared}: the same in timeline-builder.ps1 and the helper" -Expected "2|True" -Actual "$($sharedBodies.Count)|$($sharedBodies.Count -eq 2 -and $sharedBodies[0] -ceq $sharedBodies[1])"
+    }
+    foreach ($functionAst in $workerFunctions) { . ([scriptblock]::Create($functionAst.Extent.Text)) }
+    # The real functions, put back after the stubs below
+    $realFunctions = @{}
+    foreach ($name in @("Open-DbgEngSession", "Close-DbgEngSession", "Invoke-DbgEngCommand", "Read-DbgEngVirtual", "Save-KernelSymbolDownload", "Write-DbgEngWorkerLine",
+            "Find-DbgEngine", "Start-DbgEngWorker", "Get-DbgEngWorkerPath", "Read-DbgEngCommandLine")) {
+        $realFunctions[$name] = (Get-Item -LiteralPath "function:$name").ScriptBlock
+    }
+    # (dot-sourced, so the functions are put back in this script's scope)
+    $restoreTestFunctions = { foreach ($name in @($realFunctions.Keys)) { Set-Item -LiteralPath "function:$name" -Value $realFunctions[$name] } }
+    $engineDir = Join-Path $workDir "engine"
+    [void][System.IO.Directory]::CreateDirectory($engineDir)
+    $script:runScratchDir = Join-Path $workDir "engine-run [1]\scratch"
+    [void][System.IO.Directory]::CreateDirectory($script:runScratchDir)
+
+    # The NuGet folder name of the PowerShell process's architecture
+    Assert-Equal -Name "Get-DbgEngArchitecture: arm64, amd64 or x86 for this PowerShell's processor architecture, nothing for another" -Expected "arm64|amd64|x86|||arm64" -Actual ((@("ARM64", "AMD64", "x86", "IA64", "", "arm64") | ForEach-Object { Get-DbgEngArchitecture $_ }) -join "|")
+
+    # Find-DbgEngine: System32; copies of System32's (catalog-signed) DLLs in
+    # tools\dbgeng\<arch>\ are used, with the load order; an unsigned DLL in
+    # a subfolder or a missing DLL: a warning and System32; no dbgeng.dll in
+    # the system folder: a reason; another architecture: System32 only
+    $system32 = Join-Path $env:SystemRoot "System32"
+    $processArch = Get-DbgEngArchitecture
+    $engineTools = Join-Path $engineDir "tools"
+    $engine = Find-DbgEngine -ToolsFolder $engineTools
+    Assert-Equal -Name "Find-DbgEngine without tools\dbgeng: the engine of Windows (System32), by full path, with its version" -Expected "Windows|$system32|dbgeng.dll|$system32\dbgeng.dll|||True" -Actual "$($engine.Source)|$($engine.Folder)|$($engine.Dlls -join ',')|$($engine.Path)|$($engine.Warning)|$($engine.Reason)|$($engine.Version -match '^\d+\.\d+\.\d+')"
+    $copyDir = Join-Path $engineTools "dbgeng\$processArch"
+    [void][System.IO.Directory]::CreateDirectory($copyDir)
+    foreach ($dll in @("dbgeng.dll", "dbghelp.dll", "dbgmodel.dll", "dbgcore.dll")) {
+        if (Test-Path -LiteralPath (Join-Path $system32 $dll)) { Copy-Item -LiteralPath (Join-Path $system32 $dll) -Destination (Join-Path $copyDir $dll) }
+    }
+    $engine = Find-DbgEngine -ToolsFolder $engineTools
+    Assert-Equal -Name "Find-DbgEngine: copies of Windows' own (signed) DLLs in tools\dbgeng\$processArch\ are used, loaded in their order" -Expected "tools\dbgeng\$processArch|$copyDir|dbghelp.dll,dbgcore.dll,msdia140.dll,dbgmodel.dll,dbgeng.dll|$copyDir\dbgeng.dll|" -Actual "$($engine.Source)|$($engine.Folder)|$($engine.Dlls -join ',')|$($engine.Path)|$($engine.Warning)"
+    $planted = Join-Path $copyDir "winext\planted.dll"
+    [void][System.IO.Directory]::CreateDirectory((Split-Path $planted -Parent))
+    [System.IO.File]::WriteAllBytes($planted, ([byte[]](0x4D, 0x5A) + (New-Object byte[] 510)))
+    $engine = Find-DbgEngine -ToolsFolder $engineTools
+    Assert-Equal -Name "Find-DbgEngine: an unsigned DLL in a subfolder of tools\dbgeng\$processArch\: a warning that names it, and the engine of Windows" -Expected "Windows|$system32|True" -Actual "$($engine.Source)|$($engine.Folder)|$($engine.Warning -like "tools\dbgeng\$processArch\ is not used: winext\planted.dll is not signed by Microsoft (signature: *). The debugger engine that is part of Windows is used instead.")"
+    Remove-Item -LiteralPath (Split-Path $planted -Parent) -Recurse -Force
+    Remove-Item -LiteralPath (Join-Path $copyDir "dbghelp.dll") -Force
+    $engine = Find-DbgEngine -ToolsFolder $engineTools
+    Assert-Equal -Name "Find-DbgEngine: dbghelp.dll missing in tools\dbgeng\$processArch\: a warning, and the engine of Windows" -Expected "Windows|tools\dbgeng\$processArch\ is not used: dbghelp.dll is missing there (copy every DLL of the package's content folder). The debugger engine that is part of Windows is used instead." -Actual "$($engine.Source)|$($engine.Warning)"
+    $noSystem = Join-Path $engineDir "no-system"
+    [void][System.IO.Directory]::CreateDirectory($noSystem)
+    $engine = Find-DbgEngine -ToolsFolder (Join-Path $engineDir "no-tools") -SystemFolder $noSystem
+    Assert-Equal -Name "Find-DbgEngine: no dbgeng.dll in the system folder: no engine, and why" -Expected "||the Windows debugger engine (dbgeng.dll) is not in $noSystem" -Actual "$($engine.Path)|$($engine.Source)|$($engine.Reason)"
+    $engine = Find-DbgEngine -ToolsFolder $engineTools -ProcessArchitecture "IA64"
+    Assert-Equal -Name "Find-DbgEngine: an architecture without a NuGet folder: the engine of Windows, no warning" -Expected "Windows|" -Actual "$($engine.Source)|$($engine.Warning)"
+
+    # The C# host on this computer's own engine (no dump): it compiles, loads
+    # dbgeng.dll by full path (twice is fine), runs a command (output also
+    # for a failing one), throws for a fake and a missing dump and lets the
+    # file go, and refuses a second engine folder in the same process
+    Initialize-DbgEngHost
+    $hostCompiled = [bool]([System.Management.Automation.PSTypeName]'TimelineDbgEng.Session').Type
+    [TimelineDbgEng.Session]::LoadEngine($system32, [string[]]@("dbgeng.dll"))
+    [TimelineDbgEng.Session]::LoadEngine($system32, [string[]]@("dbgeng.dll"))
+    $smoke = New-Object TimelineDbgEng.Session
+    try {
+        $echo = Invoke-DbgEngCommand -Session $smoke -Command ".echo TBX" -TimeoutSeconds 60
+        $unresolved = Invoke-DbgEngCommand -Session $smoke -Command "? nosuchsymbol_tb" -TimeoutSeconds 60
+    }
+    finally {
+        $smoke.Dispose()
+        $smoke.Dispose()
+    }
+    Assert-Equal -Name "C# host: compiles, loads dbgeng.dll from System32 by full path, runs a command; a failing one still gives its output" -Expected "True|$system32\dbgeng.dll|True|True" -Actual "$hostCompiled|$([TimelineDbgEng.Session]::LoadedPath('dbgeng.dll'))|$($echo -match 'TBX')|$("$unresolved".Trim().Length -gt 0)"
+    $fakeDump = Join-Path $engineDir "fake-arm64.dmp"
+    New-TestDump -Path $fakeDump -Machine 0xAA64 -SystemTime $captureFileTime -LastWriteUtc $endUtc
+    $openResults = foreach ($target in @($fakeDump, (Join-Path $engineDir "missing.dmp"))) {
+        $session = New-Object TimelineDbgEng.Session
+        try {
+            $session.OpenDump($target, 60000)
+            "opened"
+        }
+        catch {
+            $inner = $_.Exception
+            while ($inner.InnerException) { $inner = $inner.InnerException }
+            $inner.GetType().Name
+        }
+        finally { $session.Dispose() }
+    }
+    $released = $false
+    try {
+        [System.IO.File]::Open($fakeDump, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None).Dispose()
+        $released = $true
+    }
+    catch { Write-Host "  (the fake dump is still open: $($_.Exception.Message))" }
+    Assert-Equal -Name "C# host: a fake ARM64 dump and a missing file throw DbgEngException, and the fake dump is released afterwards" -Expected "DbgEngException|DbgEngException|True" -Actual "$($openResults -join '|')|$released"
+    $secondEngine = "loaded"
+    try { [TimelineDbgEng.Session]::LoadEngine($copyDir, [string[]]@("dbghelp.dll", "dbgcore.dll", "msdia140.dll", "dbgmodel.dll", "dbgeng.dll")) }
+    catch {
+        $inner = $_.Exception
+        while ($inner.InnerException) { $inner = $inner.InnerException }
+        $secondEngine = $inner.Message
+    }
+    Assert-Equal -Name "C# host: an engine folder whose DLLs are already loaded from another folder is refused (no mixed versions)" -Expected "True" -Actual "$($secondEngine -match ' is already loaded in this PowerShell from ')"
+
+    # The dx text: "[0x..] : value" items; the echoed expression ignored;
+    # quotes stripped; engine errors and damaged rows counted as bad items;
+    # a query that fails as a whole keeps its "Error:" line (the engine's
+    # own text for a type it does not know)
+    Assert-Equal -Name "ConvertFrom-DbgEngNumber: decimal (negative too), hex with or without 0x and with a backtick, else nothing" -Expected "4|-1|0|255|$([Convert]::ToUInt64('fffff8035c600000', 16))|||" -Actual ((@(@("4", $false), @("-1", $false), @("0", $false), @("0xff", $true), @("0xfffff803``5c600000", $true), @("zz", $true), @("0x", $true), @("1.5", $false)) | ForEach-Object { if ($_[1]) { ConvertFrom-DbgEngNumber $_[0] -Hex } else { ConvertFrom-DbgEngNumber $_[0] } }) -join "|")
+    $dxText = "@`$cursession.Processes.Skip(0).Take(100).Select(p => ...)`r`n" +
+        "    [0x0]            : `"TBP|0xffffa00000001000|4|0|133|0|150|0x0|0xffffa000000015a8`"`r`n" +
+        "    [0x1]            : Unable to read memory at Address 0x10`r`n" +
+        "    [0x2]            : TBP|zz|1`r`n" +
+        "    [0x3``0]         : TBP|0xffffa00000002000|92|4|134|0|4|0x0|0xffffa000000025a8`r`n"
+    $parsed = ConvertFrom-DbgEngDxRows -Text $dxText -Tag "TBP" -FieldCount 8
+    Assert-Equal -Name "ConvertFrom-DbgEngDxRows: the echo ignored, a quoted value, an engine error and a damaged row as bad items, a backtick in the index" -Expected "4|2|2|Unable to read memory at Address 0x10||4|92" -Actual "$($parsed.Items)|$(@($parsed.Rows).Count)|$($parsed.Bad)|$($parsed.FirstBad)|$($parsed.QueryError)|$($parsed.Rows[0][1])|$($parsed.Rows[1][1])"
+    $failedQuery = ConvertFrom-DbgEngDxRows -Text "Error: Unable to find type '_EPROCESS *' for cast.`r`n" -Tag "TBP" -FieldCount 8
+    $emptyList = ConvertFrom-DbgEngDxRows -Text "@`$cursession.Processes.Skip(200).Take(100).Select(p => ...)`r`n" -Tag "TBP" -FieldCount 8
+    $nothing = ConvertFrom-DbgEngDxRows -Text "" -Tag "TBP" -FieldCount 8
+    Assert-Equal -Name "ConvertFrom-DbgEngDxRows: a query that fails as a whole keeps the engine's error; an empty list (the echo only) is no error; no output at all is one" -Expected "0|Error: Unable to find type '_EPROCESS *' for cast.|0||Error: no output" -Actual "$($failedQuery.Items)|$($failedQuery.QueryError)|$($emptyList.Items)|$($emptyList.QueryError)|$($nothing.QueryError)"
+
+    # Paging: 100 items a page, good and bad alike; a short page ends it; a
+    # list that does not end stops at -MaxItems; a failing query stops it
+    $script:pages = @()
+    $script:pageCalls = 0
+    ${function:Invoke-DbgEngCommand} = {
+        $page = $script:pages[[Math]::Min($script:pageCalls, $script:pages.Count - 1)]
+        $script:pageCalls++
+        if ($page -is [string]) { return $page }
+        $lines = for ($i = 0; $i -lt $page[0]; $i++) { "    [0x$($i.ToString('x'))] : TBS|0x$((4096 + $script:pageCalls * 1000 + $i).ToString('x'))|1" }
+        $bad = for ($i = 0; $i -lt $page[1]; $i++) { "    [0x$(($page[0] + $i).ToString('x'))] : Unable to read memory at Address 0x10" }
+        return "@`$cursession...`n" + (@($lines) + @($bad) -join "`n")
+    }
+    $pagingCases = @(
+        @{ Name = "100 + 50"; Pages = @(, @(100, 0)) + @(, @(50, 0)); Max = 20000; Expected = "2|150|150|0|False|" },
+        @{ Name = "100 + 100 + 0"; Pages = @(, @(100, 0)) + @(, @(100, 0)) + @(, @(0, 0)); Max = 20000; Expected = "3|200|200|0|False|" },
+        @{ Name = "90 good + 10 bad, then 5"; Pages = @(, @(90, 10)) + @(, @(5, 0)); Max = 20000; Expected = "2|105|95|10|False|" },
+        @{ Name = "always full, -MaxItems 300"; Pages = @(, @(100, 0)); Max = 300; Expected = "3|300|300|0|True|" },
+        @{ Name = "100, then a query error"; Pages = @(@(100, 0), "Error: Unable to read memory at Address 0x0"); Max = 20000; Expected = "2|100|100|0|False|Error: Unable to read memory at Address 0x0" }
+    )
+    foreach ($case in $pagingCases) {
+        $script:pages = $case.Pages
+        $script:pageCalls = 0
+        $paged = Get-DbgEngDxPages -Session $null -Template (Get-DbgEngQuery Session) -Tag "TBS" -FieldCount 2 -MaxItems $case.Max
+        Assert-Equal -Name "Get-DbgEngDxPages, $($case.Name): calls|items|rows|bad|capped|query error" -Expected $case.Expected -Actual "$($script:pageCalls)|$($paged.Items)|$(@($paged.Rows).Count)|$($paged.Bad)|$($paged.Capped)|$($paged.QueryError)"
+    }
+    . $restoreTestFunctions
+
+    # The queries: paged, tagged, formattable with -f (no other braces); no
+    # command the helper sends is an extension ("!") command; no
+    # attacker-tool name of report-rules.json (Defender's AMSI scans the
+    # helper) in the helper's text, its C# host or its queries
+    $queryChecks = foreach ($name in @("Process", "Session", "TokenSession")) {
+        $query = Get-DbgEngQuery $name
+        $tag = if ($name -eq "Process") { "TBP" } else { "TBS" }
+        $tagText = '"' + $tag + '|"'
+        "$name=$($query.Contains('.Skip({0}).Take(100)'))/$($query.Contains($tagText))/$(($query -f 300).Contains('.Skip(300).Take(100)'))/$($query.StartsWith('dx -r1 '))"
+    }
+    Assert-Equal -Name "Get-DbgEngQuery: each query paged with Skip({0}).Take(100), tagged, formattable with -f" -Expected "Process=True/True/True/True|Session=True/True/True/True|TokenSession=True/True/True/True" -Actual ($queryChecks -join "|")
+    $workerText = [System.IO.File]::ReadAllText($workerPath)
+    $sentCommands = @([regex]::Matches($workerText, '-Command "([^"]+)"') | ForEach-Object { $_.Groups[1].Value }) + @([regex]::Matches($workerText, '\$session\.Execute\("([^"]+)"') | ForEach-Object { $_.Groups[1].Value }) + @("Process", "Session", "TokenSession" | ForEach-Object { Get-DbgEngQuery $_ })
+    Assert-Equal -Name "the helper sends no extension (!) command (fixed commands and queries)" -Expected "0|True" -Actual "$(@($sentCommands | Where-Object { $_.TrimStart().StartsWith('!') }).Count)|$($sentCommands.Count -ge 9)"
+    $rulesJson = Get-Content -LiteralPath (Join-Path (Split-Path $builder -Parent) "report\report-rules.json") -Raw | ConvertFrom-Json
+    $toolPatterns = @($rulesJson.lists.attackerTools)
+    $queryText = (@("Process", "Session", "TokenSession") | ForEach-Object { Get-DbgEngQuery $_ }) -join "`n"
+    $named = @($toolPatterns | Where-Object { $_ -and ([regex]::IsMatch($workerText, '\b(?:' + $_ + ')', 'IgnoreCase') -or [regex]::IsMatch($queryText, '\b(?:' + $_ + ')', 'IgnoreCase')) })
+    Assert-Equal -Name "no attacker-tool name of report-rules.json in the helper, its C# host or its queries ($($toolPatterns.Count) names checked)" -Expected "0|True" -Actual "$($named.Count)|$($toolPatterns.Count -gt 10)"
+
+    # --- A fake memory map: the kernel image and the processes ----------------
+    $script:memRegions = New-Object System.Collections.Generic.List[object]
+    function Add-TestRegion {
+        param([uint64]$Process, [uint64]$Start, [byte[]]$Bytes)
+        $script:memRegions.Add([PSCustomObject]@{ P = $Process; S = $Start; B = $Bytes })
+    }
+    $stubReadVirtual = {
+        param([uint64]$Process, [uint64]$Address, [int]$Count)
+        foreach ($region in $script:memRegions) {
+            if ($region.P -ne $Process) { continue }
+            if ($Address -ge $region.S -and $Address -lt $region.S + [uint64]$region.B.Length) {
+                $offset = [int]($Address - $region.S)
+                $n = [Math]::Min($Count, $region.B.Length - $offset)
+                $out = New-Object byte[] $n
+                [Array]::Copy($region.B, $offset, $out, 0, $n)
+                return , $out
+            }
+        }
+        return , (New-Object byte[] 0)
+    }
+    # A kernel image header (MZ, PE, PE32+, the debug directory, a CodeView
+    # RSDS record) with one thing changed for each refusal
+    $kernelBase = [Convert]::ToUInt64("fffff8035c600000", 16)
+    $kernelGuid = [Guid]"0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9"
+    $kernelKey = "0A1B2C3D4E5F60718293A4B5C6D7E8F91A"
+    function New-TestKernelImage {
+        param([switch]$NoMz, [int]$PeOffset = 0x100, [uint16]$Magic = 0x20B, [uint32]$DebugSize = 28, [string]$Signature = "RSDS", [string]$PdbName = "ntkrnlmp.pdb", [uint32]$Age = 0x1A)
+        $image = New-Object byte[] 0x4000
+        if (-not $NoMz) { $image[0] = 0x4D; $image[1] = 0x5A }
+        [Array]::Copy([BitConverter]::GetBytes([int]$PeOffset), 0, $image, 0x3C, 4)
+        if ($PeOffset -gt 0 -and $PeOffset -lt 0x1000) {
+            [Array]::Copy([BitConverter]::GetBytes([uint32]0x4550), 0, $image, $PeOffset, 4)
+            [Array]::Copy([BitConverter]::GetBytes([uint16]0xAA64), 0, $image, $PeOffset + 4, 2)
+            [Array]::Copy([BitConverter]::GetBytes($Magic), 0, $image, $PeOffset + 0x18, 2)
+            [Array]::Copy([BitConverter]::GetBytes([uint32]16), 0, $image, $PeOffset + 0x18 + 0x6C, 4)
+            [Array]::Copy([BitConverter]::GetBytes([uint32]0x2000), 0, $image, $PeOffset + 0x18 + 0x70 + 48, 4)
+            [Array]::Copy([BitConverter]::GetBytes($DebugSize), 0, $image, $PeOffset + 0x18 + 0x70 + 52, 4)
+        }
+        [Array]::Copy([BitConverter]::GetBytes([uint32]2), 0, $image, 0x2000 + 12, 4)
+        [Array]::Copy([BitConverter]::GetBytes([uint32](24 + $PdbName.Length + 1)), 0, $image, 0x2000 + 16, 4)
+        [Array]::Copy([BitConverter]::GetBytes([uint32]0x3000), 0, $image, 0x2000 + 20, 4)
+        [Array]::Copy([System.Text.Encoding]::ASCII.GetBytes($Signature), 0, $image, 0x3000, 4)
+        [Array]::Copy($kernelGuid.ToByteArray(), 0, $image, 0x3004, 16)
+        [Array]::Copy([BitConverter]::GetBytes($Age), 0, $image, 0x3014, 4)
+        [Array]::Copy([System.Text.Encoding]::ASCII.GetBytes($PdbName), 0, $image, 0x3018, $PdbName.Length)
+        return , $image
+    }
+    $script:evaluateNt = "Evaluate expression: -8779370332160 = fffff803``5c600000`n"
+    ${function:Read-DbgEngVirtual} = $stubReadVirtual
+    ${function:Invoke-DbgEngCommand} = { param([string]$Command) if ($Command -eq "? nt") { return $script:evaluateNt }; return "" }
+    $kernelCases = @(
+        @{ Name = "a kernel image with its RSDS record: the name and the key (GUID, then the age 0x1A in hex)"; Image = @{}; Expected = "ntkrnlmp.pdb|$kernelKey|" },
+        @{ Name = "no MZ"; Image = @{ NoMz = $true }; Expected = "||the kernel image header is not in the dump" },
+        @{ Name = "e_lfanew out of range"; Image = @{ PeOffset = 0xF00 }; Expected = "||the kernel image header is not a 64-bit Windows image" },
+        @{ Name = "a 32-bit (PE32) image"; Image = @{ Magic = 0x10B }; Expected = "||the kernel image header is not a 64-bit Windows image" },
+        @{ Name = "no debug directory"; Image = @{ DebugSize = 0 }; Expected = "||the kernel image has no usable debug directory" },
+        @{ Name = "a debug directory of an odd size"; Image = @{ DebugSize = 30 }; Expected = "||the kernel image has no usable debug directory" },
+        @{ Name = "no RSDS record"; Image = @{ Signature = "NB10" }; Expected = "||the kernel image has no symbol file record (RSDS)" },
+        @{ Name = "a path in the record's file name"; Image = @{ PdbName = "..\x.pdb" }; Expected = "||the kernel's symbol file record is not one of a Windows kernel" },
+        @{ Name = "another file name"; Image = @{ PdbName = "evil.pdb" }; Expected = "||the kernel's symbol file record is not one of a Windows kernel" },
+        @{ Name = "age 0"; Image = @{ Age = 0 }; Expected = "||the kernel's symbol file record is not one of a Windows kernel" }
+    )
+    foreach ($case in $kernelCases) {
+        $script:memRegions.Clear()
+        $imageArgs = $case.Image
+        Add-TestRegion -Process 0 -Start $kernelBase -Bytes (New-TestKernelImage @imageArgs)
+        $kernel = Get-KernelSymbolInfo -Session $null
+        Assert-Equal -Name "Get-KernelSymbolInfo, $($case.Name)" -Expected $case.Expected -Actual "$($kernel.Name)|$($kernel.Key)|$($kernel.Error)"
+    }
+    $script:evaluateNt = "Couldn't resolve error at 'nt'`n"
+    $kernel = Get-KernelSymbolInfo -Session $null
+    Assert-Equal -Name "Get-KernelSymbolInfo: '? nt' not resolved (the engine's own text)" -Expected "||the kernel was not found in the dump" -Actual "$($kernel.Name)|$($kernel.Key)|$($kernel.Error)"
+    $script:evaluateNt = "Evaluate expression: -8779370332160 = fffff803``5c600000`n"
+
+    # The symbol cache and the download (a stub: nothing is downloaded)
+    $script:logFile = Join-Path $workDir "engine-functions.log"
+    ${function:Write-DbgEngWorkerLine} = { param([string]$Line) Receive-DbgEngWorkerLine -Line $Line -State $script:testWorkerState }
+    $script:testWorkerState = New-DbgEngWorkerState
+    $script:downloads = New-Object System.Collections.Generic.List[string]
+    $script:downloadBody = "pdb"
+    ${function:Save-KernelSymbolDownload} = {
+        param([string]$Url, [string]$Path)
+        $script:downloads.Add($Url)
+        switch ($script:downloadBody) {
+            "pdb" {
+                $bytes = New-Object byte[] (100KB)
+                [Array]::Copy([System.Text.Encoding]::ASCII.GetBytes("Microsoft C/C++ MSF 7.00`r`nGOODPDB"), $bytes, 33)
+                [System.IO.File]::WriteAllBytes($Path, $bytes)
+            }
+            "html" { [System.IO.File]::WriteAllText($Path, "<html><body>" + ("x" * 70000) + "</body></html>") }
+            "short" { [System.IO.File]::WriteAllBytes($Path, (New-Object byte[] 10)) }
+            "offline" { throw "No such host is known. (msdl.microsoft.com:443)`r`nAt line 2" }
+            "raced" {
+                # Another run puts the final file there first
+                $bytes = New-Object byte[] (100KB)
+                [Array]::Copy([System.Text.Encoding]::ASCII.GetBytes("Microsoft C/C++ MSF 7.00`r`n"), $bytes, 26)
+                [System.IO.File]::WriteAllBytes($Path, $bytes)
+                [System.IO.File]::WriteAllBytes(($Path -replace '\.\d+\.download$', ''), $bytes)
+            }
+        }
+    }
+    $cacheRoot = Join-Path $engineDir "symbol cache [1]"
+    $cachedPdb = Join-Path $cacheRoot "ntkrnlmp.pdb\$kernelKey\ntkrnlmp.pdb"
+    $expectedUrl = "https://msdl.microsoft.com/download/symbols/ntkrnlmp.pdb/$kernelKey/ntkrnlmp.pdb"
+    $staleDownload = Join-Path $cacheRoot "ntkrnlmp.pdb\$kernelKey\ntkrnlmp.pdb.999.download"
+    [void][System.IO.Directory]::CreateDirectory((Split-Path $staleDownload -Parent))
+    [System.IO.File]::WriteAllText($staleDownload, "half")
+    [System.IO.File]::SetLastWriteTimeUtc($staleDownload, [datetime]::UtcNow.AddDays(-2))
+    $file = Get-KernelSymbolFile -Name "ntkrnlmp.pdb" -Key $kernelKey -CacheRoot $cacheRoot -Fallback (Join-Path $engineDir "fallback")
+    $left = @(Get-ChildItem -LiteralPath (Split-Path $cachedPdb -Parent) -Filter "*.download" -Force).Count
+    Assert-Equal -Name "Get-KernelSymbolFile: downloaded from the exact URL into <cache>\ntkrnlmp.pdb\<key>\ntkrnlmp.pdb, no .download left (a stale one of an earlier run deleted)" -Expected "$expectedUrl|$cachedPdb|$(Split-Path $cachedPdb -Parent)|True||0|$expectedUrl" -Actual "$($script:downloads -join ',')|$($file.Path)|$($file.Folder)|$($file.Downloaded)|$($file.Error)|$left|$($file.Url)"
+    $script:downloads.Clear()
+    $file = Get-KernelSymbolFile -Name "ntkrnlmp.pdb" -Key $kernelKey -CacheRoot $cacheRoot -Fallback (Join-Path $engineDir "fallback")
+    Assert-Equal -Name "Get-KernelSymbolFile: a file in the cache is used, nothing downloaded" -Expected "0|$cachedPdb|False|" -Actual "$($script:downloads.Count)|$($file.Path)|$($file.Downloaded)|$($file.Error)"
+    $badBodies = @(
+        @{ Body = "html"; Error = "the server did not send a symbol [PDB] file" },
+        @{ Body = "short"; Error = "the server sent 10 bytes, not a kernel symbol file" },
+        @{ Body = "offline"; Error = "No such host is known. [msdl.microsoft.com:443]" }
+    )
+    foreach ($case in $badBodies) {
+        Remove-Item -LiteralPath $cacheRoot -Recurse -Force
+        $script:downloadBody = $case.Body
+        $file = Get-KernelSymbolFile -Name "ntkrnlmp.pdb" -Key $kernelKey -CacheRoot $cacheRoot -Fallback (Join-Path $engineDir "fallback")
+        $leftFiles = @(Get-ChildItem -LiteralPath $cacheRoot -Recurse -File -Force -ErrorAction SilentlyContinue).Count
+        Assert-Equal -Name "Get-KernelSymbolFile, a download that fails ($($case.Body)): the short error, no file left" -Expected "|$($case.Error)|0" -Actual "$($file.Path)|$($file.Error)|$leftFiles"
+    }
+    Remove-Item -LiteralPath $cacheRoot -Recurse -Force
+    $script:downloadBody = "raced"
+    $file = Get-KernelSymbolFile -Name "ntkrnlmp.pdb" -Key $kernelKey -CacheRoot $cacheRoot -Fallback (Join-Path $engineDir "fallback")
+    Assert-Equal -Name "Get-KernelSymbolFile: another run's file under the final name first: kept, this run's download deleted" -Expected "$cachedPdb||1" -Actual "$($file.Path)|$($file.Error)|$(@(Get-ChildItem -LiteralPath (Split-Path $cachedPdb -Parent) -File -Force).Count)"
+    $script:downloadBody = "pdb"
+    $fileAsRoot = Join-Path $engineDir "cache-is-a-file"
+    [System.IO.File]::WriteAllText($fileAsRoot, "x")
+    $script:logFile = Join-Path $workDir "engine-fallback.log"
+    $file = Get-KernelSymbolFile -Name "ntkrnlmp.pdb" -Key $kernelKey -CacheRoot $fileAsRoot -Fallback (Join-Path $engineDir "fallback")
+    $fallbackLogged = (Get-TestLog).Contains('  tools\symbols\ cannot be written (')
+    Assert-Equal -Name "Get-KernelSymbolFile: a cache that cannot be written: the work folder's fallback, and the log line" -Expected "$(Join-Path $engineDir "fallback\ntkrnlmp.pdb\$kernelKey\ntkrnlmp.pdb")|True|True" -Actual "$($file.Path)|$($file.Downloaded)|$fallbackLogged"
+
+    ${function:Invoke-DbgEngCommand} = { param([string]$Command) if ($Command -eq "lm m nt") { return $script:lmOutput }; return "" }
+    $script:lmOutput = "start             end                 module name`nfffff803``5c600000 fffff803``5da4f000   nt         (pdb symbols)          c:\x\ntkrnlmp.pdb`n"
+    $matched = Use-KernelSymbols -Session $null -Folder "C:\x"
+    $script:lmOutput = "start             end                 module name`nfffff803``5c600000 fffff803``5da4f000   nt         (export symbols)       ntkrnlmp.exe`n"
+    Assert-Equal -Name "Use-KernelSymbols: '(pdb symbols)' matched, '(export symbols)' not" -Expected "True|False" -Actual "$matched|$(Use-KernelSymbols -Session $null -Folder 'C:\x')"
+
+    # Names and command lines from the fake memory map
+    $script:memRegions.Clear()
+    $userBase = [Convert]::ToUInt64("7ff600000000", 16)
+    $eprocessBase = [Convert]::ToUInt64("ffffa00000000000", 16)
+    # One process's PEB, ProcessParameters and command line (-Text as UTF-16,
+    # -Length its UNICODE_STRING length, -Cut: only half of the text in memory)
+    function Add-TestCommandLine {
+        param([uint64]$EProcess, [uint64]$Peb, [string]$Text, [byte[]]$RawBytes, [int]$Length = -1, [switch]$NoParameters, [switch]$NullParameters, [switch]$NullBuffer, [switch]$Cut)
+        $parameters = $Peb + [uint64]0x8000
+        if ($NullParameters) { $parameters = [uint64]0 }
+        Add-TestRegion -Process $EProcess -Start ($Peb + [uint64]0x20) -Bytes ([BitConverter]::GetBytes([uint64]$parameters))
+        if ($NoParameters -or $NullParameters) { return }
+        $buffer = $Peb + [uint64]0x9000
+        $bytes = [System.Text.Encoding]::Unicode.GetBytes($Text)
+        if ($RawBytes) { $bytes = $RawBytes }
+        if ($Length -lt 0) { $Length = $bytes.Length }
+        $unicode = New-Object byte[] 16
+        [Array]::Copy([BitConverter]::GetBytes([uint16]$Length), 0, $unicode, 0, 2)
+        [Array]::Copy([BitConverter]::GetBytes([uint16][Math]::Min(65535, $Length + 2)), 0, $unicode, 2, 2)
+        if (-not $NullBuffer) { [Array]::Copy([BitConverter]::GetBytes([uint64]$buffer), 0, $unicode, 8, 8) }
+        Add-TestRegion -Process $EProcess -Start ($parameters + [uint64]0x70) -Bytes $unicode
+        if ($Cut) { $bytes = $bytes[0..([int]($bytes.Length / 2))] }
+        Add-TestRegion -Process $EProcess -Start $buffer -Bytes ([byte[]]$bytes)
+    }
+    $special = "cmd.exe /c ""echo a|b""`tc`r`nline2 " + [char]0x00FC + [char]0x4E2D + [char]0x20AC + " " + [char]0xD83D + [char]0xDE00
+    $longText = "long.exe " + ("y" * 32758)
+    $commandCases = @(
+        @{ Name = "CR, LF, tab, quotes, | and non-ASCII exactly"; Text = $special; Expected = "Read|$special" },
+        @{ Name = "32,767 characters"; Text = $longText; Expected = "Read|$longText" },
+        @{ Name = "cut at the first NUL"; Text = ("nul.exe before" + [char]0 + "after"); Expected = "Read|nul.exe before" },
+        @{ Name = "an odd length rounded down"; Text = "odd.exe 12345"; Len = 11; Expected = "Read|odd.e" },
+        @{ Name = "an unpaired surrogate as U+FFFD"; Text = "-"; Raw = [byte[]](0x78, 0, 0, 0xD8, 0x79, 0); Expected = "Read|x$([char]0xFFFD)y" },
+        @{ Name = "length 0"; Text = ""; Len = 0; Expected = "Empty|" },
+        @{ Name = "only NULs"; Text = ([string][char]0 * 3); Expected = "Empty|" },
+        @{ Name = "no ProcessParameters in memory"; Text = "x"; NoParameters = $true; Expected = "Unreadable|" },
+        @{ Name = "a null ProcessParameters"; Text = "x"; NullParameters = $true; Expected = "Unreadable|" },
+        @{ Name = "a null buffer"; Text = "abc"; NullBuffer = $true; Expected = "Unreadable|" },
+        @{ Name = "half of the buffer in memory"; Text = "partial.exe abcdefghijklmnop"; Cut = $true; Expected = "Unreadable|" }
+    )
+    $caseNumber = 0
+    foreach ($case in $commandCases) {
+        $caseNumber++
+        $eprocess = $eprocessBase + [uint64]($caseNumber * 0x1000)
+        $peb = $userBase + [uint64]($caseNumber * 0x100000)
+        $length = -1
+        if ($null -ne $case.Len) { $length = $case.Len }
+        Add-TestCommandLine -EProcess $eprocess -Peb $peb -Text $case.Text -RawBytes $case.Raw -Length $length -NoParameters:([bool]$case.NoParameters) -NullParameters:([bool]$case.NullParameters) -NullBuffer:([bool]$case.NullBuffer) -Cut:([bool]$case.Cut)
+        $commandLine = Read-DbgEngCommandLine -Session $null -Process $eprocess -Peb $peb
+        Assert-Equal -Name "Read-DbgEngCommandLine: $($case.Name)" -Expected $case.Expected -Actual "$($commandLine.State)|$($commandLine.Text)"
+    }
+    $commandLine = Read-DbgEngCommandLine -Session $null -Process ($eprocessBase + [uint64]0x99000) -Peb 0
+    $otherSpace = Read-DbgEngCommandLine -Session $null -Process ($eprocessBase + [uint64]0x98000) -Peb ($userBase + [uint64]0x100000)
+    Assert-Equal -Name "Read-DbgEngCommandLine: no PEB (a kernel process); the PEB of another process's address space is not read" -Expected "NoPeb|Unreadable" -Actual "$($commandLine.State)|$($otherSpace.State)"
+    $nameCases = @(
+        @{ Name = "up to the first NUL"; Bytes = ([System.Text.Encoding]::ASCII.GetBytes("smss.exe") + (New-Object byte[] 7)); Expected = "smss.exe" },
+        @{ Name = "all 15 bytes, no NUL"; Bytes = [System.Text.Encoding]::ASCII.GetBytes("SearchProtocolHost.exe"); Expected = "SearchProtocolH" },
+        @{ Name = "an invalid UTF-8 byte as U+FFFD"; Bytes = [byte[]](0x63, 0x61, 0x66, 0xE9, 0x2E, 0x65, 0x78, 0x65, 0); Expected = "caf$([char]0xFFFD).exe" },
+        @{ Name = "a name with spaces"; Bytes = ([System.Text.Encoding]::ASCII.GetBytes("My App.exe") + (New-Object byte[] 5)); Expected = "My App.exe" }
+    )
+    $caseNumber = 0
+    foreach ($case in $nameCases) {
+        $caseNumber++
+        $address = $eprocessBase + [uint64](0x500000 + $caseNumber * 0x1000)
+        Add-TestRegion -Process 0 -Start $address -Bytes ([byte[]]$case.Bytes)
+        Assert-Equal -Name "Read-DbgEngImageFileName: $($case.Name)" -Expected $case.Expected -Actual (Read-DbgEngImageFileName -Session $null -Address $address)
+    }
+    Assert-Equal -Name "Read-DbgEngImageFileName: not in memory, or a null address: empty" -Expected "|" -Actual "$(Read-DbgEngImageFileName -Session $null -Address ($eprocessBase + [uint64]0x900000))|$(Read-DbgEngImageFileName -Session $null -Address 0)"
+    $fileTimeCases = @(0, -1, ([datetime]::MaxValue.ToFileTimeUtc() + 1), ([datetime]::new(2026, 10, 10, 6, 0, 1, [DateTimeKind]::Utc).AddTicks(2345678).ToFileTimeUtc()))
+    Assert-Equal -Name "ConvertFrom-DbgEngFileTime: 0 and negative give no time, past 9999 the number, else ISO 8601 UTC with 7 decimals" -Expected "<null>|<null>|$([datetime]::MaxValue.ToFileTimeUtc() + 1)|2026-10-10T06:00:01.2345678+00:00" -Actual ((@($fileTimeCases | ForEach-Object { $value = ConvertFrom-DbgEngFileTime $_; if ($null -eq $value) { "<null>" } else { $value } })) -join "|")
+    $shortCases = @(
+        @("a; b", "a, b"), @("a: b -- c", "a - b - c"), @("x (y)", "x [y]"), @("first line.`r`nsecond line", "first line"), @("`r`n  `r`nafter blank lines", "after blank lines"), @(("z" * 130), (("z" * 117) + "..."))
+    )
+    Assert-Equal -Name "Get-DbgEngShortError: no ';', ': ', ' -- ' or parentheses, the first line, at most 120 characters" -Expected (($shortCases | ForEach-Object { $_[1] }) -join "|") -Actual (($shortCases | ForEach-Object { Get-DbgEngShortError $_[0] }) -join "|")
+    . $restoreTestFunctions
+
+    # --- A whole analysis on canned dx output ----------------------------------
+    # 146 processes on two pages (with two bad items, a duplicate, the idle
+    # process), session ids with one unreadable, the kernel image above; the
+    # helper's result goes through the builder's protocol reader
+    # (Receive-DbgEngWorkerLine) into Add-MemoryPluginRows, in this process
+    $boot = [datetime]::new(2026, 10, 10, 6, 0, 0, [DateTimeKind]::Utc)
+    $capture = [datetime]::new(2026, 10, 11, 0, 9, 0, [DateTimeKind]::Utc)
+    $acquisitionEnd = $capture.AddMinutes(2)
+    $script:memRegions.Clear()
+    Add-TestRegion -Process 0 -Start $kernelBase -Bytes (New-TestKernelImage)
+    $procs = New-Object System.Collections.Generic.List[object]
+    function New-TestProcess {
+        param([int]$Index, [long]$ProcId, [long]$ParentId, $Create, $Exit, [int]$Threads, $Name, [string]$CommandLine, [switch]$NoPeb, [switch]$NoParameters, [switch]$Cut, [int]$Length = -1, [long]$Session = 1)
+        $eprocess = $eprocessBase + [uint64]($Index * 0x1000)
+        $nameAddress = $eprocess + [uint64]0x5a8
+        $nameBytes = if ($Name -is [byte[]]) { $Name } else { [System.Text.Encoding]::ASCII.GetBytes($Name) }
+        $field = New-Object byte[] 15
+        [Array]::Copy($nameBytes, $field, [Math]::Min(15, $nameBytes.Length))
+        Add-TestRegion -Process 0 -Start $nameAddress -Bytes $field
+        $peb = [uint64]0
+        if (-not $NoPeb) {
+            $peb = $userBase + [uint64]($Index * 0x100000)
+            Add-TestCommandLine -EProcess $eprocess -Peb $peb -Text $CommandLine -Length $Length -NoParameters:$NoParameters -Cut:$Cut
+        }
+        $createTime = if ($Create -is [datetime]) { $Create.ToFileTimeUtc() } else { [long]$Create }
+        $exitTime = if ($Exit -is [datetime]) { $Exit.ToFileTimeUtc() } else { [long]$Exit }
+        $procs.Add([PSCustomObject]@{ E = $eprocess; Line = "TBP|0x$($eprocess.ToString('x'))|$ProcId|$ParentId|$createTime|$exitTime|$Threads|0x$($peb.ToString('x'))|0x$($nameAddress.ToString('x'))"; Session = $Session })
+    }
+    New-TestProcess -Index 0 -ProcId 4 -ParentId 0 -Create $boot -Exit 0 -Threads 150 -Name "System" -CommandLine "" -NoPeb -Session -1
+    New-TestProcess -Index 1 -ProcId 92 -ParentId 4 -Create $boot -Exit 0 -Threads 4 -Name "Registry" -CommandLine "" -NoPeb -Session -1
+    New-TestProcess -Index 2 -ProcId 404 -ParentId 4 -Create $boot.AddTicks(12345678) -Exit 0 -Threads 2 -Name "smss.exe" -CommandLine "\SystemRoot\System32\smss.exe" -Session -1
+    New-TestProcess -Index 3 -ProcId 5000 -ParentId 4000 -Create $capture.AddMinutes(-30) -Exit 0 -Threads 7 -Name "My App.exe" -CommandLine '"C:\Program Files\My App\My App.exe" --flag'
+    New-TestProcess -Index 4 -ProcId 5001 -ParentId 4000 -Create $capture.AddMinutes(-29) -Exit 0 -Threads 7 -Name "SearchProtocolHost.exe" -CommandLine "SearchProtocolHost.exe x"
+    New-TestProcess -Index 5 -ProcId 5002 -ParentId 4000 -Create $capture.AddMinutes(-28) -Exit 0 -Threads 1 -Name ([byte[]](0x63, 0x61, 0x66, 0xE9, 0x2E, 0x65, 0x78, 0x65)) -CommandLine "cafe.exe"
+    New-TestProcess -Index 6 -ProcId 5003 -ParentId 4000 -Create $capture.AddMinutes(-27) -Exit $capture.AddMinutes(-26) -Threads 0 -Name "exited.exe" -CommandLine "x" -NoParameters
+    New-TestProcess -Index 7 -ProcId 5004 -ParentId 4000 -Create 0 -Exit 0 -Threads 1 -Name "notime.exe" -CommandLine "notime.exe"
+    New-TestProcess -Index 8 -ProcId 5005 -ParentId 4000 -Create $acquisitionEnd.AddDays(1).AddSeconds(1) -Exit 0 -Threads 1 -Name "future.exe" -CommandLine "future.exe"
+    New-TestProcess -Index 9 -ProcId 5006 -ParentId 4000 -Create $capture.AddMinutes(-20) -Exit 0 -Threads 3 -Name "cmd.exe" -CommandLine $special
+    New-TestProcess -Index 10 -ProcId 5007 -ParentId 4000 -Create $capture.AddMinutes(-19) -Exit 0 -Threads 3 -Name "long.exe" -CommandLine $longText
+    New-TestProcess -Index 11 -ProcId 5008 -ParentId 4000 -Create $capture.AddMinutes(-18) -Exit 0 -Threads 3 -Name "nul.exe" -CommandLine ("nul.exe before" + [char]0 + "after")
+    New-TestProcess -Index 12 -ProcId 5009 -ParentId 4000 -Create $capture.AddMinutes(-17) -Exit 0 -Threads 3 -Name "odd.exe" -CommandLine "odd.exe 12345" -Length 11
+    New-TestProcess -Index 13 -ProcId 5010 -ParentId 4000 -Create $capture.AddMinutes(-16) -Exit 0 -Threads 3 -Name "empty.exe" -CommandLine "" -Length 0
+    New-TestProcess -Index 14 -ProcId 5011 -ParentId 4000 -Create $capture.AddMinutes(-15) -Exit 0 -Threads 3 -Name "partial.exe" -CommandLine "partial.exe abcdefghijklmnop" -Cut
+    New-TestProcess -Index 15 -ProcId 5012 -ParentId 4000 -Create $capture.AddMinutes(-14) -Exit 0 -Threads 3 -Name "services.exe" -CommandLine "C:\Windows\system32\services.exe" -Session 0
+    for ($i = 16; $i -lt 146; $i++) { New-TestProcess -Index $i -ProcId (6000 + $i) -ParentId 4000 -Create $capture.AddMinutes(-10) -Exit 0 -Threads 2 -Name "proc$i.exe" -CommandLine "C:\Windows\proc$i.exe /x" }
+    New-TestProcess -Index 146 -ProcId 0 -ParentId 0 -Create 0 -Exit 0 -Threads 4 -Name "Idle" -CommandLine "" -NoPeb
+    function Format-TestItems { param([string[]]$Lines) return (@(for ($i = 0; $i -lt $Lines.Count; $i++) { "    [0x$($i.ToString('x'))]          : $($Lines[$i])" }) -join "`n") }
+    $script:processPage1 = @($procs[0..97] | ForEach-Object { $_.Line }) + @("Unable to read memory at Address 0xffffa00000099000", "TBP|zz|1")
+    $script:processPage2 = @($procs[98..146] | ForEach-Object { $_.Line }) + @($procs[2].Line)
+    $script:sessionLines = @($procs[0..145] | ForEach-Object { "TBS|0x$($_.E.ToString('x'))|$($_.Session)" })
+    $script:sessionLines[20] = "Unable to read memory at Address 0x10"
+    $script:tokenLines = @($procs[0..145] | ForEach-Object { "TBS|0x$($_.E.ToString('x'))|$([Math]::Max(0, $_.Session))" })
+    $script:processQueryText = ""
+    $script:sessionQueryText = ""
+    $script:engineCommands = New-Object System.Collections.Generic.List[string]
+    ${function:Open-DbgEngSession} = {
+        param([string]$EngineFolder, [string[]]$EngineDlls, [string]$DumpPath, [string]$SymbolFolder, [string]$ExtensionFolder)
+        $script:opened++
+        $script:openedWith = "$EngineFolder|$($EngineDlls -join ',')|$DumpPath|$(Test-Path -LiteralPath $SymbolFolder)|$(Test-Path -LiteralPath $ExtensionFolder)"
+        return [PSCustomObject]@{ Fake = $true }
+    }
+    ${function:Close-DbgEngSession} = { param($Session) if ($Session) { $script:closed++ } }
+    ${function:Read-DbgEngVirtual} = $stubReadVirtual
+    ${function:Invoke-DbgEngCommand} = {
+        param([string]$Command)
+        $script:engineCommands.Add($Command)
+        if ($Command -eq "? nt") { return $script:evaluateNt }
+        if ($Command -like ".sympath *") { $script:symbolFolder = $Command.Substring(9).Trim('"'); $script:symbolsLoaded = $false; return "Symbol search path is: x`n" }
+        if ($Command -eq ".reload /f nt") { $script:symbolsLoaded = $true; return "" }
+        if ($Command -eq "lm m nt") {
+            # (pdb symbols) only for a symbol file the stub download wrote
+            $pdb = Join-Path $script:symbolFolder "ntkrnlmp.pdb"
+            $good = $script:symbolsLoaded -and (Test-Path -LiteralPath $pdb) -and [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($pdb)).Contains("GOODPDB")
+            $kind = if ($good) { "(pdb symbols)          $pdb" } else { "(export symbols)       ntkrnlmp.exe" }
+            return "start             end                 module name`nfffff803``5c600000 fffff803``5da4f000   nt         $kind`n"
+        }
+        if ($Command -match '^dx -r1 @\$cursession\.Processes\.Skip\((\d+)\)\.Take\(100\)\.Select\(p => "(TB[PS])\|') {
+            $skip = [int]$Matches[1]
+            $tag = $Matches[2]
+            $echo = $Command.Substring(7)
+            if ($tag -eq "TBP") {
+                if ($script:processQueryText) { return $script:processQueryText }
+                $lines = if ($skip -eq 0) { $script:processPage1 } elseif ($skip -eq 100) { $script:processPage2 } else { @() }
+            }
+            elseif ($Command.Contains("_TOKEN")) { $lines = @($script:tokenLines | Select-Object -Skip $skip -First 100) }
+            else {
+                if ($script:sessionQueryText) { return $script:sessionQueryText }
+                $lines = @($script:sessionLines | Select-Object -Skip $skip -First 100)
+            }
+            return "$echo`n" + (Format-TestItems $lines) + "`n"
+        }
+        throw "unexpected command $Command"
+    }
+    ${function:Find-DbgEngine} = { return [PSCustomObject]@{ Path = "C:\stub\dbgeng.dll"; Folder = "C:\stub"; Source = "Windows"; Version = "10.0.26100.1"; Dlls = @("dbgeng.dll"); Warning = ""; Reason = "" } }
+    ${function:Get-DbgEngWorkerPath} = { return $workerPath }
+    # The helper's work in this process: its result as protocol lines, read
+    # back by the builder's reader
+    ${function:Start-DbgEngWorker} = {
+        param([System.Collections.IDictionary]$Arguments)
+        $script:testWorkerState = New-DbgEngWorkerState
+        $script:workerArguments = $Arguments
+        $workerResult = Read-DbgEngDump -DumpPath $Arguments["DumpPath"] -EngineFolder $Arguments["EngineFolder"] -EngineDlls @("$($Arguments['EngineDlls'])" -split ',') -SymbolCache $Arguments["SymbolCache"] -JobFolder $Arguments["JobFolder"]
+        Write-DbgEngWorkerResult $workerResult
+        $script:testWorkerState.ExitCode = 0
+        return $script:testWorkerState
+    }
+    ${function:Write-DbgEngWorkerLine} = { param([string]$Line) Receive-DbgEngWorkerLine -Line $Line -State $script:testWorkerState }
+    ${function:Save-KernelSymbolDownload} = {
+        param([string]$Url, [string]$Path)
+        $script:downloads.Add($Url)
+        if ($script:offline) { throw "No such host is known. (msdl.microsoft.com:443)" }
+        $bytes = New-Object byte[] (100KB)
+        [Array]::Copy([System.Text.Encoding]::ASCII.GetBytes("Microsoft C/C++ MSF 7.00`r`nGOODPDB"), $bytes, 33)
+        [System.IO.File]::WriteAllBytes($Path, $bytes)
+    }
+    $engineDump = "D:\Cases\Fall $([char]0x00E9) [2]\TriageCollection_2026-10-11_00-08_memory_dump.dmp"
+    $engineDumpInfo = [PSCustomObject]@{ CaptureTimeUtc = $capture; LastWriteUtc = $acquisitionEnd; Architecture = "ARM64" }
+    # One analysis: the rows ("Source|Timestamp|EventType|Description|User|
+    # Details"), the result, the log and what was opened, closed, downloaded
+    function Invoke-TestEngineRun {
+        $script:timelineEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
+        $script:logFile = Join-Path $workDir ("engine-" + [guid]::NewGuid().ToString("N") + ".log")
+        $script:opened = 0
+        $script:closed = 0
+        $script:downloads.Clear()
+        $script:engineCommands.Clear()
+        $analysis = Invoke-DbgEngMemoryAnalysis -DumpPath $engineDump -DumpInfo $engineDumpInfo
+        return [PSCustomObject]@{
+            Result = $analysis; Log = ((Get-TestLog) -replace '(?m)^\[[0-9: -]+\] ', ''); Opened = $script:opened; Closed = $script:closed; Downloads = $script:downloads.Count
+            Rows = @($script:timelineEntries | ForEach-Object { "$($_.Source)|$($_.Timestamp)|$($_.EventType)|$($_.Description)|$($_.User)|$($_.Details)" })
+            Entries = @($script:timelineEntries)
+            JobLeft = (Test-Path -LiteralPath (Join-Path $script:runScratchDir "dbgeng"))
+        }
+    }
+    $symbolRoot = Join-Path $script:testToolsFolder "symbols"
+    Remove-Item -LiteralPath $symbolRoot -Recurse -Force -ErrorAction SilentlyContinue
+    $script:offline = $false
+    $run = Invoke-TestEngineRun
+    $captureRowTime = "2026-10-11 00:09:00.000"
+    $expectedRows = @(
+        "Memory-Processes|2026-10-10 06:00:00.000|ProcessCreation|Process in memory: System (PID: 4, PPID: 0)||Threads=150 SessionId=",
+        "Memory-Processes|2026-10-10 06:00:00.000|ProcessCreation|Process in memory: Registry (PID: 92, PPID: 4)||Threads=4 SessionId=",
+        "Memory-Processes|2026-10-10 06:00:01.234|ProcessCreation|Process in memory: smss.exe (PID: 404, PPID: 4)||Threads=2 SessionId=",
+        "Memory-Processes|2026-10-10 23:39:00.000|ProcessCreation|Process in memory: My App.exe (PID: 5000, PPID: 4000)||Threads=7 SessionId=1",
+        "Memory-Processes|2026-10-10 23:40:00.000|ProcessCreation|Process in memory: SearchProtocolH (PID: 5001, PPID: 4000)||Threads=7 SessionId=1",
+        "Memory-Processes|2026-10-10 23:41:00.000|ProcessCreation|Process in memory: caf$([char]0xFFFD).exe (PID: 5002, PPID: 4000)||Threads=1 SessionId=1",
+        "Memory-Processes|2026-10-10 23:42:00.000|ProcessCreation|Process in memory: exited.exe (PID: 5003, PPID: 4000)||Threads=0 SessionId=1",
+        "Memory-Processes|$captureRowTime|Snapshot|Process in memory: notime.exe (PID: 5004, PPID: 4000)||Threads=1 SessionId=1",
+        "Memory-Processes|$captureRowTime|Snapshot|Process in memory: future.exe (PID: 5005, PPID: 4000)||Threads=1 SessionId=1 CreateTime=2026-10-12 00:11:01.000",
+        "Memory-Processes|2026-10-10 23:55:00.000|ProcessCreation|Process in memory: services.exe (PID: 5012, PPID: 4000)||Threads=3 SessionId=0",
+        "Memory-Processes|2026-10-10 23:59:00.000|ProcessCreation|Process in memory: proc20.exe (PID: 6020, PPID: 4000)||Threads=2 SessionId=",
+        "Memory-CommandLine|$captureRowTime|Snapshot|Process command line: smss.exe (PID: 404)||Args=\SystemRoot\System32\smss.exe",
+        "Memory-CommandLine|$captureRowTime|Snapshot|Process command line: My App.exe (PID: 5000)||Args=`"C:\Program Files\My App\My App.exe`" --flag",
+        "Memory-CommandLine|$captureRowTime|Snapshot|Process command line: cmd.exe (PID: 5006)||Args=$special",
+        "Memory-CommandLine|$captureRowTime|Snapshot|Process command line: nul.exe (PID: 5008)||Args=nul.exe before",
+        "Memory-CommandLine|$captureRowTime|Snapshot|Process command line: odd.exe (PID: 5009)||Args=odd.e"
+    )
+    $missingRows = @($expectedRows | Where-Object { $run.Rows -cnotcontains $_ })
+    Assert-Equal -Name "debugger engine, a whole analysis: the rows of the edge processes (System, Registry and smss.exe without a session, a name with spaces, 15 bytes, invalid UTF-8, exited, no time, a time past the end, session 0, an unreadable session; exact command lines)" -Expected "" -Actual ($missingRows -join " / ")
+    $longRow = @($run.Entries | Where-Object { $_.Description -eq "Process command line: long.exe (PID: 5007)" })
+    $noRows = @($run.Entries | Where-Object { $_.Source -eq "Memory-CommandLine" -and $_.Description -match 'exited\.exe|empty\.exe|partial\.exe|: System \(|: Registry \(|\(PID: 0\)' })
+    $idle = @($run.Rows | Where-Object { $_ -match 'Idle' })
+    Assert-Equal -Name "debugger engine, a whole analysis: 146 pslist and 141 cmdline rows, a 32,767-character command line whole, no command line row for kernel, exited, empty and partly paged-out processes, no idle process" -Expected "146|141|1|32772|0|0" -Actual "$(@($run.Rows | Where-Object { $_.StartsWith('Memory-Processes|') }).Count)|$(@($run.Rows | Where-Object { $_.StartsWith('Memory-CommandLine|') }).Count)|$($longRow.Count)|$(if ($longRow.Count) { $longRow[0].Details.Length })|$($noRows.Count)|$($idle.Count)"
+    Assert-Equal -Name "debugger engine, a whole analysis: the result, one session opened and closed, one download, the work folder removed, the dump as RawPath on every row" -Expected "287|146|141|||1|1|1|False|0" -Actual "$($run.Result.Entries)|$($run.Result.Processes)|$($run.Result.CommandLines)|$($run.Result.Reason)|$($run.Result.PartialReason)|$($run.Opened)|$($run.Closed)|$($run.Downloads)|$($run.JobLeft)|$(@($run.Entries | Where-Object { $_.RawPath -ne $engineDump -or $_.Artifact -ne 'MemoryDump' }).Count)"
+    Assert-Equal -Name "debugger engine: the helper's arguments (the engine, the symbol cache in tools\, the work folder) and the empty symbol and extension folders" -Expected "C:\stub|dbgeng.dll|$engineDump|True|True|$symbolRoot|$(Join-Path $script:runScratchDir 'dbgeng')" -Actual "$($script:openedWith)|$($script:workerArguments['SymbolCache'])|$($script:workerArguments['JobFolder'])"
+    $expectedLog = @(
+        "  Debugger engine: dbgeng.dll 10.0.26100.1 from C:\stub (part of Windows)",
+        "  Downloading the Windows kernel symbol file (about 10 MB) from Microsoft's symbol server: https://msdl.microsoft.com/download/symbols/ntkrnlmp.pdb/$kernelKey/ntkrnlmp.pdb",
+        "  Downloaded 0.1 MB in ",
+        "    Processes (windows.pslist rows): 146 entries (144 timed, 2 snapshot); 2 list item(s) could not be read; session ids for 142",
+        "    Command lines (windows.cmdline rows): 141 entries; none for 2 kernel process(es) without a PEB, 2 not readable (paged out or exited), 1 empty; ",
+        "    Debugger engine analysis took "
+    )
+    $missingLog = @($expectedLog | Where-Object { -not $run.Log.Contains($_) })
+    Assert-Equal -Name "debugger engine, a whole analysis: the log lines (the engine, the download, the counts)" -Expected "|0" -Actual "$($missingLog -join ' / ')|$(@([regex]::Matches($run.Log, 'WARNING')).Count)"
+    $cachedFile = Join-Path $symbolRoot "ntkrnlmp.pdb\$kernelKey\ntkrnlmp.pdb"
+    Assert-Equal -Name "debugger engine: the kernel symbol file is kept in tools\symbols\<name>\<key>\<name>" -Expected "True" -Actual "$(Test-Path -LiteralPath $cachedFile)"
+
+    # The same under de-DE (set inside one script block for Windows PowerShell)
+    $germanRun = & {
+        $savedCulture = [System.Threading.Thread]::CurrentThread.CurrentCulture
+        try {
+            [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo("de-DE")
+            Invoke-TestEngineRun
+        }
+        finally { [System.Threading.Thread]::CurrentThread.CurrentCulture = $savedCulture }
+    }
+    Assert-Equal -Name "debugger engine, de-DE: the same rows, and the symbol file of the first run used (no download)" -Expected "True|0|True" -Actual "$(($germanRun.Rows -join "`n") -ceq ($run.Rows -join "`n"))|$($germanRun.Downloads)|$($germanRun.Log.Contains("  Kernel symbols: $cachedFile (downloaded earlier)"))"
+
+    # A cached symbol file that does not match the dump: deleted, downloaded
+    # once more
+    [System.IO.File]::WriteAllBytes($cachedFile, ([System.Text.Encoding]::ASCII.GetBytes("Microsoft C/C++ MSF 7.00`r`n") + (New-Object byte[] 70000)))
+    $mismatch = Invoke-TestEngineRun
+    Assert-Equal -Name "debugger engine: a cached symbol file that does not match: the warning, one download, the rows" -Expected "True|1|287" -Actual "$($mismatch.Log.Contains('WARNING:   The cached kernel symbol file does not match the dump and was deleted; downloading it again.'))|$($mismatch.Downloads)|$($mismatch.Result.Entries)"
+
+    # No internet: the reason, the offline advice, no rows, nothing left
+    Remove-Item -LiteralPath $symbolRoot -Recurse -Force
+    $script:offline = $true
+    $offlineRun = Invoke-TestEngineRun
+    $script:offline = $false
+    $offlineReason = "the Windows kernel symbol file could not be downloaded from Microsoft's symbol server (No such host is known. [msdl.microsoft.com:443]); connect to the internet and run the builder again, or see ""Windows kernel symbols"" in README.txt"
+    Assert-Equal -Name "debugger engine, no internet: the reason, the offline advice, no rows, no partial file, the session closed" -Expected "$offlineReason|True|0|0|1|1" -Actual "$($offlineRun.Result.Reason)|$($offlineRun.Log.Contains("  To analyze it without internet access here, download $expectedUrl on another computer and copy it to $cachedFile, then run the builder again."))|$($offlineRun.Rows.Count)|$(@(Get-ChildItem -LiteralPath $symbolRoot -Recurse -File -Force -ErrorAction SilentlyContinue).Count)|$($offlineRun.Opened)|$($offlineRun.Closed)"
+
+    # The process query fails as a whole (the engine's own text): the reason
+    # names it; the session query fails: the token's session ids
+    $script:processQueryText = "Error: Unable to find type '_EPROCESS *' for cast.`n"
+    $noProcesses = Invoke-TestEngineRun
+    $script:processQueryText = ""
+    Assert-Equal -Name "debugger engine: the process query fails as a whole: the reason with the engine's error, no rows" -Expected "the Windows debugger engine listed no processes in it (Error - Unable to find type '_EPROCESS *' for cast)|0|1" -Actual "$($noProcesses.Result.Reason)|$($noProcesses.Rows.Count)|$($noProcesses.Closed)"
+    $script:sessionQueryText = "Error: Unable to find type '_MM_SESSION_SPACE *' for cast.`n"
+    $tokenRun = Invoke-TestEngineRun
+    $script:sessionQueryText = ""
+    $tokenSystem = @($tokenRun.Rows | Where-Object { $_.Contains("Process in memory: System (PID: 4, PPID: 0)") })
+    Assert-Equal -Name "debugger engine: the session query fails: logged, the token's session ids (0 for System), the token query sent" -Expected "True|True|1|True" -Actual "$($tokenRun.Log.Contains("    Session ids: Error - Unable to find type '_MM_SESSION_SPACE *' for cast; the token's session id is used instead"))|$($tokenRun.Log.Contains('session ids for 146'))|$(@($tokenSystem | Where-Object { $_.EndsWith('Threads=150 SessionId=0') }).Count)|$(@($script:engineCommands | Where-Object { $_.Contains('_TOKEN') }).Count -gt 0)"
+
+    # The command lines cannot be read: the processes only, and why
+    ${function:Read-DbgEngCommandLine} = { throw "boom (in the engine)" }
+    $partialRun = Invoke-TestEngineRun
+    ${function:Read-DbgEngCommandLine} = $realFunctions["Read-DbgEngCommandLine"]
+    Assert-Equal -Name "debugger engine: the command lines cannot be read: the processes, PartialReason, the warning" -Expected "146|146|0|its command lines could not be read [boom [in the engine]]|True" -Actual "$($partialRun.Result.Entries)|$($partialRun.Result.Processes)|$($partialRun.Result.CommandLines)|$($partialRun.Result.PartialReason)|$($partialRun.Log.Contains('WARNING:   Command lines (windows.cmdline rows): none; its command lines could not be read [boom [in the engine]]'))"
+
+    # The engine cannot open the dump; an error while reading: the reasons,
+    # and the session closed
+    ${function:Open-DbgEngSession} = { throw "OpenDumpFileWide failed (HRESULT 0x80004005)" }
+    $notOpened = Invoke-TestEngineRun
+    ${function:Open-DbgEngSession} = { $script:opened++; return [PSCustomObject]@{ Fake = $true } }
+    $stoppedRun = & {
+        ${function:Get-DbgEngDxPages} = { throw "the command did not finish within 300 s" }
+        Invoke-TestEngineRun
+    }
+    Assert-Equal -Name "debugger engine: the dump cannot be opened; the engine stops while reading: the reasons, the session closed" -Expected "the Windows debugger engine could not open it (OpenDumpFileWide failed [HRESULT 0x80004005])|0|the Windows debugger engine stopped (the command did not finish within 300 s)|1|1" -Actual "$($notOpened.Result.Reason)|$($notOpened.Closed)|$($stoppedRun.Result.Reason)|$($stoppedRun.Opened)|$($stoppedRun.Closed)"
+    . $restoreTestFunctions
+
+    # --- The helper in a process of its own (Start-DbgEngWorker) ----------------
+    # The real helper on a fake ARM64 dump, with this computer's engine: the
+    # engine cannot open it, and says so. Then stand-in helpers: canned
+    # entries with every kind of character through the pipe, a crash, an
+    # error, a hang (ended after the time limit), output without its end,
+    # and no helper at all.
+    Write-Host "Testing the debugger engine helper as a process of its own ..."
+    $script:logFile = Join-Path $workDir "engine-process.log"
+    $script:timelineEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
+    ${function:Get-DbgEngWorkerPath} = { return $workerPath }
+    $realHelper = Invoke-DbgEngMemoryAnalysis -DumpPath $fakeDump -DumpInfo $engineDumpInfo
+    Assert-Equal -Name "the real helper on a fake ARM64 dump: the engine of Windows logged, it could not open the dump, the work folder removed" -Expected "True|True|0|False" -Actual "$($realHelper.Reason -like 'the Windows debugger engine could not open it (*)')|$((Get-TestLog) -match [regex]::Escape("  Debugger engine: dbgeng.dll ") + '\S+' + [regex]::Escape(" from $system32 (part of Windows)"))|$($realHelper.Entries)|$(Test-Path -LiteralPath (Join-Path $script:runScratchDir 'dbgeng'))"
+
+    ${function:Find-DbgEngine} = { return [PSCustomObject]@{ Path = "C:\stub dir\dbgeng.dll"; Folder = "C:\stub dir"; Source = "Windows"; Version = "10.0.26100.1"; Dlls = @("dbgeng.dll"); Warning = ""; Reason = "" } }
+    $helperText = [System.IO.File]::ReadAllText($workerPath)
+    $mainAnchor = "# --- Run by the builder ---"
+    Assert-Equal -Name "the helper's main block found once (for the stand-in helpers)" -Expected 1 -Actual ([regex]::Matches($helperText, [regex]::Escape($mainAnchor))).Count
+    # Canned entries: built from character codes, so this file stays ASCII
+    $cannedHelper = Join-Path $engineDir "canned helper.ps1"
+    $cannedFunction = @'
+function Read-DbgEngDump {
+    param([string]$DumpPath, [string]$EngineFolder, [string[]]$EngineDlls, [string]$SymbolCache, [string]$JobFolder)
+    Write-DbgEngLog "  canned: $DumpPath|$EngineFolder|$($EngineDlls -join '+')|$SymbolCache|$JobFolder"
+    Write-DbgEngLog -Warning "  canned warning"
+    $result = New-DbgEngResult
+    $text = "say ""hi""|there`ttab`r`nnext " + [string][char]0x00FC + [char]0x4E2D + [char]0x20AC + [char]0xD83D + [char]0xDE00 + [char]0xFFFE + " end"
+    $result.Processes = @(
+        [PSCustomObject]@{ PID = [long]4321; PPID = [long]3000; ImageFileName = ("fixture " + [char]0x00E9 + "|x"); Offset = "0xffffa00000001000"; Threads = [long]3; SessionId = $null; CreateTime = "2026-10-10T23:59:01.1234567+00:00"; ExitTime = $null },
+        [PSCustomObject]@{ PID = [long]4400; PPID = $null; ImageFileName = ""; Offset = "0xffffa00000002000"; Threads = $null; SessionId = [long]0; CreateTime = $null; ExitTime = "2026-10-10T23:59:02.0000000+00:00" }
+    )
+    $result.CommandLines = @([PSCustomObject]@{ PID = [long]4321; Process = "fixture-stage.exe"; Args = $text }, [PSCustomObject]@{ PID = [long]4400; Process = "long.exe"; Args = ("y" * 32767) })
+    $result.BadItems = 1
+    $result.SessionIds = 1
+    $result.NoPeb = 2
+    $result.Unreadable = 3
+    $result.Empty = 4
+    $result.Seconds = 1.5
+    return $result
+}
+
+'@
+    [System.IO.File]::WriteAllText($cannedHelper, $helperText.Replace($mainAnchor, $cannedFunction + $mainAnchor))
+    ${function:Get-DbgEngWorkerPath} = { return $script:testHelperPath }
+    $script:testHelperPath = $cannedHelper
+    $script:logFile = Join-Path $workDir "engine-canned.log"
+    $script:timelineEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $cannedResult = Invoke-DbgEngMemoryAnalysis -DumpPath $engineDump -DumpInfo $engineDumpInfo
+    $cannedLog = Get-TestLog
+    $cannedText = "say ""hi""|there`ttab`r`nnext " + [string][char]0x00FC + [char]0x4E2D + [char]0x20AC + [char]0xD83D + [char]0xDE00 + [char]0xFFFE + " end"
+    $cannedRows = @($script:timelineEntries | ForEach-Object { "$($_.Source)|$($_.Timestamp)|$($_.EventType)|$($_.Description)|$($_.Details)" })
+    $expectedCanned = @(
+        "Memory-Processes|2026-10-10 23:59:01.123|ProcessCreation|Process in memory: fixture $([char]0x00E9)|x (PID: 4321, PPID: 3000)|Threads=3 SessionId=",
+        "Memory-Processes|$captureRowTime|Snapshot|Process in memory: Unknown (PID: 4400, PPID: )|Threads= SessionId=0",
+        "Memory-CommandLine|$captureRowTime|Snapshot|Process command line: fixture-stage.exe (PID: 4321)|Args=$($script:xmlInvalidRegex.Replace($cannedText, ''))",
+        "Memory-CommandLine|$captureRowTime|Snapshot|Process command line: long.exe (PID: 4400)|Args=$("y" * 32767)"
+    )
+    Assert-Equal -Name "the helper as a process: canned entries (non-ASCII, |, quotes, CR/LF, tab, a surrogate pair, U+FFFE, 32,767 characters) come through the pipe whole, as rows" -Expected ($expectedCanned -join "`n") -Actual ($cannedRows -join "`n")
+    $argumentLine = "  canned: $engineDump|C:\stub dir|dbgeng.dll|$symbolRoot|$(Join-Path $script:runScratchDir 'dbgeng')"
+    Assert-Equal -Name "the helper as a process: its arguments (spaces, [ ], non-ASCII), its log lines relayed (a warning too), the counts logged" -Expected "True|True|True|True|4" -Actual "$($cannedLog.Contains($argumentLine))|$($cannedLog.Contains('WARNING:   canned warning'))|$($cannedLog.Contains('    Processes (windows.pslist rows): 2 entries (1 timed, 1 snapshot); 1 list item(s) could not be read; session ids for 1'))|$($cannedLog.Contains('    Command lines (windows.cmdline rows): 2 entries; none for 2 kernel process(es) without a PEB, 3 not readable (paged out or exited), 4 empty; 1.5 s'))|$($cannedResult.Entries)"
+    $script:logFile = Join-Path $workDir "engine-direct.log"
+    $state = Start-DbgEngWorker -WorkerPath $cannedHelper -WorkingDirectory $engineDir -TimeoutSeconds 120 -Arguments ([ordered]@{ DumpPath = $engineDump; EngineFolder = "C:\x\"; EngineDlls = "a.dll,b.dll"; SymbolCache = "C:\y"; JobFolder = $engineDir })
+    Assert-Equal -Name "Start-DbgEngWorker: the entries exactly as sent (U+FFFE too), the END line, exit code 0, a trailing backslash in an argument" -Expected "True|True|0|0|True|True" -Actual "$($state.CommandLines[0].Args -ceq $cannedText)|$($state.Ended)|$($state.ExitCode)|$($state.BadLines)|$((Get-TestLog).Contains("  canned: $engineDump|C:\x\|a.dll+b.dll|C:\y|$engineDir"))|$($state.Processes[1].ExitTime -eq '2026-10-10T23:59:02.0000000+00:00' -and $null -eq $state.Processes[1].CreateTime -and $null -eq $state.Processes[1].PPID)"
+
+    $standIns = @(
+        @{ Name = "a crash"; Script = '[Environment]::Exit(-1073741819)'; Reason = "the Windows debugger engine stopped (exit code 0xC0000005)" },
+        @{ Name = "an error"; Script = 'throw "boom in the helper"'; Reason = "the Windows debugger engine stopped (exit code 1 - boom in the helper)" },
+        @{ Name = "output without its end"; Script = '[Console]::Out.WriteLine("TBDBG|LOG|I|" + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("  half-way"))); [Console]::Out.WriteLine("TBDBG|P|1|2"); exit 0'; Reason = "the Windows debugger engine stopped (exit code 0)"; Log = "  half-way" }
+    )
+    foreach ($case in $standIns) {
+        $script:testHelperPath = Join-Path $engineDir "stand-in $($standIns.IndexOf($case)).ps1"
+        [System.IO.File]::WriteAllText($script:testHelperPath, "param([string]`$DumpPath, [string]`$EngineFolder, [string]`$EngineDlls, [string]`$SymbolCache, [string]`$JobFolder)`r`n$($case.Script)`r`n")
+        $script:logFile = Join-Path $workDir ("engine-stand-in-" + [guid]::NewGuid().ToString("N") + ".log")
+        $standIn = Invoke-DbgEngMemoryAnalysis -DumpPath $engineDump -DumpInfo $engineDumpInfo
+        Assert-Equal -Name "the helper as a process, $($case.Name): the reason$(if ($case.Log) { ', its log line relayed' })" -Expected "$($case.Reason)|0|True" -Actual "$($standIn.Reason)|$($standIn.Entries)|$(-not $case.Log -or (Get-TestLog).Contains($case.Log))"
+    }
+    $script:testHelperPath = Join-Path $engineDir "stand-in hang.ps1"
+    $pidFile = Join-Path $engineDir "hang.pid"
+    [System.IO.File]::WriteAllText($script:testHelperPath, "param([string]`$DumpPath, [string]`$EngineFolder, [string]`$EngineDlls, [string]`$SymbolCache, [string]`$JobFolder)`r`n[System.IO.File]::WriteAllText('$($pidFile.Replace("'", "''"))', `"`$PID`")`r`nStart-Sleep -Seconds 120`r`n")
+    $script:dbgEngTimeoutSeconds = 4
+    $hangTimer = [System.Diagnostics.Stopwatch]::StartNew()
+    $hang = Invoke-DbgEngMemoryAnalysis -DumpPath $engineDump -DumpInfo $engineDumpInfo
+    $hangSeconds = $hangTimer.Elapsed.TotalSeconds
+    $script:dbgEngTimeoutSeconds = 900
+    $hangPid = 0
+    if (Test-Path -LiteralPath $pidFile) { $hangPid = [int]([System.IO.File]::ReadAllText($pidFile).Trim()) }
+    $hangGone = $hangPid -gt 0 -and -not (Get-Process -Id $hangPid -ErrorAction SilentlyContinue)
+    Assert-Equal -Name "the helper as a process, a hang: ended after the time limit, the reason" -Expected "the Windows debugger engine did not finish within 4 seconds|True|True" -Actual "$($hang.Reason)|$hangGone|$($hangSeconds -lt 60)"
+    $script:testHelperPath = Join-Path $engineDir "no such helper.ps1"
+    $noHelper = Invoke-DbgEngMemoryAnalysis -DumpPath $engineDump -DumpInfo $engineDumpInfo
+    Assert-Equal -Name "no helper script: the reason" -Expected "the debugger engine helper memory\TimelineDbgEng.ps1 is missing, an antivirus may have removed it; copy the whole win11-timeline-builder folder again" -Actual $noHelper.Reason
+    ${function:Find-DbgEngine} = { return [PSCustomObject]@{ Path = ""; Folder = ""; Source = ""; Version = ""; Dlls = @(); Warning = "tools\dbgeng\arm64\ is not used: x"; Reason = "the Windows debugger engine (dbgeng.dll) is not in C:\none" } }
+    $script:logFile = Join-Path $workDir "engine-none.log"
+    $noEngine = Invoke-DbgEngMemoryAnalysis -DumpPath $engineDump -DumpInfo $engineDumpInfo
+    Assert-Equal -Name "no debugger engine: the reason with the README section, the warning logged" -Expected "the Windows debugger engine (dbgeng.dll) is not in C:\none; see ""ARM64 memory dumps"" in README.txt|True" -Actual "$($noEngine.Reason)|$((Get-TestLog).Contains('WARNING:   tools\dbgeng\arm64\ is not used: x'))"
+    $errorLines = @(
+        @("C:\x\TimelineDbgEng.ps1 : This script contains malicious content and has been blocked by your antivirus software.`r`n    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException", "This script contains malicious content and has been blocked by your antivirus software"),
+        @("Exception: C:\x\stand-in.ps1:2`r`nLine |`r`n   2 |  throw ""boom""`r`n     |  ~~~~~~~~~~~~`r`n     | boom: it failed", "boom - it failed"),
+        @("", "")
+    )
+    Assert-Equal -Name "Get-DbgEngWorkerErrorLine: the message of Windows PowerShell's and PowerShell 7's error output" -Expected (($errorLines | ForEach-Object { $_[1] }) -join "|") -Actual (($errorLines | ForEach-Object { Get-DbgEngWorkerErrorLine $_[0] }) -join "|")
+    Assert-Equal -Name "Format-DbgEngExitCode: decimal, hex for a Windows error" -Expected "0|1|0xC0000005|0xC000013A|unknown" -Actual ((@(0, 1, -1073741819, 3221225786, $null) | ForEach-Object { Format-DbgEngExitCode $_ }) -join "|")
+    . $restoreTestFunctions
+    $script:runScratchDir = $null
 }
 catch {
     Write-TestResult -Name "test run" -Passed $false -Message "$($_.Exception.Message) ($($_.InvocationInfo.PositionMessage))"

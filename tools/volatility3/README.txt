@@ -41,5 +41,8 @@ LIMITATION: WINDOWS ON ARM
 --------------------------
   Volatility 3 analyzes Windows memory from Intel x86/x64 systems only. The
   triage collector CAN capture memory on Windows ARM64 (DumpIt has an ARM64
-  build), but the builder detects ARM64 dumps from the crash dump header and
-  skips Volatility for them. Open those .dmp files in WinDbg instead.
+  build): the builder detects ARM64 dumps from the crash dump header and
+  reads them with Microsoft's debugger engine instead (part of Windows; see
+  tools\dbgeng\README.txt and "ARM64 memory dumps" in the builder's
+  README.txt) -- the processes and their command lines, not network
+  connections or services. Volatility 3 is not needed for them.

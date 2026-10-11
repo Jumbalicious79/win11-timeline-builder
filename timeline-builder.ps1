@@ -16597,7 +16597,7 @@ function Parse-PowerShellHistory {
 }
 
 # ----------------------------------------------------------
-# 15. Memory Dump Parser (Volatility 3)
+# 15. Memory Dump Parser (Volatility 3; Windows ARM64 dumps: Microsoft's debugger engine)
 # ----------------------------------------------------------
 $script:memoryDumpPathWarned = $false   # Find-MemoryDump has reported a bad -MemoryDumpPath
 $script:memoryDumpNotices = New-Object 'System.Collections.Generic.HashSet[string]'   # the lines Find-MemoryDump has logged in this run
@@ -16994,17 +16994,9 @@ function Write-NoMemoryDumpToOffer {
     $notFound = Get-MemoryDumpNotFoundText -Listed $listed
     $sizeText = Get-MemoryDumpSizeText -Bytes $listed.SizeBytes
     Log ""
-    if (Test-CollectionArm64) {
-        # Copying the dump next to the zip would not help: it is not offered
-        Log "No memory dump to offer: $($notFound.Note)."
-        Log "  The collection is from a Windows ARM64 computer, so the dump does not need to be copied here."
-        Write-MemoryDumpNotAnalyzed -What "the dump listed in collection_manifest.csv$($sizeText)" -Why (Get-MemoryDumpArm64Reason)
-    }
-    else {
-        Log "No memory dump to offer: $($notFound.Note)."
-        Log "  To have it analyzed, $($notFound.Remedy), then run the builder again."
-        Write-MemoryDumpNotAnalyzed -What "the dump listed in collection_manifest.csv$($sizeText)" -Why "it was not found (or not usable) next to the collection or where the collector saved it"
-    }
+    Log "No memory dump to offer: $($notFound.Note)."
+    Log "  To have it analyzed, $($notFound.Remedy), then run the builder again."
+    Write-MemoryDumpNotAnalyzed -What "the dump listed in collection_manifest.csv$($sizeText)" -Why "it was not found (or not usable) next to the collection or where the collector saved it"
     Log ""
 }
 
@@ -17027,26 +17019,6 @@ function Get-MemoryDumpSizeText {
 function Write-MemoryDumpNotAnalyzed {
     param([string]$What, [string]$Why)
     Log "  Memory dump not analyzed: $What -- $Why."
-}
-
-# Why a Windows ARM64 dump is not analyzed (Volatility 3 reads only Intel
-# x86/x64 Windows memory), for Write-MemoryDumpNotAnalyzed
-function Get-MemoryDumpArm64Reason {
-    return "Volatility 3 cannot read Windows ARM64 dumps; examine it in WinDbg"
-}
-
-# $true when the collection comes from a Windows ARM64 computer: its
-# systeminfo.txt (live collections, the only ones with a memory dump) says
-# "System Type: ARM64-based PC".
-function Test-CollectionArm64 {
-    foreach ($file in @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("systeminfo.txt"))) {
-        try {
-            $values = ConvertFrom-SystemInfoText -Lines (Get-Content -LiteralPath $file.FullName -ErrorAction Stop)
-            if ("$($values['System Type'])" -match 'ARM64') { return $true }
-        }
-        catch { Write-Verbose "Could not read $($file.FullName): $($_.Exception.Message)" }
-    }
-    return $false
 }
 
 # A memory dump as the user is shown it: "<path in the collection> in the
@@ -17294,8 +17266,410 @@ function Find-VolatilityExe {
     return $null
 }
 
+# --- Windows ARM64 dumps: Microsoft's debugger engine ----------------------
+# Volatility 3 cannot read Windows ARM64 memory. For an ARM64 dump the
+# builder runs memory\TimelineDbgEng.ps1 in a PowerShell process of its own
+# (the same PowerShell, so the same processor architecture): it loads the
+# debugger engine (dbgeng.dll, part of Windows, or a copy signed by
+# Microsoft in tools\dbgeng\<arch>\) by full path, takes the kernel's symbol
+# file from tools\symbols\ or downloads it once from Microsoft's symbol
+# server, and reads the processes and their command lines. The engine is
+# native code: a crash or a hang on a damaged dump ends that process, not
+# the builder (whose rows are not written yet), and the process is ended
+# after $script:dbgEngTimeoutSeconds. Its output comes back as protocol
+# lines (Receive-DbgEngWorkerLine); the rows are made here, by
+# Add-MemoryPluginRows, exactly as from Volatility's windows.pslist and
+# windows.cmdline. Network connections and services are not read.
+$script:dbgEngTimeoutSeconds = 900
+
+# The builder's tools\ folder. A function of its own so the tests can put
+# another folder in its place.
+function Get-BuilderToolsFolder {
+    return (Join-Path $PSScriptRoot "tools")
+}
+
+# The helper script that runs the debugger engine (a function of its own so
+# the tests can put another script in its place)
+function Get-DbgEngWorkerPath {
+    return (Join-Path $PSScriptRoot "memory\TimelineDbgEng.ps1")
+}
+
+# The NuGet content folder name for this PowerShell PROCESS's processor
+# architecture (not the dump's, not the machine's): an x64 PowerShell on an
+# ARM64 computer loads amd64 DLLs. "" when there is none.
+function Get-DbgEngArchitecture {
+    param([string]$ProcessArchitecture = $env:PROCESSOR_ARCHITECTURE)
+    switch ("$ProcessArchitecture".ToUpperInvariant()) {
+        "ARM64" { return "arm64" }
+        "AMD64" { return "amd64" }
+        "X86" { return "x86" }
+    }
+    return ""
+}
+
+# "" when the folder holds dbgeng.dll, dbghelp.dll and dbgmodel.dll and
+# every DLL in it (subfolders too: the engine loads extension DLLs from
+# there) has a valid Authenticode signature from Microsoft; else why not.
+# The builder runs as Administrator, so a DLL planted there must never load.
+function Test-DbgEngFolderSigned {
+    param([string]$Folder)
+    foreach ($name in @("dbgeng.dll", "dbghelp.dll", "dbgmodel.dll")) {
+        if (-not (Test-Path -LiteralPath (Join-Path $Folder $name) -PathType Leaf)) {
+            return "$name is missing there (copy every DLL of the package's content folder)"
+        }
+    }
+    foreach ($dll in @(Get-ChildItem -LiteralPath $Folder -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Extension -eq ".dll" })) {
+        $relative = $dll.FullName.Substring($Folder.TrimEnd('\').Length + 1)
+        $signature = $null
+        try { $signature = Get-AuthenticodeSignature -LiteralPath $dll.FullName -ErrorAction Stop }
+        catch { return "$relative could not be checked ($(Get-DbgEngShortError (Get-DbgEngErrorText $_)))" }
+        $certificate = $signature.SignerCertificate
+        if ("$($signature.Status)" -ne "Valid" -or -not $certificate -or
+            $certificate.Subject -notmatch '(^|,\s*)O=Microsoft Corporation(,|$)' -or $certificate.Issuer -notmatch '(^|,\s*)O=Microsoft Corporation(,|$)') {
+            return "$relative is not signed by Microsoft (signature: $($signature.Status))"
+        }
+    }
+    return ""
+}
+
+# Which debugger engine to load: tools\dbgeng\<arch>\ (user-supplied DLLs
+# from Microsoft's NuGet package, all signed by Microsoft), else the one
+# that is part of Windows (System32; from a 32-bit PowerShell Windows gives
+# the SysWOW64 one). Never searched for by name. Returns Path (dbgeng.dll,
+# "" when there is none), Folder, Source ("Windows" or
+# "tools\dbgeng\<arch>"), Version, Dlls (loaded in this order, by full
+# path), Warning (why tools\dbgeng\<arch>\ was not used) and Reason (why
+# there is none).
+function Find-DbgEngine {
+    param(
+        [string]$ToolsFolder = (Get-BuilderToolsFolder),
+        [string]$ProcessArchitecture = $env:PROCESSOR_ARCHITECTURE,
+        [string]$SystemFolder = (Join-Path $env:SystemRoot "System32")
+    )
+    $result = [PSCustomObject]@{ Path = ""; Folder = ""; Source = ""; Version = ""; Dlls = @(); Warning = ""; Reason = "" }
+    $arch = Get-DbgEngArchitecture $ProcessArchitecture
+    if ($arch) {
+        $toolsEngine = Join-Path $ToolsFolder "dbgeng\$arch"
+        if (Test-Path -LiteralPath (Join-Path $toolsEngine "dbgeng.dll") -PathType Leaf) {
+            $problem = Test-DbgEngFolderSigned -Folder $toolsEngine
+            if ($problem) { $result.Warning = "tools\dbgeng\$arch\ is not used: $problem. The debugger engine that is part of Windows is used instead." }
+            else {
+                $result.Folder = $toolsEngine
+                $result.Source = "tools\dbgeng\$arch"
+                # Its own copies first, so the engine never binds to the
+                # System32 ones by name
+                $result.Dlls = @("dbghelp.dll", "dbgcore.dll", "msdia140.dll", "dbgmodel.dll", "dbgeng.dll")
+            }
+        }
+    }
+    if (-not $result.Folder) {
+        if (-not (Test-Path -LiteralPath (Join-Path $SystemFolder "dbgeng.dll") -PathType Leaf)) {
+            $result.Reason = "the Windows debugger engine (dbgeng.dll) is not in $SystemFolder"
+            return $result
+        }
+        $result.Folder = $SystemFolder
+        $result.Source = "Windows"
+        $result.Dlls = @("dbgeng.dll")
+    }
+    $result.Path = Join-Path $result.Folder "dbgeng.dll"
+    try { $result.Version = ("$((Get-Item -LiteralPath $result.Path -Force -ErrorAction Stop).VersionInfo.FileVersion)" -split '\s')[0] }
+    catch { Write-Verbose "No version of $($result.Path): $($_.Exception.Message)" }
+    return $result
+}
+
+# The message of an error: of the innermost exception (a .NET method's own
+# message, not PowerShell's "Exception calling ..." around it). The same
+# function is in memory\TimelineDbgEng.ps1.
+function Get-DbgEngErrorText {
+    param($ErrorRecord)
+    $exception = $ErrorRecord.Exception
+    while ($exception.InnerException) { $exception = $exception.InnerException }
+    return $exception.Message
+}
+
+# A short, single-line form of an error message for a reason in the log:
+# no ";", " -- ", ": " or parentheses (the report splits the line on them),
+# at most 120 characters. The same function is in memory\TimelineDbgEng.ps1.
+function Get-DbgEngShortError {
+    param([string]$Message)
+    $text = (("$Message" -split "\r?\n") | Where-Object { $_.Trim() } | Select-Object -First 1)
+    $text = "$text".Trim().Replace(";", ",").Replace(" -- ", " - ").Replace(": ", " - ").Replace("(", "[").Replace(")", "]").TrimEnd('.')
+    if ($text.Length -gt 120) { $text = $text.Substring(0, 117) + "..." }
+    return $text
+}
+
+# The command an analyst with WinDbg can run for more than the builder
+# reads (handles, drivers, ...), with this dump and the builder's symbol
+# cache (WinDbg's own symbol server client fills it the same way):
+# kdARM64.exe (the WinDbg app's command-line debugger for ARM64 Windows), or
+# kd.exe on another processor architecture (Debugging Tools for Windows)
+function Get-DbgEngWinDbgCommand {
+    param([string]$DumpPath, [string]$ProcessArchitecture = $env:PROCESSOR_ARCHITECTURE)
+    $debugger = if ("$ProcessArchitecture" -eq "ARM64") { "kdARM64.exe" } else { "kd.exe" }
+    return "$debugger -z `"$DumpPath`" -y `"srv*$(Join-Path (Get-BuilderToolsFolder) 'symbols')*https://msdl.microsoft.com/download/symbols`""
+}
+
+# The PowerShell that runs the helper: this one ($PSHOME, so the same
+# edition and processor architecture), never a GUI host such as the ISE
+function Get-DbgEngWorkerHost {
+    if ($PSVersionTable.PSEdition -eq "Core") { return (Join-Path $PSHOME "pwsh.exe") }
+    return (Join-Path $PSHOME "powershell.exe")
+}
+
+# A command-line argument in quotes (paths have no " in them; a trailing
+# backslash is doubled, or it would escape the closing quote)
+function ConvertTo-DbgEngProcessArgument {
+    param([string]$Text)
+    return '"' + ($Text -replace '(\\+)$', '$1$1') + '"'
+}
+
+# What the helper sent: its result values (Reason, PartialReason and the
+# counts), the pslist and cmdline entries, Ended (its END line came, with
+# the entry numbers it names), BadLines (protocol lines that could not be
+# read), and how its process ended
+function New-DbgEngWorkerState {
+    return [PSCustomObject]@{
+        Values = @{}; Processes = (New-Object System.Collections.Generic.List[object]); CommandLines = (New-Object System.Collections.Generic.List[object])
+        Ended = $false; BadLines = 0; ExitCode = $null; TimedOut = $false; ErrorText = ""; StartError = ""
+    }
+}
+
+# A text field of a protocol line (Base64 of UTF-8)
+function ConvertFrom-DbgEngBase64 {
+    param([string]$Text)
+    if (-not $Text) { return "" }
+    return [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Text))
+}
+
+# A number field of a protocol line: $null when empty
+function ConvertFrom-DbgEngWorkerNumber {
+    param([string]$Text)
+    if (-not $Text) { return $null }
+    return [long]::Parse($Text, [System.Globalization.NumberStyles]::AllowLeadingSign, [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+# One line of the helper's output: "TBDBG|LOG|<I, W or S>|<text>" is logged
+# here (Log, Log-Warning, Log-Success), "TBDBG|R|<name>|<value>" is a result
+# value, "TBDBG|P|..." a windows.pslist entry, "TBDBG|C|..." a
+# windows.cmdline entry, "TBDBG|END|<processes>|<command lines>" the end.
+# Other lines (PowerShell's own output) are ignored.
+function Receive-DbgEngWorkerLine {
+    param([string]$Line, $State)
+    $at = "$Line".IndexOf("TBDBG|")
+    if ($at -lt 0) { return }
+    $fields = $Line.Substring($at + 6).TrimEnd().Split('|')
+    try {
+        switch ($fields[0]) {
+            "LOG" {
+                $text = ConvertFrom-DbgEngBase64 $fields[2]
+                if ($fields[1] -eq "W") { Log-Warning $text }
+                elseif ($fields[1] -eq "S") { Log-Success $text }
+                else { Log $text }
+            }
+            "R" { $State.Values[$fields[1]] = ConvertFrom-DbgEngBase64 $fields[2] }
+            "P" {
+                if ($fields.Count -ne 9) { throw "a process line with $($fields.Count) fields" }
+                $created = ConvertFrom-DbgEngBase64 $fields[7]
+                $exited = ConvertFrom-DbgEngBase64 $fields[8]
+                $State.Processes.Add([PSCustomObject]@{
+                        PID = (ConvertFrom-DbgEngWorkerNumber $fields[1]); PPID = (ConvertFrom-DbgEngWorkerNumber $fields[2]); ImageFileName = (ConvertFrom-DbgEngBase64 $fields[6])
+                        Offset = $fields[5]; Threads = (ConvertFrom-DbgEngWorkerNumber $fields[3]); SessionId = (ConvertFrom-DbgEngWorkerNumber $fields[4])
+                        CreateTime = $(if ($created) { $created } else { $null }); ExitTime = $(if ($exited) { $exited } else { $null })
+                    })
+            }
+            "C" {
+                if ($fields.Count -ne 4) { throw "a command line line with $($fields.Count) fields" }
+                $State.CommandLines.Add([PSCustomObject]@{ PID = (ConvertFrom-DbgEngWorkerNumber $fields[1]); Process = (ConvertFrom-DbgEngBase64 $fields[2]); Args = (ConvertFrom-DbgEngBase64 $fields[3]) })
+            }
+            "END" {
+                if ($fields.Count -eq 3 -and $fields[1] -eq "$($State.Processes.Count)" -and $fields[2] -eq "$($State.CommandLines.Count)") { $State.Ended = $true }
+                else { $State.BadLines++ }
+            }
+            default { $State.BadLines++ }
+        }
+    }
+    catch { $State.BadLines++ }
+}
+
+# Runs the helper script in a PowerShell process of its own and reads its
+# output line by line (Receive-DbgEngWorkerLine), so its log lines appear
+# as they come. The process shares this console (Ctrl+C reaches it too); it
+# is ended after -TimeoutSeconds, and when this run stops (Ctrl+C) while it
+# is running. Windows PowerShell gets its default module path (a path of
+# PowerShell 7's modules would load the wrong ones). Returns the state
+# (New-DbgEngWorkerState) with ExitCode, TimedOut, ErrorText (its stderr)
+# and StartError. A function of its own so the tests can run the helper's
+# functions in their own process instead.
+function Start-DbgEngWorker {
+    param([string]$WorkerPath, [System.Collections.IDictionary]$Arguments, [string]$WorkingDirectory, [int]$TimeoutSeconds = 900)
+    $state = New-DbgEngWorkerState
+    $argumentText = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File " + (ConvertTo-DbgEngProcessArgument $WorkerPath)
+    foreach ($name in @($Arguments.Keys)) { $argumentText += " -$name " + (ConvertTo-DbgEngProcessArgument ([string]$Arguments[$name])) }
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = Get-DbgEngWorkerHost
+    $startInfo.Arguments = $argumentText
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    if ($WorkingDirectory) { $startInfo.WorkingDirectory = $WorkingDirectory }
+    if ($PSVersionTable.PSEdition -ne "Core" -and $startInfo.EnvironmentVariables.ContainsKey("PSModulePath")) { $startInfo.EnvironmentVariables.Remove("PSModulePath") }
+    $process = $null
+    try { $process = [System.Diagnostics.Process]::Start($startInfo) }
+    catch {
+        $state.StartError = Get-DbgEngShortError (Get-DbgEngErrorText $_)
+        return $state
+    }
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $errorTask = $process.StandardError.ReadToEndAsync()
+        $lineTask = $process.StandardOutput.ReadLineAsync()
+        while ($true) {
+            if ($lineTask.Wait(200)) {
+                $line = $lineTask.Result
+                if ($null -eq $line) { break }
+                Receive-DbgEngWorkerLine -Line $line -State $state
+                $lineTask = $process.StandardOutput.ReadLineAsync()
+            }
+            elseif ($timer.Elapsed.TotalSeconds -ge $TimeoutSeconds) { $state.TimedOut = $true; break }
+        }
+        if (-not $state.TimedOut -and -not $process.WaitForExit([int][Math]::Max(1000, ($TimeoutSeconds - $timer.Elapsed.TotalSeconds) * 1000))) { $state.TimedOut = $true }
+        if ($state.TimedOut) {
+            try { $process.Kill() } catch { Write-Verbose "Ending the debugger engine helper: $($_.Exception.Message)" }
+            [void]$process.WaitForExit(10000)
+        }
+        else {
+            $process.WaitForExit()
+            $state.ExitCode = $process.ExitCode
+        }
+        if ($errorTask.Wait(5000)) { $state.ErrorText = [string]$errorTask.Result }
+    }
+    finally {
+        # Ctrl+C (or an error) while it runs: it is ended with this run
+        if (-not $process.HasExited) {
+            try { $process.Kill() } catch { Write-Verbose "Ending the debugger engine helper: $($_.Exception.Message)" }
+            [void]$process.WaitForExit(10000)
+        }
+        $process.Dispose()
+    }
+    return $state
+}
+
+# The message of the helper's error output (PowerShell's error text without
+# its position lines), short, for a reason; "" for none. Windows PowerShell
+# gives the message first ("<script>.ps1 : <message>", or the message
+# alone), PowerShell 7 as the last "| <message>" line under the code line.
+function Get-DbgEngWorkerErrorLine {
+    param([string]$Text)
+    $lines = @(("$Text" -split "\r?\n") | ForEach-Object { ($_ -replace '\x1b\[[0-9;?]*[A-Za-z]', '').Trim() } | Where-Object { $_ })
+    $barLines = @($lines | Where-Object { $_ -match '^\|\s+[^~\s]' })
+    if ($barLines.Count -gt 0) { return (Get-DbgEngShortError ($barLines[-1] -replace '^\|\s+', '')) }
+    foreach ($line in $lines) {
+        if ($line -match '^(At |\+|~|Line \|)' -or $line -match '^[-\w]+\s*:\s*$') { continue }
+        if ($line -match '^\S.*?\.ps1\s*:\s+(.+)$') { $line = $Matches[1] }
+        return (Get-DbgEngShortError $line)
+    }
+    return ""
+}
+
+# An exit code as the log gives it: decimal, or hex for a Windows error
+# such as 0xC0000005 (an access violation)
+function Format-DbgEngExitCode {
+    param($ExitCode)
+    if ($null -eq $ExitCode) { return "unknown" }
+    $code = [long]$ExitCode
+    if ($code -lt 0 -or $code -gt 0xFFFF) { return "0x" + ([uint32]($code -band 0xFFFFFFFFL)).ToString("X8") }
+    return "$code"
+}
+
+# A Windows ARM64 dump: its processes and command lines with Microsoft's
+# debugger engine, as the rows Volatility's windows.pslist and
+# windows.cmdline give (Add-MemoryPluginRows). Returns Entries (rows
+# added), Processes and CommandLines (rows of each), Reason when nothing
+# was added (for "Memory dump not analyzed: <dump> -- <reason>") and
+# PartialReason when the processes were read but not the command lines.
+function Invoke-DbgEngMemoryAnalysis {
+    param([string]$DumpPath, $DumpInfo)
+    $result = [PSCustomObject]@{ Entries = 0; Processes = 0; CommandLines = 0; Reason = ""; PartialReason = "" }
+    $engine = Find-DbgEngine
+    if ($engine.Warning) { Log-Warning "  $($engine.Warning)" }
+    if (-not $engine.Path) {
+        $result.Reason = "$($engine.Reason); see ""ARM64 memory dumps"" in README.txt"
+        return $result
+    }
+    $where = if ($engine.Source -eq "Windows") { "part of Windows" } else { "signed by Microsoft" }
+    Log "  Debugger engine: dbgeng.dll $($engine.Version) from $($engine.Folder) ($where)"
+    $worker = Get-DbgEngWorkerPath
+    if (-not (Test-Path -LiteralPath $worker -PathType Leaf)) {
+        $result.Reason = "the debugger engine helper memory\TimelineDbgEng.ps1 is missing, an antivirus may have removed it; copy the whole win11-timeline-builder folder again"
+        return $result
+    }
+    $timeout = 900
+    if ($script:dbgEngTimeoutSeconds -gt 0) { $timeout = [int]$script:dbgEngTimeoutSeconds }
+    $jobFolder = Join-Path (Get-ScratchFolder) "dbgeng"
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $state = $null
+    try {
+        [void][System.IO.Directory]::CreateDirectory($jobFolder)
+        $state = Start-DbgEngWorker -WorkerPath $worker -WorkingDirectory $jobFolder -TimeoutSeconds $timeout -Arguments ([ordered]@{
+                DumpPath = $DumpPath; EngineFolder = $engine.Folder; EngineDlls = (@($engine.Dlls) -join ",")
+                SymbolCache = (Join-Path (Get-BuilderToolsFolder) "symbols"); JobFolder = $jobFolder
+            })
+    }
+    catch {
+        $result.Reason = "the debugger engine helper could not be run ($(Get-DbgEngShortError (Get-DbgEngErrorText $_)))"
+        return $result
+    }
+    finally { Remove-Item -LiteralPath $jobFolder -Recurse -Force -ErrorAction SilentlyContinue }
+    if ($state.StartError) {
+        $result.Reason = "the debugger engine helper could not be started ($($state.StartError))"
+        return $result
+    }
+    if ($state.TimedOut) {
+        $limit = "$timeout seconds"
+        if ($timeout -ge 120) { $limit = "$([int][Math]::Ceiling($timeout / 60)) minutes" }
+        $result.Reason = "the Windows debugger engine did not finish within $limit"
+        return $result
+    }
+    if (-not $state.Ended) {
+        $detail = "exit code $(Format-DbgEngExitCode $state.ExitCode)"
+        $errorLine = Get-DbgEngWorkerErrorLine $state.ErrorText
+        if ($errorLine) { $detail += " - $errorLine" }
+        $result.Reason = "the Windows debugger engine stopped ($detail)"
+        return $result
+    }
+    $values = $state.Values
+    if ($values["Reason"]) {
+        $result.Reason = $values["Reason"]
+        return $result
+    }
+    if ($state.Processes.Count -eq 0) {
+        $result.Reason = "the Windows debugger engine listed no processes in it"
+        return $result
+    }
+    $counts = Add-MemoryPluginRows -Plugin "windows.pslist" -Source "Memory-Processes" -Entries $state.Processes.ToArray() `
+        -CaptureTimeUtc $DumpInfo.CaptureTimeUtc -AcquisitionEndUtc $DumpInfo.LastWriteUtc -DumpPath $DumpPath
+    $badNote = ""
+    if ([int]$values["BadItems"] -gt 0) { $badNote = "; $($values['BadItems']) list item(s) could not be read" }
+    Log "    Processes (windows.pslist rows): $($counts.Entries) entries ($($counts.Timed) timed, $($counts.Snapshot) snapshot)$badNote; session ids for $($values['SessionIds'])"
+    $cmdCounts = Add-MemoryPluginRows -Plugin "windows.cmdline" -Source "Memory-CommandLine" -Entries $state.CommandLines.ToArray() `
+        -CaptureTimeUtc $DumpInfo.CaptureTimeUtc -AcquisitionEndUtc $DumpInfo.LastWriteUtc -DumpPath $DumpPath
+    if ($values["PartialReason"]) {
+        $result.PartialReason = $values["PartialReason"]
+        Log-Warning "  Command lines (windows.cmdline rows): none; $($result.PartialReason)"
+    }
+    else {
+        Log "    Command lines (windows.cmdline rows): $($cmdCounts.Entries) entries; none for $($values['NoPeb']) kernel process(es) without a PEB, $($values['Unreadable']) not readable (paged out or exited), $($values['Empty']) empty; $($values['Seconds']) s"
+    }
+    if ($state.BadLines -gt 0) { Log-Warning "  $($state.BadLines) line(s) of the debugger engine helper's output could not be read." }
+    Log "    Debugger engine analysis took $(([math]::Round($timer.Elapsed.TotalSeconds, 1)).ToString([System.Globalization.CultureInfo]::InvariantCulture)) s"
+    $result.Processes = $counts.Entries
+    $result.CommandLines = $cmdCounts.Entries
+    $result.Entries = $counts.Entries + $cmdCounts.Entries
+    return $result
+}
+
 function Parse-Memory {
-    Log "--- Parsing Memory Dump (Volatility 3) ---"
+    Log "--- Parsing Memory Dump ---"
 
     $memParsed = $false
 
@@ -17318,16 +17692,32 @@ function Parse-Memory {
     # The time of the Snapshot rows (entries without a valid time of their own)
     Log "  Dump time: $($dumpInfo.CaptureTimeUtc.ToString('yyyy-MM-dd HH:mm:ss.fff', [System.Globalization.CultureInfo]::InvariantCulture)) UTC ($($dumpInfo.TimeSource))"
 
-    # Volatility 3's Windows support is for Intel x86/x64 memory only
     $dumpText = "$([System.IO.Path]::GetFileName($dumpPath))$(Get-MemoryDumpSizeText -Bytes (Get-Item -LiteralPath $dumpPath -Force).Length)"
+    Log "  Analyzing in-place (not copied to temp)"
+
+    # Volatility 3's Windows support is for Intel x86/x64 memory only: a
+    # Windows ARM64 dump is read with Microsoft's debugger engine (processes
+    # and command lines). The findings report reads the "analyzed with the
+    # Windows debugger engine" line (a coverage note and a caveat) or the
+    # "Memory dump not analyzed" line.
     if ($dumpArch -eq "ARM64") {
-        Log-Warning "  This is a Windows ARM64 memory dump. Volatility 3 cannot analyze Windows ARM64 memory, so memory analysis is skipped."
-        Write-MemoryDumpNotAnalyzed -What $dumpText -Why (Get-MemoryDumpArm64Reason)
+        Log "  Windows ARM64 dump: analyzing it with Microsoft's debugger engine (Volatility 3 cannot read ARM64 memory)"
+        $engineResult = Invoke-DbgEngMemoryAnalysis -DumpPath $dumpPath -DumpInfo $dumpInfo
+        if ($engineResult.Entries -gt 0) {
+            $readText = "processes and command lines only"
+            if ($engineResult.PartialReason) { $readText = "processes only, $($engineResult.PartialReason)" }
+            Log "  Memory dump analyzed with the Windows debugger engine: $dumpText -- $readText; network connections and services are not read from Windows ARM64 dumps."
+            Log-Success "  Memory analysis complete: $($engineResult.Entries) entries from $dumpSizeGB GB dump"
+        }
+        else {
+            Log-Warning "  Memory analysis skipped: $($engineResult.Reason)."
+            Write-MemoryDumpNotAnalyzed -What $dumpText -Why $engineResult.Reason
+        }
+        Log "  For more (handles, drivers and other kernel objects), open the dump in WinDbg; its command-line debugger, with the builder's symbol cache: $(Get-DbgEngWinDbgCommand -DumpPath $dumpPath)"
         Log "  Memory parsing complete."
         Log ""
         return
     }
-    Log "  Analyzing in-place (not copied to temp)"
 
     # --- Find Volatility 3 ---
     $volExe = Find-VolatilityExe
@@ -18601,21 +18991,19 @@ if ($Sources -notcontains "Memory") {
         $detectedDumpSize = Get-MemoryDumpSizeText -Bytes (Get-Item -LiteralPath $detectedDump -Force).Length
         $detectedDumpText = "$([System.IO.Path]::GetFileName($detectedDump))$detectedDumpSize"
     }
-    if ($detectedDump -and (Get-MemoryDumpInfo -Path $detectedDump).Architecture -eq "ARM64") {
-        # Volatility 3 cannot analyze Windows ARM64 memory: don't offer it
-        # (the next line says why, and names WinDbg)
-        Log ""
-        Log "Memory dump detected: $(Get-MemoryDumpDisplayName $detectedDump) (Windows ARM64)"
-        Write-MemoryDumpNotAnalyzed -What $detectedDumpText -Why (Get-MemoryDumpArm64Reason)
-        Log ""
-        $detectedDump = $null
-    }
-
-    # If dump found, check if Volatility 3 is available
+    # If dump found, check that what reads it is available: Volatility 3 for
+    # an x64 or x86 dump, Microsoft's debugger engine for a Windows ARM64
+    # dump (Volatility 3 cannot read ARM64 memory)
     if ($detectedDump) {
-        $volAvailable = [bool](Find-VolatilityExe)
+        $detectedArm64 = (Get-MemoryDumpInfo -Path $detectedDump).Architecture -eq "ARM64"
+        $dumpEngine = $null
+        if ($detectedArm64) {
+            $dumpEngine = Find-DbgEngine
+            $readerAvailable = [bool]$dumpEngine.Path
+        }
+        else { $readerAvailable = [bool](Find-VolatilityExe) }
 
-        if ($volAvailable) {
+        if ($readerAvailable) {
             Write-Host ""
             Write-Host "========================================" -ForegroundColor Cyan
             Write-Host "  Memory Dump Detected" -ForegroundColor Cyan
@@ -18628,11 +19016,26 @@ if ($Sources -notcontains "Memory") {
             } elseif ($script:memoryDumpFromManifest) {
                 Write-Host "  (where the collector saved it, as collection_manifest.csv says)" -ForegroundColor Green
             }
-            Write-Host "  Volatility 3 is available in tools\" -ForegroundColor Green
-            Write-Host ""
-            Write-Host "  Memory analysis extracts processes, network connections," -ForegroundColor White
-            Write-Host "  command lines, and services from the RAM dump." -ForegroundColor White
-            Write-Host "  Adds 5-30 minutes depending on dump size." -ForegroundColor DarkGray
+            if ($detectedArm64) {
+                $engineWhere = "(dbgeng.dll, part of Windows)"
+                if ($dumpEngine.Source -ne "Windows") { $engineWhere = "(dbgeng.dll in $($dumpEngine.Source)\)" }
+                Write-Host "  A Windows ARM64 dump: Volatility 3 cannot read it, so the builder uses" -ForegroundColor Green
+                Write-Host "  Microsoft's debugger engine $engineWhere." -ForegroundColor Green
+                Write-Host ""
+                Write-Host "  Memory analysis adds the processes (parent, start time, session," -ForegroundColor White
+                Write-Host "  threads) and their command lines from the RAM dump. Network" -ForegroundColor White
+                Write-Host "  connections and services are not read from ARM64 dumps." -ForegroundColor White
+                Write-Host "  Takes under a minute. Once per Windows build it downloads the kernel's" -ForegroundColor DarkGray
+                Write-Host "  symbol file (about 10 MB) from Microsoft's symbol server into" -ForegroundColor DarkGray
+                Write-Host "  tools\symbols\; the request names only that file (see README.txt)." -ForegroundColor DarkGray
+            }
+            else {
+                Write-Host "  Volatility 3 is available in tools\" -ForegroundColor Green
+                Write-Host ""
+                Write-Host "  Memory analysis extracts processes, network connections," -ForegroundColor White
+                Write-Host "  command lines, and services from the RAM dump." -ForegroundColor White
+                Write-Host "  Adds 5-30 minutes depending on dump size." -ForegroundColor DarkGray
+            }
             Write-Host ""
             Write-Host "  [1] Yes -- analyze memory dump (recommended for IR)" -ForegroundColor Green
             Write-Host "  [2] No  -- skip, build timeline from disk artifacts only" -ForegroundColor White
@@ -18655,6 +19058,11 @@ if ($Sources -notcontains "Memory") {
                 Write-MemoryDumpNotAnalyzed -What $detectedDumpText -Why "skipped at the memory prompt; run the builder again and answer 1 to analyze it"
                 Log ""
             }
+        } elseif ($detectedArm64) {
+            Log ""
+            Log "Memory dump detected ($(Get-MemoryDumpDisplayName $detectedDump), Windows ARM64) but Microsoft's debugger engine is not available: $($dumpEngine.Reason)."
+            Write-MemoryDumpNotAnalyzed -What $detectedDumpText -Why "$($dumpEngine.Reason); see ""ARM64 memory dumps"" in README.txt"
+            Log ""
         } else {
             Log ""
             Log "Memory dump detected ($(Get-MemoryDumpDisplayName $detectedDump)) but Volatility 3 not found in tools\ directory."

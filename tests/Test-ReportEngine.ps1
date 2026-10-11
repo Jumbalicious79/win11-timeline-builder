@@ -865,19 +865,24 @@ try {
     Assert-Equal "$($passed.Incomplete)|$($passed.MissingInputFiles)|$($passed.UnexpectedErrors)|$(@($passed.Lines).Count)" "True|5|0|1" -Message "the builder's own counts (-MissingInputFiles) without a log"
     Assert-Equal "$($model.Coverage.TimelineCompleteness.Incomplete)|$(@($model.Caveats | Where-Object { $_ -match 'incomplete' }).Count)" "False|0" -Message "a complete run: no incomplete caveat"
 
-    # --- A memory dump the builder found but did not analyze (Windows ARM64,
-    # skipped at its prompt, no Volatility 3, or not found) ---
+    # --- A memory dump the builder found but did not analyze (skipped at its
+    # prompt, no Volatility 3, no kernel symbol file for an ARM64 dump, or
+    # not found) ---
     # The note (Evidence coverage) names the dump and gives the reason and
     # advice with one colon; the caveat (page 1) gives the reason as one
     # short phrase. A log from an older builder ("<dump>: <why>", "<dump>,
-    # but <why>") reads the same way.
+    # but <why>") reads the same way; one that could not analyze Windows
+    # ARM64 dumps at all says the timeline can be built again for that.
     $memoryCaveatTail = ", so the programs, network connections and command lines in memory are not in this report."
-    $arm64Note = "Memory dump not analyzed: T_memory_dump.dmp (7.99 GB) -- Volatility 3 cannot read Windows ARM64 dumps; examine it in WinDbg."
-    $arm64Caveat = "A memory dump of this collection was not analyzed (Volatility 3 cannot read Windows ARM64 dumps)$memoryCaveatTail"
+    $arm64Note = "Memory dump not analyzed: T_memory_dump.dmp (7.99 GB) -- the builder that made this timeline could not analyze Windows ARM64 dumps; build the timeline again to analyze it with the Windows debugger engine."
+    $arm64Caveat = "A memory dump of this collection was not analyzed (the builder that made this timeline could not analyze Windows ARM64 dumps)$memoryCaveatTail"
     $missingCaveat = "A memory dump of this collection was not analyzed (it was not found next to the collection or where the collector saved it)$memoryCaveatTail"
     $memoryCases = @(
-        @("ARM64", "T_memory_dump.dmp (7.99 GB) -- Volatility 3 cannot read Windows ARM64 dumps; examine it in WinDbg.", $arm64Note, $arm64Caveat),
-        @("ARM64, older builder", "T_memory_dump.dmp (7.99 GB): a Windows ARM64 dump, which Volatility 3 cannot analyze; examine it in WinDbg.", $arm64Note, $arm64Caveat),
+        @("ARM64, older builder", "T_memory_dump.dmp (7.99 GB) -- Volatility 3 cannot read Windows ARM64 dumps; examine it in WinDbg.", $arm64Note, $arm64Caveat),
+        @("ARM64, oldest builder", "T_memory_dump.dmp (7.99 GB): a Windows ARM64 dump, which Volatility 3 cannot analyze; examine it in WinDbg.", $arm64Note, $arm64Caveat),
+        @("ARM64, no kernel symbol file", "T_memory_dump.dmp (7.99 GB) -- the Windows kernel symbol file could not be downloaded from Microsoft's symbol server (No such host is known - msdl.microsoft.com); connect to the internet and run the builder again, or see ""Windows kernel symbols"" in README.txt.",
+            "Memory dump not analyzed: T_memory_dump.dmp (7.99 GB) -- the Windows kernel symbol file could not be downloaded from Microsoft's symbol server (No such host is known - msdl.microsoft.com); connect to the internet and run the builder again, or see ""Windows kernel symbols"" in README.txt.",
+            "A memory dump of this collection was not analyzed (the Windows kernel symbol file could not be downloaded from Microsoft's symbol server)$memoryCaveatTail"),
         @("not found", "the dump listed in collection_manifest.csv (7.99 GB) -- it was not found (or not usable) next to the collection or where the collector saved it.",
             "Memory dump not analyzed: the dump listed in collection_manifest.csv (7.99 GB) -- it was not found (or not usable) next to the collection or where the collector saved it.", $missingCaveat),
         @("not found, older builder", "collection_manifest.csv lists one (7.99 GB), but it was not found (or not usable) next to the collection or where the collector saved it.",
@@ -900,7 +905,31 @@ try {
         $colons = @(@($memoryNotes) + @($memoryCaveats) | Where-Object { ([regex]::Matches($_, ':\s')).Count -gt 1 })
         Assert-Equal "$($memoryNotes -join ' / ')|$($memoryCaveats -join ' / ')|$($colons.Count)" "$($case[2])|$($case[3])|0" -Message "a memory dump not analyzed ($($case[0])): one note with the dump and why, one caveat with the reason, no double colon"
     }
-    Assert-Equal "$(@($model.Coverage.Notes | Where-Object { $_ -match '^Memory dump not analyzed|memory dump of this collection' }).Count)|$(@($model.Caveats | Where-Object { $_ -match 'memory dump of this collection' }).Count)" "0|0" -Message "no such log line: no memory-dump note or caveat"
+    Assert-Equal "$(@($model.Coverage.Notes | Where-Object { $_ -match '^Memory dump not analyzed|memory dump of this collection|^Memory dump analyzed' }).Count)|$(@($model.Caveats | Where-Object { $_ -match 'memory dump of this collection|Windows ARM64 dump' }).Count)" "0|0" -Message "no such log line: no memory-dump note or caveat"
+
+    # --- A Windows ARM64 dump read with Microsoft's debugger engine ---
+    # The builder's "Memory dump analyzed with the Windows debugger engine"
+    # line: a note with the dump and what was read, a caveat that network
+    # connections and services are not in the report, no "not analyzed" note
+    # or caveat; the processes alone when the command lines could not be read
+    $engineCases = @(
+        @("processes and command lines", "T_memory_dump.dmp (7.99 GB) -- processes and command lines only; network connections and services are not read from Windows ARM64 dumps.",
+            "The memory dump is a Windows ARM64 dump, read with the Windows debugger engine: only its processes and command lines are in this report, not its network connections or services."),
+        @("processes only", "T_memory_dump.dmp (7.99 GB) -- processes only, its command lines could not be read [the command did not finish within 300 s]; network connections and services are not read from Windows ARM64 dumps.",
+            "The memory dump is a Windows ARM64 dump, read with the Windows debugger engine: only its processes are in this report, not its command lines (they could not be read), network connections or services.")
+    )
+    foreach ($case in $engineCases) {
+        $engineLog = Join-Path $workDir "engine_builder_log.txt"
+        New-TestTextFile $engineLog ("[2026-02-02 01:00:00] === Windows 11 Forensic Timeline Builder Started ===`r`n" +
+            "[2026-02-02 01:00:05]   Windows ARM64 dump: analyzing it with Microsoft's debugger engine (Volatility 3 cannot read ARM64 memory)`r`n" +
+            "[2026-02-02 01:00:09]   Memory dump analyzed with the Windows debugger engine: $($case[1])`r`n" +
+            "[2026-02-02 01:00:09]   For more (handles, drivers and other kernel objects), open the dump in WinDbg; its command-line debugger, with the builder's symbol cache: kdARM64.exe -z ""C:\x\T_memory_dump.dmp"" -y ""srv*C:\t\tools\symbols*https://msdl.microsoft.com/download/symbols""`r`n")
+        $engineModel = New-ReportModel -Rows $userRows -BuilderLogPath $engineLog
+        $engineNotes = @($engineModel.Coverage.Notes | Where-Object { $_ -match '^Memory dump' })
+        $engineCaveats = @($engineModel.Caveats | Where-Object { $_ -match 'memory dump' })
+        $colons = @(@($engineNotes) + @($engineCaveats) | Where-Object { ([regex]::Matches($_, ':\s')).Count -gt 1 })
+        Assert-Equal "$($engineNotes -join ' / ')|$($engineCaveats -join ' / ')|$($colons.Count)" "Memory dump analyzed with the Windows debugger engine: $($case[1])|$($case[2])|0" -Message "an ARM64 dump read with the Windows debugger engine ($($case[0])): the note says what was read, the caveat what is not in the report, no 'not analyzed' note or caveat, no double colon"
+    }
 
     # =========================================================
     # report-model.json
