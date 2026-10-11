@@ -417,15 +417,22 @@ function Get-ReportHtmlRowTotal {
 }
 
 # Row number list text ("12, 40, 41 +299 more"): the first evidence rows,
-# then how many more rows the finding has in all (not only evidence rows)
+# then how many more rows the finding has in all (not only evidence rows).
+# For a rule that lists its latest rows (EvidenceLatest): how many other
+# rows, then the last evidence rows ("+299 earlier, 340, 341, 342")
 function Format-ReportHtmlRowList {
     param([object]$Finding, [int]$Max = 6)
     $numbers = Get-ReportHtmlRowNumbers -Finding $Finding
     if ($numbers.Count -eq 0) { return "" }
-    $shown = @($numbers | Select-Object -First $Max)
+    $latest = [bool](Get-ReportHtmlField $Finding "EvidenceLatest")
+    $shown = if ($latest) { @($numbers | Select-Object -Last $Max) } else { @($numbers | Select-Object -First $Max) }
     $text = $shown -join ", "
     $total = Get-ReportHtmlRowTotal -Finding $Finding
-    if ($total -gt $shown.Count) { $text += " +" + ($total - $shown.Count).ToString("N0", $script:ReportHtmlInvariant) + " more" }
+    if ($total -gt $shown.Count) {
+        $others = ($total - $shown.Count).ToString("N0", $script:ReportHtmlInvariant)
+        if ($latest) { $text = "+" + $others + " earlier, " + $text }
+        else { $text += " +" + $others + " more" }
+    }
     return $text
 }
 
@@ -764,7 +771,8 @@ function Add-ReportHtmlFinding {
     $count = Get-ReportHtmlField $Finding "Count"
     $evidence = Get-ReportHtmlList $Finding "Evidence"
     # The card prints at most $script:ReportHtmlCardEvidenceRows rows: the
-    # ones that raised the severity, then the earliest. The Findings sheet,
+    # ones that raised the severity, then the earliest (the latest for a
+    # rule that lists its latest rows: EvidenceLatest). The Findings sheet,
     # findings.csv and the Finding column keep the rest.
     $printed = $evidence
     if ($evidence.Count -gt $script:ReportHtmlCardEvidenceRows) {
@@ -772,7 +780,10 @@ function Add-ReportHtmlFinding {
         for ($e = 0; $e -lt $evidence.Count -and $keepIndex.Count -lt $script:ReportHtmlCardEvidenceRows; $e++) {
             if ([bool](Get-ReportHtmlField $evidence[$e] "Escalation")) { $keepIndex.Add($e) }
         }
-        for ($e = 0; $e -lt $evidence.Count -and $keepIndex.Count -lt $script:ReportHtmlCardEvidenceRows; $e++) {
+        $order = @(0..($evidence.Count - 1))
+        if ([bool](Get-ReportHtmlField $Finding "EvidenceLatest")) { [array]::Reverse($order) }
+        foreach ($e in $order) {
+            if ($keepIndex.Count -ge $script:ReportHtmlCardEvidenceRows) { break }
             if (-not $keepIndex.Contains($e)) { $keepIndex.Add($e) }
         }
         $keepIndex.Sort()
@@ -823,6 +834,13 @@ function Add-ReportHtmlFinding {
     if ([bool](Get-ReportHtmlField $Finding "MemoryOnly")) {
         $flags.Add('<span class="flag">Captured in the memory dump</span>')
     }
+    # An older (or unrecognized) collection could not tell the collector's own
+    # processes apart, or a recognized one could not identify this process
+    # exactly (a launcher that was not recorded): a memory-only lead from
+    # during the collection may be the collector
+    if ([bool](Get-ReportHtmlField $Finding "CollectorSuspect")) {
+        $flags.Add('<span class="flag">This process was seen only in the memory dump during the collection, and the collector&#39;s own process IDs do not identify it (this collection does not record them, or they were not all recognized in the memory dump): check that it is not the triage collector, its launcher or the memory capture tool</span>')
+    }
     if ([bool](Get-ReportHtmlField $Finding "DuringCollection")) {
         $flags.Add('<span class="flag">Every row is from during the collection: this may be the collector&#39;s own activity</span>')
     }
@@ -835,6 +853,9 @@ function Add-ReportHtmlFinding {
     }
     if ([bool](Get-ReportHtmlField $Finding "TimesAuthorSupplied")) {
         $flags.Add('<span class="flag">Dated only by a scheduled task&#39;s author-supplied registration date, which whoever wrote the task sets (it can be old or forged)</span>')
+    }
+    elseif ([bool](Get-ReportHtmlField $Finding "TimesCollectorCaused")) {
+        $flags.Add('<span class="flag">Dated only by a registry key&#39;s last-write time that the triage collector itself set during the collection: the activity is older</span>')
     }
     elseif ((Get-ReportHtmlField $Finding "ActivityTime") -eq $false) {
         $flags.Add('<span class="flag">Dated by file times, which can be older than the activity or altered</span>')
@@ -868,7 +889,7 @@ function Add-ReportHtmlFinding {
     $excel = New-Object System.Collections.Generic.List[string]
     $total = Get-ReportHtmlRowTotal -Finding $Finding
     if ($printed.Count -gt 0 -and $total -gt $printed.Count) {
-        $shownText = "Showing " + (Format-ReportHtmlNumber $printed.Count) + " of the " + (Format-ReportHtmlNumber $total) + " rows of this lead (the earliest"
+        $shownText = "Showing " + (Format-ReportHtmlNumber $printed.Count) + " of the " + (Format-ReportHtmlNumber $total) + " rows of this lead (the " + $(if ([bool](Get-ReportHtmlField $Finding "EvidenceLatest")) { "latest" } else { "earliest" })
         if (@($printed | Where-Object { [bool](Get-ReportHtmlField $_ "Escalation") }).Count -gt 0) { $shownText += ", and the rows that raised its severity" }
         $shownText += ")."
         if ($evidence.Count -gt $printed.Count) { $shownText += " findings.csv" + $(if ($Context.WorkbookAvailable) { " and the Findings sheet list " } else { " lists " }) + (Format-ReportHtmlNumber $evidence.Count) + "." }
@@ -908,22 +929,27 @@ function Add-ReportHtmlSummary {
     if ($leads -gt 0) {
         # The window leaves out leads dated by file times (timestomp
         # candidates, Amcache/ShimCache) or only by a task author's date:
-        # those times can be old or forged
+        # those times can be old or forged; and leads dated only by a time
+        # the collector itself set (the Defender Exclusions key it changed)
         $timed = Get-ReportHtmlActivityFindings -Findings $Context.Findings
         $fileTimed = $Context.Findings.Count - $timed.Count
         $authorDated = @($Context.Findings | Where-Object { [bool](Get-ReportHtmlField $_ "TimesAuthorSupplied") }).Count
-        $datedBy = "file times"
-        if ($authorDated -gt 0 -and $authorDated -eq $fileTimed) { $datedBy = "author-supplied task dates" }
-        elseif ($authorDated -gt 0) { $datedBy = "file times or author-supplied task dates" }
+        $collectorDated = @($Context.Findings | Where-Object { [bool](Get-ReportHtmlField $_ "TimesCollectorCaused") }).Count
+        $kinds = @()
+        if ($fileTimed - $authorDated - $collectorDated -gt 0) { $kinds += "file times" }
+        if ($authorDated -gt 0) { $kinds += "author-supplied task dates" }
+        if ($collectorDated -gt 0) { $kinds += "times the collector itself set" }
+        $datedBy = if ($kinds.Count -le 1) { "$(@($kinds + 'file times')[0])" } else { ($kinds[0..($kinds.Count - 2)] -join ", ") + " or " + $kinds[-1] }
+        $caution = if ($collectorDated -gt 0) { "which do not show when the activity happened" } else { "which can be older than the activity or altered" }
         $span = Get-ReportHtmlFindingSpan -Findings $timed
         $text = "The rules flagged " + (Format-ReportHtmlCount -Value $leads -Singular "lead" -Plural "leads") + " to review."
         if ($span.First) {
             $text += " The flagged activity falls between <b>" + (Format-ReportHtmlUtcAndLocal -Value $span.First -TimeZone $tz) + "</b> and <b>" + (Format-ReportHtmlUtcAndLocal -Value $span.Last -TimeZone $tz) + "</b>"
-            if ($fileTimed -gt 0) { $text += " (plus " + (Format-ReportHtmlCount -Value $fileTimed -Singular "lead" -Plural "leads") + " dated by $datedBy, which can be older than the activity or altered)" }
+            if ($fileTimed -gt 0) { $text += " (plus " + (Format-ReportHtmlCount -Value $fileTimed -Singular "lead" -Plural "leads") + " dated by $datedBy, $caution)" }
             $text += "."
         }
         elseif ($fileTimed -gt 0) {
-            $text += " The flagged items are dated by $datedBy, which can be older than the activity or altered, so they give no activity window."
+            $text += " The flagged items are dated by $datedBy, $caution, so they give no activity window."
         }
         $null = $Builder.AppendLine('<p>' + $text + '</p>')
         $null = $Builder.AppendLine('<p class="framing">A lead is a reason to look closer, not proof that the computer was compromised. Each one needs a person to review the evidence rows listed with it.</p>')
@@ -999,6 +1025,16 @@ function Add-ReportHtmlSummary {
         $bulk = Get-ReportHtmlBulkSpan -Activity $Context.Activity
         if ($bulk) { $spanText += "; 99% of the rows fall between " + $bulk.First + " and " + $bulk.Last }
         $facts.Add(@("Time span covered", $spanText.Trim()))
+    }
+    # The collector's own processes in the memory dump, left unflagged
+    $collectorCoverage = Get-ReportHtmlField $Context.Coverage "CollectorProcesses"
+    $collectorSummary = ConvertTo-ReportHtmlText (Get-ReportHtmlField $collectorCoverage "Summary")
+    if ([bool](Get-ReportHtmlField $collectorCoverage "Recorded") -and $collectorSummary) {
+        # Built first: in @("a", "b" + "c") the comma binds before the plus
+        $collectorFact = $collectorSummary + " &ndash; listed under Evidence coverage"
+        $outsideFact = [int](ConvertTo-ReportHtmlNumber (Get-ReportHtmlField $collectorCoverage "OutsideTree"))
+        if ($outsideFact -gt 0) { $collectorFact += "; collection_info.json lists " + $outsideFact + " process(es) the collector would not have recorded that way: check whether it was altered" }
+        $facts.Add(@("Collector processes", $collectorFact))
     }
     if ([bool](Get-ReportHtmlField $collection "SecretsIncluded")) {
         $facts.Add(@("Sensitive material", "This collection includes credential material (made with -IncludeSecrets). Store and share it as sensitive."))
@@ -1270,6 +1306,70 @@ function Add-ReportHtmlCoverage {
         }
     }
     else { $null = $Builder.AppendLine('<p class="empty">The collector logged no errors or warnings.</p>') }
+
+    # The collector's own processes in the memory dump, left out of the rules.
+    # Shown only when the collection recorded its process ids and the timeline
+    # has memory rows (a Summary is then set); older models have no field.
+    $collectorCoverage = Get-ReportHtmlField $coverage "CollectorProcesses"
+    $collectorSummary = ConvertTo-ReportHtmlText (Get-ReportHtmlField $collectorCoverage "Summary")
+    if ([bool](Get-ReportHtmlField $collectorCoverage "Recorded") -and $collectorSummary) {
+        $processes = Get-ReportHtmlList $collectorCoverage "Processes"
+        $null = $Builder.AppendLine('<h3>The collector&#39;s own processes (not flagged)</h3>')
+        if ($processes.Count -gt 0) {
+            $null = $Builder.AppendLine('<p>' + $collectorSummary + '. They are recognized by the process ID, name and start time recorded in collection_info.json, and the processes they started during the collection; their rows stay in the timeline but the rules do not check them. Memory network and service rows of these processes are kept and checked.</p>')
+        }
+        else {
+            $null = $Builder.AppendLine('<p>' + $collectorSummary + '. The collector recorded its own process IDs in collection_info.json, but its PowerShell process could not be recognized in the memory dump (see below), so the rules check its processes like any other, and a lead seen only in the memory dump during the collection is marked on its card as possibly the collector.</p>')
+        }
+        # Entries the collector would not have written: a sign of an edit
+        $outsideTree = [int](ConvertTo-ReportHtmlNumber (Get-ReportHtmlField $collectorCoverage "OutsideTree"))
+        if ($outsideTree -gt 0) {
+            $null = $Builder.AppendLine('<p class="incomplete">collection_info.json lists ' + $outsideTree + ' process(es) the collector would not have recorded that way (marked below). They were not left out. Check whether collection_info.json was altered after the collection.</p>')
+        }
+        if ($processes.Count -gt 0) {
+            $null = $Builder.AppendLine('<table><colgroup><col style="width:12%"><col style="width:8%"><col style="width:9%"><col style="width:17%"><col style="width:17%"><col style="width:17%"><col style="width:20%"></colgroup>')
+            $null = $Builder.AppendLine('<thead><tr><th>' + $Context.RowHeading + 's</th><th class="num">PID</th><th class="num">Parent PID</th><th>Name</th><th>Started (UTC)</th><th>Recognized as</th><th>Command line</th></tr></thead><tbody>')
+            foreach ($proc in @($processes | Select-Object -First 50)) {
+                # Get-ReportHtmlList returns its array as one pipeline object:
+                # loop over it, do not pipe it
+                $rowNumbers = @(foreach ($rowNumber in (Get-ReportHtmlList $proc "RowNumbers")) { [string]([long](ConvertTo-ReportHtmlNumber $rowNumber)) })
+                # Process IDs as the timeline and the log write them (no
+                # thousands separator), so they can be searched for there
+                $null = $Builder.AppendLine('<tr><td class="mono">' + (ConvertTo-ReportHtmlText (($rowNumbers | Select-Object -First 10) -join ", ") -MaxLength 120) +
+                    '</td><td class="num">' + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $proc "Pid")) +
+                    '</td><td class="num">' + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $proc "ParentPid")) +
+                    '</td><td>' + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $proc "Name") -MaxLength 120) +
+                    '</td><td class="mono">' + (Format-ReportHtmlTime (Get-ReportHtmlField $proc "CreateTimeUtc") "yyyy-MM-dd HH:mm:ss") +
+                    '</td><td>' + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $proc "How") -MaxLength 120) +
+                    '</td><td class="mono">' + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $proc "CommandLine") -MaxLength 200) + '</td></tr>')
+            }
+            $null = $Builder.AppendLine('</tbody></table>')
+            if ($processes.Count -gt 50) { $null = $Builder.AppendLine('<p class="small muted">The first 50 of ' + $processes.Count + ' are listed.</p>') }
+        }
+        $collectorNotes = New-Object System.Collections.Generic.List[string]
+        foreach ($mismatch in (Get-ReportHtmlList $collectorCoverage "Mismatched")) {
+            $entry = "PID " + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $mismatch "Pid")) + " (" + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $mismatch "Name") -MaxLength 120) + ")"
+            $role = ConvertTo-ReportHtmlText (Get-ReportHtmlField $mismatch "Role") -MaxLength 60
+            if ($role) { $entry += " as " + $role }
+            $dumpName = ConvertTo-ReportHtmlText (Get-ReportHtmlField $mismatch "DumpName") -MaxLength 120
+            $text = "collection_info.json lists " + $entry
+            if ($dumpName) { $text += " and the memory dump has " + $dumpName + " with that id" }
+            $text += ": " + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $mismatch "Reason")) + ", so it was not left out."
+            if ([bool](Get-ReportHtmlField $mismatch "OutsideTree")) { $text = '<strong>Not written by the collector that way:</strong> ' + $text }
+            $collectorNotes.Add($text)
+        }
+        foreach ($missing in (Get-ReportHtmlList $collectorCoverage "NotInDump")) {
+            $collectorNotes.Add("The collector recorded PID " + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $missing "Pid")) + " (" + (ConvertTo-ReportHtmlText (Get-ReportHtmlField $missing "Name") -MaxLength 120) + "), which the memory dump does not have.")
+        }
+        if ($collectorNotes.Count -gt 0) {
+            # At most 50 here; report-model.json and the builder log have them all
+            $null = $Builder.AppendLine('<ul class="plain small">')
+            foreach ($note in @($collectorNotes | Select-Object -First 50)) { $null = $Builder.AppendLine('<li>' + $note + '</li>') }
+            $null = $Builder.AppendLine('</ul>')
+            if ($collectorNotes.Count -gt 50) { $null = $Builder.AppendLine('<p class="small muted">The first 50 of ' + $collectorNotes.Count + ' are listed; report-model.json and the builder log list them all.</p>') }
+        }
+    }
+
     $noteList = Get-ReportHtmlList $coverage "Notes"
     $notes = @($noteList | ForEach-Object { ConvertTo-ReportHtmlText $_ } | Where-Object { $_ })
     if ($notes.Count -gt 0) {

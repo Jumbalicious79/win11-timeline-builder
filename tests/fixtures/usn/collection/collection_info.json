@@ -1,0 +1,15 @@
+{
+  "SchemaVersion": 1,
+  "CollectorVersion": "2026.10.10",
+  "CollectorScriptSha256": "A07C4E19D2B85F36C0E7194B2D58A6F3E1C90B7D4A265F83E0C1D9B7A4625F18",
+  "CollectorGitCommit": "6f1d2c3b4a5968778695a4b3c2d1e0f9a8b7c6d5",
+  "ComputerName": "FIXTURE-HOST",
+  "CollectorUser": "FIXTURE\\analyst",
+  "Mode": "Live",
+  "TargetDrive": "C",
+  "TargetRoot": "C:\\",
+  "CollectionStartUtc": "2026-08-14T12:00:00.0000000Z",
+  "CollectorTimeZoneId": "UTC",
+  "CollectorCulture": "en-US",
+  "TargetTimeZoneId": "UTC"
+}

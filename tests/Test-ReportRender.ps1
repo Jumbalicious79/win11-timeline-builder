@@ -296,8 +296,62 @@ try {
     $startedFlags = @([regex]::Matches($memoryStarted, '<span class="flag[^"]*">(.*?)</span>') | ForEach-Object { $_.Groups[1].Value })
     Write-TestResult -Succeeded (($startedFlags -join "|") -ceq "Captured in the memory dump|Every row is from during the collection: this may be the collector&#39;s own activity") -Message "a memory-only lead whose process started during the collection (a creation time in the dump) gets both notes ($($startedFlags -join ' | '))"
     $finding.DuringCollection = $false
+    # CollectorSuspect: an older collection's memory-only lead gets a card note
+    $finding.CollectorSuspect = $true
+    Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath
+    $suspectHtml = [System.IO.File]::ReadAllText($memoryHtmlPath)
+    Write-TestResult -Succeeded ($suspectHtml.Contains("the collector&#39;s own process IDs do not identify it (this collection does not record them, or they were not all recognized in the memory dump): check that it is not the triage collector, its launcher or the memory capture tool")) -Message "a memory-only lead from an older (or unrecognized) collection is flagged CollectorSuspect on its card"
+    $finding.CollectorSuspect = $false
     $finding.MemoryOnly = $false
     $finding.MemoryOnlyNote = ""
+
+    # The collector's own processes in the memory dump: a key fact in the
+    # summary and a subsection in Evidence coverage. A model without the field
+    # (model-minimal) renders fine and shows neither.
+    $memoryModel.Coverage.CollectorProcesses = [ordered]@{
+        Recorded = $true; Count = 2; RowCount = 3
+        Summary  = "Collector's own processes in the memory dump: 2 (not flagged)"
+        # RowNumbers as the engine gives them ([int[]]) and as report-model.json
+        # gives them back (object[])
+        Processes = @(
+            [ordered]@{ Pid = 19120; ParentPid = 18840; Name = "powershell.exe"; CreateTimeUtc = $collectionStart; Role = "Collector"; How = "recorded by the collector: collector"; CommandLine = "powershell.exe -File x"; RowNumbers = [int[]]@(5, 6) },
+            [ordered]@{ Pid = 10232; ParentPid = 19120; Name = "DumpIt.exe"; CreateTimeUtc = $collectionStart; Role = "MemoryCapture"; How = "started by PID 19120 during the collection"; CommandLine = "DumpIt.exe /q"; RowNumbers = @(7) })
+        NotInDump = @()
+        Mismatched = @([ordered]@{ Pid = 14242; Name = "cmd.exe"; Reason = "a reused id"; DumpName = "other.exe" })
+    }
+    Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath -NoFileHashes
+    $collectorHtml = [System.IO.File]::ReadAllText($memoryHtmlPath)
+    Write-TestResult -Succeeded ($collectorHtml.Contains("<th>Collector processes</th>") -and $collectorHtml.Contains("Collector&#39;s own processes in the memory dump: 2 (not flagged) &ndash; listed under Evidence coverage")) -Message "the summary's key facts gives the collector-processes summary"
+    Write-TestResult -Succeeded ($collectorHtml.Contains("The collector&#39;s own processes (not flagged)") -and $collectorHtml.Contains(">DumpIt.exe</td>") -and $collectorHtml.Contains("started by PID 19120 during the collection") -and $collectorHtml.Contains("a reused id")) -Message "Evidence coverage has the collector subsection with the process table and the mismatch note"
+    Write-TestResult -Succeeded ($collectorHtml.Contains('<tr><td class="mono">5, 6</td><td class="num">19120</td><td class="num">18840</td>') -and $collectorHtml.Contains('<tr><td class="mono">7</td><td class="num">10232</td><td class="num">19120</td>') -and
+        $collectorHtml.Contains("collection_info.json lists PID 14242 (cmd.exe) and the memory dump has other.exe with that id: a reused id, so it was not left out.") -and -not $collectorHtml.Contains("19,120")) -Message "the collector table gives each process's rows (5, 6 and 7) and plain process IDs, as the timeline writes them"
+    Write-TestResult -Succeeded (-not $collectorHtml.Contains("was altered") -and -not $collectorHtml.Contains("Not written by the collector that way")) -Message "an unedited record shows no altered warning"
+    # Entries the collector would not have written: a warning paragraph, the
+    # key fact, and each such entry marked
+    $memoryModel.Coverage.CollectorProcesses.OutsideTree = 2
+    $memoryModel.Coverage.CollectorProcesses.Mismatched = @(
+        [ordered]@{ Pid = 6100; Name = "loader.exe"; Role = "Child"; Reason = "its parent in the memory dump (PID 5000) is not one of the collector processes"; DumpName = "loader.exe"; OutsideTree = $true },
+        [ordered]@{ Pid = 6200; Name = "payload.exe"; Role = "Foo"; Reason = "its role is not one the collector writes"; DumpName = ""; OutsideTree = $true })
+    Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath -NoFileHashes
+    $alteredHtml = [System.IO.File]::ReadAllText($memoryHtmlPath)
+    Write-TestResult -Succeeded ($alteredHtml.Contains('<p class="incomplete">collection_info.json lists 2 process(es) the collector would not have recorded that way (marked below). They were not left out. Check whether collection_info.json was altered after the collection.</p>') -and
+        $alteredHtml.Contains("2 (not flagged) &ndash; listed under Evidence coverage; collection_info.json lists 2 process(es) the collector would not have recorded that way: check whether it was altered") -and
+        $alteredHtml.Contains("<strong>Not written by the collector that way:</strong> collection_info.json lists PID 6100 (loader.exe) as Child and the memory dump has loader.exe with that id:") -and
+        $alteredHtml.Contains("collection_info.json lists PID 6200 (payload.exe) as Foo: its role")) -Message "entries the collector would not have written: the warning paragraph, the key fact and each entry marked (an entry without a dump process has no 'the memory dump has')"
+    Write-TestResult -Succeeded (-not $minimal.Contains("The collector&#39;s own processes (not flagged)") -and -not $minimal.Contains("<th>Collector processes</th>")) -Message "a model without Coverage.CollectorProcesses renders no collector key fact or subsection"
+    # Recorded but none recognized (the collector's PowerShell not in the dump)
+    $memoryModel.Coverage.CollectorProcesses = [ordered]@{
+        Recorded = $true; Count = 0; RowCount = 0
+        Summary  = "Collector's own processes in the memory dump: none recognized (nothing left out)"
+        Processes = @()
+        NotInDump = @([ordered]@{ Pid = 19120; Name = "powershell.exe"; Role = "Collector" })
+        Mismatched = @()
+    }
+    Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath -NoFileHashes
+    $unrecognizedHtml = [System.IO.File]::ReadAllText($memoryHtmlPath)
+    Write-TestResult -Succeeded ($unrecognizedHtml.Contains("none recognized (nothing left out) &ndash; listed under Evidence coverage") -and $unrecognizedHtml.Contains("but its PowerShell process could not be recognized in the memory dump") -and
+        -not $unrecognizedHtml.Contains("their rows stay in the timeline but the rules do not check them") -and $unrecognizedHtml.Contains("The collector recorded PID 19120 (powershell.exe), which the memory dump does not have.")) -Message "a collection whose recorded processes were not recognized says nothing was left out, with the not-in-dump note"
+    $memoryModel.Coverage.CollectorProcesses = $null
 
     # --- Hostile and edge values: bidi controls, a long unbroken title, more
     # evidence than a card prints, a lead dated by file times, a folded lead,
@@ -341,6 +395,18 @@ try {
     Write-TestResult -Succeeded ($hostile.Contains("collection_log.txt) was not available, so problems during the collection are unknown") -and -not $hostile.Contains("logged no errors")) -Message "a missing collector log is not reported as a collection without errors"
     Write-TestResult -Succeeded ($hostile.Contains(">Lead about</td>") -and -not $hostile.Contains("{{group}}")) -Message "Appendix B shows rule titles without the {{group}} placeholder"
     Write-TestResult -Succeeded ($hostile.Contains("2001, 2002, 2003 +27 more")) -Message "the leads index counts every row of a lead after the first ones, not only evidence rows"
+    # A rule that lists its latest rows ("evidence": "latest"): the card
+    # prints the row that raised the severity and the latest rows, and the
+    # row lists end with the last ones
+    $finding.EvidenceLatest = $true
+    Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath -NoFileHashes
+    $latestHtml = [System.IO.File]::ReadAllText($memoryHtmlPath)
+    $latestCardStart = $latestHtml.IndexOf('id="finding-F001"')
+    $latestCard = $latestHtml.Substring($latestCardStart, $latestHtml.IndexOf('</article>', $latestCardStart) - $latestCardStart)
+    $latestPrinted = @([regex]::Matches($latestCard, '<td class="num mono">(\d+)</td>') | ForEach-Object { $_.Groups[1].Value })
+    Write-TestResult -Succeeded ($latestPrinted.Count -eq 15 -and $latestPrinted -contains "2020" -and $latestPrinted -contains "2006" -and $latestPrinted -notcontains "2005" -and $latestPrinted -notcontains "2001" -and
+        $latestCard.Contains("Showing 15 of the 30 rows of this lead (the latest, and the rows that raised its severity).") -and $latestHtml.Contains("+27 earlier, 2018, 2019, 2020")) -Message "evidence latest: the card prints the latest rows and says so, and the leads index ends with the last rows ($($latestPrinted -join ','))"
+    $finding.EvidenceLatest = $false
     # A lead dated only by a scheduled task's author-supplied date: left out
     # of the window like file times, with its own wording
     $fileTimed.TimesAuthorSupplied = $true
@@ -350,6 +416,16 @@ try {
     Write-TestResult -Succeeded ($authorSummary.Contains("(plus 1 lead dated by author-supplied task dates, which can be older than the activity or altered)") -and -not $authorSummary.Contains("<b>2020-01-01") -and
         $authorDated.Contains("Dated only by a scheduled task&#39;s author-supplied registration date") -and -not $authorDated.Contains("Dated by file times")) -Message "a lead dated only by a task's author-supplied date is left out of the activity window, and its card and the summary say so"
     $fileTimed.TimesAuthorSupplied = $false
+    # A lead dated only by a time the triage collector itself set (the
+    # Defender Exclusions key it changes at the collection start): left out
+    # of the window, with wording that does not call the time old or altered
+    $fileTimed.TimesCollectorCaused = $true
+    Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath -NoFileHashes
+    $collectorDated = [System.IO.File]::ReadAllText($memoryHtmlPath)
+    $collectorSummary = $collectorDated.Substring($collectorDated.IndexOf('id="summary"'), $collectorDated.IndexOf('" id="leads">') - $collectorDated.IndexOf('id="summary"'))
+    Write-TestResult -Succeeded ($collectorSummary.Contains("(plus 1 lead dated by times the collector itself set, which do not show when the activity happened)") -and -not $collectorSummary.Contains("<b>2020-01-01") -and
+        $collectorDated.Contains("Dated only by a registry key&#39;s last-write time that the triage collector itself set during the collection: the activity is older") -and -not $collectorDated.Contains("Dated by file times")) -Message "a lead dated only by a time the collector set is left out of the activity window, and its card and the summary say so"
+    $fileTimed.TimesCollectorCaused = $false
     $memoryModel.Coverage.CollectorErrors = [ordered]@{ Available = $true; Count = 0; WarningCount = 1; Lines = @("[2026-10-08 14:20:00] WARNING: Could not copy BBI") }
     Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath -NoFileHashes
     $warned = [System.IO.File]::ReadAllText($memoryHtmlPath)

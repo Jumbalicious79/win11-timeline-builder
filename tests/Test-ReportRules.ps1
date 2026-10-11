@@ -22,6 +22,12 @@
 # compiled pattern may be empty or keep a {{list:...}} placeholder: an empty
 # pattern matches every row (a rule that "fails open").
 #
+# After the cases, the crafted memory command lines of
+# tests\fixtures\report\rules\long-lines.json (about 32,000 characters each,
+# the Windows limit) are added: no rule's patterns may time out on them (a
+# rule stopped by timeouts reports nothing), every case row must be flagged
+# by the same rules as without them, and the run must take under 30 s.
+#
 # Exit code 0 = every expectation held, 1 = a failure (a missing engine,
 # rules file or cases file is a failure). Runs in Windows PowerShell 5.1 and
 # PowerShell 7.
@@ -29,17 +35,20 @@
 #   powershell -ExecutionPolicy Bypass -File tests\Test-ReportRules.ps1
 #   ... -EnginePath <TimelineReport.Engine.ps1>   (override the engine path)
 #   ... -RulesPath <rules .json> -CasesPath <cases .csv>   (other files)
+#   ... -LongLinesPath <.json>   (other crafted long command lines)
 # =============================================================
 param(
     [string]$EnginePath = "",
     [string]$RulesPath = "",
-    [string]$CasesPath = ""
+    [string]$CasesPath = "",
+    [string]$LongLinesPath = ""
 )
 
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path $PSScriptRoot -Parent
 if (-not $RulesPath) { $RulesPath = Join-Path $repoRoot "report\report-rules.json" }
 if (-not $CasesPath) { $CasesPath = Join-Path $PSScriptRoot "fixtures\report\rules\cases.csv" }
+if (-not $LongLinesPath) { $LongLinesPath = Join-Path $PSScriptRoot "fixtures\report\rules\long-lines.json" }
 
 # --- Locate the engine ---------------------------------------
 if (-not $EnginePath) { $EnginePath = Join-Path $repoRoot "report\TimelineReport.Engine.ps1" }
@@ -252,6 +261,70 @@ if ($missingMiss.Count -gt 0) {
     Write-Host "  FAIL  no MISS (near-miss) case for rule(s): $($missingMiss -join ', ')" -ForegroundColor Red
     if ($env:GITHUB_ACTIONS) { Write-Host "::error::no MISS case for: $($missingMiss -join ', ')" }
     $fail += $missingMiss.Count
+}
+
+# --- Long crafted command lines: no pattern may time out ------
+# Memory command lines of about 32,000 characters (the Windows limit; an
+# attacker controls their own process's), built from long-lines.json. A
+# pattern that backtracks badly on one times out (2 s per row), and a rule
+# stopped 3 times reports nothing, so its other leads are lost. The rows are
+# added after the cases (the case rows keep their numbers): no rule may time
+# out, every case row must be flagged by the same rules as before, and the
+# run must stay fast.
+if (-not (Test-Path -LiteralPath $LongLinesPath)) {
+    Write-Host "  FAIL  long-line fixture not found: $LongLinesPath" -ForegroundColor Red
+    if ($env:GITHUB_ACTIONS) { Write-Host "::error file=tests/Test-ReportRules.ps1::long-line fixture not found" }
+    $fail++
+}
+else {
+    $long = Get-Content -LiteralPath $LongLinesPath -Raw | ConvertFrom-Json
+    $longRows = New-Object System.Collections.Generic.List[object]
+    foreach ($row in $rows) { $longRows.Add($row) }
+    $shapeCount = 0
+    foreach ($shape in @($long.rows)) {
+        $shapeCount++
+        $commandLine = [string]$shape.prefix + ([string]$shape.unit * [int]$long.repeat) + [string]$shape.suffix
+        $longRows.Add([PSCustomObject]@{
+                Timestamp = "2026-05-17 10:00:00.000"; Source = "Memory-CommandLine"; EventType = "Snapshot"
+                Description = "Process command line: $($shape.process) (PID: $(9900 + $shapeCount))"; User = ""
+                Details = "Args=$commandLine"; Artifact = "MemoryDump"; RawPath = ""
+            })
+    }
+    $longWarnings = $null
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $longFindings = @(Invoke-ReportRules -Rows $longRows -Rules $imported -WarningVariable longWarnings -WarningAction SilentlyContinue)
+    $timer.Stop()
+    $longSeconds = [math]::Round($timer.Elapsed.TotalSeconds, 1)
+    $timeoutWarnings = @($longWarnings | Where-Object { "$_" -match 'timed out|was stopped' })
+    foreach ($warning in $timeoutWarnings) { Write-Host "  FAIL  long command lines: $warning" -ForegroundColor Red }
+    if ($env:GITHUB_ACTIONS -and $timeoutWarnings.Count -gt 0) { Write-Host "::error file=tests/Test-ReportRules.ps1::$($timeoutWarnings.Count) rule pattern timeout(s) on the long command lines" }
+    $fail += $timeoutWarnings.Count
+    # Case rows (Excel rows 2 .. cases + 1) per rule, with and without them
+    $lastCaseRow = $rows.Count + 1
+    $longRuleRows = @{}
+    foreach ($finding in $longFindings) {
+        foreach ($rowNumber in $finding.RowNumbers) {
+            if ([int]$rowNumber -gt $lastCaseRow) { continue }
+            $longRuleRows["$($finding.RuleId)|$([int]$rowNumber)"] = $true
+        }
+    }
+    $caseRuleRows = @{}
+    foreach ($id in $ruleRows.Keys) { foreach ($rowNumber in $ruleRows[$id]) { $caseRuleRows["$id|$rowNumber"] = $true } }
+    $changed = @(@($caseRuleRows.Keys | Where-Object { -not $longRuleRows.ContainsKey($_) }) + @($longRuleRows.Keys | Where-Object { -not $caseRuleRows.ContainsKey($_) }))
+    if ($changed.Count -gt 0) {
+        Write-Host "  FAIL  long command lines changed which case rows are flagged: $(@($changed | Sort-Object | Select-Object -First 10) -join ', ')" -ForegroundColor Red
+        if ($env:GITHUB_ACTIONS) { Write-Host "::error file=tests/Test-ReportRules.ps1::the long command lines changed $($changed.Count) case row flag(s)" }
+        $fail++
+    }
+    if ($longSeconds -gt 30) {
+        Write-Host "  FAIL  long command lines: the rules took $longSeconds s (more than 30 s)" -ForegroundColor Red
+        if ($env:GITHUB_ACTIONS) { Write-Host "::error file=tests/Test-ReportRules.ps1::the rules took $longSeconds s on the long command lines" }
+        $fail++
+    }
+    if ($timeoutWarnings.Count -eq 0 -and $changed.Count -eq 0 -and $longSeconds -le 30) {
+        $pass++
+        Write-Host "Long command lines: $shapeCount crafted row(s) of about $([int]$long.repeat * 4) characters, no pattern timed out, case rows flagged as before ($longSeconds s)."
+    }
 }
 
 Write-Host ""

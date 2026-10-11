@@ -1,0 +1,3 @@
+[
+  { "Proto": "TCPv4", "LocalAddr": "10.0.0.5", "LocalPort": 50123, "ForeignAddr": "203.0.113.9", "ForeignPort": 443, "State": "ESTABLISHED", "PID": 9120, "Owner": "powershell.exe", "Created": "2026-03-02T12:02:30+00:00", "__children": [] }
+]

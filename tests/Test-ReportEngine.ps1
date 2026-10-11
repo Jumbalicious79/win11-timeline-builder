@@ -408,6 +408,94 @@ try {
     foreach ($lead in $taskLeads) { $taskRuleOf[$lead.Id] = $lead.GroupKey }
     Assert-Equal "$(Format-TestUtc $taskModel.LeadSpan.FirstUtc)|$(Format-TestUtc $taskModel.LeadSpan.LastUtc)|$($taskModel.LeadSpan.FileTimeLeads)|$(@($taskModel.TopFindings | ForEach-Object { $taskRuleOf[$_] }) -join ',')" "2026-05-04 11:02:01|2026-05-06 08:00:00|1|\EvilTask,\OnlyAuthor" -Message "the flagged-activity window and the top leads leave a lead dated only by an author-supplied date out of the window and put it last"
 
+    # A time the triage collector itself caused: the Defender Exclusions
+    # key's last-write time, stamped on the other exclusions' rows when the
+    # collector adds its own temporary exclusion at the collection start.
+    # Such a row stays in the lead but does not set its first and last time
+    # (nor the summary's flagged-activity window); a lead with only such rows
+    # keeps those times, is not dated by activity and is not "during the
+    # collection".
+    $exclusionRulesPath = Join-Path $workDir "exclusion-rules.json"
+    New-TestTextFile $exclusionRulesPath '{ "schemaVersion": 1, "rules": [ { "id": "EXCL", "title": "Exclusion {{group}}", "category": "Antivirus", "severity": "Medium", "match": { "description": "^Defender exclusion (?:added|in effect) \\((?<key>\\w+)\\)" }, "groupBy": "capture", "why": "w" } ] }'
+    $collectorNote = "Time=Exclusions\Paths key last write, when the triage collector added its own exclusion during the collection; this exclusion is older"
+    $exclusionRows = @(
+        @{ Timestamp = "2026-05-01 10:00:00.000"; Source = "Microsoft-Windows-Windows Defender%4Operational.evtx"; EventType = "SecurityAlert"; Description = "Defender exclusion added (Paths): C:\Tools"; User = ""; Details = "EventID=5007" },
+        @{ Timestamp = "2026-05-02 09:00:00.000"; Source = "Registry-DefenderExclusions"; EventType = "SecurityAlert"; Description = "Defender exclusion in effect (Processes): tool.exe"; User = ""; Details = "Type=Processes | Exclusion=tool.exe | Time=Exclusions\Processes key last write (key last changed; this exclusion may be older)" },
+        @{ Timestamp = "2026-05-09 12:00:04.000"; Source = "Registry-DefenderExclusions"; EventType = "SecurityAlert"; Description = "Defender exclusion in effect (Paths): C:\Tools"; User = ""; Details = "Type=Paths | Exclusion=C:\Tools | $collectorNote" },
+        @{ Timestamp = "2026-05-09 12:00:04.000"; Source = "Registry-DefenderExclusions"; EventType = "SecurityAlert"; Description = "Defender exclusion in effect (Temp): C:\Old"; User = ""; Details = "Type=TemporaryPaths | Exclusion=C:\Old | Time=Exclusions\TemporaryPaths key last write, when the triage collector added its own exclusion during the collection; this exclusion is older" })
+    $exclusionInfo = @{ CollectionStartUtc = "2026-05-09T12:00:00Z" }
+    $exclusionLeads = @(Invoke-ReportRules -Rows $exclusionRows -Rules (Import-ReportRules -Path $exclusionRulesPath) -CollectionInfo $exclusionInfo)
+    Assert-Equal (@($exclusionLeads | Sort-Object GroupKey | ForEach-Object { "$($_.GroupKey)|$($_.Count)|$(Format-TestUtc $_.FirstSeenUtc)|$(Format-TestUtc $_.LastSeenUtc)|$($_.ActivityTime)|$($_.TimesCollectorCaused)|$($_.DuringCollection)" }) -join " / ") "Paths|2|2026-05-01 10:00:00|2026-05-01 10:00:00|True|False|False / Processes|1|2026-05-02 09:00:00|2026-05-02 09:00:00|True|False|False / Temp|1|2026-05-09 12:00:04|2026-05-09 12:00:04|False|True|False" -Message "a key last-write time the collector caused does not set a lead's last time; a lead with only such a time keeps it, is not dated by activity and is not 'during the collection'"
+    $exclusionModel = New-ReportModel -Rows $exclusionRows -Findings $exclusionLeads -CollectionInfo $exclusionInfo
+    Assert-Equal "$(Format-TestUtc $exclusionModel.LeadSpan.FirstUtc)|$(Format-TestUtc $exclusionModel.LeadSpan.LastUtc)|$($exclusionModel.LeadSpan.FileTimeLeads)" "2026-05-01 10:00:00|2026-05-02 09:00:00|1" -Message "the flagged-activity window does not reach the collector's own key write at the collection start"
+    $collectorOwn = "Type=Paths | Exclusion=D:\TriageCollection_2026-05-09_07-00 | Time=Exclusions\Paths key last write (when the triage collector added this exclusion)"
+    $exclusionSource = "Registry-DefenderExclusions"
+    Assert-Equal "$([TimelineReport.Engine]::IsCollectorCausedTime($exclusionSource, $collectorOwn))|$([TimelineReport.Engine]::IsCollectorCausedTime($exclusionSource, "Type=Paths | Exclusion=C:\Tools | $collectorNote"))|$([TimelineReport.Engine]::IsCollectorCausedTime($exclusionSource, 'Type=Paths | Exclusion=C:\Tools | Time=Exclusions\Paths key last write (key last changed; this exclusion may be older)'))" "True|True|False" -Message "IsCollectorCausedTime: the collector's own exclusion row and the rows it re-dated, not a plain key last write"
+    # The collector's words only count as the builder writes them: on a
+    # Registry-DefenderExclusions row, in its last Details field (Time=).
+    # Elsewhere they are text whoever made the row's data chose (an
+    # exclusion path, a service's image path, a command line), which must
+    # not take a lead out of the activity window
+    $inPath = "Type=Paths | Exclusion=C:\Drop (when the triage collector added this exclusion) | Time=Exclusions\Paths key last write (key last changed; this exclusion may be older)"
+    $inImagePath = "EventID=7045 | ImagePath=C:\Drop\svc.exe -note ""when the triage collector added this exclusion"" | StartType=demand start"
+    $otherSource = "EventID=5007 | Time=Exclusions\Paths key last write (when the triage collector added this exclusion)"
+    Assert-Equal "$([TimelineReport.Engine]::IsCollectorCausedTime($exclusionSource, $inPath))|$([TimelineReport.Engine]::IsCollectorCausedTime('System.evtx', $inImagePath))|$([TimelineReport.Engine]::IsCollectorCausedTime($exclusionSource, $inImagePath))|$([TimelineReport.Engine]::IsCollectorCausedTime('Microsoft-Windows-Windows Defender%4Operational.evtx', $otherSource))|$([TimelineReport.Engine]::IsCollectorCausedTime($exclusionSource, ''))" "False|False|False|False|False" -Message "IsCollectorCausedTime: the collector's words in an exclusion path, in another field, or on a row of another source are not the builder's time note"
+    $spoofRulesPath = Join-Path $workDir "spoof-rules.json"
+    New-TestTextFile $spoofRulesPath '{ "schemaVersion": 1, "rules": [ { "id": "SVC", "title": "Service {{group}}", "category": "Persistence", "severity": "High", "match": { "description": "^New service installed: (?<key>\\S+)" }, "groupBy": "capture", "why": "w" }, { "id": "EXCL", "title": "Exclusion", "category": "Antivirus", "severity": "Medium", "match": { "description": "^Defender exclusion in effect" }, "why": "w" } ] }'
+    $spoofRows = @(
+        @{ Timestamp = "2026-05-08 07:00:00.000"; Source = "System.evtx"; EventType = "ServiceChange"; Description = "Event log service started"; User = ""; Details = "EventID=6005" },
+        @{ Timestamp = "2026-05-09 12:00:04.000"; Source = "System.evtx"; EventType = "ServiceChange"; Description = "New service installed: DropSvc"; User = ""; Details = $inImagePath },
+        @{ Timestamp = "2026-05-09 12:00:05.000"; Source = $exclusionSource; EventType = "SecurityAlert"; Description = "Defender exclusion in effect (Paths): C:\Drop (when the triage collector added this exclusion)"; User = ""; Details = $inPath })
+    $spoofLeads = @(Invoke-ReportRules -Rows $spoofRows -Rules (Import-ReportRules -Path $spoofRulesPath) -CollectionInfo @{ CollectionStartUtc = "2026-05-09T13:00:00Z" })
+    Assert-Equal (@($spoofLeads | Sort-Object RuleId | ForEach-Object { "$($_.RuleId)|$($_.ActivityTime)|$($_.TimesCollectorCaused)|$(Format-TestUtc $_.LastSeenUtc)" }) -join " / ") "EXCL|True|False|2026-05-09 12:00:05 / SVC|True|False|2026-05-09 12:00:04" -Message "a service whose image path, or an exclusion whose path, holds the collector's words stays dated by its own time and in the activity window"
+    $spoofModel = New-ReportModel -Rows $spoofRows -Findings $spoofLeads -CollectionInfo @{ CollectionStartUtc = "2026-05-09T13:00:00Z" }
+    Assert-Equal "$(Format-TestUtc $spoofModel.LeadSpan.FirstUtc)|$(Format-TestUtc $spoofModel.LeadSpan.LastUtc)|$($spoofModel.LeadSpan.FileTimeLeads)" "2026-05-09 12:00:04|2026-05-09 12:00:05|0" -Message "those leads set the flagged-activity window"
+
+    # threshold.distinct: count distinct values (one renamed file writes
+    # two or three USN records with the same description), and list the
+    # first row of each value as evidence before repeats
+    $distinctRulesPath = Join-Path $workDir "distinct-rules.json"
+    New-TestTextFile $distinctRulesPath '{ "schemaVersion": 1, "rules": [ { "id": "FILES", "title": "Files", "category": "FileSystem", "severity": "High", "match": { "description": "^renamed: " }, "threshold": { "count": 4, "windowMinutes": 10, "distinct": "description" }, "maxEvidence": 4, "why": "w" }, { "id": "RECORDS", "title": "Records", "category": "FileSystem", "severity": "High", "match": { "description": "^renamed: " }, "threshold": { "count": 4, "windowMinutes": 10 }, "why": "w" }, { "id": "BYKEY", "title": "Keys", "category": "FileSystem", "severity": "High", "match": { "description": "^moved: " }, "threshold": { "count": 3, "windowMinutes": 10, "distinct": "detail:From" }, "why": "w" } ] }'
+    $distinctRows = New-Object System.Collections.Generic.List[object]
+    # 3 files x 3 records: 9 records, 3 files (below 4 files)
+    foreach ($n in 1..3) { foreach ($s in 0..2) { $distinctRows.Add(@{ Timestamp = "2026-06-01 10:00:0$($n).00$s"; Source = "UsnJournal"; EventType = "FileAccess"; Description = "renamed: f$n.x"; User = ""; Details = "Reason=r$s" }) } }
+    # 4 files (one in a different case) x 2 records, an hour later: 4 files
+    foreach ($n in 1..4) { foreach ($s in 0..1) { $name = if ($n -eq 4 -and $s -eq 1) { "G4.X" } else { "g$n.x" }; $distinctRows.Add(@{ Timestamp = "2026-06-01 11:00:0$($n).00$s"; Source = "UsnJournal"; EventType = "FileAccess"; Description = "renamed: $name"; User = ""; Details = "Reason=r$s" }) } }
+    # detail:From: 3 rows, two with the same From, one without the key (counts on its own)
+    $distinctRows.Add(@{ Timestamp = "2026-06-01 12:00:01.000"; Source = "UsnJournal"; EventType = "FileAccess"; Description = "moved: a"; User = ""; Details = "Reason=r | From=a.txt" })
+    $distinctRows.Add(@{ Timestamp = "2026-06-01 12:00:02.000"; Source = "UsnJournal"; EventType = "FileAccess"; Description = "moved: b"; User = ""; Details = "Reason=r | From=a.txt" })
+    $distinctRows.Add(@{ Timestamp = "2026-06-01 12:00:03.000"; Source = "UsnJournal"; EventType = "FileAccess"; Description = "moved: c"; User = ""; Details = "Reason=r" })
+    $distinctRows.Add(@{ Timestamp = "2026-06-01 12:00:04.000"; Source = "UsnJournal"; EventType = "FileAccess"; Description = "moved: d"; User = ""; Details = "Reason=r | From=b.txt" })
+    $distinctImported = Import-ReportRules -Path $distinctRulesPath
+    $distinctLeads = @(Invoke-ReportRules -Rows $distinctRows -Rules $distinctImported)
+    $files = @($distinctLeads | Where-Object { $_.RuleId -eq "FILES" })
+    $records = @($distinctLeads | Where-Object { $_.RuleId -eq "RECORDS" })
+    $byKey = @($distinctLeads | Where-Object { $_.RuleId -eq "BYKEY" })
+    Assert-Equal "$($files.Count)|$(@($files | ForEach-Object { $_.Count }) -join ',')|$(@($files.Evidence | ForEach-Object { $_.Description }) -join ',')" "1|8|renamed: g1.x,renamed: g2.x,renamed: g3.x,renamed: g4.x" -Message "threshold.distinct ""description"": 9 records of 3 files stay below 4 files, 8 records of 4 files (one name in another case) reach it; the evidence lists each file once first"
+    Assert-Equal "$($records.Count)|$(@($records | ForEach-Object { $_.Count }) -join ',')" "1|17" -Message "without distinct, the same rows count as records (9 and 8 records reach 4)"
+    Assert-Equal "$($byKey.Count)|$(@($byKey | ForEach-Object { $_.Count }) -join ',')|$($distinctImported.Rules[2].Threshold.Distinct)" "1|4|detail:From" -Message "threshold.distinct ""detail:From"": a.txt twice counts once, a row without From counts on its own (3 values)"
+
+    # "evidence": "latest": after the rows that raised the severity, the
+    # latest rule rows are the evidence (installs nearest the collection),
+    # not the earliest; findings.csv says so. The default stays "earliest"
+    $latestRulesPath = Join-Path $workDir "latest-rules.json"
+    New-TestTextFile $latestRulesPath '{ "schemaVersion": 1, "rules": [ { "id": "NEW", "title": "Latest", "category": "Other", "severity": "Info", "match": { "description": "^installed: " }, "maxEvidence": 3, "evidence": "latest", "escalate": { "severity": "Medium", "withinMinutes": 1, "match": { "description": "^failed: " } }, "why": "w" }, { "id": "OLD", "title": "Earliest", "category": "Other", "severity": "Info", "match": { "description": "^installed: " }, "maxEvidence": 3, "evidence": "earliest", "why": "w" } ] }'
+    $latestRows = New-Object System.Collections.Generic.List[object]
+    foreach ($n in 1..6) {
+        $latestRows.Add(@{ Timestamp = "2026-06-0$n 10:00:00.000"; Source = "System.evtx"; EventType = "Installation"; Description = "installed: KB$n"; User = ""; Details = "EventID=19" })
+        if ($n -eq 1) { $latestRows.Add(@{ Timestamp = "2026-06-01 10:00:30.000"; Source = "System.evtx"; EventType = "Installation"; Description = "failed: KB0"; User = ""; Details = "EventID=20" }) }
+    }
+    $latestImported = Import-ReportRules -Path $latestRulesPath
+    $latestLeads = @(Invoke-ReportRules -Rows $latestRows -Rules $latestImported)
+    $newest = @($latestLeads | Where-Object { $_.RuleId -eq "NEW" })[0]
+    $oldest = @($latestLeads | Where-Object { $_.RuleId -eq "OLD" })[0]
+    Assert-Equal "$(@($newest.Evidence | ForEach-Object { $_.Description }) -join ',')|$($newest.EvidenceLatest)|$($newest.EvidenceTruncated)|$($newest.Severity)" "failed: KB0,installed: KB5,installed: KB6|True|True|Medium" -Message "evidence latest: the row that raised the severity, then the latest rows (KB5, KB6), not KB1"
+    Assert-Equal "$(@($oldest.Evidence | ForEach-Object { $_.Description }) -join ',')|$($oldest.EvidenceLatest)" "installed: KB1,installed: KB2,installed: KB3|False" -Message "evidence earliest (the default): the earliest rows"
+    $latestCsv = Join-Path $workDir "latest-findings.csv"
+    Export-ReportFindingsCsv -Findings $latestLeads -Path $latestCsv
+    $latestSummary = @(Import-Csv -LiteralPath $latestCsv | Where-Object { -not $_.RowNumber } | ForEach-Object { "$($_.RuleId):$(if ($_.Description -match '; (latest|first) 3 rows listed') { $Matches[1] })" }) | Sort-Object
+    Assert-Equal ($latestSummary -join ",") "NEW:latest,OLD:first" -Message "findings.csv: the summary says which rows are listed (latest or first)"
+
     # A pattern that keeps timing out stops its rule after a few timeouts
     # instead of costing the timeout on every row; other rules still run
     $script:ReportEngineRegexTimeout = [TimeSpan]::FromMilliseconds(50)
@@ -460,6 +548,8 @@ try {
         @(('{ "schemaVersion": 1, "rules": [ { ' + $rule + ', "match": { "description": "x" } } ], "allowlist": [ { "ruleId": "*", "match": { "user": "(" }, "reason": "r" } ] }'), @("allowlist[0] (ruleId '*')", "match.user", "invalid regular expression")),
         @(('{ "schemaVersion": 1, "rules": [ { ' + $rule + ', "match": { "description": "x" }, "maxFindings": 1 } ] }'), @("rule 'BAD-1'", ".maxFindings", "0 (no limit) or a whole number from 2")),
         @(('{ "schemaVersion": 1, "rules": [ { ' + $rule + ', "match": { "description": "x" }, "activityTime": "no" } ] }'), @("rule 'BAD-1'", ".activityTime", "true or false")),
+        @(('{ "schemaVersion": 1, "rules": [ { ' + $rule + ', "match": { "description": "x" }, "evidence": "newest" } ] }'), @("rule 'BAD-1'", ".evidence", """earliest"" or ""latest""", "'newest'")),
+        @(('{ "schemaVersion": 1, "rules": [ { ' + $rule + ', "match": { "description": "x" }, "evidence": 1 } ] }'), @("rule 'BAD-1'", ".evidence", """earliest"" or ""latest""")),
         @('{ "schemaVersion": 1, "rules": [ ] }', @("invalid.json", "rules", "non-empty array")),
         @('{ "schemaVersion": 1, "rule": [ ] }', @("invalid.json", "unknown field 'rule'"))
     )
@@ -555,6 +645,16 @@ try {
         }
     }
     Assert-Equal "$(@($shippedErrors).Count)|$(@($shipped.Rules).Count -gt 40)|$($emptyConditions -join ',')" "0|True|" -Message "report-rules.json: imports with no error, and no compiled condition is empty"
+
+    # FS-WINDOWS-UPDATE lists the latest installs: with more than its 40, the
+    # update installed just before the collection is listed, the oldest not
+    $updateRows = @(foreach ($n in 0..51) {
+            $kb = "KB50{0:D5}" -f (10000 + $n)
+            @{ Timestamp = ([datetime]"2024-01-05").AddDays(14 * $n).ToString("yyyy-MM-dd", [System.Globalization.CultureInfo]::InvariantCulture) + " 05:38:07.000"; Source = "System.evtx"; EventType = "Installation"; Description = "Windows Update installed: 20xx-xx Cumulative Update ($kb)"; User = ""; Details = "EventID=19 | KB=$kb" }
+        })
+    $updateLead = @(Invoke-ReportRules -Rows $updateRows -Rules $shipped | Where-Object { $_.RuleId -eq "FS-WINDOWS-UPDATE" })
+    $updateKbs = @($updateLead.Evidence | ForEach-Object { if ($_.Description -match '\((KB\d+)\)$') { $Matches[1] } })
+    Assert-Equal "$($updateLead.Count)|$(@($updateLead.Evidence).Count)|$($updateKbs -contains 'KB5010051')|$($updateKbs -contains 'KB5010000')|$($updateKbs[0])" "1|40|True|False|KB5010012" -Message "FS-WINDOWS-UPDATE: of 52 installs, the latest 40 are listed (the newest, KB5010051, is; the oldest is not)"
 
     # =========================================================
     # findings.csv (written before the model, which hashes it)
@@ -767,23 +867,40 @@ try {
 
     # --- A memory dump the builder found but did not analyze (Windows ARM64,
     # skipped at its prompt, no Volatility 3, or not found) ---
-    $memoryLog = Join-Path $workDir "memory_builder_log.txt"
-    New-TestTextFile $memoryLog ("[2026-02-02 01:00:00] === Windows 11 Forensic Timeline Builder Started ===`r`n" +
-        "[2026-02-02 01:00:05] Memory dump detected: C:\x\T_memory_dump.dmp (Windows ARM64), not offered for analysis.`r`n" +
-        "[2026-02-02 01:00:05]   Memory dump not analyzed: T_memory_dump.dmp (7.99 GB): a Windows ARM64 dump, which Volatility 3 cannot analyze; examine it in WinDbg.`r`n")
-    $memoryModel = New-ReportModel -Rows $userRows -BuilderLogPath $memoryLog
-    $memoryNotes = @($memoryModel.Coverage.Notes | Where-Object { $_ -eq "A memory dump of this collection was not analyzed: T_memory_dump.dmp (7.99 GB): a Windows ARM64 dump, which Volatility 3 cannot analyze; examine it in WinDbg." })
-    $memoryCaveat = "A memory dump of this collection was not analyzed (see Evidence coverage): the programs, network connections and command lines in memory are not in this report."
-    $memoryCaveats = @($memoryModel.Caveats | Where-Object { $_ -eq $memoryCaveat })
-    Assert-Equal "$($memoryNotes.Count)|$($memoryCaveats.Count)" "1|1" -Message "a memory dump not analyzed: named in Coverage.Notes with the reason, and a caveat"
-    # A dump the manifest lists but that was not found: the same caveat,
-    # which does not say that the dump exists
-    $missingDumpLog = Join-Path $workDir "memory_missing_builder_log.txt"
-    New-TestTextFile $missingDumpLog ("[2026-02-02 01:00:00] === Windows 11 Forensic Timeline Builder Started ===`r`n" +
-        "[2026-02-02 01:00:05]   Memory dump not analyzed: collection_manifest.csv lists one (7.99 GB), but it was not found (or not usable) next to the collection or where the collector saved it.`r`n")
-    $missingDumpModel = New-ReportModel -Rows $userRows -BuilderLogPath $missingDumpLog
-    Assert-Equal "$(@($missingDumpModel.Caveats | Where-Object { $_ -eq $memoryCaveat }).Count)|$(@($missingDumpModel.Caveats | Where-Object { $_ -match 'dump of this collection exists' }).Count)" "1|0" -Message "a listed memory dump not found: the caveat does not say that it exists"
-    Assert-Equal "$(@($model.Coverage.Notes | Where-Object { $_ -match 'memory dump of this collection' }).Count)|$(@($model.Caveats | Where-Object { $_ -match 'memory dump of this collection' }).Count)" "0|0" -Message "no such log line: no memory-dump note or caveat"
+    # The note (Evidence coverage) names the dump and gives the reason and
+    # advice with one colon; the caveat (page 1) gives the reason as one
+    # short phrase. A log from an older builder ("<dump>: <why>", "<dump>,
+    # but <why>") reads the same way.
+    $memoryCaveatTail = ", so the programs, network connections and command lines in memory are not in this report."
+    $arm64Note = "Memory dump not analyzed: T_memory_dump.dmp (7.99 GB) -- Volatility 3 cannot read Windows ARM64 dumps; examine it in WinDbg."
+    $arm64Caveat = "A memory dump of this collection was not analyzed (Volatility 3 cannot read Windows ARM64 dumps)$memoryCaveatTail"
+    $missingCaveat = "A memory dump of this collection was not analyzed (it was not found next to the collection or where the collector saved it)$memoryCaveatTail"
+    $memoryCases = @(
+        @("ARM64", "T_memory_dump.dmp (7.99 GB) -- Volatility 3 cannot read Windows ARM64 dumps; examine it in WinDbg.", $arm64Note, $arm64Caveat),
+        @("ARM64, older builder", "T_memory_dump.dmp (7.99 GB): a Windows ARM64 dump, which Volatility 3 cannot analyze; examine it in WinDbg.", $arm64Note, $arm64Caveat),
+        @("not found", "the dump listed in collection_manifest.csv (7.99 GB) -- it was not found (or not usable) next to the collection or where the collector saved it.",
+            "Memory dump not analyzed: the dump listed in collection_manifest.csv (7.99 GB) -- it was not found (or not usable) next to the collection or where the collector saved it.", $missingCaveat),
+        @("not found, older builder", "collection_manifest.csv lists one (7.99 GB), but it was not found (or not usable) next to the collection or where the collector saved it.",
+            "Memory dump not analyzed: collection_manifest.csv lists one (7.99 GB) -- it was not found (or not usable) next to the collection or where the collector saved it.", $missingCaveat),
+        @("skipped", "T_memory_dump.dmp (7.99 GB) -- skipped at the memory prompt; run the builder again and answer 1 to analyze it.",
+            "Memory dump not analyzed: T_memory_dump.dmp (7.99 GB) -- skipped at the memory prompt; run the builder again and answer 1 to analyze it.",
+            "A memory dump of this collection was not analyzed (skipped at the memory prompt)$memoryCaveatTail"),
+        @("no Volatility 3, older builder", "T_memory_dump.dmp (7.99 GB): Volatility 3 (vol.exe) is not in the builder's tools\volatility3\ folder.",
+            "Memory dump not analyzed: T_memory_dump.dmp (7.99 GB) -- Volatility 3 (vol.exe) is not in the builder's tools\volatility3\ folder.",
+            "A memory dump of this collection was not analyzed (Volatility 3 is not in the builder's tools\volatility3\ folder)$memoryCaveatTail")
+    )
+    foreach ($case in $memoryCases) {
+        $memoryLog = Join-Path $workDir "memory_builder_log.txt"
+        New-TestTextFile $memoryLog ("[2026-02-02 01:00:00] === Windows 11 Forensic Timeline Builder Started ===`r`n" +
+            "[2026-02-02 01:00:05] Memory dump detected: C:\x\T_memory_dump.dmp (Windows ARM64)`r`n" +
+            "[2026-02-02 01:00:05]   Memory dump not analyzed: $($case[1])`r`n")
+        $memoryModel = New-ReportModel -Rows $userRows -BuilderLogPath $memoryLog
+        $memoryNotes = @($memoryModel.Coverage.Notes | Where-Object { $_ -match '^Memory dump not analyzed' })
+        $memoryCaveats = @($memoryModel.Caveats | Where-Object { $_ -match 'memory dump of this collection' })
+        $colons = @(@($memoryNotes) + @($memoryCaveats) | Where-Object { ([regex]::Matches($_, ':\s')).Count -gt 1 })
+        Assert-Equal "$($memoryNotes -join ' / ')|$($memoryCaveats -join ' / ')|$($colons.Count)" "$($case[2])|$($case[3])|0" -Message "a memory dump not analyzed ($($case[0])): one note with the dump and why, one caveat with the reason, no double colon"
+    }
+    Assert-Equal "$(@($model.Coverage.Notes | Where-Object { $_ -match '^Memory dump not analyzed|memory dump of this collection' }).Count)|$(@($model.Caveats | Where-Object { $_ -match 'memory dump of this collection' }).Count)" "0|0" -Message "no such log line: no memory-dump note or caveat"
 
     # =========================================================
     # report-model.json
@@ -805,6 +922,291 @@ try {
         Map   = [ordered]@{ a = "x" }
     })
     Write-TestResult -Succeeded ($special.Contains('"Text": "caf\u00e9 \u003cb\u003e\u0026\u2603\t"') -and $special.Contains('"When": "2026-01-02T03:04:05.006Z"') -and $special.Contains('"Empty": []') -and $special -match '"List": \[\s+1,\s+null,\s+true,\s+2\.5\s+\]' -and $special -match '"Map": \{\s+"a": "x"\s+\}') -Message "JSON writer: \u escapes for non-ASCII and < > &, ISO dates, arrays, nulls, dictionaries"
+
+    # =========================================================
+    # Per-branch capture key, the match-capture fallback, and the
+    # row-description fallback; import accepts capture with a key only in an
+    # anyOf entry and rejects capture with no key source anywhere
+    # =========================================================
+    $capRulesPath = Join-Path $workDir "capture-rules.json"
+    New-TestTextFile $capRulesPath ('{ "schemaVersion": 1, "rules": [ ' +
+        '{ "id": "CAP", "title": "{{group}}", "category": "Other", "severity": "Medium", "why": "w", "groupBy": "capture", "match": { "source": "^S$" }, "anyOf": [ { "description": "^plain" }, { "details": "^tag=(?<key>\\w+)" } ] }, ' +
+        '{ "id": "CAP2", "title": "{{group}}", "category": "Other", "severity": "Medium", "why": "w", "groupBy": "capture", "match": { "source": "^T$", "description": "^cmd (?<key>\\w+)" }, "anyOf": [ { "details": "^opt" } ] } ] }')
+    $capRows = @(
+        @{ Timestamp = "2026-01-01 00:00:01.000"; Source = "S"; EventType = "E"; Description = "plain row one"; User = ""; Details = "" },
+        @{ Timestamp = "2026-01-01 00:00:02.000"; Source = "S"; EventType = "E"; Description = "whatever"; User = ""; Details = "tag=alpha extra" },
+        @{ Timestamp = "2026-01-01 00:00:03.000"; Source = "T"; EventType = "E"; Description = "cmd zulu now"; User = ""; Details = "opt stuff" }
+    )
+    $capFindings = @(Invoke-ReportRules -Rows $capRows -Rules (Import-ReportRules -Path $capRulesPath))
+    $capByRow = @{}
+    foreach ($f in $capFindings) { foreach ($rn in $f.RowNumbers) { $capByRow["$($f.RuleId)|$rn"] = $f.GroupKey } }
+    Assert-Equal $capByRow["CAP|2"] "plain row one" -Message "capture: an anyOf branch without a key, and match without a capture, falls back to the row Description"
+    Assert-Equal $capByRow["CAP|3"] "alpha" -Message "capture: the matched anyOf branch's (?<key>) group is used (Details)"
+    Assert-Equal $capByRow["CAP2|4"] "zulu" -Message "capture: an anyOf branch without a key falls back to match.description's (?<key>)"
+    $capReject = Join-Path $workDir "capture-reject.json"
+    New-TestTextFile $capReject '{ "schemaVersion": 1, "rules": [ { "id": "NOKEY", "title": "t", "category": "Other", "severity": "Medium", "why": "w", "groupBy": "capture", "match": { "source": "^S$" }, "anyOf": [ { "description": "^x" } ] } ] }'
+    $message = ""
+    try { $null = Import-ReportRules -Path $capReject } catch { $message = $_.Exception.Message }
+    Write-TestResult -Succeeded ($message -match 'capture' -and $message -match 'NOKEY') -Message "import rejects groupBy capture when no match or anyOf entry has a key ($message)"
+
+    # =========================================================
+    # The collector's own processes in the memory dump (Find-ReportCollectorRows)
+    # =========================================================
+    function New-TestProc { param([string]$Time, [string]$Name, [int]$ProcId, [int]$Ppid, [switch]$Snapshot)
+        return @{ Timestamp = $Time; Source = "Memory-Processes"; EventType = $(if ($Snapshot) { "Snapshot" } else { "ProcessCreation" }); Description = "Process in memory: $Name (PID: $ProcId, PPID: $Ppid)"; User = ""; Details = "Threads=3 SessionId=1"; Artifact = "MemoryDump"; RawPath = "" } }
+    function New-TestCmd { param([string]$Name, [int]$ProcId, [string]$CmdLine)
+        return @{ Timestamp = "2026-05-15 12:03:30.000"; Source = "Memory-CommandLine"; EventType = "Snapshot"; Description = "Process command line: $Name (PID: $ProcId)"; User = ""; Details = "Args=$CmdLine"; Artifact = "MemoryDump"; RawPath = "" } }
+    $collStart = "2026-05-15T12:03:00.5000000Z"
+    $colRows = @(
+        (New-TestProc -Time "2026-05-15 12:02:58.000" -Name "powershell.exe" -ProcId 9120 -Ppid 8840),
+        (New-TestProc -Time "2026-05-15 12:02:55.000" -Name "cmd.exe" -ProcId 8840 -Ppid 8000),
+        (New-TestProc -Time "2026-05-15 12:02:56.000" -Name "conhost.exe" -ProcId 8848 -Ppid 8840),
+        (New-TestProc -Time "2026-05-15 12:03:30.000" -Name "DumpIt.exe" -ProcId 10232 -Ppid 9120),
+        (New-TestProc -Time "2026-05-15 12:03:05.000" -Name "csc.exe" -ProcId 9500 -Ppid 9120),
+        (New-TestProc -Time "2026-05-15 12:03:06.000" -Name "cvtres.exe" -ProcId 9600 -Ppid 9500),
+        (New-TestProc -Time "2026-05-15 12:02:59.000" -Name "conhost.exe" -ProcId 9700 -Ppid 9120),
+        (New-TestProc -Time "2026-05-15 12:03:10.000" -Name "powershell.exe" -ProcId 1234 -Ppid 5000),
+        (New-TestProc -Time "2026-05-15 12:03:11.000" -Name "evil.exe" -ProcId 8840 -Ppid 5000 -Snapshot),
+        (New-TestCmd -Name "powershell.exe" -ProcId 9120 -CmdLine "powershell.exe -File C:\col\triage-collector.ps1"),
+        (New-TestCmd -Name "DumpIt.exe" -ProcId 10232 -CmdLine "DumpIt.exe /q"),
+        (New-TestCmd -Name "powershell.exe" -ProcId 1234 -CmdLine "powershell.exe -enc AAAA"),
+        @{ Timestamp = "2026-05-15 12:03:30.000"; Source = "Memory-Network"; EventType = "Snapshot"; Description = "Memory network: TCPv4 10.0.0.5:5 -> 1.2.3.4:443 (ESTABLISHED)"; User = ""; Details = "PID=9120 Process=powershell.exe"; Artifact = "MemoryDump"; RawPath = "" },
+        @{ Timestamp = "2026-05-15 12:03:30.000"; Source = "Memory-Services"; EventType = "Snapshot"; Description = "Service in memory: X (X)"; User = ""; Details = "State=RUNNING PID=9120"; Artifact = "MemoryDump"; RawPath = "" }
+    )
+    $colRecorded = @(
+        [PSCustomObject]@{ Role = "Collector"; Pid = 9120; Name = "powershell.exe"; StartUtc = "2026-05-15T12:02:58.1234567Z"; ParentPid = 8840 },
+        [PSCustomObject]@{ Role = "Launcher"; Pid = 8840; Name = "cmd.exe"; StartUtc = "2026-05-15T12:02:55.7654321Z"; ParentPid = 8000 },
+        [PSCustomObject]@{ Role = "Console"; Pid = 8848; Name = "conhost.exe"; StartUtc = "2026-05-15T12:02:56.9000000Z"; ParentPid = 8840 },
+        [PSCustomObject]@{ Role = "MemoryCapture"; Pid = 10232; Name = "DumpIt.exe"; StartUtc = "2026-05-15T12:03:30.2000000Z"; ParentPid = 9120 }
+    )
+    $colInfo = [PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $collStart; CollectorProcesses = $colRecorded }
+    $col = Find-ReportCollectorRows -Rows $colRows -CollectionInfo $colInfo
+    Assert-Equal "$($col.Recorded)|$($col.HasMemoryRows)|$($col.Count)" "True|True|6" -Message "collector: recorded, has memory rows, 6 processes (tree + closure)"
+    Assert-Equal (@($col.Processes | ForEach-Object { $_.Pid } | Sort-Object) -join ",") "8840,8848,9120,9500,9600,10232" -Message "collector: excluded set = collector, launcher, console, capture tool, and the children they started"
+    Assert-Equal $col.Summary "Collector's own processes in the memory dump: 6 (not flagged)" -Message "collector: Summary text"
+    $csc = @($col.Processes | Where-Object { $_.Pid -eq 9500 })[0]
+    Assert-Equal $csc.How "started by PID 9120 during the collection" -Message "collector: a child started during the collection (closure) is in, with its How"
+    Write-TestResult -Succeeded (-not (@($col.Processes | ForEach-Object { $_.Pid }) -contains 9700)) -Message "collector: a child created before the collection start is not in the closure"
+    Write-TestResult -Succeeded (-not (@($col.Processes | ForEach-Object { $_.Pid }) -contains 1234)) -Message "collector: an impostor process named powershell.exe with another PID is NOT excluded"
+    $colExSources = @(); for ($i = 0; $i -lt $col.Excluded.Length; $i++) { if ($col.Excluded[$i]) { $colExSources += $colRows[$i].Source } }
+    Write-TestResult -Succeeded (-not ($colExSources -contains "Memory-Network") -and -not ($colExSources -contains "Memory-Services")) -Message "collector: Memory-Network and Memory-Services rows are never excluded"
+    $colImpostorExcluded = $false; for ($i = 0; $i -lt $col.Excluded.Length; $i++) { if ($col.Excluded[$i] -and $colRows[$i].Description -like "*PID: 1234*") { $colImpostorExcluded = $true } }
+    Write-TestResult -Succeeded (-not $colImpostorExcluded) -Message "collector: the impostor's Memory-Processes and Memory-CommandLine rows are not excluded"
+    $colDecoyExcluded = $false; for ($i = 0; $i -lt $col.Excluded.Length; $i++) { if ($col.Excluded[$i] -and $colRows[$i].Description -like "*evil.exe*") { $colDecoyExcluded = $true } }
+    Write-TestResult -Succeeded (-not $colDecoyExcluded) -Message "collector: a decoy row that reused an excluded PID (other name) is not excluded"
+    # 14-char truncated name (the ISE's powershell_ise.exe), and the
+    # whole-second time match
+    $truncRows = @( (New-TestProc -Time "2026-05-15 12:02:58.000" -Name "powershell_ise" -ProcId 4000 -Ppid 3000) )
+    $truncInfo = [PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $collStart; CollectorProcesses = @([PSCustomObject]@{ Role = "Collector"; Pid = 4000; Name = "powershell_ise.exe"; StartUtc = "2026-05-15T12:02:58.9000000Z"; ParentPid = 3000 }) }
+    $truncCol = Find-ReportCollectorRows -Rows $truncRows -CollectionInfo $truncInfo
+    Assert-Equal (@($truncCol.Processes).Count) 1 -Message "collector: a Volatility 14-char name (powershell_ise) matches the full recorded name"
+    foreach ($pair in @(@("2026-05-15 12:00:02.000", 1), @("2026-05-15 12:00:03.000", 0), @("2026-05-15 12:00:01.000", 0))) {
+        $tRows = @( (New-TestProc -Time $pair[0] -Name "powershell.exe" -ProcId 5 -Ppid 4) )
+        $tInfo = [PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = "2026-05-15T12:00:05Z"; CollectorProcesses = @([PSCustomObject]@{ Role = "Collector"; Pid = 5; Name = "powershell.exe"; StartUtc = "2026-05-15T12:00:02.9999999Z"; ParentPid = 4 }) }
+        $tCol = Find-ReportCollectorRows -Rows $tRows -CollectionInfo $tInfo
+        Assert-Equal (@($tCol.Processes).Count) $pair[1] -Message "collector: whole-second match, dump $($pair[0]) vs recorded :02.9999999 -> $($pair[1]) process(es)"
+    }
+    # StartUtc as a [datetime]; a reused PID (name differs) -> Mismatched, not excluded
+    $dtInfo = [PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $collStart; CollectorProcesses = @([PSCustomObject]@{ Role = "Collector"; Pid = 9120; Name = "powershell.exe"; StartUtc = [datetime]::new(2026, 5, 15, 12, 2, 58, [System.DateTimeKind]::Utc); ParentPid = 8840 }) }
+    $dtCol = Find-ReportCollectorRows -Rows $colRows -CollectionInfo $dtInfo
+    Assert-Equal (@($dtCol.Processes | Where-Object { $_.Pid -eq 9120 }).Count) 1 -Message "collector: StartUtc as a [datetime] is read"
+    $reuse = Find-ReportCollectorRows -Rows $colRows -CollectionInfo ([PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $collStart; CollectorProcesses = @([PSCustomObject]@{ Role = "Collector"; Pid = 7777; Name = "powershell.exe"; StartUtc = "2026-05-15T12:02:58.1Z"; ParentPid = 8840 }) })
+    Assert-Equal "$(@($reuse.Processes).Count)|$(@($reuse.NotInDump).Count)" "0|1" -Message "collector: the anchor (Collector) not in the dump leaves nothing out; it is reported as not-in-dump"
+    # MountedImage: not applied; an older collection (no field): not recorded
+    $imgCol = Find-ReportCollectorRows -Rows $colRows -CollectionInfo ([PSCustomObject]@{ Mode = "MountedImage"; CollectionStartUtc = $collStart; CollectorProcesses = $colRecorded })
+    Assert-Equal "$($imgCol.Recorded)|$(@($imgCol.Processes).Count)" "False|0" -Message "collector: not applied to a mounted image"
+    $oldCol = Find-ReportCollectorRows -Rows $colRows -CollectionInfo ([PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $collStart })
+    Assert-Equal "$($oldCol.Recorded)|$(@($oldCol.Processes).Count)" "False|0" -Message "collector: an older collection with no CollectorProcesses field recognizes nothing"
+    # An injected Child whose real parent is not the collector -> Mismatched
+    $inj = Find-ReportCollectorRows -Rows $colRows -CollectionInfo ([PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $collStart; CollectorProcesses = @($colRecorded + @([PSCustomObject]@{ Role = "Child"; Pid = 1234; Name = "powershell.exe"; StartUtc = "2026-05-15T12:03:10Z"; ParentPid = 9120 })) })
+    Write-TestResult -Succeeded (-not (@($inj.Processes | ForEach-Object { $_.Pid }) -contains 1234) -and @($inj.Mismatched | Where-Object { $_.Pid -eq 1234 }).Count -eq 1) -Message "collector: an injected Child PID whose parent in the dump is not the collector is Mismatched, not excluded"
+
+    # =========================================================
+    # Evaluate skips the collector rows; escalation skips them too; the rules
+    # leave them unflagged while a non-collector lead in the dump is unchanged
+    # =========================================================
+    $skipRulesPath = Join-Path $workDir "skip-rules.json"
+    New-TestTextFile $skipRulesPath '{ "schemaVersion": 1, "rules": [ { "id": "ANYPROC", "title": "Seen {{group}}", "category": "Execution", "severity": "High", "why": "w", "groupBy": "capture", "match": { "source": "^Memory-CommandLine$", "description": "^Process command line: (?<key>[^ ]+) " } } ] }'
+    $skipRules = Import-ReportRules -Path $skipRulesPath
+    $skipNoCollector = @(Invoke-ReportRules -Rows $colRows -Rules $skipRules -CollectionInfo ([PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $collStart }))
+    $skipWithCollector = @(Invoke-ReportRules -Rows $colRows -Rules $skipRules -CollectionInfo $colInfo -CollectorRows $col)
+    $skipKeysNo = @($skipNoCollector | ForEach-Object { $_.GroupKey } | Sort-Object)
+    $skipKeysYes = @($skipWithCollector | ForEach-Object { $_.GroupKey } | Sort-Object)
+    Write-TestResult -Succeeded (($skipKeysNo -contains "powershell.exe") -and ($skipKeysNo -contains "DumpIt.exe")) -Message "without the collector record, the rule flags the collector's own command-line rows"
+    Write-TestResult -Succeeded (-not ($skipKeysYes -contains "DumpIt.exe")) -Message "with the collector record, the capture tool's command-line row is skipped by the rules"
+    Write-TestResult -Succeeded (@($skipWithCollector | Where-Object { $_.GroupKey -eq "powershell.exe" }).Count -ge 1) -Message "the impostor powershell.exe row (not the collector's) is still flagged"
+    # CollectorSuspect: a memory-only lead from during the collection is flagged
+    # as possibly the collector when the collection did not record/recognize
+    # its IDs (older collection), but not when it did (the impostor is a lead)
+    $impNo = @($skipNoCollector | Where-Object { $_.GroupKey -eq "powershell.exe" })[0]
+    $impYes = @($skipWithCollector | Where-Object { $_.GroupKey -eq "powershell.exe" })[0]
+    Write-TestResult -Succeeded ([bool]$impNo.CollectorSuspect) -Message "an older collection (no recorded IDs): a memory-only lead during the collection is flagged CollectorSuspect"
+    Write-TestResult -Succeeded (-not [bool]$impYes.CollectorSuspect) -Message "a recognized collection: a flagged impostor lead is not marked CollectorSuspect"
+    # Recorded but not recognized (the collector's PowerShell is not in the
+    # dump): nothing is left out, and the memory-only leads from during the
+    # collection -- the collector's own capture tool among them -- are marked
+    # CollectorSuspect as in an older collection
+    $reuseInfo = [PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $collStart; CollectorProcesses = @([PSCustomObject]@{ Role = "Collector"; Pid = 7777; Name = "powershell.exe"; StartUtc = "2026-05-15T12:02:58.1Z"; ParentPid = 8840 }) }
+    Assert-Equal "$($reuse.Recorded)|$($reuse.HasMemoryRows)|$($reuse.Count)|$($reuse.Summary)" "True|True|0|Collector's own processes in the memory dump: none recognized (nothing left out)" -Message "collector: recorded but none recognized: Summary says nothing was left out"
+    $skipUnrecognized = @(Invoke-ReportRules -Rows $colRows -Rules $skipRules -CollectionInfo $reuseInfo -CollectorRows $reuse)
+    $unrecDumpIt = @($skipUnrecognized | Where-Object { $_.GroupKey -eq "DumpIt.exe" })
+    $unrecImpostor = @($skipUnrecognized | Where-Object { $_.GroupKey -eq "powershell.exe" })
+    Write-TestResult -Succeeded ($unrecDumpIt.Count -eq 1 -and [bool]$unrecDumpIt[0].CollectorSuspect -and $unrecImpostor.Count -eq 1 -and [bool]$unrecImpostor[0].CollectorSuspect) -Message "recorded but not recognized: the memory-only leads from during the collection (the capture tool, powershell.exe) are flagged CollectorSuspect"
+
+    # =========================================================
+    # The model's Coverage.CollectorProcesses, the Notes/Method lines, the
+    # findings.csv collector block, and the older-collection note
+    # =========================================================
+    $colModel = New-ReportModel -Rows $colRows -Findings $skipWithCollector -CollectionInfo $colInfo -CollectorRows $col
+    $cp = $colModel.Coverage.CollectorProcesses
+    Assert-Equal "$($cp.Recorded)|$($cp.Count)|$($cp.Summary)" "True|6|Collector's own processes in the memory dump: 6 (not flagged)" -Message "model Coverage.CollectorProcesses: recorded, count and summary"
+    Write-TestResult -Succeeded (-not ($cp.PSObject.Properties.Name -contains "Excluded")) -Message "model Coverage.CollectorProcesses has no Excluded mask"
+    Write-TestResult -Succeeded (@($colModel.Coverage.Notes | Where-Object { $_ -match "Collector's own processes in the memory dump: 6 \(not flagged\)" }).Count -eq 1) -Message "model Notes carries the collector summary"
+    Write-TestResult -Succeeded (@($colModel.Method | Where-Object { $_ -match "recognized by the process ID, name and start time recorded in collection_info.json" }).Count -eq 1) -Message "model Method describes the collector exclusion"
+    $colCsv = Join-Path $workDir "collector-findings.csv"
+    Export-ReportFindingsCsv -Findings $skipWithCollector -Path $colCsv -CollectorRows $col
+    $colCsvLines = @(Import-Csv -LiteralPath $colCsv)
+    $colBlock = @($colCsvLines | Where-Object { $_.FindingId -eq "Collector" })
+    $colBlockSummary = @($colBlock | Where-Object { -not $_.RowNumber })
+    Write-TestResult -Succeeded ($colBlockSummary.Count -eq 1 -and $colBlockSummary[0].Severity -eq "Not flagged" -and $colBlockSummary[0].Description -match "not checked by the rules" -and @($colBlock | Where-Object { $_.RowNumber }).Count -eq $col.RowCount) -Message "findings.csv has the Collector block: a 'Not flagged' summary and one line per left-out row"
+    Write-TestResult -Succeeded ($col.RowCount -ne $col.Count -and $colBlockSummary.Count -eq 1 -and $colBlockSummary[0].Description.StartsWith("Summary: $($col.RowCount) row(s) of $($col.Count) collector process(es),")) -Message "findings.csv's Collector summary counts the left-out rows and the processes apart ($(if ($colBlockSummary.Count -eq 1) { $colBlockSummary[0].Description }))"
+    $unrecModel = New-ReportModel -Rows $colRows -Findings $skipUnrecognized -CollectionInfo $reuseInfo -CollectorRows $reuse
+    Write-TestResult -Succeeded (@($unrecModel.Coverage.Notes | Where-Object { $_ -match "but its PowerShell process could not be recognized in the memory dump, so nothing was left out" }).Count -eq 1 -and
+        @($unrecModel.Coverage.Notes | Where-Object { $_ -match "These rows stay in the timeline" -or $_ -match "older triage collector" }).Count -eq 0) -Message "model: recorded but not recognized gets its own note (nothing left out), not the left-out or older-collector note"
+    # The older-collection note when memory rows exist but nothing is recorded
+    $oldModel = New-ReportModel -Rows $colRows -Findings $skipNoCollector -CollectionInfo ([PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $collStart }) -CollectorRows $oldCol
+    Write-TestResult -Succeeded (@($oldModel.Coverage.Notes | Where-Object { $_ -match "does not record the collector's own process IDs" }).Count -eq 1 -and -not $oldModel.Coverage.CollectorProcesses.Recorded) -Message "model: an older collection (memory rows, no record) gets the older-collector note"
+    # "Captured in the memory dump" still applies to a non-excluded memory lead
+    Write-TestResult -Succeeded (@($skipWithCollector | Where-Object { $_.GroupKey -eq "powershell.exe" -and $_.MemoryOnly }).Count -ge 1) -Message "a non-collector memory-only lead keeps MemoryOnly (Captured in the memory dump)"
+
+    # =========================================================
+    # The recorded set is checked against the collector's own process tree:
+    # an entry added to collection_info.json is never left out and cannot
+    # vouch for another (a second collector, chained children, unknown
+    # roles), the anchor must be a PowerShell process started before the
+    # collection and the launcher the collector's cmd.exe parent, a child
+    # created before its parent (a reused parent id) is not in the closure,
+    # and a launcher that was not recorded keeps the "possibly the collector"
+    # card note in a recognized collection
+    # =========================================================
+    $treeStart = "2026-05-15T12:03:00.5000000Z"
+    $treeRows = @(
+        (New-TestProc -Time "2026-05-15 12:02:58.000" -Name "powershell.exe" -ProcId 9120 -Ppid 8840),
+        (New-TestProc -Time "2026-05-15 12:02:55.000" -Name "cmd.exe" -ProcId 8840 -Ppid 5000),
+        (New-TestProc -Time "2026-05-15 12:02:56.000" -Name "conhost.exe" -ProcId 8848 -Ppid 8840),
+        (New-TestProc -Time "2026-05-15 12:03:30.000" -Name "DumpIt.exe" -ProcId 10232 -Ppid 9120),
+        (New-TestProc -Time "2026-05-15 08:00:00.000" -Name "explorer.exe" -ProcId 5000 -Ppid 4000),
+        (New-TestProc -Time "2026-05-15 12:03:05.000" -Name "loader.exe" -ProcId 6100 -Ppid 5000),
+        (New-TestProc -Time "2026-05-15 12:03:06.000" -Name "payload.exe" -ProcId 6200 -Ppid 6100),
+        (New-TestProc -Time "2026-05-15 12:03:07.000" -Name "dropper.exe" -ProcId 6300 -Ppid 5000),
+        # DumpIt's console host (closure), a process created before that host
+        # under its id, and one created before the recorded DumpIt under its id
+        (New-TestProc -Time "2026-05-15 12:03:40.000" -Name "conhost.exe" -ProcId 7777 -Ppid 10232),
+        (New-TestProc -Time "2026-05-15 12:03:35.000" -Name "stale.exe" -ProcId 10300 -Ppid 7777),
+        (New-TestProc -Time "2026-05-15 12:03:20.000" -Name "orphan.exe" -ProcId 10500 -Ppid 10232),
+        (New-TestCmd -Name "cmd.exe" -ProcId 8840 -CmdLine "cmd.exe /c x.bat"),
+        (New-TestCmd -Name "powershell.exe" -ProcId 9120 -CmdLine "powershell.exe -File x.ps1"),
+        (New-TestCmd -Name "loader.exe" -ProcId 6100 -CmdLine "loader.exe"),
+        (New-TestCmd -Name "payload.exe" -ProcId 6200 -CmdLine "payload.exe"),
+        (New-TestCmd -Name "dropper.exe" -ProcId 6300 -CmdLine "dropper.exe"),
+        (New-TestCmd -Name "stale.exe" -ProcId 10300 -CmdLine "stale.exe"),
+        (New-TestCmd -Name "orphan.exe" -ProcId 10500 -CmdLine "orphan.exe")
+    )
+    $treeCollector = [PSCustomObject]@{ Role = "Collector"; Pid = 9120; Name = "powershell.exe"; StartUtc = "2026-05-15T12:02:58.1234567Z"; ParentPid = 8840 }
+    $treeLauncher = [PSCustomObject]@{ Role = "Launcher"; Pid = 8840; Name = "cmd.exe"; StartUtc = "2026-05-15T12:02:55.7000000Z"; ParentPid = 5000 }
+    $treeConsole = [PSCustomObject]@{ Role = "Console"; Pid = 8848; Name = "conhost.exe"; StartUtc = "2026-05-15T12:02:56.9000000Z"; ParentPid = 8840 }
+    $treeCapture = [PSCustomObject]@{ Role = "MemoryCapture"; Pid = 10232; Name = "DumpIt.exe"; StartUtc = "2026-05-15T12:03:30.2000000Z"; ParentPid = 9120 }
+    $treeFull = @($treeCollector, $treeLauncher, $treeConsole, $treeCapture)
+    function Get-TreeResult { param([object[]]$Records, [string]$Start = $treeStart)
+        return Find-ReportCollectorRows -Rows $treeRows -CollectionInfo ([PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $Start; CollectorProcesses = $Records }) }
+    function Get-TreePids { param($Result) return (@($Result.Processes | ForEach-Object { [int]$_.Pid } | Sort-Object) -join ",") }
+
+    $tree = Get-TreeResult $treeFull
+    Assert-Equal "$(Get-TreePids $tree)|$($tree.OutsideTree)|$($tree.Anchored)|$(@($tree.SuspectPids).Count)" "7777,8840,8848,9120,10232|0|True|0" -Message "tree: the full record leaves out the collector, launcher, console, capture tool and the capture tool's console (closure); nothing outside the tree, no suspect pid"
+    Write-TestResult -Succeeded (-not (@($tree.Processes | ForEach-Object { $_.Pid }) -contains 10300)) -Message "tree: a process created before its closure parent (DumpIt's console, whose id it names as its parent) is not left out"
+    Write-TestResult -Succeeded (-not (@($tree.Processes | ForEach-Object { $_.Pid }) -contains 10500)) -Message "tree: a process created before its recorded parent (DumpIt) is not left out"
+
+    # F1: a second Collector entry: nothing is anchored, nothing left out
+    $dup = Get-TreeResult @($treeFull + @([PSCustomObject]@{ Role = "Collector"; Pid = 6100; Name = "loader.exe"; StartUtc = "2026-05-15T12:03:05.3000000Z"; ParentPid = 5000 }))
+    Assert-Equal "$($dup.Count)|$($dup.Anchored)|$($dup.OutsideTree)" "0|False|2" -Message "tree: a second Collector entry leaves nothing out and counts both collector entries as not written by the collector"
+    Write-TestResult -Succeeded (@($dup.Mismatched | Where-Object { $_.Reason -match "lists 2 processes as the collector" }).Count -eq 5) -Message "tree: with two collectors every entry is reported with the reason"
+    # F1: chained Child entries outside the tree vouch for nothing
+    $chain = Get-TreeResult @($treeFull + @(
+            [PSCustomObject]@{ Role = "Child"; Pid = 6100; Name = "loader.exe"; StartUtc = "2026-05-15T12:03:05.3000000Z"; ParentPid = 9120 },
+            [PSCustomObject]@{ Role = "Child"; Pid = 6200; Name = "payload.exe"; StartUtc = "2026-05-15T12:03:06.3000000Z"; ParentPid = 6100 }))
+    $chainPids = @($chain.Processes | ForEach-Object { [int]$_.Pid })
+    Write-TestResult -Succeeded (-not ($chainPids -contains 6100) -and -not ($chainPids -contains 6200) -and $chain.OutsideTree -eq 2 -and (Get-TreePids $chain) -eq "7777,8840,8848,9120,10232") -Message "tree: chained Child entries whose parent in the dump is not the collector's are both rejected (outside the tree: $($chain.OutsideTree)), the real tree is still left out"
+    # F1: a role the collector does not write
+    $foo = Get-TreeResult @($treeFull + @([PSCustomObject]@{ Role = "Foo"; Pid = 6300; Name = "dropper.exe"; StartUtc = "2026-05-15T12:03:07.3000000Z"; ParentPid = 9120 }))
+    Write-TestResult -Succeeded (-not (@($foo.Processes | ForEach-Object { [int]$_.Pid }) -contains 6300) -and $foo.OutsideTree -eq 1 -and @($foo.Mismatched | Where-Object { $_.Pid -eq 6300 -and $_.OutsideTree -and $_.Reason -match 'role "Foo" is not one the collector writes' }).Count -eq 1) -Message "tree: an unknown role is rejected and marked as not written by the collector"
+    # A genuine Child (started by the collector during the collection) and one
+    # started by it in turn are accepted
+    $kids = Find-ReportCollectorRows -Rows @($treeRows + @(
+            (New-TestProc -Time "2026-05-15 12:03:10.000" -Name "helper.exe" -ProcId 11000 -Ppid 9120),
+            (New-TestProc -Time "2026-05-15 12:03:11.000" -Name "sub.exe" -ProcId 11100 -Ppid 11000))) -CollectionInfo ([PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $treeStart; CollectorProcesses = @($treeFull + @(
+                [PSCustomObject]@{ Role = "Child"; Pid = 11000; Name = "helper.exe"; StartUtc = "2026-05-15T12:03:10.1000000Z"; ParentPid = 9120 },
+                [PSCustomObject]@{ Role = "Child"; Pid = 11100; Name = "sub.exe"; StartUtc = "2026-05-15T12:03:11.1000000Z"; ParentPid = 11000 })) })
+    Assert-Equal "$(@($kids.Processes | Where-Object { $_.Pid -eq 11000 -or $_.Pid -eq 11100 } | ForEach-Object { $_.How }) -join '|')|$($kids.OutsideTree)" "recorded by the collector: child|recorded by the collector: child|0" -Message "tree: a Child of the collector and a Child of that child are both accepted"
+
+    # F2: an anchor that is not a PowerShell process, or that started after
+    # the collection; a launcher that is not the collector's cmd.exe parent
+    $notPs = Get-TreeResult @(
+        [PSCustomObject]@{ Role = "Collector"; Pid = 6100; Name = "loader.exe"; StartUtc = "2026-05-15T12:03:05.3000000Z"; ParentPid = 5000 },
+        [PSCustomObject]@{ Role = "Launcher"; Pid = 5000; Name = "explorer.exe"; StartUtc = "2026-05-15T08:00:00.1000000Z"; ParentPid = 4000 })
+    Assert-Equal "$($notPs.Count)|$($notPs.Anchored)|$($notPs.OutsideTree)" "0|False|1" -Message "tree: a Collector that is not a PowerShell process is not an anchor: nothing left out (explorer.exe and its children included)"
+    $late = Get-TreeResult $treeFull "2026-05-15T12:02:50Z"
+    Write-TestResult -Succeeded ($late.Count -eq 0 -and -not $late.Anchored -and @($late.Mismatched | Where-Object { $_.Pid -eq 9120 -and $_.Reason -match "started after the collection did" }).Count -eq 1) -Message "tree: a Collector that started after the collection is not an anchor"
+    $explorerLauncher = Get-TreeResult @($treeCollector, [PSCustomObject]@{ Role = "Launcher"; Pid = 5000; Name = "explorer.exe"; StartUtc = "2026-05-15T08:00:00.1000000Z"; ParentPid = 4000 })
+    $elPids = @($explorerLauncher.Processes | ForEach-Object { [int]$_.Pid })
+    Write-TestResult -Succeeded ($explorerLauncher.Anchored -and -not ($elPids -contains 5000) -and -not ($elPids -contains 6300) -and $explorerLauncher.OutsideTree -eq 1) -Message "tree: a Launcher that is not the collector's cmd.exe parent (explorer.exe) is rejected; explorer.exe and the processes it started are not left out"
+
+    # F4: the collector's own fallback (Win32_Process unreadable): only the
+    # Collector, ParentPid 0. The launcher is not left out, so its lead keeps
+    # the "possibly the collector" card note; other leads do not get it
+    $only = Get-TreeResult @([PSCustomObject]@{ Role = "Collector"; Pid = 9120; Name = "powershell.exe"; StartUtc = "2026-05-15T12:02:58.1234567Z"; ParentPid = 0 })
+    Assert-Equal "$(Get-TreePids $only)|$(@($only.SuspectPids) -join ',')|$($only.OutsideTree)" "7777,9120,10232|8840|0" -Message "tree: a Collector-only record leaves out the collector and the processes it started; its parent (the launcher) is a suspect pid"
+    $onlyInfo = [PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $treeStart; CollectorProcesses = @([PSCustomObject]@{ Role = "Collector"; Pid = 9120; Name = "powershell.exe"; StartUtc = "2026-05-15T12:02:58.1234567Z"; ParentPid = 0 }) }
+    $onlyLeads = @(Invoke-ReportRules -Rows $treeRows -Rules $skipRules -CollectionInfo $onlyInfo -CollectorRows $only)
+    $onlyCmd = @($onlyLeads | Where-Object { $_.GroupKey -eq "cmd.exe" })
+    $onlyLoader = @($onlyLeads | Where-Object { $_.GroupKey -eq "loader.exe" })
+    Write-TestResult -Succeeded ($onlyCmd.Count -eq 1 -and [bool]$onlyCmd[0].CollectorSuspect -and $onlyLoader.Count -eq 1 -and -not [bool]$onlyLoader[0].CollectorSuspect -and @($onlyLeads | Where-Object { $_.GroupKey -eq "powershell.exe" }).Count -eq 0) -Message "tree: Collector-only record: the launcher's lead is marked CollectorSuspect, another lead from during the collection is not"
+    # F4: a launcher whose start time does not match: not left out, a suspect
+    # pid; its console fails with it (the launcher was not recognized), which
+    # is not counted as an edit
+    $offLauncher = [PSCustomObject]@{ Role = "Launcher"; Pid = 8840; Name = "cmd.exe"; StartUtc = "2026-05-15T12:02:51.7000000Z"; ParentPid = 5000 }
+    $off = Get-TreeResult @($treeCollector, $offLauncher, $treeConsole, $treeCapture)
+    Write-TestResult -Succeeded ($off.Anchored -and $off.OutsideTree -eq 0 -and (@($off.SuspectPids) -contains 8840) -and @($off.Mismatched | Where-Object { $_.Pid -eq 8848 -and $_.Reason -match "the launcher \(PID 8840\), was not recognized" }).Count -eq 1) -Message "tree: a launcher with another start time is a suspect pid, and its console's reason names the launcher"
+    $offLeads = @(Invoke-ReportRules -Rows $treeRows -Rules $skipRules -CollectionInfo ([PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $treeStart; CollectorProcesses = @($treeCollector, $offLauncher, $treeConsole, $treeCapture) }) -CollectorRows $off)
+    Write-TestResult -Succeeded (@($offLeads | Where-Object { $_.GroupKey -eq "cmd.exe" -and $_.CollectorSuspect }).Count -eq 1) -Message "tree: the unmatched launcher's lead is marked CollectorSuspect"
+    $fullLeads = @(Invoke-ReportRules -Rows $treeRows -Rules $skipRules -CollectionInfo ([PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $treeStart; CollectorProcesses = $treeFull }) -CollectorRows $tree)
+    Write-TestResult -Succeeded (@($fullLeads | Where-Object { $_.GroupKey -eq "cmd.exe" -or $_.GroupKey -eq "powershell.exe" }).Count -eq 0 -and @($fullLeads | Where-Object { $_.CollectorSuspect }).Count -eq 0 -and @($fullLeads | Where-Object { $_.GroupKey -eq "stale.exe" }).Count -eq 1) -Message "tree: with the full record the launcher and collector are not leads, no lead is CollectorSuspect, and the process under a reused parent id is a lead"
+
+    # The model: a note when entries were not written by the collector, and
+    # Coverage.CollectorProcesses.OutsideTree
+    $chainInfo = [PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $treeStart; CollectorProcesses = @($treeFull) }
+    $chainModel = New-ReportModel -Rows $treeRows -Findings @() -CollectionInfo $chainInfo -CollectorRows $chain
+    Write-TestResult -Succeeded (@($chainModel.Coverage.Notes | Where-Object { $_ -match "lists 2 process\(es\) the collector would not have recorded that way" -and $_ -match "Check whether collection_info.json was altered" }).Count -eq 1 -and $chainModel.Coverage.CollectorProcesses.OutsideTree -eq 2) -Message "model: entries outside the collector's tree get the 'check whether collection_info.json was altered' note and OutsideTree"
+    $fullModel = New-ReportModel -Rows $treeRows -Findings @() -CollectionInfo $chainInfo -CollectorRows $tree
+    Write-TestResult -Succeeded (@($fullModel.Coverage.Notes | Where-Object { $_ -match "was altered" }).Count -eq 0 -and $fullModel.Coverage.CollectorProcesses.OutsideTree -eq 0) -Message "model: an unedited record gets no altered note"
+
+    # F5: why the collector's own process IDs are not known
+    $stateCases = @(
+        @{ Name = "Unreadable"; Info = [PSCustomObject]@{ Mode = ""; CollectionInfoState = "Unreadable" }; Note = "collection_info.json could not be read" },
+        @{ Name = "Missing"; Info = [PSCustomObject]@{ Mode = ""; CollectionInfoState = "Missing" }; Note = "collection_info.json was not available" },
+        @{ Name = "NoUsableEntries"; Info = [PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $treeStart; CollectionInfoState = "Read"; CollectorProcesses = @() }; Note = "has a CollectorProcesses field but no usable entry" },
+        @{ Name = "NoUsableEntries"; Info = [PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $treeStart; CollectionInfoState = "Read"; CollectorProcesses = [PSCustomObject]@{} }; Note = "has a CollectorProcesses field but no usable entry" },
+        @{ Name = "NotRecorded"; Info = [PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $treeStart; CollectionInfoState = "Read" }; Note = "made by an older triage collector" },
+        @{ Name = "Missing"; Info = $null; Note = "collection_info.json was not available" }
+    )
+    foreach ($case in $stateCases) {
+        $stateResult = Find-ReportCollectorRows -Rows $treeRows -CollectionInfo $case.Info
+        $stateModel = New-ReportModel -Rows $treeRows -Findings @() -CollectionInfo $case.Info -CollectorRows $stateResult
+        $stateNotes = @($stateModel.Coverage.Notes | Where-Object { $_ -match [regex]::Escape($case.Note) })
+        $otherNotes = @($stateModel.Coverage.Notes | Where-Object { $_ -match "older triage collector|could not be read|was not available, so|no usable entry" })
+        Write-TestResult -Succeeded ($stateResult.State -eq $case.Name -and -not $stateResult.Recorded -and $stateResult.Count -eq 0 -and $stateNotes.Count -eq 1 -and $otherNotes.Count -eq 1) -Message "collector state $($case.Name): nothing left out, and the note says why ('$($case.Note)'; state $($stateResult.State))"
+    }
+    $imgState = Find-ReportCollectorRows -Rows $treeRows -CollectionInfo ([PSCustomObject]@{ Mode = "MountedImage"; CollectionInfoState = "Read" })
+    Assert-Equal $imgState.State "NotApplicable" -Message "collector state: a mounted image is NotApplicable"
 
     if ($script:failures -gt 0) {
         Write-Host "FAIL: $($script:failures) of $($script:checks) check(s) failed" -ForegroundColor Red

@@ -1,0 +1,3 @@
+[
+  { "PID": 900, "Start": "SERVICE_AUTO_START", "State": "SERVICE_RUNNING", "Name": "Dhcp", "Display": "DHCP Client", "Binary": "C:\\Windows\\system32\\svchost.exe -k LocalServiceNetworkRestricted -p", "__children": [] }
+]

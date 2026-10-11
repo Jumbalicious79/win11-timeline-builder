@@ -1045,10 +1045,21 @@ function Get-TimelineReportCollectionInfo {
         CollectionStartUtc       = $null
         SecretsIncluded          = $false
         ThunderbirdIndexIncluded = $false
+        # The collector's own process IDs in the memory dump (live collections
+        # only; older collections lack this field). The report leaves exactly
+        # these processes, and those they start during the collection,
+        # unflagged in the memory dump.
+        CollectorProcesses       = $null
+        # Whether collection_info.json was read ("Read"), is not there
+        # ("Missing") or could not be read ("Unreadable"), so the report can
+        # say why the collector's own process IDs are not known
+        CollectionInfoState      = "Missing"
     }
     if ($InfoJsonPath -and (Test-Path -LiteralPath $InfoJsonPath -PathType Leaf)) {
         try {
             $json = Get-Content -LiteralPath $InfoJsonPath -Raw -ErrorAction Stop | ConvertFrom-Json
+            if ($null -eq $json) { throw "the file is empty" }
+            $info.CollectionInfoState = "Read"
             foreach ($name in @("ComputerName", "CollectorUser", "Mode", "TargetTimeZoneId")) {
                 if ($json.PSObject.Properties[$name] -and $json.$name) { $info[$name] = [string]$json.$name }
             }
@@ -1057,8 +1068,12 @@ function Get-TimelineReportCollectionInfo {
             foreach ($name in @("SecretsIncluded", "ThunderbirdIndexIncluded")) {
                 if ($json.PSObject.Properties[$name]) { $info[$name] = [bool]$json.$name }
             }
+            if ($json.PSObject.Properties["CollectorProcesses"] -and $null -ne $json.CollectorProcesses) { $info.CollectorProcesses = $json.CollectorProcesses }
         }
-        catch { Log-Warning "  Could not read $InfoJsonPath for the report: $($_.Exception.Message)" }
+        catch {
+            $info.CollectionInfoState = "Unreadable"
+            Log-Warning "  Could not read $InfoJsonPath for the report: $($_.Exception.Message)"
+        }
     }
     if ($BuilderInfo) {
         if ($BuilderInfo.Mode) { $info.Mode = [string]$BuilderInfo.Mode }
@@ -1139,9 +1154,41 @@ function Invoke-TimelineReportRules {
         $rules = Import-ReportRules -Path $RulesPath
         $statistics = @{}
         $ruleWarnings = $null
-        $findings = @(Invoke-ReportRules -Rows $Rows -Rules $rules -CollectionInfo $CollectionInfo -Statistics $statistics -WarningVariable ruleWarnings -WarningAction SilentlyContinue)
+        # The collector's own processes in the memory dump, recognized by the
+        # IDs collection_info.json records, are left out of the rules
+        $collector = Find-ReportCollectorRows -Rows $Rows -CollectionInfo $CollectionInfo
+        $findings = @(Invoke-ReportRules -Rows $Rows -Rules $rules -CollectionInfo $CollectionInfo -Statistics $statistics -CollectorRows $collector -WarningVariable ruleWarnings -WarningAction SilentlyContinue)
         $timer.Stop()
         foreach ($warning in @($ruleWarnings)) { Log-Warning "  $warning" }
+        if ($collector.Recorded -and $collector.HasMemoryRows -and [int]$collector.Count -gt 0) {
+            $roleList = @($collector.Processes | ForEach-Object { "$($_.Name) (PID $($_.Pid))" }) -join ", "
+            Log "  $($collector.Summary): $roleList; $([int]$collector.RowCount) row(s) left out of the rules"
+        }
+        elseif ($collector.Recorded -and $collector.HasMemoryRows) {
+            Log "  Collector's own processes recorded in collection_info.json, but its PowerShell process could not be recognized in the memory dump (see below): nothing is left out, and a lead seen only in the memory dump during the collection is marked on its card as possibly the collector."
+        }
+        foreach ($mismatch in @($collector.Mismatched)) {
+            $recordedTime = if ($mismatch.RecordedStartUtc) { $mismatch.RecordedStartUtc.ToString("yyyy-MM-dd HH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture) } else { "unknown time" }
+            $dumpTime = if ($mismatch.DumpCreateTimeUtc) { $mismatch.DumpCreateTimeUtc.ToString("yyyy-MM-dd HH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture) } else { "no recorded time" }
+            $dumpText = if ($mismatch.DumpName) { " and the memory dump has $($mismatch.DumpName) ($dumpTime) with that PID" } else { "" }
+            Log-Warning "  collection_info.json lists PID $($mismatch.Pid) ($($mismatch.Name), $($mismatch.Role), started $recordedTime)${dumpText}: not left out ($($mismatch.Reason))."
+        }
+        foreach ($missing in @($collector.NotInDump)) {
+            Log "  The collector recorded PID $($missing.Pid) ($($missing.Name), $($missing.Role)) but the memory dump has no process with that PID."
+        }
+        if ($collector.PSObject.Properties["OutsideTree"] -and [int]$collector.OutsideTree -gt 0) {
+            Log-Warning "  collection_info.json lists $([int]$collector.OutsideTree) process(es) the collector would not have recorded that way (see above); they were not left out. Check whether collection_info.json was altered after the collection."
+        }
+        $memoryPresent = @($Rows | Where-Object { "$($_.Source)" -like "Memory-*" }).Count -gt 0
+        # (A mounted image's collection has no process IDs to record: NotApplicable)
+        if ($memoryPresent -and -not $collector.Recorded -and [string]$collector.State -ne "NotApplicable") {
+            switch ([string]$collector.State) {
+                "Unreadable" { Log "  collection_info.json could not be read (see above), so the collector's own process IDs are not known: its own processes in the memory dump are checked by the rules like any other." }
+                "Missing" { Log "  collection_info.json was not available, so the collector's own process IDs are not known: its own processes in the memory dump are checked by the rules like any other." }
+                "NoUsableEntries" { Log "  collection_info.json has a CollectorProcesses field with no usable entry: the collector's own processes in the memory dump are checked by the rules like any other." }
+                default { Log "  This collection does not record the collector's own process IDs (older triage collector): its own processes in the memory dump are checked by the rules like any other." }
+            }
+        }
         $high = @($findings | Where-Object { $_.Severity -eq "High" }).Count
         $medium = @($findings | Where-Object { $_.Severity -eq "Medium" }).Count
         $info = $findings.Count - $high - $medium
@@ -1158,6 +1205,7 @@ function Invoke-TimelineReportRules {
             Rules           = $rules
             Findings        = [object[]]$findings
             Statistics      = $statistics
+            CollectorRows   = $collector
             High            = $high
             Medium          = $medium
             Info            = $info
@@ -1206,6 +1254,20 @@ function Set-TimelineReportRowLink {
     $Cell.Style.Font.Color.SetColor((ConvertTo-TimelineReportColor "0563C1"))
 }
 
+# Caps the column widths of the Timeline sheet. Export-Excel -AutoSize fits
+# each column to its longest text in the first 1,000 rows, which makes
+# Description, Details and RawPath several screens wide; the cells keep all
+# their text (wrap stays off, so each row stays one line high: the cell or
+# the formula bar shows the rest). A few columns, so it costs nothing.
+function Limit-TimelineColumnWidth {
+    param($Sheet, [double]$MaxWidth = 80)
+    if (-not $Sheet -or -not $Sheet.Dimension) { return }
+    for ($c = 1; $c -le $Sheet.Dimension.End.Column; $c++) {
+        $column = $Sheet.Column($c)
+        if ($column.Width -gt $MaxWidth) { $column.Width = $MaxWidth }
+    }
+}
+
 # Adds the report's findings to an open workbook (EPPlus package from
 # ImportExcel): a FIRST sheet "Findings" -- per finding a summary row, then
 # one row per evidence row, each linked to its row on the Timeline sheet --
@@ -1213,12 +1275,19 @@ function Set-TimelineReportRowLink {
 # matching row, to filter on. A Findings sheet and Finding column from an
 # earlier run (-ReportOnly) are replaced. Throws on failure.
 function Add-TimelineReportWorkbookSheets {
-    param($Package, [object[]]$Findings)
+    param($Package, [object[]]$Findings, $CollectorRows)
     $invariant = [System.Globalization.CultureInfo]::InvariantCulture
     $workbook = $Package.Workbook
     $timeline = $workbook.Worksheets["Timeline"]
     if (-not $timeline -or -not $timeline.Dimension) { throw "the workbook has no Timeline sheet" }
     $lastRow = $timeline.Dimension.End.Row
+    # Timeline row numbers of the collector's own memory-dump rows (left out of
+    # the rules): the Finding column tags them "Collector (not flagged)"
+    $collectorMarker = "Collector (not flagged)"
+    $collectorRowNumbers = @()
+    if ($null -ne $CollectorRows -and [int]$CollectorRows.Count -gt 0) {
+        $collectorRowNumbers = @($CollectorRows.Rows | ForEach-Object { [int]$_.RowNumber })
+    }
     $severityOf = @{}
     foreach ($finding in $Findings) { $severityOf[[string]$finding.Id] = [string]$finding.Severity }
     $severityRank = @{ High = 3; Medium = 2; Info = 1 }
@@ -1254,6 +1323,11 @@ function Add-TimelineReportWorkbookSheets {
             $cell.Style.Font.Color.SetColor((ConvertTo-TimelineReportColor $script:reportSeverityColors[$top][1]))
         }
     }
+    # The collector's own rows are not in any finding: tag them, no color
+    foreach ($collectorRowNumber in $collectorRowNumbers) {
+        if ($collectorRowNumber -lt 2 -or $collectorRowNumber -gt $lastRow) { continue }
+        $timeline.Cells[$collectorRowNumber, $findingColumn].Value = $collectorMarker
+    }
     # Widen the AutoFilter to the new column
     $timeline.Cells[1, 1, [Math]::Max(2, $lastRow), $findingColumn].AutoFilter = $true
 
@@ -1283,13 +1357,14 @@ function Add-TimelineReportWorkbookSheets {
         $summary = "$($finding.Count) matching row(s), $first to $last UTC"
         if ($finding.GroupKey) { $summary += "; group: $($finding.GroupKey)" }
         if ($finding.Escalated) { $summary += "; severity raised by $($finding.EscalationCount) related row(s)" }
-        if ($rowNumbers.Count -gt $evidence.Count) { $summary += "; the first $($evidence.Count) of $($rowNumbers.Count) rows are listed (filter the Finding column of the Timeline sheet for all)" }
+        if ($rowNumbers.Count -gt $evidence.Count) { $summary += "; the $(if ($finding.EvidenceLatest) { 'latest' } else { 'first' }) $($evidence.Count) of $($rowNumbers.Count) rows are listed (filter the Finding column of the Timeline sheet for all)" }
         if ($finding.AllowlistedCount) { $summary += "; $($finding.AllowlistedCount) allowlisted row(s) not counted" }
         # Every row from the memory dump: the engine's note, "Captured in the memory dump"
         if ($finding.MemoryOnly) { $summary += "; $($finding.MemoryOnlyNote)" }
         if ($finding.DuringCollection) { $summary += "; all rows are from during the collection (possibly the collector itself)" }
         elseif ($finding.CapturedDuringCollection) { $summary += "; seen only in Snapshot rows from during the collection (the state when it was collected or the memory dump captured; it may have started earlier: check it is not the collector or its memory tool)" }
         if ($finding.TimesAuthorSupplied) { $summary += "; dated only by a task's author-supplied registration date (can be old or forged)" }
+        elseif ($finding.TimesCollectorCaused) { $summary += "; dated only by a registry key last-write time the triage collector itself set during the collection (the activity is older)" }
 
         # Summary row: the whole row in the severity color, linked to the first row
         $values = @($finding.Id, $severity, "Summary", $null, $first, $finding.Title, $summary, "", "", "", $finding.Category, $finding.RuleId)
@@ -1327,6 +1402,31 @@ function Add-TimelineReportWorkbookSheets {
         $sheet.Cells[2, 6].Value = "The report rules found nothing in this timeline."
         $row++
     }
+
+    # The collector's own processes in the memory dump: a gray summary row,
+    # then one "Not flagged" row per left-out row, linked to the Timeline row
+    if ($null -ne $CollectorRows -and [int]$CollectorRows.Count -gt 0) {
+        $collectorColor = "D9D9D9"
+        $summaryText = "Recognized by process ID, name and start time (collection_info.json); rows stay on the Timeline sheet and are not checked by the rules"
+        $values = @("Collector", "Not flagged", "Summary", $null, "", $CollectorRows.Summary, $summaryText, "", "", "", "", "")
+        for ($c = 0; $c -lt $values.Count; $c++) {
+            if ($c -ne 3) { $sheet.Cells[$row, ($c + 1)].Value = ConvertTo-TimelineReportCellText ([string]$values[$c]) }
+        }
+        $summaryRange = $sheet.Cells[$row, 1, $row, $headers.Count]
+        $summaryRange.Style.Font.Bold = $true
+        $summaryRange.Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+        $summaryRange.Style.Fill.BackgroundColor.SetColor((ConvertTo-TimelineReportColor $collectorColor))
+        $row++
+        foreach ($item in $CollectorRows.Rows) {
+            $values = @("Collector", "Not flagged", "Not flagged", $null, $item.Timestamp, $CollectorRows.Summary, $item.Description, $item.Source, $item.EventType, $item.User, "", "")
+            for ($c = 0; $c -lt $values.Count; $c++) {
+                if ($c -ne 3) { $sheet.Cells[$row, ($c + 1)].Value = ConvertTo-TimelineReportCellText ([string]$values[$c]) }
+            }
+            Set-TimelineReportRowLink -Cell $sheet.Cells[$row, 4] -RowNumber ([int]$item.RowNumber)
+            $row++
+        }
+    }
+
     $sheet.Cells[1, 1, ($row - 1), $headers.Count].AutoFilter = $true
     $sheet.View.FreezePanes(2, 1)
 
@@ -1345,7 +1445,7 @@ function Add-TimelineReportWorkbookSheets {
 # -ReportOnly: adds the findings to an existing workbook (it must hold the
 # same rows as timeline.csv). $true when the workbook was updated.
 function Update-TimelineReportWorkbook {
-    param([string]$Path, [object[]]$Findings, [int]$RowCount)
+    param([string]$Path, [object[]]$Findings, [int]$RowCount, $CollectorRows)
     $staleNote = "$(Split-Path $Path -Leaf) keeps the Findings sheet and Finding column of the earlier report (if it has them): their finding ids do not match this report."
     if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
         Log-Warning "  ImportExcel is not installed, so the workbook's findings are not updated (Install-Module -Name ImportExcel -Scope CurrentUser). $staleNote"
@@ -1363,7 +1463,9 @@ function Update-TimelineReportWorkbook {
         if (-not $timeline -or -not $timeline.Dimension) { throw "it has no Timeline sheet" }
         $sheetRows = $timeline.Dimension.End.Row - 1
         if ($sheetRows -ne $RowCount) { throw "its Timeline sheet has $sheetRows rows but the timeline CSV has $RowCount" }
-        Add-TimelineReportWorkbookSheets -Package $package -Findings $Findings
+        # (a workbook from an older builder has its columns sized to fit)
+        Limit-TimelineColumnWidth -Sheet $timeline
+        Add-TimelineReportWorkbookSheets -Package $package -Findings $Findings -CollectorRows $CollectorRows
         Close-ExcelPackage $package
         $package = $null
         Log-Success "  Workbook updated: Findings sheet and Finding column."
@@ -1407,13 +1509,15 @@ function Complete-TimelineReport {
     $findingsCsv = Join-Path $folder "findings.csv"
     $htmlPath = Join-Path $folder "report.html"
     $pdfPath = Join-Path $folder "report.pdf"
+    $collectorRows = $null
+    if ($State.PSObject.Properties["CollectorRows"]) { $collectorRows = $State.CollectorRows }
     try {
-        Export-ReportFindingsCsv -Findings $State.Findings -Path $findingsCsv
+        Export-ReportFindingsCsv -Findings $State.Findings -Path $findingsCsv -CollectorRows $collectorRows
         $modelWarnings = $null
         $model = New-ReportModel -Rows $Rows -Findings $State.Findings -CollectionInfo $CollectionInfo -CollectorLogPath $CollectorLogPath `
             -BuilderLogPath $BuilderLogPath -TimelinePath $timelineFull -WorkbookPath $workbookFull -WorkbookAvailable:$WorkbookAvailable `
             -Rules $State.Rules -RuleStatistics $State.Statistics -FindingsCsvPath $findingsCsv -MftDays $MftDays -CollectionPath $CollectionPath `
-            -MissingInputFiles $MissingInputFiles -UnexpectedErrors $UnexpectedErrors -WarningVariable modelWarnings -WarningAction SilentlyContinue
+            -MissingInputFiles $MissingInputFiles -UnexpectedErrors $UnexpectedErrors -CollectorRows $collectorRows -WarningVariable modelWarnings -WarningAction SilentlyContinue
         foreach ($warning in @($modelWarnings)) { Log-Warning "  $warning" }
         Export-ReportModelJson -Model $model -Path (Join-Path $folder "report-model.json")
         Export-ReportHtml -Model $model -Path $htmlPath
@@ -1598,8 +1702,6 @@ function Invoke-TimelineViewer {
         try {
             Start-Process -FilePath $XlsxPath
             Log-Success "  Excel launched with color-coded timeline."
-            Log "  NOTE: Excel may prompt to repair the file -- click Yes. This is a known"
-            Log "  ImportExcel library issue. The data and formatting are intact."
         }
         catch {
             Log-Warning "  Could not open Excel: $($_.Exception.Message)"
@@ -1714,7 +1816,7 @@ function Invoke-TimelineReportOnly {
             Log ""
             Log "--- Adding the Findings to the Excel Workbook ---"
             if ($NoExcel) { Log-Warning "  -NoExcel: the workbook is left as it is, so the report does not link to it. Its Findings sheet and Finding column (if any) are from an earlier report and do not match this report's finding ids." }
-            else { $workbookReady = Update-TimelineReportWorkbook -Path $xlsxFile -Findings $reportState.Findings -RowCount $reportRows.Count }
+            else { $workbookReady = Update-TimelineReportWorkbook -Path $xlsxFile -Findings $reportState.Findings -RowCount $reportRows.Count -CollectorRows $reportState.CollectorRows }
         }
         else {
             Log "  No workbook next to the timeline: the report gives timeline.csv row numbers."
@@ -3194,13 +3296,35 @@ function Add-SecurityEventEntry {
         -Artifact "EventLogs" -RawPath $FilePath
 }
 
-# System.evtx: event log cleared (104, Microsoft-Windows-Eventlog; SecurityAlert)
-# and the event log service started / stopped (6005 / 6006, EventLog), the
-# markers of a boot and of a clean shutdown (ServiceChange)
+# System.evtx: event log cleared (104, Microsoft-Windows-Eventlog; SecurityAlert),
+# the event log service started / stopped (6005 / 6006, EventLog), the
+# markers of a boot and of a clean shutdown (ServiceChange), and Windows
+# Update (Microsoft-Windows-WindowsUpdateClient; Installation): 44 download
+# started, 43 installation started, 19 installed, 20 installation failed.
+# A Windows update renames and moves thousands of system files while it
+# installs, which these rows put in context.
 function Add-SystemEventEntry {
     param($Record, [string]$FileName, [string]$FilePath)
     $id = [int]$Record.Id
-    if ($id -eq 104 -and $Record.ProviderName -eq "Microsoft-Windows-Eventlog") {
+    if ($id -in @(19, 20, 43, 44) -and $Record.ProviderName -eq "Microsoft-Windows-WindowsUpdateClient") {
+        $f = Get-EvtxEventFields $Record
+        $title = Get-EvtxFieldValue $f @("updateTitle")
+        $what = switch ($id) {
+            19 { "Windows Update installed" }
+            20 { "Windows Update installation failed" }
+            43 { "Windows Update installation started" }
+            default { "Windows Update download started" }
+        }
+        $errorCode = Get-EvtxFieldValue $f @("errorCode")
+        $desc = if ($title) { "${what}: $title" } else { $what }
+        if ($id -eq 20 -and $errorCode) { $desc += " (error $errorCode)" }
+        $kb = if ($title -match '\b(KB\d{6,8})\b') { $Matches[1] } else { "" }
+        Add-TimelineEntry -Timestamp $Record.TimeCreated -Source $FileName -EventType "Installation" `
+            -Description $desc `
+            -Details (Format-ArtifactDetails ([ordered]@{ EventID = $id; Update = $title; KB = $kb; ErrorCode = $errorCode; UpdateGuid = (Get-EvtxFieldValue $f @("updateGuid")); Revision = (Get-EvtxFieldValue $f @("updateRevisionNumber")) })) `
+            -Artifact "EventLogs" -RawPath $FilePath
+    }
+    elseif ($id -eq 104 -and $Record.ProviderName -eq "Microsoft-Windows-Eventlog") {
         $f = Get-EvtxEventFields $Record
         $by = Join-EvtxAccountName $f["SubjectDomainName"] $f["SubjectUserName"]
         Add-TimelineEntry -Timestamp $Record.TimeCreated -Source $FileName -EventType "SecurityAlert" `
@@ -4552,10 +4676,14 @@ function Parse-EventLogs {
                 }
             }
 
-            # System log events (104, 6005 and 6006 are handled by Add-SystemEventEntry)
+            # System log events (104, 6005 and 6006, and Windows Update's 19,
+            # 20, 43 and 44 -- those IDs only from its provider -- are handled by
+            # Add-SystemEventEntry)
             if ($logName -eq "System") {
                 $targetIds = @(7034, 7036, 7040, 7045, 1074, 6008, 104, 6005, 6006)
-                $events = @(Get-EvtxEventsById -Path $filePath -Ids $targetIds -Label "System")
+                $systemState = @{}
+                $events = @(Get-EvtxEventsById -Path $filePath -Ids $targetIds -Label "System" -State $systemState)
+                $events += @(Get-EvtxEventsById -Path $filePath -Ids @(19, 20, 43, 44) -Providers @("Microsoft-Windows-WindowsUpdateClient") -Label "System" -State $systemState)
                 if ($events.Count -gt 0) { Log "    Events read: $(Format-EvtxEventCounts $events)" }
 
                 foreach ($evt in $events) {
@@ -12405,8 +12533,10 @@ function Parse-UsnJournal {
     if ($MaxUsnEntries -gt 0) { Log "  Keeping the newest $MaxUsnEntries entries per journal file (-MaxUsnEntries, 0 = unlimited)." }
 
     # Leading fields of an fsutil "usn readjournal csv" line:
-    # Usn,"File name",File name length,Reason #,"Reason","Time stamp",File attributes #,...
-    $usnLineRegex = New-Object System.Text.RegularExpressions.Regex('^\d+,"(.*?)",\d+,0x[0-9A-Fa-f]+,"([^"]*)","([^"]*)"', [System.Text.RegularExpressions.RegexOptions]::Compiled)
+    # Usn,"File name",File name length,Reason #,"Reason","Time stamp",File attributes #,
+    # "File attributes",File ID,Parent file ID,... (File ID and Parent file ID
+    # are optional here: a line without them is read as before, unpaired)
+    $usnLineRegex = New-Object System.Text.RegularExpressions.Regex('^\d+,"(.*?)",\d+,0x[0-9A-Fa-f]+,"([^"]*)","([^"]*)"(?:,0x[0-9A-Fa-f]+,"[^"]*",([0-9A-Fa-f]+),([0-9A-Fa-f]+))?', [System.Text.RegularExpressions.RegexOptions]::Compiled)
 
     foreach ($usnFile in $usnFiles) {
         Log "  Parsing: $($usnFile.FullName)"
@@ -12417,6 +12547,9 @@ function Parse-UsnJournal {
         $dropped = 0
         $reader = $null
         $timeCache = @{}
+        # File ID -> old name and parent folder ID of a rename in progress
+        $renameFrom = New-Object 'System.Collections.Generic.Dictionary[string,string[]]'
+        $paired = 0
         # Ring buffer: once full, the oldest row is dropped for each new one
         $kept = New-Object 'System.Collections.Generic.Queue[object]'
         $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -12438,9 +12571,53 @@ function Parse-UsnJournal {
                 $m = $usnLineRegex.Match($line)
                 if (-not $m.Success) { $unparsed++; continue }
                 $total++
+                $reason = $m.Groups[2].Value
+
+                # A rename writes a "Rename: old name" record, then one or more
+                # "Rename: new name" records (the last with "| Close") for the
+                # same File ID. Each new-name row gets what it was renamed from,
+                # whether the extension changed (yes, no, or removed: only a
+                # temporary suffix dropped) and whether the parent folder
+                # changed (Moved): ransomware renames in place to a new
+                # extension; Windows servicing moves files between folders with
+                # their names. Paired before the date filter and the ring
+                # buffer, so a rename at their edge still pairs.
+                $renameInfo = ""
+                if ($m.Groups[4].Success -and $reason.IndexOf("Rename: ", [System.StringComparison]::Ordinal) -ge 0) {
+                    $fileId = $m.Groups[4].Value
+                    if ($reason.IndexOf("Rename: old name", [System.StringComparison]::Ordinal) -ge 0) {
+                        $renameFrom[$fileId] = [string[]]@($m.Groups[1].Value, $m.Groups[5].Value)
+                    }
+                    elseif ($reason.IndexOf("Rename: new name", [System.StringComparison]::Ordinal) -ge 0) {
+                        $from = $null
+                        if ($renameFrom.TryGetValue($fileId, [ref]$from)) {
+                            $oldName = $from[0]
+                            $newName = $m.Groups[1].Value
+                            $oldDot = $oldName.LastIndexOf('.')
+                            $newDot = $newName.LastIndexOf('.')
+                            $oldExt = if ($oldDot -ge 0) { $oldName.Substring($oldDot + 1) } else { "" }
+                            $newExt = if ($newDot -ge 0) { $newName.Substring($newDot + 1) } else { "" }
+                            $extChanged = if ([string]::Equals($oldExt, $newExt, [System.StringComparison]::OrdinalIgnoreCase)) { "no" } else { "yes" }
+                            # "removed": only a suffix after a '.' or '_' was dropped
+                            # ("photo.jpg.part" -> "photo.jpg", "IMG.JPG_exiftool_tmp"
+                            # -> "IMG.JPG"): a finished download or atomic save, not
+                            # ransomware's new extension. The separator is required:
+                            # ".ZXCRYT" -> ".ZXCRY" stays "yes".
+                            if ($extChanged -eq "yes" -and $oldName.Length -gt $newName.Length -and
+                                $oldName.StartsWith($newName, [System.StringComparison]::OrdinalIgnoreCase) -and
+                                ($oldName[$newName.Length] -eq [char]'.' -or $oldName[$newName.Length] -eq [char]'_')) {
+                                $extChanged = "removed"
+                            }
+                            $moved = if ($from[1] -ceq $m.Groups[5].Value) { "no" } else { "yes" }
+                            # From= last: a file name cannot fake the two flags before it
+                            $renameInfo = " | ExtChanged=$extChanged | Moved=$moved | From=$oldName"
+                            $paired++
+                            if ($reason.IndexOf("Close", [System.StringComparison]::Ordinal) -ge 0) { [void]$renameFrom.Remove($fileId) }
+                        }
+                    }
+                }
 
                 # Skip pure "Close" or "Basic info change | Close" entries to reduce noise
-                $reason = $m.Groups[2].Value
                 if ($reason -eq "Close" -or $reason -eq "Basic info change | Close") {
                     $skipped++
                     continue
@@ -12467,7 +12644,7 @@ function Parse-UsnJournal {
                     [void]$kept.Dequeue()
                     $dropped++
                 }
-                $kept.Enqueue(@($ts, $m.Groups[1].Value, $reason))
+                $kept.Enqueue(@($ts, $m.Groups[1].Value, $reason, $renameInfo))
             }
         }
         catch {
@@ -12478,7 +12655,7 @@ function Parse-UsnJournal {
         }
 
         $readSeconds = [Math]::Round($stopwatch.Elapsed.TotalSeconds, 1)
-        Log "  Read $total USN row(s) in $readSeconds s (skipped $skipped noisy close events, $unparsed unparsed line(s), $outOfRange outside the date filter)."
+        Log "  Read $total USN row(s) in $readSeconds s (skipped $skipped noisy close events, $unparsed unparsed line(s), $outOfRange outside the date filter; $paired renamed-to record(s) paired with their old name)."
         # Adding the rows takes far longer than reading them (about 1-2
         # minutes for 350,000 rows), and nothing is printed meanwhile
         if ($kept.Count -gt 0) { Log "  Adding $($kept.Count) USN entries to the timeline (about 1-2 minutes for 350,000 entries)..." }
@@ -12489,6 +12666,7 @@ function Parse-UsnJournal {
             $ts = $item[0]
             $fileName = $item[1]
             $reason = $item[2]
+            $renameInfo = $item[3]
             if ($null -eq $minTs -or $ts -lt $minTs) { $minTs = $ts }
             if ($null -eq $maxTs -or $ts -gt $maxTs) { $maxTs = $ts }
 
@@ -12500,8 +12678,9 @@ function Parse-UsnJournal {
             elseif ($reason -match "Security change") { $desc = "USN security changed: $fileName" }
             elseif ($reason -match "Basic info change") { $desc = "USN attr changed: $fileName" }
 
+            # A paired rename's new-name row: " | ExtChanged=yes|no|removed | Moved=yes|no | From=<old name>"
             Add-TimelineEntry -Timestamp $ts -Source "UsnJournal" -EventType "FileAccess" `
-                -Description $desc -Details "Reason=$reason" `
+                -Description $desc -Details "Reason=$reason$renameInfo" `
                 -Artifact "UsnJournal" -RawPath $usnFile.FullName
         }
 
@@ -16819,12 +16998,12 @@ function Write-NoMemoryDumpToOffer {
         # Copying the dump next to the zip would not help: it is not offered
         Log "No memory dump to offer: $($notFound.Note)."
         Log "  The collection is from a Windows ARM64 computer, so the dump does not need to be copied here."
-        Write-MemoryDumpNotAnalyzed "collection_manifest.csv lists one$($sizeText): a Windows ARM64 dump (the collection's systeminfo.txt says ARM64), which Volatility 3 cannot analyze; examine it in WinDbg."
+        Write-MemoryDumpNotAnalyzed -What "the dump listed in collection_manifest.csv$($sizeText)" -Why (Get-MemoryDumpArm64Reason)
     }
     else {
         Log "No memory dump to offer: $($notFound.Note)."
         Log "  To have it analyzed, $($notFound.Remedy), then run the builder again."
-        Write-MemoryDumpNotAnalyzed "collection_manifest.csv lists one$($sizeText), but it was not found (or not usable) next to the collection or where the collector saved it."
+        Write-MemoryDumpNotAnalyzed -What "the dump listed in collection_manifest.csv$($sizeText)" -Why "it was not found (or not usable) next to the collection or where the collector saved it"
     }
     Log ""
 }
@@ -16842,10 +17021,18 @@ function Get-MemoryDumpSizeText {
 
 # The line the findings report reads from the log (TimelineReport.Engine.ps1,
 # Read-ReportEngineBuilderLog) when a memory dump of the collection exists
-# but this run did not analyze it: "Memory dump not analyzed: <what and why>"
+# but this run did not analyze it: "Memory dump not analyzed: <what> --
+# <why>". $Why is the reason as one short phrase, then any advice after
+# "; " (the report's caveat gives the reason, its note the whole line).
 function Write-MemoryDumpNotAnalyzed {
-    param([string]$Text)
-    Log "  Memory dump not analyzed: $Text"
+    param([string]$What, [string]$Why)
+    Log "  Memory dump not analyzed: $What -- $Why."
+}
+
+# Why a Windows ARM64 dump is not analyzed (Volatility 3 reads only Intel
+# x86/x64 Windows memory), for Write-MemoryDumpNotAnalyzed
+function Get-MemoryDumpArm64Reason {
+    return "Volatility 3 cannot read Windows ARM64 dumps; examine it in WinDbg"
 }
 
 # $true when the collection comes from a Windows ARM64 computer: its
@@ -17135,7 +17322,7 @@ function Parse-Memory {
     $dumpText = "$([System.IO.Path]::GetFileName($dumpPath))$(Get-MemoryDumpSizeText -Bytes (Get-Item -LiteralPath $dumpPath -Force).Length)"
     if ($dumpArch -eq "ARM64") {
         Log-Warning "  This is a Windows ARM64 memory dump. Volatility 3 cannot analyze Windows ARM64 memory, so memory analysis is skipped."
-        Write-MemoryDumpNotAnalyzed "${dumpText}: a Windows ARM64 dump, which Volatility 3 cannot analyze; examine it in WinDbg."
+        Write-MemoryDumpNotAnalyzed -What $dumpText -Why (Get-MemoryDumpArm64Reason)
         Log "  Memory parsing complete."
         Log ""
         return
@@ -17154,7 +17341,7 @@ function Parse-Memory {
         Log "    2. Place vol.exe in: $(Join-Path $PSScriptRoot 'tools\volatility3\vol.exe')"
         Log ""
         Log "  Skipping memory analysis."
-        Write-MemoryDumpNotAnalyzed "${dumpText}: Volatility 3 (vol.exe) is not in the builder's tools\volatility3\ folder."
+        Write-MemoryDumpNotAnalyzed -What $dumpText -Why "Volatility 3 (vol.exe) is not in the builder's tools\volatility3\ folder"
         Log "  Memory parsing complete."
         Log ""
         return
@@ -18418,8 +18605,8 @@ if ($Sources -notcontains "Memory") {
         # Volatility 3 cannot analyze Windows ARM64 memory: don't offer it
         # (the next line says why, and names WinDbg)
         Log ""
-        Log "Memory dump detected: $(Get-MemoryDumpDisplayName $detectedDump) (Windows ARM64), not offered for analysis."
-        Write-MemoryDumpNotAnalyzed "${detectedDumpText}: a Windows ARM64 dump, which Volatility 3 cannot analyze; examine it in WinDbg."
+        Log "Memory dump detected: $(Get-MemoryDumpDisplayName $detectedDump) (Windows ARM64)"
+        Write-MemoryDumpNotAnalyzed -What $detectedDumpText -Why (Get-MemoryDumpArm64Reason)
         Log ""
         $detectedDump = $null
     }
@@ -18465,7 +18652,7 @@ if ($Sources -notcontains "Memory") {
             } else {
                 Log ""
                 Log "Memory analysis skipped (answer 2 at the memory prompt)."
-                Write-MemoryDumpNotAnalyzed "${detectedDumpText}: skipped at the memory prompt (run the builder again and answer 1 to analyze it)."
+                Write-MemoryDumpNotAnalyzed -What $detectedDumpText -Why "skipped at the memory prompt; run the builder again and answer 1 to analyze it"
                 Log ""
             }
         } else {
@@ -18473,7 +18660,7 @@ if ($Sources -notcontains "Memory") {
             Log "Memory dump detected ($(Get-MemoryDumpDisplayName $detectedDump)) but Volatility 3 not found in tools\ directory."
             Log "  To enable memory analysis, place vol.exe in: $(Join-Path $PSScriptRoot 'tools\volatility3\')"
             Log "  Download from: https://github.com/volatilityfoundation/volatility3/releases"
-            Write-MemoryDumpNotAnalyzed "${detectedDumpText}: Volatility 3 (vol.exe) is not in the builder's tools\volatility3\ folder."
+            Write-MemoryDumpNotAnalyzed -What $detectedDumpText -Why "Volatility 3 (vol.exe) is not in the builder's tools\volatility3\ folder"
             Log ""
         }
     }
@@ -18738,7 +18925,7 @@ if (-not $skipExcel -and (Get-Module -ListAvailable -Name ImportExcel)) {
 
         # Nothing is printed while the cells are cleaned and the workbook is
         # written: say how long that takes for a large timeline
-        Log "  Exporting $($sorted.Count) rows to Excel with conditional formatting (about 2 minutes for 300,000 rows)..."
+        Log "  Exporting $($sorted.Count) rows to Excel with row colors (about 2 minutes for 300,000 rows)..."
 
         # Second-pass sanitization for Excel compatibility:
         # 1. Remove XML-invalid characters (same rule as Add-TimelineEntry)
@@ -18770,6 +18957,7 @@ if (-not $skipExcel -and (Get-Module -ListAvailable -Name ImportExcel)) {
         if ($ws) {
             $totalRows = $ws.Dimension.End.Row
             $totalCols = $ws.Dimension.End.Column
+            Limit-TimelineColumnWidth -Sheet $ws
 
             # Find the EventType column index
             $eventTypeCol = -1
@@ -18827,7 +19015,7 @@ if (-not $skipExcel -and (Get-Module -ListAvailable -Name ImportExcel)) {
         # evidence rows, and a "Finding" column on the Timeline sheet
         if ($reportState) {
             try {
-                Add-TimelineReportWorkbookSheets -Package $excelPkg -Findings $reportState.Findings
+                Add-TimelineReportWorkbookSheets -Package $excelPkg -Findings $reportState.Findings -CollectorRows $reportState.CollectorRows
                 $reportState.WorkbookUpdated = $true
                 Log-Success "  Findings sheet and Finding column added ($(@($reportState.Findings).Count) finding(s))."
             }
@@ -18839,10 +19027,6 @@ if (-not $skipExcel -and (Get-Module -ListAvailable -Name ImportExcel)) {
         }
 
         Close-ExcelPackage $excelPkg
-
-        # Note: Excel may show a "Repaired Records" dialog when opening the xlsx.
-        # This is a known ImportExcel/EPPlus library issue -- the file data is intact.
-        # Excel repairs minor XML formatting differences and opens normally.
 
         $xlsxSizeMB = [math]::Round((Get-Item -LiteralPath $xlsxFile).Length / 1MB, 2)
         Log-Success "  Excel timeline: $xlsxFile ($xlsxSizeMB MB)"
