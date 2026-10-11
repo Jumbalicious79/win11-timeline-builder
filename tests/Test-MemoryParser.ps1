@@ -52,7 +52,8 @@
 # (TimelineReport.Engine.ps1), with the size the prompt shows. Parse-Memory
 # gives that line too (no vol.exe; an ARM64 dump the engine could not
 # read), and for an ARM64 dump that was read the "analyzed with the Windows
-# debugger engine" line (also processes only), the WinDbg command, and no
+# debugger engine" line (what was read and what not; also processes only)
+# with its "Memory dump coverage" lines, the WinDbg command, and no
 # Volatility 3.
 # The debugger engine path for Windows ARM64 dumps, with the helper's
 # functions (lib\memory\TimelineDbgEng.ps1) loaded from its syntax tree: the
@@ -88,8 +89,9 @@
 # describe the process structure (a failing process query, its "corrupted
 # linked list" warning, session ids decided per process).
 # Real helper processes: the real
-# helper on a fake dump, canned entries with every kind of character, a
-# crash, an error, a hang (ended), output without its end, no helper.
+# helper on a fake dump, canned entries with every kind of character (an
+# area's E and AREA lines and END with three counts too), a crash, an
+# error, a hang (ended), output without its end, no helper.
 # Then the dump header (Get-MemoryDumpInfo) on synthetic headers: the
 # architecture and the capture time (DUMP_HEADER64.SystemTime; zero,
 # implausible, 32-bit and raw fall back to the file's last-write time),
@@ -156,6 +158,10 @@ $functionAsts = @($ast.FindAll({ param($node) $node -is [System.Management.Autom
         $null -eq $parent
     })
 foreach ($functionAst in $functionAsts) { . ([scriptblock]::Create($functionAst.Extent.Text)) }
+# The rows of the debugger engine helper's entries (lib\memory\TimelineMemoryRows.ps1,
+# which the builder dot-sources at script level)
+$rowsAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Split-Path $builder -Parent) "lib\memory\TimelineMemoryRows.ps1"), [ref]$null, [ref]$null)
+$rowsAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false) | ForEach-Object { . ([scriptblock]::Create($_.Extent.Text)) }
 # The fixed and removable drives where Find-MemoryDump looks for a dump
 # whose drive has another letter now: folders of the test stand in for
 # them ($script:testDriveRoots, none unless a case sets them), so the
@@ -921,15 +927,17 @@ try {
     ${function:Invoke-DbgEngMemoryAnalysis} = { param([string]$DumpPath) $script:engineCalls++; $script:engineDump = $DumpPath; return $script:engineStub }
     ${function:Find-VolatilityExe} = { $script:volCalls++; return $null }
     $armCases = @(
-        @{ Name = "read"; Stub = [PSCustomObject]@{ Entries = 5; Processes = 3; CommandLines = 2; Reason = ""; PartialReason = "" }
-            Line = "  Memory dump analyzed with the Windows debugger engine: ${nameC}_memory_dump.dmp (8192 bytes) -- processes and command lines only; network connections and services are not read from Windows ARM64 dumps."
-            Complete = "  Memory analysis complete: 5 entries from 0 GB dump"; NotAnalyzed = "" },
-        @{ Name = "processes only"; Stub = [PSCustomObject]@{ Entries = 3; Processes = 3; CommandLines = 0; Reason = ""; PartialReason = "its command lines could not be read [boom]" }
-            Line = "  Memory dump analyzed with the Windows debugger engine: ${nameC}_memory_dump.dmp (8192 bytes) -- processes only, its command lines could not be read [boom]; network connections and services are not read from Windows ARM64 dumps."
-            Complete = "  Memory analysis complete: 3 entries from 0 GB dump"; NotAnalyzed = "" },
-        @{ Name = "not read"; Stub = [PSCustomObject]@{ Entries = 0; Processes = 0; CommandLines = 0; Reason = "the Windows debugger engine listed no processes in it (Error - Unable to find type '_EPROCESS *' for cast)"; PartialReason = "" }
+        @{ Name = "read"; Stub = [PSCustomObject]@{ Entries = 9; Processes = 3; CommandLines = 2; AreaRows = 4; Reason = ""; PartialReason = ""; ReadText = "read processes, command lines, DLLs; not read handles (stopped at its time limit of 60 s)"
+                CoverageTexts = @("DLLs -- the loader lists of 2 processes could not be read; 36 processes' memory-region trees were inconsistent") }
+            Line = "  Memory dump analyzed with the Windows debugger engine: ${nameC}_memory_dump.dmp (8192 bytes) -- read processes, command lines, DLLs; not read handles (stopped at its time limit of 60 s)"
+            Coverage = "  Memory dump coverage: DLLs -- the loader lists of 2 processes could not be read; 36 processes' memory-region trees were inconsistent"
+            Complete = "  Memory analysis complete: 9 entries from 0 GB dump"; NotAnalyzed = "" },
+        @{ Name = "processes only"; Stub = [PSCustomObject]@{ Entries = 3; Processes = 3; CommandLines = 0; AreaRows = 0; Reason = ""; PartialReason = "its command lines could not be read [boom]"; ReadText = "read processes; not read command lines (could not be read [boom])"; CoverageTexts = @() }
+            Line = "  Memory dump analyzed with the Windows debugger engine: ${nameC}_memory_dump.dmp (8192 bytes) -- read processes; not read command lines (could not be read [boom])"
+            Coverage = ""; Complete = "  Memory analysis complete: 3 entries from 0 GB dump"; NotAnalyzed = "" },
+        @{ Name = "not read"; Stub = [PSCustomObject]@{ Entries = 0; Processes = 0; CommandLines = 0; AreaRows = 0; Reason = "the Windows debugger engine listed no processes in it (Error - Unable to find type '_EPROCESS *' for cast)"; PartialReason = ""; ReadText = ""; CoverageTexts = @() }
             Line = "WARNING:   Memory analysis skipped: the Windows debugger engine listed no processes in it (Error - Unable to find type '_EPROCESS *' for cast)."
-            Complete = ""; NotAnalyzed = "${nameC}_memory_dump.dmp (8192 bytes) -- the Windows debugger engine listed no processes in it (Error - Unable to find type '_EPROCESS *' for cast)." }
+            Coverage = ""; Complete = ""; NotAnalyzed = "${nameC}_memory_dump.dmp (8192 bytes) -- the Windows debugger engine listed no processes in it (Error - Unable to find type '_EPROCESS *' for cast)." }
     )
     try {
         foreach ($case in $armCases) {
@@ -945,6 +953,11 @@ try {
             $winDbgLine = "  For more (handles, drivers and other kernel objects), open the dump in WinDbg; its command-line debugger, with the builder's symbol cache: $(Get-DbgEngWinDbgCommand -DumpPath $armDump)"
             Assert-Equal -Name "Parse-Memory, an ARM64 dump ($($case.Name)): the dump time, the debugger engine (not Volatility 3) on the dump, the line for the report, read back, and the WinDbg command" -Expected "True|True|True|1|$armDump|0|True|True|True|$expectedEngineLine|$($case.NotAnalyzed)|True" `
                 -Actual "$($log.Contains("Found memory dump: $armDump (0 GB, ARM64)"))|$($log.Contains("Dump time: $captureText UTC (crash dump header)"))|$($log.Contains("  Windows ARM64 dump: analyzing it with Microsoft's debugger engine (Volatility 3 cannot read ARM64 memory)"))|$($script:engineCalls)|$($script:engineDump)|$($script:volCalls)|$($log.Contains($case.Line))|$(-not $case.Complete -or $log.Contains($case.Complete))|$($log.Contains($winDbgLine))|$($readBack.MemoryDumpEngine)|$($readBack.MemoryDumpNotAnalyzed)|$($log.Contains('Memory parsing complete.'))"
+            # The coverage line of an area read in part: an information line
+            # (not a warning), read back by the report
+            $expectedCoverage = if ($case.Coverage) { $case.Coverage.Substring("  Memory dump coverage: ".Length) } else { "" }
+            Assert-Equal -Name "Parse-Memory, an ARM64 dump ($($case.Name)): the coverage line of each area read in part, no warning for it, read back" -Expected "True|False|$expectedCoverage" `
+                -Actual "$(if ($case.Coverage) { $log.Contains($case.Coverage) } else { -not $log.Contains('Memory dump coverage') })|$($log -match 'WARNING:\s+Memory dump coverage')|$(@($readBack.MemoryDumpCoverage) -join ' / ')"
         }
         Assert-Equal -Name "the WinDbg command: kdARM64.exe on ARM64 (kd.exe on another architecture), the dump and the builder's symbol cache with Microsoft's symbol server" -Expected "kdARM64.exe -z `"$armDump`" -y `"srv*$($script:testToolsFolder)\symbols*https://msdl.microsoft.com/download/symbols`"|kd.exe -z" `
             -Actual "$(Get-DbgEngWinDbgCommand -DumpPath $armDump -ProcessArchitecture ARM64)|$((Get-DbgEngWinDbgCommand -DumpPath $armDump -ProcessArchitecture AMD64).Substring(0, 9))"
@@ -2391,6 +2404,8 @@ function Read-DbgEngDump {
     $result.Unreadable = 3
     $result.Empty = 4
     $result.Seconds = 1.5
+    $result.Entries = @([PSCustomObject]@{ Kind = "Module"; Fields = [ordered]@{ PID = "4321"; Path = $text } })
+    $result.Areas = @([PSCustomObject]@{ Name = "Modules"; State = "Partial"; Rows = 1; Seconds = 0.5; Note = "1 process's loader list could not be read" })
     return $result
 }
 
@@ -2416,6 +2431,12 @@ function Read-DbgEngDump {
     $script:logFile = Join-Path $workDir "engine-direct.log"
     $state = Start-DbgEngWorker -WorkerPath $cannedHelper -WorkingDirectory $engineDir -TimeoutSeconds 120 -Arguments ([ordered]@{ DumpPath = $engineDump; EngineFolder = "C:\x\"; EngineDlls = "a.dll,b.dll"; SymbolCache = "C:\y"; JobFolder = $engineDir })
     Assert-Equal -Name "Start-DbgEngWorker: the entries exactly as sent (U+FFFE too), the END line, exit code 0, a trailing backslash in an argument" -Expected "True|True|0|0|True|True" -Actual "$($state.CommandLines[0].Args -ceq $cannedText)|$($state.Ended)|$($state.ExitCode)|$($state.BadLines)|$((Get-TestLog).Contains("  canned: $engineDump|C:\x\|a.dll+b.dll|C:\y|$engineDir"))|$($state.Processes[1].ExitTime -eq '2026-10-10T23:59:02.0000000+00:00' -and $null -eq $state.Processes[1].CreateTime -and $null -eq $state.Processes[1].PPID)"
+    Assert-Equal -Name "Start-DbgEngWorker: an area's entry exactly as sent (E line), its AREA line, the END line with the three counts" -Expected "1|4321|True|Modules|Partial|1|0.5|1 process's loader list could not be read" `
+        -Actual "$($state.EntryCount)|$($state.Entries['Module'][0].PID)|$($state.Entries['Module'][0].Path -ceq $cannedText)|$($state.Areas[0].Name)|$($state.Areas[0].State)|$($state.Areas[0].Rows)|$($state.Areas[0].Seconds)|$($state.Areas[0].Note)"
+    $readStart = $cannedResult.ReadText.StartsWith('read processes, command lines, DLLs; not read process users and paths (not reported by the debugger engine helper), kernel drivers (not reported')
+    $moduleRowsLogged = $cannedLog.Contains('    Memory-Modules rows (Module entries): 0 of 1 entries (0 timed, 0 snapshot)')
+    Assert-Equal -Name "the helper as a process: the areas' entries counted, the read text and the coverage text (an area not reported says so)" -Expected "True|DLLs -- 1 process's loader list could not be read|True" `
+        -Actual "$readStart|$(@($cannedResult.CoverageTexts) -join ' / ')|$moduleRowsLogged"
 
     $standIns = @(
         @{ Name = "a crash"; Script = '[Environment]::Exit(-1073741819)'; Reason = "the Windows debugger engine stopped (exit code 0xC0000005)" },

@@ -2,7 +2,9 @@
 # Report rules test
 # Dot-sources lib\report\TimelineReport.Engine.ps1, loads the real report rules
 # (lib\report\report-rules.json) and runs them over a synthetic timeline of
-# cases (tests\fixtures\report\rules\cases.csv).
+# cases: every tests\fixtures\report\rules\cases*.csv (cases.csv first, then
+# the others by name, such as the memory areas' cases-memory-<area>.csv),
+# their rows one after another in one timeline.
 #
 # Each fixture row carries its expectation in the RawPath column (the
 # engine ignores RawPath when matching), as one or more ";"-separated tags:
@@ -15,8 +17,9 @@
 #                              {{group}} in its title shows) must be <group>
 #                              (the rest of the tag, any case): rows tagged
 #                              with the same group must form one finding
-# Row i of the CSV (0-based among data rows) is Excel row i + 2, the same
-# numbering Invoke-ReportRules uses.
+# Row i of that timeline (0-based among data rows) is Excel row i + 2, the
+# same numbering Invoke-ReportRules uses; a failure names the file and its
+# line too.
 #
 # Before the cases, the rules file must load without an error, and no
 # compiled pattern may be empty or keep a {{list:...}} placeholder: an empty
@@ -34,7 +37,8 @@
 #
 #   powershell -ExecutionPolicy Bypass -File tests\Test-ReportRules.ps1
 #   ... -EnginePath <TimelineReport.Engine.ps1>   (override the engine path)
-#   ... -RulesPath <rules .json> -CasesPath <cases .csv>   (other files)
+#   ... -RulesPath <rules .json> -CasesPath <cases .csv>   (other files; one
+#       cases file, or a folder of cases*.csv)
 #   ... -LongLinesPath <.json>   (other crafted long command lines)
 # =============================================================
 param(
@@ -47,7 +51,7 @@ param(
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path $PSScriptRoot -Parent
 if (-not $RulesPath) { $RulesPath = Join-Path $repoRoot "lib\report\report-rules.json" }
-if (-not $CasesPath) { $CasesPath = Join-Path $PSScriptRoot "fixtures\report\rules\cases.csv" }
+if (-not $CasesPath) { $CasesPath = Join-Path $PSScriptRoot "fixtures\report\rules" }
 if (-not $LongLinesPath) { $LongLinesPath = Join-Path $PSScriptRoot "fixtures\report\rules\long-lines.json" }
 
 # --- Locate the engine ---------------------------------------
@@ -62,7 +66,13 @@ if (-not (Test-Path -LiteralPath $RulesPath)) {
     if ($env:GITHUB_ACTIONS) { Write-Host "::error file=tests/Test-ReportRules.ps1::report rules file not found" }
     exit 1
 }
-if (-not (Test-Path -LiteralPath $CasesPath)) {
+# The cases files: one, or every cases*.csv of a folder (cases.csv first)
+$casesFiles = @()
+if (Test-Path -LiteralPath $CasesPath -PathType Container) {
+    $casesFiles = @(Get-ChildItem -LiteralPath $CasesPath -Filter "cases*.csv" -File | Sort-Object @{ Expression = { if ($_.Name -eq "cases.csv") { "" } else { $_.Name } } } | ForEach-Object { $_.FullName })
+}
+elseif (Test-Path -LiteralPath $CasesPath -PathType Leaf) { $casesFiles = @($CasesPath) }
+if ($casesFiles.Count -eq 0) {
     Write-Host "FAIL: cases fixture not found: $CasesPath" -ForegroundColor Red
     if ($env:GITHUB_ACTIONS) { Write-Host "::error file=tests/Test-ReportRules.ps1::cases fixture not found" }
     exit 1
@@ -71,7 +81,7 @@ if (-not (Test-Path -LiteralPath $CasesPath)) {
 . $EnginePath
 Write-Host "Engine : $EnginePath"
 Write-Host "Rules  : $RulesPath"
-Write-Host "Cases  : $CasesPath"
+Write-Host "Cases  : $(@($casesFiles | ForEach-Object { Split-Path $_ -Leaf }) -join ', ')"
 Write-Host "PowerShell $($PSVersionTable.PSVersion)"
 Write-Host ""
 
@@ -140,8 +150,18 @@ if ($patternProblems.Count -gt 0) {
 }
 Write-Host "Compiled patterns: $patternCount, none empty or with a {{list:...}} placeholder."
 
-# Use the engine's own loader so Excel row numbers match exactly
-$rows = Import-TimelineCsvForReport -Path $CasesPath
+# Use the engine's own loader so Excel row numbers match exactly; the rows
+# of every cases file, one after another, and where each came from
+$rows = New-Object System.Collections.Generic.List[object]
+$rowOrigins = New-Object System.Collections.Generic.List[string]
+foreach ($casesFile in $casesFiles) {
+    $fileLine = 1
+    foreach ($row in @(Import-TimelineCsvForReport -Path $casesFile)) {
+        $fileLine++
+        $rows.Add($row)
+        $rowOrigins.Add("$(Split-Path $casesFile -Leaf) line $fileLine")
+    }
+}
 $findings = Invoke-ReportRules -Rows $rows -Rules $imported
 
 # ruleId -> set of row numbers; "ruleId|rowNumber" -> finding severity and
@@ -188,7 +208,7 @@ for ($i = 0; $i -lt $rows.Count; $i++) {
             $keyParts = @($tag -split '\s+', 3)
             if ($keyParts.Count -ge 3) { $wantGroup = $keyParts[2] }
         }
-        $label = "row $rowNumber  $tag"
+        $label = "row $rowNumber ($($rowOrigins[$i]))  $tag"
 
         if ($verb -ne "HIT" -and $verb -ne "MISS" -and $verb -ne "KEY") {
             Write-Host "  FAIL  $label -- tag must start with HIT, MISS or KEY" -ForegroundColor Red

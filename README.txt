@@ -543,6 +543,12 @@ The script creates a timestamped report folder next to the script:
         TimelineDbgEng.ps1           -- Reads Windows ARM64 memory dumps with
                                         Microsoft's debugger engine (run in a
                                         PowerShell process of its own)
+        TimelineDbgEng.Reader.ps1    -- Its shared memory-reading layer
+        TimelineDbgEng.<area>.ps1    -- Its areas (process details, DLLs,
+                                        drivers, handles, registry, console
+                                        history, services, network, ...)
+        TimelineMemoryRows.ps1       -- The builder's rows of the areas'
+                                        entries
     tools\
       sqlite3\                       -- Auto-downloaded, cached
       TimelineExplorer\              -- Auto-downloaded on first use, cached
@@ -1341,8 +1347,11 @@ once more.
       overwrite it.
     - Check the effect with -ReportOnly: it needs no new collection.
     - tests\Test-ReportRules.ps1 checks lib\report\report-rules.json
-      against tests\fixtures\report\rules\cases.csv (a matching and a
-      near-miss row for every rule); add cases there when you change a rule.
+      against every tests\fixtures\report\rules\cases*.csv (cases.csv, and
+      cases-memory-<area>.csv for the rules of the ARM64 memory areas: a
+      matching and a near-miss row for every rule that is switched on); add
+      cases there when you change a rule. A rule with "enabled": false is
+      not run and not listed in the report's "Rules used".
 
   Memory command lines where a script host runs a script, HTA or DLL from a
   staging folder (Downloads, Users\Public, PerfLogs, the Recycle Bin) are
@@ -2246,9 +2255,52 @@ of WinDbg -- instead:
         Memory Compression: no PEB), and none for a process whose command
         line is paged out of memory or that has exited -- where Volatility
         writes "Required memory at ... is not valid", this writes no row.
-  - What is not read: network connections and services (Volatility's
-    netscan and svcscan). No free tool reads those from Windows ARM64
-    memory except MemProcFS, which the builder does not use.
+  - The areas: beyond the processes and command lines, the helper reads
+    more of the dump, from the same kernel symbol file (nothing else is
+    downloaded). Each area is code of its own in lib\memory\
+    (TimelineDbgEng.<area>.ps1) on a shared reading layer
+    (TimelineDbgEng.Reader.ps1: reads through a page cache of at most
+    64 MB, structure offsets only from the kernel's symbol file, a
+    process's memory regions walked with the copy's inconsistencies
+    counted). The areas run after the command lines, one after the other in
+    a fixed order, each with a time limit; then their results are combined
+    and only then written. An area that fails, or whose file is missing or
+    was blocked, is "not read" and the others go on; the processes and
+    command lines are never affected. The builder makes the rows of the
+    areas (lib\memory\TimelineMemoryRows.ps1: Snapshot rows at the capture
+    time unless an entry has a valid time of its own, Details as
+    "Key=value | Key=value", and every row of a process with
+    "PID=<n> | ProcessCreated=<its create time>", by which the findings
+    report leaves the collector's own processes out). The log has one line
+    per area (read, partly read or not read with why, its entries and
+    seconds), and for an area read with gaps that a live copy leaves, an
+    information line that the findings report shows as a coverage note:
+      Memory dump coverage: <area> -- <what could not be read>
+    The areas, in the order they run (each is described here when it is
+    built; until then the log says "not read (not built yet)"):
+      Process users and paths (ProcessDetails): the user, integrity level
+        and elevation of each process from its token, its full program
+        path and current folder. Not built yet.
+      DLLs (Modules): each process's DLLs from the loader's lists and the
+        image mappings, with mapped-but-unlinked ones; Source
+        Memory-Modules. Not built yet.
+      Executable private memory (PrivateCode): executable memory without a
+        file behind it; Source Memory-PrivateCode. Not built yet.
+      Kernel drivers (Drivers): loaded kernel modules, drivers hidden from
+        the module list, recently unloaded drivers; Source Memory-Drivers.
+        Not built yet.
+      Handles (Handles): a subset of the handles of each process; Source
+        Memory-Handles. Not built yet.
+      Registry hives (Registry): the hives in memory, Run and RunOnce
+        values, the Services key; Source Memory-Registry. SAM and SECURITY
+        are listed by name only, never read. Not built yet.
+      Console history (Console): commands typed in console windows; Source
+        Memory-ConsoleHistory. Not built yet.
+      Services (Services): the service control manager's list, as
+        Volatility's windows.svcscan; Source Memory-Services. Not built yet.
+      Network connections (Network): TCP connections, listeners and UDP
+        endpoints from one read-only pass over the dump file, as
+        Volatility's windows.netscan; Source Memory-Network. Not built yet.
   - Kernel symbols: the engine needs the symbol file of the dump's exact
     Windows kernel. The builder reads its name and ID from the kernel image
     in the dump and takes the file from tools\symbols\, or downloads it once
@@ -2267,22 +2319,33 @@ of WinDbg -- instead:
     ("Processes (windows.pslist rows): N entries (T timed, S snapshot);
     session ids for K" and "Command lines (windows.cmdline rows): M
     entries; none for A kernel process(es) without a PEB, U not readable
-    (paged out or exited), E empty"), then the line the findings report
-    reads:
+    (paged out or exited), E empty"), a line per area, then the line the
+    findings report reads, with what was read and what not:
       Memory dump analyzed with the Windows debugger engine: <dump> (<size>)
-        -- processes and command lines only; network connections and
-        services are not read from Windows ARM64 dumps.
-    ("processes only, its command lines could not be read [<why>]" when
-    the command lines failed). The report shows it as an Evidence coverage
-    note, and its caveat says "The memory dump is a Windows ARM64 dump, read
-    with the Windows debugger engine: only its processes and command lines
-    are in this report, not its network connections or services."
+        -- read processes, command lines, DLLs, ...; not read handles
+        (<why>), ...
+    ("not read command lines (could not be read [<why>])" when the command
+    lines failed), and the "Memory dump coverage" lines. The report shows
+    each as an Evidence coverage note; its caveat names what was not read
+    ("The memory dump is a Windows ARM64 dump, read with the Windows
+    debugger engine: these were not read from it, so they are not in this
+    report -- <what> (<why>), ..."), and when they were read, network
+    connections (a scan of memory that can include closed connections) and
+    the registry in memory (partial: a key missing there is no proof it was
+    absent) have caveats of their own. For -ReportOnly on a timeline of an
+    older builder, whose line says "processes and command lines only;
+    network connections and services are not read from Windows ARM64
+    dumps", the caveat is that builder's ("only its processes and command
+    lines are in this report, not its network connections or services").
   - When it is not analyzed, the "Memory dump not analyzed" line gives one
     of these reasons:
       the Windows debugger engine (dbgeng.dll) is not in <folder>; see
         "ARM64 memory dumps" in README.txt
       the debugger engine helper lib\memory\TimelineDbgEng.ps1 is missing,
         an antivirus may have removed it; copy the whole
+        win11-timeline-builder folder again
+      the builder's lib\memory\TimelineMemoryRows.ps1 is missing (or could
+        not be loaded), an antivirus may have removed it; copy the whole
         win11-timeline-builder folder again
       the Windows debugger engine could not open it (<error>)
       <what is wrong with the kernel image> (the Windows debugger engine
@@ -3520,6 +3583,45 @@ parsing is skipped, and the timeline CSV can be opened manually.
   the time limit), output without its end, no helper, no engine. Nothing
   is downloaded; no real dump is opened.
 
+  tests\Test-MemoryFoundation.ps1 -- the shared layer of the Windows ARM64
+  memory areas, on synthetic memory (no dump, no admin): every area file of
+  lib\memory\ is there, parses and has only functions, and their C#
+  compiles with the helper's as one unit (a fragment that does not compile
+  is left out with the compiler's reason, in a process of its own); no
+  extension command and no attacker-tool name in lib\memory\; the reads and
+  strings of the reader over a sparse memory map, the page cache, the
+  sticky process switch, refused processes and the cache limit; layouts from
+  canned "dt -v" output (missing fields and types, bitfields, symbols, each
+  type asked once), a process from its EPROCESS bytes, the VAD walker on a
+  synthetic tree (address order, image file names cached per control area,
+  a loop, a node not in the dump, order and parent errors, the cap,
+  VadCount, an empty tree); entries and their E lines (Base64 of UTF-8),
+  the area dispatcher (the fixed order, "not built yet", a missing file,
+  an area that fails before or after its entries, the time limit, the raw
+  pass started and disposed, the joins after every area, no areas without
+  the reader); the protocol (P, C, E, AREA, END with three counts) read
+  back by the builder, bad E, AREA and END lines; the builder's process
+  merge, User and ExtraDetails on the four Volatility-shaped row kinds,
+  the rows of the areas' entries, and the "analyzed with" and coverage texts.
+
+  tests\Test-MemoryTokens.ps1, Test-MemoryModules.ps1,
+  Test-MemoryKernelObjects.ps1, Test-MemoryRegistry.ps1,
+  Test-MemoryConsole.ps1, Test-MemoryNetwork.ps1, Test-MemoryServices.ps1
+  -- one per memory area work package, on synthetic memory through
+  tests\MemoryTestKit.ps1 (no dump in CI). While an area is not built yet,
+  its test checks only that the area reports "not read (not built yet)" and
+  that its rows functions add no rows.
+
+  tests\MemoryTestKit.ps1 -- what these tests share (dot-sourced): it loads
+  the helper's and the area files' functions (and with -Builder the
+  builder's and lib\memory\TimelineMemoryRows.ps1's) from their syntax
+  trees, compiles their C#, and gives a sparse memory map with readers over
+  it, layouts and canned "dt -v" output, a stand-in engine, a context of
+  processes, an area run as the helper runs it, the protocol lines captured,
+  and the canned entries of tests\fixtures\memory\canned-*.txt (which
+  tests\Test-ReportBuilder.ps1's canned ARM64 helper also sends through the
+  builder; see that folder's README.txt).
+
   tests\Test-ShimCacheParser.ps1 -- loads the builder's functions and runs
   the PowerShellHistory parser (which also reads BAM and the ShimCache) on
   a synthetic collection whose appcompat_cache.reg holds a synthetic
@@ -3669,7 +3771,9 @@ parsing is skipped, and the timeline CSV can be opened manually.
   gives its own note.
 
   tests\Test-ReportRules.ps1 -- loads lib\report\report-rules.json with
-  the engine and checks it against tests\fixtures\report\rules\cases.csv:
+  the engine and checks it against every tests\fixtures\report\rules\
+  cases*.csv (cases.csv first, then the others by name, as one timeline; a
+  failure names the file and its line):
   rows in timeline format, in the shapes the parsers write now (memory command
   lines as Snapshot rows, author-supplied task dates, task actions written
   with environment variables (%TEMP%, %PUBLIC%, ...), Security 4698/4702
@@ -3779,10 +3883,13 @@ parsing is skipped, and the timeline CSV can be opened manually.
   not left out, and the builder log, report-model.json and report.html say
   to check whether collection_info.json was altered; a copy of the builder
   whose debugger engine helper (lib\memory\TimelineDbgEng.ps1) returns
-  canned entries, run with -MemoryDumpPath on a synthetic Windows ARM64 dump
-  header (the engine lookup, the helper in a process of its own and its
-  output are real): the engine and the "analyzed with the Windows debugger
-  engine" lines, the rows, the note and caveat in report-model.json, the
+  canned entries (with the areas' canned entries of
+  tests\fixtures\memory\canned-*.txt and their AREA lines), run with
+  -MemoryDumpPath on a synthetic Windows ARM64 dump header (the engine
+  lookup, the helper in a process of its own, its output and the builder's
+  rows of the entries are real): the engine and the "analyzed with the
+  Windows debugger engine" lines (what was read and what not), the rows,
+  the notes (coverage notes too) and caveats in report-model.json, the
   memory-only lead "Captured in the memory dump", also after -ReportOnly;
   -ReportOnly with -ReportRules
   and -NoExcel

@@ -1,0 +1,3 @@
+# The Proc entry of the canned process (Offset of its P entry). WP1 adds
+# the fields its rows use and the ProcessDetails #AREA line.
+Proc	Offset=0xffffa00000001000	Pid=4321

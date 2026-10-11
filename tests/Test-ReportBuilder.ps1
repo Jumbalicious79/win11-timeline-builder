@@ -655,8 +655,9 @@ try {
     # reading the dump, run with -MemoryDumpPath on a synthetic ARM64 crash
     # dump header. The builder's own path is real: the engine lookup, the
     # helper in a PowerShell process of its own, its output read back, the
-    # rows (the same entries as the memory run of 2b), the log line the
-    # report reads. The report gets the "analyzed with the Windows debugger
+    # rows (the same entries as the memory run of 2b, and the areas' canned
+    # entries of tests\fixtures\memory\canned-*.txt with their AREA lines), the
+    # log lines the report reads. The report gets the "analyzed with the Windows debugger
     # engine" note and caveat (not the "not analyzed" ones), the memory-only
     # lead still says "Captured in the memory dump", and -ReportOnly keeps
     # them ---
@@ -666,6 +667,9 @@ try {
     Copy-Item -LiteralPath $builder -Destination (Join-Path $armBuilderDir "timeline-builder.ps1")
     $helperText = [System.IO.File]::ReadAllText((Join-Path $builderDir "lib\memory\TimelineDbgEng.ps1"))
     $helperAnchor = "function Read-DbgEngDump {"
+    # The areas' canned entries (tests\fixtures\memory\canned-*.txt, read by
+    # the test kit's Read-TestCannedEntries in the helper's process): an area
+    # that no file names is not built yet, as the helper's stubs say
     $cannedHelper = @'
 function Read-DbgEngDump {
     param([string]$DumpPath, [string]$EngineFolder, [string[]]$EngineDlls, [string]$SymbolCache, [string]$JobFolder)
@@ -677,11 +681,33 @@ function Read-DbgEngDump {
         [PSCustomObject]@{ PID = [long]4400; Process = "fixture-invoice.exe"; Args = "C:\Users\alice\Downloads\fixture-invoice.exe /quiet" }
     )
     $result.SessionIds = 1
+    . '<KIT>'
+    $canned = Read-TestCannedEntries -Path '<FIXTURES>'
+    $result.Entries = $canned.Entries
+    $result.Areas = @(foreach ($area in @(Get-DbgEngAreas)) {
+            $named = @($canned.Areas | Where-Object { $_.Name -eq $area.Name })
+            if ($named.Count -gt 0) { $named[0] } else { New-DbgEngAreaSummary -Name $area.Name -State "NotRead" -Note "not built yet" }
+        })
     return $result
 }
 
 function Read-DbgEngDumpReal {
 '@
+    $memoryKit = Join-Path $PSScriptRoot "MemoryTestKit.ps1"
+    $memoryFixtures = Join-Path $PSScriptRoot "fixtures\memory"
+    $cannedHelper = $cannedHelper.Replace("<KIT>", $memoryKit.Replace("'", "''")).Replace("<FIXTURES>", $memoryFixtures.Replace("'", "''"))
+    # What the builder and the report must then say: from the same canned
+    # areas, with the helper's and the builder's own functions
+    . $memoryKit
+    [void](Import-MemoryTestFunctions -Path (Join-Path $builderDir "lib\memory\TimelineDbgEng.ps1"))
+    [void](Import-MemoryTestFunctions -Path (Join-Path $builderDir "lib\memory\TimelineMemoryRows.ps1"))
+    $cannedData = Read-TestCannedEntries -Path $memoryFixtures
+    $cannedAreas = @(foreach ($area in @(Get-DbgEngAreas)) {
+            $named = @($cannedData.Areas | Where-Object { $_.Name -eq $area.Name })
+            if ($named.Count -gt 0) { $named[0] } else { New-DbgEngAreaSummary -Name $area.Name -State "NotRead" -Note "not built yet" }
+        })
+    $cannedReadText = Get-DbgEngReadText -Areas $cannedAreas
+    $cannedCoverage = @(Get-DbgEngCoverageTexts -Areas $cannedAreas)
     $helperAnchorFound = ([regex]::Matches($helperText, [regex]::Escape($helperAnchor))).Count -eq 1
     if (-not $helperAnchorFound) { Write-TestResult -Succeeded $false -Message "the debugger engine helper has no single Read-DbgEngDump to replace for the ARM64 run" }
     else {
@@ -706,7 +732,7 @@ function Read-DbgEngDumpReal {
         finally { $builder = $savedBuilder3 }
         $armRows = @()
         if (Test-Path -LiteralPath (Join-Path $armRunDir "timeline.csv")) { $armRows = @(Import-Csv -LiteralPath (Join-Path $armRunDir "timeline.csv")) }
-        $analyzedLine = "Memory dump analyzed with the Windows debugger engine: arm64 memory.dmp (8192 bytes) -- processes and command lines only; network connections and services are not read from Windows ARM64 dumps."
+        $analyzedLine = "Memory dump analyzed with the Windows debugger engine: arm64 memory.dmp (8192 bytes) -- $cannedReadText"
         $armWarnings = @($armRun.Output | Where-Object { $_ -match 'WARNING:' -and $_ -match 'memory|debugger|engine|symbol|report|finding|rule|workbook|PDF' -and -not ($_ -match 'PDF not created' -and -not $edge) })
         $armLogged = @($armRun.Output | Where-Object { $_.EndsWith("  $analyzedLine") }).Count -eq 1 -and @($armRun.Output | Where-Object { $_ -match '  Debugger engine: dbgeng\.dll \S+ from .+ \(part of Windows\)$' }).Count -eq 1 -and
             @($armRun.Output | Where-Object { $_ -match 'Kernel symbols: \(canned for the test\)$' }).Count -eq 1
@@ -715,7 +741,15 @@ function Read-DbgEngDumpReal {
             $armRun.Output | Select-Object -Last 30 | ForEach-Object { Write-Host "  | $_" }
         }
         else { Write-TestResult -Succeeded $true -Message "the ARM64 run: the engine and the helper's log line, the 'analyzed with the Windows debugger engine' line, one pslist and two cmdline rows" }
-        $armCaveat = "The memory dump is a Windows ARM64 dump, read with the Windows debugger engine: only its processes and command lines are in this report, not its network connections or services."
+        # The ARM64 caveat says what was not read; a scan of network objects and
+        # the registry in memory have a caveat of their own when read
+        $cannedNotRead = if ($cannedReadText.Contains("; not read ")) { $cannedReadText.Substring($cannedReadText.IndexOf("; not read ") + 11) } else { "" }
+        $armCaveats = @(if ($cannedNotRead) { "The memory dump is a Windows ARM64 dump, read with the Windows debugger engine: these were not read from it, so they are not in this report -- $cannedNotRead." } else { "The memory dump is a Windows ARM64 dump, read with the Windows debugger engine, not with Volatility 3." })
+        $cannedReadPart = ($cannedReadText -split '; not read ')[0]
+        if ($cannedReadPart -match '(?:^read |, )network connections(?:,|$)') { $armCaveats += "Network connections in the memory dump come from a scan of memory for connection objects and can include closed ones (Stale=Yes, never flagged)." }
+        if ($cannedReadPart -match '(?:^read |, )registry hives(?:,|$)') { $armCaveats += "The registry in the memory dump is partial: a key or value missing there is not proof that it was absent." }
+        $armCaveat = $armCaveats -join " / "
+        $armNotesExpected = (@("$analyzedLine.") + @($cannedCoverage | ForEach-Object { "Memory dump coverage: $_." })) -join " / "
         foreach ($pass in @("ARM64 run", "ARM64 run, -ReportOnly")) {
             if ($pass -like "*-ReportOnly") {
                 # -ReportOnly reads the run's log next to the timeline (with
@@ -729,8 +763,8 @@ function Read-DbgEngDumpReal {
             $armModel = $null
             if (Test-Path -LiteralPath (Join-Path $armRunDir "report-model.json")) { $armModel = Get-Content -LiteralPath (Join-Path $armRunDir "report-model.json") -Raw | ConvertFrom-Json }
             $armNotes = @($armModel.Coverage.Notes | Where-Object { $_ -match '^Memory dump' })
-            $armCaveats = @($armModel.Caveats | Where-Object { $_ -match 'memory dump' })
-            Write-TestResult -Succeeded ($armModel -and ($armNotes -join " / ") -ceq $analyzedLine -and ($armCaveats -join " / ") -ceq $armCaveat) -Message "${pass}: report-model.json has the 'analyzed with the Windows debugger engine' note and the ARM64 caveat, no 'not analyzed' note or caveat ($($armNotes -join ' / ') | $($armCaveats -join ' / '))"
+            $armModelCaveats = @($armModel.Caveats | Where-Object { $_ -match 'memory dump' })
+            Write-TestResult -Succeeded ($armModel -and ($armNotes -join " / ") -ceq $armNotesExpected -and ($armModelCaveats -join " / ") -ceq $armCaveat) -Message "${pass}: report-model.json has the 'analyzed with the Windows debugger engine' note (what was read and not), the coverage notes and the ARM64 caveats, no 'not analyzed' note or caveat ($($armNotes -join ' / ') | $($armModelCaveats -join ' / '))"
             Test-MemoryOnlyLead -Folder $armRunDir -Label $pass
         }
     }

@@ -17,13 +17,21 @@
 # ways and its process ID table; see "Processes: the kernel's own
 # structures" below) and reads each process's fields and command line from
 # memory. The engine never gets a symbol server of its own: its symbol
-# path is a local folder, and _NT_SYMBOL_PATH is ignored.
+# path is a local folder, and _NT_SYMBOL_PATH is ignored. Then the areas run
+# (process details, DLLs, private code, drivers, handles, registry, console
+# history, services, network; see "The areas" below): each is code of its
+# own in lib\memory\TimelineDbgEng.<Area>.ps1, dot-sourced at the end of
+# this file, on the shared reading layer of TimelineDbgEng.Reader.ps1.
 #
 # Output: protocol lines on stdout, "TBDBG|<kind>|..." (log lines, the
 # entries and the counts; text fields in Base64 of UTF-8, so any character
-# of a command line survives the pipe), ending with "TBDBG|END|..." when
-# the analysis finished. The builder relays the log lines and adds the
-# rows itself (Add-MemoryPluginRows).
+# of a command line survives the pipe): LOG and R lines, then P (processes),
+# C (command lines), E (the areas' entries, "TBDBG|E|<Kind>|<Key>:<Base64>|
+# ..."), AREA (one per area, "TBDBG|AREA|<Area>|Read|Partial|NotRead|<rows>|
+# <seconds>|<Base64 note>"), ending with "TBDBG|END|<P>|<C>|<E>" when the
+# analysis finished. The builder relays the log lines and adds the rows
+# itself (Add-MemoryPluginRows, and lib\memory\TimelineMemoryRows.ps1 for
+# the entries).
 #
 #   powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File TimelineDbgEng.ps1
 #     -DumpPath <dump> -EngineFolder <folder> -EngineDlls <a.dll,b.dll>
@@ -51,10 +59,17 @@ param(
 
 # The C# host (C# 5: Windows PowerShell 5.1 compiles it too). The engine's
 # COM interfaces are called through their vtables; dbgeng.dll is loaded by
-# full path before DebugCreate is bound.
+# full path before DebugCreate is bound. The area files' C# (their
+# Get-DbgEng<File>Source fragments: namespace blocks only, no using lines)
+# is compiled with it as one unit, under this using header; Session is a
+# partial class, so TimelineDbgEng.Reader.ps1 adds its process switch and
+# its reads without a switch (see Initialize-DbgEngHost).
 function Get-DbgEngHostSource {
     return @'
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Text;
 using System.Threading;
@@ -102,7 +117,7 @@ namespace TimelineDbgEng
     // One debugger engine session on one dump file. Every method runs on the
     // thread that created the session (the engine's rule); only the
     // interrupt of a command that runs too long comes from another thread.
-    public sealed class Session : IDisposable
+    public sealed partial class Session : IDisposable
     {
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern IntPtr LoadLibraryExW(string path, IntPtr reserved, uint flags);
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr GetModuleHandleW(string name);
@@ -317,9 +332,65 @@ namespace TimelineDbgEng
 '@
 }
 
+# Compiles the host and the C# of every area file that was loaded (its
+# Get-DbgEng<Stem>Source function, see Get-DbgEngAreaFiles) as one unit,
+# once per process. A fragment that does not compile (the first compiler
+# error's line names it) is left out and the rest compiled again; its areas
+# are then not read ($script:DbgEngCompileProblems: stem -> why). When the
+# error cannot be placed, only the host is compiled; when the host alone
+# does not compile, that throws, as before.
 function Initialize-DbgEngHost {
-    if (-not ([System.Management.Automation.PSTypeName]'TimelineDbgEng.Session').Type) {
-        Add-Type -TypeDefinition (Get-DbgEngHostSource) -ErrorAction Stop
+    if (([System.Management.Automation.PSTypeName]'TimelineDbgEng.Session').Type) { return }
+    $script:DbgEngCompileProblems = @{}
+    $fragments = [ordered]@{}
+    foreach ($file in @(Get-DbgEngAreaFiles)) {
+        $stem = Get-DbgEngFileStem $file
+        $command = Get-Command -Name "Get-DbgEng${stem}Source" -CommandType Function -ErrorAction SilentlyContinue
+        if (-not $command) { continue }
+        $source = [string](& $command)
+        if ($source.Trim()) { $fragments[$stem] = $source }
+    }
+    $included = New-Object System.Collections.Generic.List[string]
+    foreach ($stem in $fragments.Keys) { $included.Add($stem) }
+    while ($true) {
+        # The unit, and the line where each fragment starts
+        $hostText = Get-DbgEngHostSource
+        $text = New-Object System.Text.StringBuilder
+        [void]$text.Append($hostText)
+        $line = @($hostText -split "\n").Count
+        $starts = New-Object System.Collections.Generic.List[object]
+        foreach ($stem in $included) {
+            [void]$text.Append("`r`n")
+            $starts.Add(@(($line + 1), $stem))
+            [void]$text.Append($fragments[$stem])
+            $line += @($fragments[$stem] -split "\n").Count
+        }
+        try {
+            Add-Type -TypeDefinition $text.ToString() -ErrorAction Stop
+            return
+        }
+        catch {
+            $message = Get-DbgEngErrorText $_
+            if ($included.Count -eq 0) { throw }
+            # PowerShell 7: "(<line>,<column>): error ..."; Windows PowerShell:
+            # "<file>.cs(<line>) : ..."
+            $culprit = $null
+            if ($message -match '\((\d+)(?:,\d+)?\)\s*:') {
+                $errorLine = [int]$Matches[1]
+                foreach ($start in $starts) { if ($errorLine -ge $start[0]) { $culprit = $start[1] } }
+            }
+            $compilerText = Get-DbgEngShortError ($message -replace '^.*?\)\s*:\s*', '')
+            $why = if ($culprit) { "the code of lib\memory\TimelineDbgEng.$culprit.ps1 could not be compiled [$compilerText]" } else { "the code of the area files in lib\memory\ could not be compiled [$compilerText]" }
+            if ($culprit -and $culprit -ne "Reader") {
+                $script:DbgEngCompileProblems[$culprit] = $why
+                [void]$included.Remove($culprit)
+            }
+            else {
+                # Every area builds on the reader's code
+                foreach ($stem in $included) { $script:DbgEngCompileProblems[$stem] = $why }
+                $included.Clear()
+            }
+        }
     }
 }
 
@@ -356,7 +427,10 @@ function Write-DbgEngLog {
 # has FoundBy (the ways that found it), TableId (the ID the process ID table
 # holds it under, when that is not its own) and Anomaly (what copying memory
 # does not explain), each "" when there is nothing to say. The counts are
-# for the builder's log.
+# for the builder's log. Entries: the areas' entries (MemoryEntry objects of
+# the reader's C#; a test may give [PSCustomObject]@{ Kind; Fields =
+# [ordered]@{...} } instead), Areas: one summary per area (Name, State,
+# Rows, Seconds, Note; Invoke-DbgEngAreas).
 function New-DbgEngResult {
     return [PSCustomObject]@{
         Reason = ""; PartialReason = ""
@@ -364,13 +438,28 @@ function New-DbgEngResult {
         BadItems = 0; Capped = $false; SessionIds = 0
         NoPeb = 0; Unreadable = 0; Empty = 0
         Seconds = 0.0
+        Entries = @(); Areas = @()
     }
+}
+
+# The protocol line of one entry: "TBDBG|E|<Kind>|<Key>:<Base64>|...". A
+# MemoryEntry formats itself (in C#: the text read from memory is never a
+# PowerShell string argument); a test's [PSCustomObject]@{ Kind; Fields } is
+# formatted here.
+function ConvertTo-DbgEngEntryLine {
+    param($Entry)
+    if ($Entry.GetType().FullName -eq "TimelineDbgEng.MemoryEntry") { return $Entry.ToLine() }
+    $line = "TBDBG|E|$($Entry.Kind)"
+    foreach ($key in @($Entry.Fields.Keys)) { $line += "|${key}:$(ConvertTo-DbgEngBase64 ([string]$Entry.Fields[$key]))" }
+    return $line
 }
 
 # The result as protocol lines: the counts, one line per process ("P":
 # PID, PPID, Threads, SessionId, Offset, then in Base64 ImageFileName,
 # CreateTime, ExitTime, FoundBy, TableId, Anomaly) and command line ("C"),
-# then END with both numbers (the builder checks them)
+# one per entry of the areas ("E", after the joins), one per area ("AREA":
+# name, state, rows, seconds, the note in Base64), then END with the three
+# numbers of P, C and E lines (the builder checks them)
 function Write-DbgEngWorkerResult {
     param($Result)
     $invariant = [System.Globalization.CultureInfo]::InvariantCulture
@@ -391,7 +480,17 @@ function Write-DbgEngWorkerResult {
     foreach ($entry in @($Result.CommandLines)) {
         Write-DbgEngWorkerLine ("TBDBG|C|" + (& $number $entry.PID) + "|" + (ConvertTo-DbgEngBase64 $entry.Process) + "|" + (ConvertTo-DbgEngBase64 $entry.Args))
     }
-    Write-DbgEngWorkerLine "TBDBG|END|$(@($Result.Processes).Count)|$(@($Result.CommandLines).Count)"
+    $entryCount = 0
+    foreach ($entry in @($Result.Entries)) {
+        if ($null -eq $entry) { continue }
+        Write-DbgEngWorkerLine (ConvertTo-DbgEngEntryLine $entry)
+        $entryCount++
+    }
+    foreach ($area in @($Result.Areas)) {
+        if ($null -eq $area) { continue }
+        Write-DbgEngWorkerLine ("TBDBG|AREA|$($area.Name)|$($area.State)|" + ([long]$area.Rows).ToString($invariant) + "|" + ([double]$area.Seconds).ToString('0.0', $invariant) + "|" + (ConvertTo-DbgEngBase64 ([string]$area.Note)))
+    }
+    Write-DbgEngWorkerLine "TBDBG|END|$(@($Result.Processes).Count)|$(@($Result.CommandLines).Count)|$entryCount"
 }
 
 # --- The engine ---------------------------------------------------------------
@@ -1384,7 +1483,8 @@ function ConvertFrom-DbgEngProcessBlock {
 # The processes from the kernel's own structures (a layout without Error):
 # Processes (windows.pslist entries, every process any way found, also one
 # whose process ID does not fit, as windows.pslist lists what the list
-# holds), Pebs (@(EPROCESS, PEB) of each, for its command line), Capped,
+# holds), Pebs (@(EPROCESS, PEB) of each, for its command line), Blocks
+# (the EPROCESS bytes of each, for the areas' ProcessInfo), Capped,
 # and the log's text (Get-DbgEngScanText: Info, Ways, Note), which the
 # caller logs only when these processes are used. Each entry says which
 # ways found it (FoundBy: ListForward, ListBackward, ProcessIdTable), the
@@ -1419,6 +1519,7 @@ function Read-DbgEngScannedProcesses {
     $o = $Layout.Offsets
     $processes = New-Object System.Collections.Generic.List[object]
     $pebs = New-Object System.Collections.Generic.List[object]
+    $blocks = New-Object System.Collections.Generic.List[object]
     $missed = New-Object System.Collections.Generic.List[object]
     $idChanges = New-Object System.Collections.Generic.List[object]
     $staleEntries = 0
@@ -1454,6 +1555,7 @@ function Read-DbgEngScannedProcesses {
         $entry.Anomaly = $anomalies -join ","
         $processes.Add($entry)
         $pebs.Add(@($address, [BitConverter]::ToUInt64($block, $o["Peb"])))
+        $blocks.Add($block)
     }
     $engine = [PSCustomObject]@{ Count = [long]-1; Corrupt = $false }
     try { $engine = Get-DbgEngEngineProcessCount -Session $Session }
@@ -1461,7 +1563,7 @@ function Read-DbgEngScannedProcesses {
     $text = Get-DbgEngScanText -Forward $forward -Backward $backward -Cid $cid -Methods $joined.Methods -Missed $missed.ToArray() -IdChanges $idChanges.ToArray() `
         -StaleEntries $staleEntries -EngineCount $engine.Count -EngineCorrupt $engine.Corrupt
     return [PSCustomObject]@{
-        Processes = $processes.ToArray(); Pebs = $pebs.ToArray(); Capped = ($forward.Capped -or $backward.Capped); BadItems = 0
+        Processes = $processes.ToArray(); Pebs = $pebs.ToArray(); Blocks = $blocks.ToArray(); Capped = ($forward.Capped -or $backward.Capped); BadItems = 0
         Info = $text.Info; Ways = $text.Ways; Note = $text.Note
     }
 }
@@ -1564,6 +1666,154 @@ function ConvertFrom-DbgEngCaptureStart {
     return [long]0
 }
 
+# --- The areas: what else is read from the dump ------------------------------------
+# Each area is code of its own, in lib\memory\TimelineDbgEng.<Stem>.ps1
+# files that this script dot-sources (each on its own: a missing or blocked
+# file makes only its areas "not read"). An area file has a function
+# Get-DbgEng<Stem>Source (its C#, compiled with the host as one unit by
+# Initialize-DbgEngHost) and the area's function Invoke-DbgEng<Area>Area
+# -Context <MemoryContext> -Area <AreaResult>, which reads what it needs
+# through $Context.Reader and puts its entries in $Area.Entries ($Area.Add
+# (<Kind>).Set(<Key>, <value>)), its counts and notes in $Area.Coverage, and
+# says what it could not read ($Area.SetPartial, $Area.SetNotRead; Read when
+# it does neither). The areas run in a fixed order, after the processes and
+# command lines, each in try/catch and timed, with a time cap it checks
+# itself ($Area.TimeUp()); then the joins (Invoke-DbgEngJoins -Context,
+# TimelineDbgEng.Joins.ps1) combine what the areas found, and only then are
+# the entries written. An area whose function is not there yet is "not read
+# (not built yet)".
+
+# The area files, in the order they are loaded: TimelineDbgEng.Reader.ps1
+# (the shared reading layer every area builds on) first
+function Get-DbgEngAreaFiles {
+    return @(
+        "TimelineDbgEng.Reader.ps1", "TimelineDbgEng.Tokens.ps1", "TimelineDbgEng.ImagePaths.ps1", "TimelineDbgEng.Modules.ps1",
+        "TimelineDbgEng.PrivateCode.ps1", "TimelineDbgEng.Objects.ps1", "TimelineDbgEng.Drivers.ps1", "TimelineDbgEng.Handles.ps1",
+        "TimelineDbgEng.Registry.ps1", "TimelineDbgEng.Console.ps1", "TimelineDbgEng.Services.ps1", "TimelineDbgEng.PoolScan.ps1",
+        "TimelineDbgEng.Network.ps1", "TimelineDbgEng.Joins.ps1"
+    )
+}
+
+# "TimelineDbgEng.Reader.ps1" -> "Reader"
+function Get-DbgEngFileStem {
+    param([string]$FileName)
+    return ($FileName -replace '^TimelineDbgEng\.', '' -replace '\.ps1$', '')
+}
+
+# The areas, in the order they run: Name (Invoke-DbgEng<Name>Area), the
+# files (stems) they need, and their time cap in seconds. The raw pass over
+# the dump file (Start-DbgEngRawPass, TimelineDbgEng.PoolScan.ps1) starts
+# before the first area and runs beside them on a thread of its own.
+function Get-DbgEngAreas {
+    return @(
+        [PSCustomObject]@{ Name = "ProcessDetails"; Files = @("Tokens", "ImagePaths"); CapSeconds = 30 }
+        [PSCustomObject]@{ Name = "Modules"; Files = @("Modules"); CapSeconds = 60 }
+        [PSCustomObject]@{ Name = "PrivateCode"; Files = @("PrivateCode"); CapSeconds = 30 }
+        [PSCustomObject]@{ Name = "Drivers"; Files = @("Objects", "Drivers"); CapSeconds = 30 }
+        [PSCustomObject]@{ Name = "Handles"; Files = @("Objects", "Handles"); CapSeconds = 60 }
+        [PSCustomObject]@{ Name = "Registry"; Files = @("Registry"); CapSeconds = 30 }
+        [PSCustomObject]@{ Name = "Console"; Files = @("Console"); CapSeconds = 30 }
+        [PSCustomObject]@{ Name = "Services"; Files = @("Services"); CapSeconds = 30 }
+        [PSCustomObject]@{ Name = "Network"; Files = @("PoolScan", "Network"); CapSeconds = 300 }
+    )
+}
+
+# Why an area file cannot be used ("" when it can): it was missing or did
+# not load (the script's load loop, $script:DbgEngFileProblems), or its C#
+# did not compile ($script:DbgEngCompileProblems). Nothing is recorded when
+# the functions were loaded another way (the tests).
+function Get-DbgEngFileProblem {
+    param([string]$Stem)
+    foreach ($problems in @($script:DbgEngFileProblems, $script:DbgEngCompileProblems)) {
+        if ($problems -is [System.Collections.IDictionary] -and $problems.Contains($Stem) -and $problems[$Stem]) { return [string]$problems[$Stem] }
+    }
+    return ""
+}
+
+# One area's summary for the AREA line
+function New-DbgEngAreaSummary {
+    param([string]$Name, [string]$State, [long]$Rows = 0, [double]$Seconds = 0, [string]$Note = "")
+    return [PSCustomObject]@{ Name = $Name; State = $State; Rows = $Rows; Seconds = $Seconds; Note = $Note }
+}
+
+# Runs the areas on the processes of the scan (Get-DbgEngAreas): Areas (one
+# summary each, in their order) and Entries (theirs, in area order, after
+# the joins; none of an area that was not read). -Memory: what the reader
+# reads through (the session; a test's IProcessMemory). Never throws: an
+# area that fails is "not read" (or "partial" when it had entries), and the
+# processes and command lines are never affected.
+function Invoke-DbgEngAreas {
+    param($Session, $Memory, [object[]]$Processes, [object[]]$Blocks = @(), [string]$DumpPath = "", [long]$CaptureFileTime = 0)
+    $areas = @(Get-DbgEngAreas)
+    $summaries = New-Object System.Collections.Generic.List[object]
+    $entries = New-Object System.Collections.Generic.List[object]
+    $notRead = {
+        param($why)
+        foreach ($area in $areas) { $summaries.Add((New-DbgEngAreaSummary -Name $area.Name -State "NotRead" -Note $why)) }
+        return [PSCustomObject]@{ Areas = $summaries.ToArray(); Entries = @() }
+    }
+    $readerProblem = Get-DbgEngFileProblem "Reader"
+    if (-not $readerProblem -and -not ([System.Management.Automation.PSTypeName]'TimelineDbgEng.MemoryContext').Type) { $readerProblem = "the code of lib\memory\TimelineDbgEng.Reader.ps1 was not compiled" }
+    if ($readerProblem) { return (& $notRead $readerProblem) }
+    $context = $null
+    try {
+        $layout = New-DbgEngLayout -Session $Session -Spec (Get-DbgEngProcessLayoutSpec)
+        $context = New-DbgEngContext -Session $Session -Memory $Memory -Processes $Processes -Blocks $Blocks -ProcessLayout $layout -DumpPath $DumpPath -CaptureFileTime $CaptureFileTime
+    }
+    catch { return (& $notRead "the processes could not be prepared for it [$(Get-DbgEngShortError (Get-DbgEngErrorText $_))]") }
+    $results = New-Object System.Collections.Generic.List[object]
+    try {
+        # The pass over the dump file starts first, to run beside the areas
+        if (Get-Command -Name "Start-DbgEngRawPass" -CommandType Function -ErrorAction SilentlyContinue) {
+            if (-not (Get-DbgEngFileProblem "PoolScan")) {
+                try { Start-DbgEngRawPass -Context $context }
+                catch { Write-DbgEngLog "    The pass over the dump file could not be started: $(Get-DbgEngShortError (Get-DbgEngErrorText $_))" }
+            }
+        }
+        foreach ($area in $areas) {
+            $result = New-Object TimelineDbgEng.AreaResult -ArgumentList $area.Name, ([double]$area.CapSeconds)
+            $timer = [System.Diagnostics.Stopwatch]::StartNew()
+            $problem = ""
+            foreach ($stem in $area.Files) { if (-not $problem) { $problem = Get-DbgEngFileProblem $stem } }
+            $function = "Invoke-DbgEng$($area.Name)Area"
+            if ($problem) { $result.SetNotRead($problem) }
+            elseif (-not (Get-Command -Name $function -CommandType Function -ErrorAction SilentlyContinue)) { $result.SetNotRead("not built yet") }
+            else {
+                try { & $function -Context $context -Area $result }
+                catch {
+                    $why = "it stopped [$(Get-DbgEngShortError (Get-DbgEngErrorText $_))]"
+                    if ($result.Entries.Count -gt 0 -and $result.State -ne "NotRead") { $result.SetPartial($why) } else { $result.SetNotRead($why) }
+                }
+            }
+            $result.Seconds = $timer.Elapsed.TotalSeconds
+            $context.Areas[$area.Name] = $result
+            $results.Add($result)
+            if ($result.Coverage.CountsText) { Write-DbgEngLog "    $($area.Name): $($result.Coverage.CountsText)" }
+        }
+        # What the areas found, combined (after all of them)
+        if ((Get-Command -Name "Invoke-DbgEngJoins" -CommandType Function -ErrorAction SilentlyContinue) -and -not (Get-DbgEngFileProblem "Joins")) {
+            try { Invoke-DbgEngJoins -Context $context }
+            catch { Write-DbgEngLog -Warning "  The memory areas' results could not be combined: $(Get-DbgEngShortError (Get-DbgEngErrorText $_))" }
+        }
+    }
+    finally {
+        if ($context.RawPass -is [System.IDisposable]) {
+            try { $context.RawPass.Dispose() } catch { Write-DbgEngLog "    The pass over the dump file did not end cleanly: $(Get-DbgEngShortError (Get-DbgEngErrorText $_))" }
+        }
+        try { $context.Reader.Restore() } catch { Write-Verbose "Restoring the engine's process: $($_.Exception.Message)" }
+    }
+    foreach ($result in $results) {
+        $rows = 0
+        if ($result.State -ne "NotRead") {
+            foreach ($entry in $result.Entries) { $entries.Add($entry) }
+            $rows = $result.Entries.Count
+        }
+        $summaries.Add((New-DbgEngAreaSummary -Name $result.Name -State $result.State -Rows $rows -Seconds $result.Seconds -Note $result.Note))
+    }
+    if ($context.Reader.Stats.Requests -gt 0) { Write-DbgEngLog "    Memory reads of the areas: $($context.Reader.Stats)" }
+    return [PSCustomObject]@{ Areas = $summaries.ToArray(); Entries = $entries.ToArray() }
+}
+
 # The dump's processes and command lines (New-DbgEngResult). Nothing read:
 # Reason says why. The processes read but not the command lines:
 # PartialReason says why. -CaptureStart: as the script's parameter.
@@ -1571,6 +1821,7 @@ function Read-DbgEngDump {
     param([string]$DumpPath, [string]$EngineFolder, [string[]]$EngineDlls, [string]$SymbolCache, [string]$JobFolder, [string]$CaptureStart)
     $result = New-DbgEngResult
     $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $script:DbgEngTypeCache = @{}
     $emptySymbols = Join-Path $JobFolder "nosymbols"
     $emptyExtensions = Join-Path $JobFolder "noextensions"
     [void][System.IO.Directory]::CreateDirectory($emptySymbols)
@@ -1676,6 +1927,21 @@ function Read-DbgEngDump {
             $result.CommandLines = @()
             $result.PartialReason = "its command lines could not be read [$(Get-DbgEngShortError (Get-DbgEngErrorText $_))]"
         }
+
+        # The areas (process details, DLLs, ...), on the same processes; they
+        # never change the processes or command lines above
+        try {
+            $blocks = @()
+            if ($found.PSObject.Properties["Blocks"] -and $null -ne $found.Blocks) { $blocks = @($found.Blocks) }
+            $areaRun = Invoke-DbgEngAreas -Session $session -Processes $processes -Blocks $blocks -DumpPath $DumpPath -CaptureFileTime (ConvertFrom-DbgEngCaptureStart $CaptureStart)
+            $result.Areas = $areaRun.Areas
+            $result.Entries = $areaRun.Entries
+        }
+        catch {
+            $why = "it stopped [$(Get-DbgEngShortError (Get-DbgEngErrorText $_))]"
+            $result.Areas = @(Get-DbgEngAreas | ForEach-Object { New-DbgEngAreaSummary -Name $_.Name -State "NotRead" -Note $why })
+            $result.Entries = @()
+        }
     }
     catch {
         if (@($result.Processes).Count -eq 0) { $result.Reason = "the Windows debugger engine stopped ($(Get-DbgEngShortError (Get-DbgEngErrorText $_)))" }
@@ -1686,6 +1952,23 @@ function Read-DbgEngDump {
         $result.Seconds = $timer.Elapsed.TotalSeconds
     }
     return $result
+}
+
+# --- The area files ---------------------------------------------------------------
+# Dot-sourced here, at script level, each on its own: a file that is missing
+# or does not load (an antivirus may block one) makes only its areas "not
+# read" ($script:DbgEngFileProblems: stem -> why). (The tests load their
+# functions from their syntax trees instead.)
+$script:DbgEngFileProblems = @{}
+foreach ($areaFile in @(Get-DbgEngAreaFiles)) {
+    $areaStem = Get-DbgEngFileStem $areaFile
+    $areaPath = Join-Path $PSScriptRoot $areaFile
+    if (-not (Test-Path -LiteralPath $areaPath -PathType Leaf)) {
+        $script:DbgEngFileProblems[$areaStem] = "lib\memory\$areaFile is missing"
+        continue
+    }
+    try { . $areaPath }
+    catch { $script:DbgEngFileProblems[$areaStem] = "lib\memory\$areaFile could not be loaded [$(Get-DbgEngShortError (Get-DbgEngErrorText $_))]" }
 }
 
 # --- Run by the builder ---------------------------------------------------------

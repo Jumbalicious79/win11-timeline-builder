@@ -146,6 +146,41 @@ jobs:
         if: ${{ !cancelled() }}
         run: ./tests/Test-MemoryParser.ps1
 
+      # The Windows ARM64 memory areas (lib\memory\): the shared reading
+      # layer and the test kit (tests\MemoryTestKit.ps1), then one test per
+      # area work package, on synthetic memory (no dump, no admin)
+      - name: Run memory foundation test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-MemoryFoundation.ps1
+
+      - name: Run memory tokens test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-MemoryTokens.ps1
+
+      - name: Run memory modules test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-MemoryModules.ps1
+
+      - name: Run memory kernel objects test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-MemoryKernelObjects.ps1
+
+      - name: Run memory registry test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-MemoryRegistry.ps1
+
+      - name: Run memory console test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-MemoryConsole.ps1
+
+      - name: Run memory network test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-MemoryNetwork.ps1
+
+      - name: Run memory services test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-MemoryServices.ps1
+
       - name: Run ShimCache parser test
         if: ${{ !cancelled() }}
         run: ./tests/Test-ShimCacheParser.ps1

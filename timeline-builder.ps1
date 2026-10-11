@@ -17193,7 +17193,11 @@ function Get-MemoryFieldText {
 #   process's own memory, which the process can change, and a service
 #   record is the service's state; neither says when something happened.
 # A time that is there but not valid is kept in Details (CreateTime=,
-# Created=). Returns the row counts: Entries, Timed and Snapshot.
+# Created=). An entry of the Windows debugger engine (ARM64 dumps) may also
+# have User (the User column: the process token's SID) and ExtraDetails
+# (appended to Details after the fields above; lib\memory\
+# TimelineMemoryRows.ps1 sets both); Volatility's entries have neither.
+# Returns the row counts: Entries, Timed and Snapshot.
 function Add-MemoryPluginRows {
     param(
         [string]$Plugin,
@@ -17239,10 +17243,11 @@ function Add-MemoryPluginRows {
                 if ($entry.FoundBy) { $details += " FoundBy=$($entry.FoundBy)" }
                 if ($entry.TableId) { $details += " TableId=$($entry.TableId)" }
                 if ($entry.Anomaly) { $details += " Anomaly=$($entry.Anomaly)" }
+                if ($entry.ExtraDetails) { $details += " $("$($entry.ExtraDetails)".Trim())" }
 
                 Add-TimelineEntry -Timestamp $ts -Source $Source -EventType $eventType `
                     -Description "Process in memory: $name (PID: $procId, PPID: $ppid)" `
-                    -Details $details `
+                    -User ([string]$entry.User) -Details $details `
                     -Artifact "MemoryDump" -RawPath $DumpPath
             }
             "windows.netscan" {
@@ -17264,10 +17269,11 @@ function Add-MemoryPluginRows {
                     if ($created.Text) { $details += " Created=$($created.Text)" }
                     $snapshot++
                 }
+                if ($entry.ExtraDetails) { $details += " $("$($entry.ExtraDetails)".Trim())" }
 
                 Add-TimelineEntry -Timestamp $ts -Source $Source -EventType $eventType `
                     -Description "Memory network: $proto $localAddr -> $foreignAddr ($state)" `
-                    -Details $details `
+                    -User ([string]$entry.User) -Details $details `
                     -Artifact "MemoryDump" -RawPath $DumpPath
             }
             "windows.cmdline" {
@@ -17275,10 +17281,12 @@ function Add-MemoryPluginRows {
                 $procName = if ($entry.Process) { $entry.Process } else { "" }
                 $cmdArgs = if ($entry.Args) { $entry.Args } else { "" }
                 if (-not $cmdArgs -or $cmdArgs -eq "N/A") { continue }
+                $details = "Args=$cmdArgs"
+                if ($entry.ExtraDetails) { $details += " $("$($entry.ExtraDetails)".Trim())" }
 
                 Add-TimelineEntry -Timestamp $ts -Source $Source -EventType $eventType `
                     -Description "Process command line: $procName (PID: $procId)" `
-                    -Details "Args=$cmdArgs" `
+                    -User ([string]$entry.User) -Details $details `
                     -Artifact "MemoryDump" -RawPath $DumpPath
                 $snapshot++
             }
@@ -17289,10 +17297,12 @@ function Add-MemoryPluginRows {
                 $state = if ($entry.State) { $entry.State } else { "" }
                 $start = if ($entry.Start) { $entry.Start } else { "" }
                 $procId = Get-MemoryFieldText $entry.PID
+                $details = "State=$state StartType=$start Binary=$binary PID=$procId"
+                if ($entry.ExtraDetails) { $details += " $("$($entry.ExtraDetails)".Trim())" }
 
                 Add-TimelineEntry -Timestamp $ts -Source $Source -EventType $eventType `
                     -Description "Service in memory: $display ($svcName)" `
-                    -Details "State=$state StartType=$start Binary=$binary PID=$procId" `
+                    -User ([string]$entry.User) -Details $details `
                     -Artifact "MemoryDump" -RawPath $DumpPath
                 $snapshot++
             }
@@ -17330,8 +17340,18 @@ function Find-VolatilityExe {
 # after $script:dbgEngTimeoutSeconds. Its output comes back as protocol
 # lines (Receive-DbgEngWorkerLine); the rows are made here, by
 # Add-MemoryPluginRows, exactly as from Volatility's windows.pslist and
-# windows.cmdline. Network connections and services are not read.
+# windows.cmdline, and the rows of the helper's other areas (process
+# details, DLLs, drivers, handles, executable private memory, registry,
+# console history, network, services) by lib\memory\TimelineMemoryRows.ps1,
+# dot-sourced here at script level (without it an ARM64 dump is not
+# analyzed, and the reason names it).
 $script:dbgEngTimeoutSeconds = 900
+$script:dbgEngRowsLoadError = ""
+try { . (Join-Path $PSScriptRoot "lib\memory\TimelineMemoryRows.ps1") }
+catch { $script:dbgEngRowsLoadError = $_.Exception.Message }
+# The entries of this run's ARM64 dump by kind (for the hooks after the
+# parsers, such as Register-DbgEngLogonNames before the User column pass)
+$script:dbgEngEntries = @{}
 
 # The builder's tools\ folder. A function of its own so the tests can put
 # another folder in its place.
@@ -17476,12 +17496,16 @@ function ConvertTo-DbgEngProcessArgument {
 }
 
 # What the helper sent: its result values (Reason, PartialReason and the
-# counts), the pslist and cmdline entries, Ended (its END line came, with
-# the entry numbers it names), BadLines (protocol lines that could not be
-# read), and how its process ended
+# counts), the pslist and cmdline entries, the areas' entries (Entries:
+# kind -> a list of PSCustomObjects, one property per key; EntryCount: all
+# of them) and what each area read (Areas: Name, State, Rows, Seconds,
+# Note), Ended (its END line came, with the numbers of P, C and E lines it
+# names), BadLines (protocol lines that could not be read), and how its
+# process ended
 function New-DbgEngWorkerState {
     return [PSCustomObject]@{
         Values = @{}; Processes = (New-Object System.Collections.Generic.List[object]); CommandLines = (New-Object System.Collections.Generic.List[object])
+        Entries = @{}; EntryCount = 0; Areas = (New-Object System.Collections.Generic.List[object])
         Ended = $false; BadLines = 0; ExitCode = $null; TimedOut = $false; ErrorText = ""; StartError = ""
     }
 }
@@ -17504,7 +17528,10 @@ function ConvertFrom-DbgEngWorkerNumber {
 # here (Log, Log-Warning, Log-Success), "TBDBG|R|<name>|<value>" is a result
 # value, "TBDBG|P|..." a windows.pslist entry (with the helper's FoundBy,
 # TableId and Anomaly), "TBDBG|C|..." a windows.cmdline entry,
-# "TBDBG|END|<processes>|<command lines>" the end. Other lines
+# "TBDBG|E|<Kind>|<Key>:<value>|..." an entry of an area (keys: a letter,
+# then letters and digits, each once), "TBDBG|AREA|<area>|<Read, Partial or
+# NotRead>|<rows>|<seconds>|<note>" what an area read,
+# "TBDBG|END|<processes>|<command lines>|<entries>" the end. Other lines
 # (PowerShell's own output) are ignored.
 function Receive-DbgEngWorkerLine {
     param([string]$Line, $State)
@@ -17535,8 +17562,29 @@ function Receive-DbgEngWorkerLine {
                 if ($fields.Count -ne 4) { throw "a command line line with $($fields.Count) fields" }
                 $State.CommandLines.Add([PSCustomObject]@{ PID = (ConvertFrom-DbgEngWorkerNumber $fields[1]); Process = (ConvertFrom-DbgEngBase64 $fields[2]); Args = (ConvertFrom-DbgEngBase64 $fields[3]) })
             }
+            "E" {
+                if ($fields.Count -lt 2 -or $fields[1] -cnotmatch '^[A-Za-z][A-Za-z0-9]{0,63}$') { throw "an entry line without a kind" }
+                $values = [ordered]@{}
+                for ($i = 2; $i -lt $fields.Count; $i++) {
+                    $colon = $fields[$i].IndexOf(':')
+                    $key = if ($colon -gt 0) { $fields[$i].Substring(0, $colon) } else { "" }
+                    if ($key -cnotmatch '^[A-Za-z][A-Za-z0-9]{0,63}$' -or $values.Contains($key)) { throw "an entry line with a field that is not <key>:<value> or a key twice" }
+                    $values[$key] = ConvertFrom-DbgEngBase64 $fields[$i].Substring($colon + 1)
+                }
+                $kind = $fields[1]
+                if (-not $State.Entries.ContainsKey($kind)) { $State.Entries[$kind] = New-Object System.Collections.Generic.List[object] }
+                $State.Entries[$kind].Add([PSCustomObject]$values)
+                $State.EntryCount++
+            }
+            "AREA" {
+                if ($fields.Count -ne 6 -or $fields[1] -cnotmatch '^[A-Za-z][A-Za-z0-9]{0,63}$' -or @("Read", "Partial", "NotRead") -cnotcontains $fields[2]) { throw "an area line that cannot be read" }
+                $State.Areas.Add([PSCustomObject]@{
+                        Name = $fields[1]; State = $fields[2]; Rows = [long](ConvertFrom-DbgEngWorkerNumber $fields[3])
+                        Seconds = [double]::Parse($fields[4], [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture); Note = (ConvertFrom-DbgEngBase64 $fields[5])
+                    })
+            }
             "END" {
-                if ($fields.Count -eq 3 -and $fields[1] -eq "$($State.Processes.Count)" -and $fields[2] -eq "$($State.CommandLines.Count)") { $State.Ended = $true }
+                if ($fields.Count -eq 4 -and $fields[1] -eq "$($State.Processes.Count)" -and $fields[2] -eq "$($State.CommandLines.Count)" -and $fields[3] -eq "$($State.EntryCount)") { $State.Ended = $true }
                 else { $State.BadLines++ }
             }
             default { $State.BadLines++ }
@@ -17635,15 +17683,27 @@ function Format-DbgEngExitCode {
     return "$code"
 }
 
+# The builder's rows of the helper's entries (a function of its own so the
+# tests can put another file in its place)
+function Get-DbgEngRowsPath {
+    return (Join-Path $PSScriptRoot "lib\memory\TimelineMemoryRows.ps1")
+}
+
 # A Windows ARM64 dump: its processes and command lines with Microsoft's
 # debugger engine, as the rows Volatility's windows.pslist and
-# windows.cmdline give (Add-MemoryPluginRows). Returns Entries (rows
-# added), Processes and CommandLines (rows of each), Reason when nothing
+# windows.cmdline give (Add-MemoryPluginRows), and the rows of the helper's
+# areas (lib\memory\TimelineMemoryRows.ps1). Returns Entries (rows added),
+# Processes and CommandLines (rows of each), AreaRows (rows of the areas'
+# entries), Areas (what each area read: Name, State, Rows, Seconds, Note),
+# ReadText (what was read and what not, for the "analyzed with" line),
+# CoverageTexts (for the "Memory dump coverage" lines), Reason when nothing
 # was added (for "Memory dump not analyzed: <dump> -- <reason>") and
 # PartialReason when the processes were read but not the command lines.
 function Invoke-DbgEngMemoryAnalysis {
     param([string]$DumpPath, $DumpInfo)
-    $result = [PSCustomObject]@{ Entries = 0; Processes = 0; CommandLines = 0; Reason = ""; PartialReason = "" }
+    $result = [PSCustomObject]@{
+        Entries = 0; Processes = 0; CommandLines = 0; AreaRows = 0; Areas = @(); ReadText = ""; CoverageTexts = @(); Reason = ""; PartialReason = ""
+    }
     $engine = Find-DbgEngine
     if ($engine.Warning) { Log-Warning "  $($engine.Warning)" }
     if (-not $engine.Path) {
@@ -17655,6 +17715,17 @@ function Invoke-DbgEngMemoryAnalysis {
     $worker = Get-DbgEngWorkerPath
     if (-not (Test-Path -LiteralPath $worker -PathType Leaf)) {
         $result.Reason = "the debugger engine helper lib\memory\TimelineDbgEng.ps1 is missing, an antivirus may have removed it; copy the whole win11-timeline-builder folder again"
+        return $result
+    }
+    # The rows of the helper's entries: dot-sourced with the builder
+    if (-not (Get-Command -Name "Add-DbgEngEntryRows" -CommandType Function -ErrorAction SilentlyContinue)) {
+        if (-not (Test-Path -LiteralPath (Get-DbgEngRowsPath) -PathType Leaf)) {
+            $result.Reason = "the builder's lib\memory\TimelineMemoryRows.ps1 is missing, an antivirus may have removed it; copy the whole win11-timeline-builder folder again"
+        }
+        else {
+            $why = if ($script:dbgEngRowsLoadError) { " [$(Get-DbgEngShortError $script:dbgEngRowsLoadError)]" } else { "" }
+            $result.Reason = "the builder's lib\memory\TimelineMemoryRows.ps1 could not be loaded$why, an antivirus may have blocked it; copy the whole win11-timeline-builder folder again"
+        }
         return $result
     }
     $timeout = 900
@@ -17707,6 +17778,16 @@ function Invoke-DbgEngMemoryAnalysis {
         $result.Reason = "the Windows debugger engine listed no processes in it"
         return $result
     }
+    # The process details (Proc entries) onto their processes, before their
+    # rows are made (lib\memory\TimelineMemoryRows.ps1)
+    $script:dbgEngEntries = $state.Entries
+    if ($state.Entries.ContainsKey("Proc")) {
+        $merge = Merge-DbgEngProcessEntries -Processes $state.Processes.ToArray() -ProcEntries $state.Entries["Proc"].ToArray()
+        $unmatchedText = if ($merge.Unmatched -gt 0) { "; $($merge.Unmatched) without a process" } else { "" }
+        Log "    Process details: $($merge.Merged) process(es)$unmatchedText"
+    }
+    try { Set-DbgEngProcessRowFields -Processes $state.Processes.ToArray() -CommandLines $state.CommandLines.ToArray() }
+    catch { Log-Warning "  The process details could not be added to the process rows: $(Get-DbgEngShortError (Get-DbgEngErrorText $_))" }
     $counts = Add-MemoryPluginRows -Plugin "windows.pslist" -Source "Memory-Processes" -Entries $state.Processes.ToArray() `
         -CaptureTimeUtc $DumpInfo.CaptureTimeUtc -AcquisitionEndUtc $DumpInfo.LastWriteUtc -DumpPath $DumpPath
     $badNote = ""
@@ -17721,11 +17802,30 @@ function Invoke-DbgEngMemoryAnalysis {
     else {
         Log "    Command lines (windows.cmdline rows): $($cmdCounts.Entries) entries; none for $($values['NoPeb']) kernel process(es) without a PEB, $($values['Unreadable']) not readable (paged out or exited), $($values['Empty']) empty; $($values['Seconds']) s"
     }
+    # The rows of the areas' entries, and what each area read
+    $areaRows = 0
+    foreach ($kind in @(Add-DbgEngEntryRows -Entries $state.Entries -CaptureTimeUtc $DumpInfo.CaptureTimeUtc -AcquisitionEndUtc $DumpInfo.LastWriteUtc -DumpPath $DumpPath)) {
+        if ($kind.Unknown) { Log "    $($kind.Received) $($kind.Kind) entries of the helper have no rows in this builder"; continue }
+        if ($kind.Error) { Log-Warning "  $($kind.Source) rows: stopped after $($kind.Rows) of $($kind.Received) entries ($(Get-DbgEngShortError $kind.Error))" }
+        else { Log "    $($kind.Source) rows ($($kind.Kind) entries): $($kind.Rows) of $($kind.Received) entries ($($kind.Timed) timed, $($kind.Snapshot) snapshot)" }
+        $areaRows += $kind.Rows
+    }
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    foreach ($label in @(Get-DbgEngAreaLabels)) {
+        $area = @($state.Areas | Where-Object { $_.Name -eq $label.Name }) | Select-Object -First 1
+        if ($null -eq $area) { Log "    $($label.Label): not reported by the helper"; continue }
+        $stateText = switch ($area.State) { "Read" { "read" } "Partial" { "partly read" } default { "not read ($($area.Note))" } }
+        Log "    $($label.Label): $stateText, $($area.Rows) entries, $(([double]$area.Seconds).ToString('0.0', $invariant)) s"
+    }
     if ($state.BadLines -gt 0) { Log-Warning "  $($state.BadLines) line(s) of the debugger engine helper's output could not be read." }
     Log "    Debugger engine analysis took $(([math]::Round($timer.Elapsed.TotalSeconds, 1)).ToString([System.Globalization.CultureInfo]::InvariantCulture)) s"
     $result.Processes = $counts.Entries
     $result.CommandLines = $cmdCounts.Entries
-    $result.Entries = $counts.Entries + $cmdCounts.Entries
+    $result.AreaRows = $areaRows
+    $result.Entries = $counts.Entries + $cmdCounts.Entries + $areaRows
+    $result.Areas = $state.Areas.ToArray()
+    $result.ReadText = Get-DbgEngReadText -Areas $result.Areas -PartialReason $result.PartialReason
+    $result.CoverageTexts = @(Get-DbgEngCoverageTexts -Areas $result.Areas)
     return $result
 }
 
@@ -17765,9 +17865,11 @@ function Parse-Memory {
         Log "  Windows ARM64 dump: analyzing it with Microsoft's debugger engine (Volatility 3 cannot read ARM64 memory)"
         $engineResult = Invoke-DbgEngMemoryAnalysis -DumpPath $dumpPath -DumpInfo $dumpInfo
         if ($engineResult.Entries -gt 0) {
-            $readText = "processes and command lines only"
-            if ($engineResult.PartialReason) { $readText = "processes only, $($engineResult.PartialReason)" }
-            Log "  Memory dump analyzed with the Windows debugger engine: $dumpText -- $readText; network connections and services are not read from Windows ARM64 dumps."
+            # What was read and what not (the report's coverage note and
+            # caveat), and per area what a live copy left unreadable (an
+            # information line each: some of that is normal)
+            Log "  Memory dump analyzed with the Windows debugger engine: $dumpText -- $($engineResult.ReadText)"
+            foreach ($coverage in @($engineResult.CoverageTexts)) { Log "  Memory dump coverage: $coverage" }
             Log-Success "  Memory analysis complete: $($engineResult.Entries) entries from $dumpSizeGB GB dump"
         }
         else {
@@ -19208,6 +19310,13 @@ if ($entryCount -eq 0) {
 # system's only in a live collection (a mounted image is collected on
 # another machine).
 if ((Get-CollectionInfo).Mode -eq "Live") { Add-TimelineMachineName (Get-CollectionInfo).ComputerName }
+# The account names a Windows ARM64 dump's logon sessions hold
+# (lib\memory\TimelineMemoryRows.ps1): fallback names only, so the
+# SOFTWARE hive's ProfileList and bam_entries.csv still win
+if (Get-Command -Name "Register-DbgEngLogonNames" -CommandType Function -ErrorAction SilentlyContinue) {
+    try { Register-DbgEngLogonNames -Entries $script:dbgEngEntries }
+    catch { Log-Warning "The account names of the memory dump could not be registered: $($_.Exception.Message)" }
+}
 $userPass = Update-TimelineUserColumn -Entries $script:timelineEntries -SidNames (Get-TimelineSidNames) -MachineNames @((Get-TimelineUserContext).MachineNames)
 Log "  User column: $($userPass.Rows) row(s) changed to one form per account ($($userPass.Transitions.Count) distinct value(s)); $($userPass.SidRows) row(s) whose SID got a name keep it in Details (UserSID=)"
 if ($userPass.Unresolved.Count -gt 0) {
