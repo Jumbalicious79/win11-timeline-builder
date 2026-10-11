@@ -255,6 +255,13 @@ function Test-CollectorFixture {
     $rows = @(Import-Csv -LiteralPath (Join-Path $Folder "timeline.csv"))
     $model = Get-Content -LiteralPath (Join-Path $Folder "report-model.json") -Raw | ConvertFrom-Json
     $cp = $model.Coverage.CollectorProcesses
+    # The fixture's collection_info.json has every field the current
+    # collector writes, in its order (the provenance fields right after
+    # SchemaVersion, CollectorGitCommit null as for a copy outside a git
+    # checkout, CollectorProcesses last): the fields the report uses are read
+    $c = $model.Collection
+    Write-TestResult -Succeeded ($c -and $c.ComputerName -eq "COLLECTOR-FIX" -and $c.Mode -eq "Live" -and $c.TargetTimeZoneId -eq "UTC" -and $c.CollectorUser -eq "FIXTURE\analyst" -and
+        $c.SecretsIncluded -eq $false -and $c.ThunderbirdIndexIncluded -eq $false) -Message "${Label}: the current collector's full collection_info.json is read (computer '$($c.ComputerName)', mode '$($c.Mode)', user '$($c.CollectorUser)')"
     Write-TestResult -Succeeded ($cp -and [bool]$cp.Recorded -and [int]$cp.Count -eq 6 -and $cp.Summary -eq "Collector's own processes in the memory dump: 6 (not flagged)") -Message "${Label}: model marks 6 collector processes not flagged ($($cp.Summary))"
     $colRowNums = @($cp.Processes | ForEach-Object { $_.RowNumbers } | ForEach-Object { [int]$_ } | Sort-Object -Unique)
     $allFind = @($model.Findings) + @($model.InfoFindings)
@@ -562,8 +569,10 @@ try {
         # unflagged and listed, while an attacker script (invoice.vbs) and a
         # same-name process with another PID (triage-collector.ps1) are still
         # flagged. Uses the stub Volatility with the collector fixture's canned
-        # output. Then -ReportOnly, and a copy with CollectorProcesses removed
-        # (an older collection) where the collector's own run is flagged again ---
+        # output; its collection_info.json is in the current collector's
+        # format, provenance fields included. Then -ReportOnly, and a copy
+        # with CollectorProcesses removed (an older collection) where the
+        # collector's own run is flagged again ---
         $collectorFix = Join-Path $PSScriptRoot "fixtures\report\collector"
         Get-ChildItem -LiteralPath (Join-Path $collectorFix "vol") -Filter "*.json" | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $volDir $_.Name) -Force }
         $colRunDir = Join-Path $workDir "collector-run"

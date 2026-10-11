@@ -1,5 +1,8 @@
 {
   "SchemaVersion": 1,
+  "CollectorVersion": "2026.10.10",
+  "CollectorScriptSha256": "5C1E0A7F3B9D2486E1F0C3A5B7D9E2F4061A3C5E7092B4D6F8A1C3E5079B2D4F",
+  "CollectorGitCommit": null,
   "ComputerName": "COLLECTOR-FIX",
   "CollectorUser": "FIXTURE\\analyst",
   "Mode": "Live",
@@ -9,6 +12,8 @@
   "CollectorTimeZoneId": "UTC",
   "CollectorCulture": "en-US",
   "TargetTimeZoneId": "UTC",
+  "SecretsIncluded": false,
+  "ThunderbirdIndexIncluded": false,
   "CollectorProcesses": [
     { "Role": "Collector", "Pid": 9120, "Name": "powershell.exe", "StartUtc": "2026-03-02T11:58:00.1234567Z", "ParentPid": 8840 },
     { "Role": "Launcher", "Pid": 8840, "Name": "cmd.exe", "StartUtc": "2026-03-02T11:57:55.7654321Z", "ParentPid": 8000 },

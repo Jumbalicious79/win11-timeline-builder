@@ -3252,7 +3252,10 @@ parsing is skipped, and the timeline CSV can be opened manually.
   -ReportOnly that updates the workbook (a lead that also has a BAM row is
   not memory-only); a collector-fixture run (tests\fixtures\report\collector\,
   the stub Volatility's canned output) whose collection_info.json records
-  the collector's process IDs -- the collector's 6 processes in the dump are
+  the collector's process IDs, in the current collector's format with every
+  field it writes (CollectorVersion, CollectorScriptSha256 and a null
+  CollectorGitCommit after SchemaVersion; the report reads its computer,
+  mode and user) -- the collector's 6 processes in the dump are
   not flagged and are listed (model, report.html with each process's rows
   and PIDs, findings.csv "Collector" block, Findings sheet and the
   "Collector (not flagged)" Finding column), the launcher's
