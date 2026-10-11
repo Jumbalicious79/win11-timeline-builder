@@ -836,6 +836,9 @@ function Add-ReportHtmlFinding {
     if ([bool](Get-ReportHtmlField $Finding "TimesAuthorSupplied")) {
         $flags.Add('<span class="flag">Dated only by a scheduled task&#39;s author-supplied registration date, which whoever wrote the task sets (it can be old or forged)</span>')
     }
+    elseif ([bool](Get-ReportHtmlField $Finding "TimesCollectorCaused")) {
+        $flags.Add('<span class="flag">Dated only by a registry key&#39;s last-write time that the triage collector itself set during the collection: the activity is older</span>')
+    }
     elseif ((Get-ReportHtmlField $Finding "ActivityTime") -eq $false) {
         $flags.Add('<span class="flag">Dated by file times, which can be older than the activity or altered</span>')
     }
@@ -908,22 +911,27 @@ function Add-ReportHtmlSummary {
     if ($leads -gt 0) {
         # The window leaves out leads dated by file times (timestomp
         # candidates, Amcache/ShimCache) or only by a task author's date:
-        # those times can be old or forged
+        # those times can be old or forged; and leads dated only by a time
+        # the collector itself set (the Defender Exclusions key it changed)
         $timed = Get-ReportHtmlActivityFindings -Findings $Context.Findings
         $fileTimed = $Context.Findings.Count - $timed.Count
         $authorDated = @($Context.Findings | Where-Object { [bool](Get-ReportHtmlField $_ "TimesAuthorSupplied") }).Count
-        $datedBy = "file times"
-        if ($authorDated -gt 0 -and $authorDated -eq $fileTimed) { $datedBy = "author-supplied task dates" }
-        elseif ($authorDated -gt 0) { $datedBy = "file times or author-supplied task dates" }
+        $collectorDated = @($Context.Findings | Where-Object { [bool](Get-ReportHtmlField $_ "TimesCollectorCaused") }).Count
+        $kinds = @()
+        if ($fileTimed - $authorDated - $collectorDated -gt 0) { $kinds += "file times" }
+        if ($authorDated -gt 0) { $kinds += "author-supplied task dates" }
+        if ($collectorDated -gt 0) { $kinds += "times the collector itself set" }
+        $datedBy = if ($kinds.Count -le 1) { "$(@($kinds + 'file times')[0])" } else { ($kinds[0..($kinds.Count - 2)] -join ", ") + " or " + $kinds[-1] }
+        $caution = if ($collectorDated -gt 0) { "which do not show when the activity happened" } else { "which can be older than the activity or altered" }
         $span = Get-ReportHtmlFindingSpan -Findings $timed
         $text = "The rules flagged " + (Format-ReportHtmlCount -Value $leads -Singular "lead" -Plural "leads") + " to review."
         if ($span.First) {
             $text += " The flagged activity falls between <b>" + (Format-ReportHtmlUtcAndLocal -Value $span.First -TimeZone $tz) + "</b> and <b>" + (Format-ReportHtmlUtcAndLocal -Value $span.Last -TimeZone $tz) + "</b>"
-            if ($fileTimed -gt 0) { $text += " (plus " + (Format-ReportHtmlCount -Value $fileTimed -Singular "lead" -Plural "leads") + " dated by $datedBy, which can be older than the activity or altered)" }
+            if ($fileTimed -gt 0) { $text += " (plus " + (Format-ReportHtmlCount -Value $fileTimed -Singular "lead" -Plural "leads") + " dated by $datedBy, $caution)" }
             $text += "."
         }
         elseif ($fileTimed -gt 0) {
-            $text += " The flagged items are dated by $datedBy, which can be older than the activity or altered, so they give no activity window."
+            $text += " The flagged items are dated by $datedBy, $caution, so they give no activity window."
         }
         $null = $Builder.AppendLine('<p>' + $text + '</p>')
         $null = $Builder.AppendLine('<p class="framing">A lead is a reason to look closer, not proof that the computer was compromised. Each one needs a person to review the evidence rows listed with it.</p>')

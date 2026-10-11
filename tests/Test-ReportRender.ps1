@@ -350,7 +350,17 @@ try {
     Write-TestResult -Succeeded ($authorSummary.Contains("(plus 1 lead dated by author-supplied task dates, which can be older than the activity or altered)") -and -not $authorSummary.Contains("<b>2020-01-01") -and
         $authorDated.Contains("Dated only by a scheduled task&#39;s author-supplied registration date") -and -not $authorDated.Contains("Dated by file times")) -Message "a lead dated only by a task's author-supplied date is left out of the activity window, and its card and the summary say so"
     $fileTimed.TimesAuthorSupplied = $false
-    $memoryModel.Coverage.CollectorErrors = [ordered]@{ Available = $true; Count = 0; WarningCount = 1; Lines = @("[2026-10-08 14:20:00] WARNING: Could not copy BBI") }
+    # A lead dated only by a time the triage collector itself set (the
+    # Defender Exclusions key it changes at the collection start): left out
+    # of the window, with wording that does not call the time old or altered
+    $fileTimed.TimesCollectorCaused = $true
+    Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath -NoFileHashes
+    $collectorDated = [System.IO.File]::ReadAllText($memoryHtmlPath)
+    $collectorSummary = $collectorDated.Substring($collectorDated.IndexOf('id="summary"'), $collectorDated.IndexOf('" id="leads">') - $collectorDated.IndexOf('id="summary"'))
+    Write-TestResult -Succeeded ($collectorSummary.Contains("(plus 1 lead dated by times the collector itself set, which do not show when the activity happened)") -and -not $collectorSummary.Contains("<b>2020-01-01") -and
+        $collectorDated.Contains("Dated only by a registry key&#39;s last-write time that the triage collector itself set during the collection: the activity is older") -and -not $collectorDated.Contains("Dated by file times")) -Message "a lead dated only by a time the collector set is left out of the activity window, and its card and the summary say so"
+    $fileTimed.TimesCollectorCaused = $false
+    $memoryModel.Coverage.CollectorErrors =[ordered]@{ Available = $true; Count = 0; WarningCount = 1; Lines = @("[2026-10-08 14:20:00] WARNING: Could not copy BBI") }
     Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath -NoFileHashes
     $warned = [System.IO.File]::ReadAllText($memoryHtmlPath)
     Write-TestResult -Succeeded ($warned.Contains("The collector logged 0 errors and 1 warning.") -and $warned.Contains("WARNING: Could not copy BBI")) -Message "collector warnings are counted as warnings, not errors"

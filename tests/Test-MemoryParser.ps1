@@ -757,7 +757,7 @@ try {
         Write-NoMemoryDumpToOffer
         $log = (Get-TestLog) -replace '(?m)^\[[0-9: -]+\] ', ''
         # The last line is the one the findings report reads (Coverage.Notes)
-        $expected = "No memory dump to offer: $($case.Note).`r`n  To have it analyzed, $($case.Remedy), then run the builder again.`r`n  Memory dump not analyzed: collection_manifest.csv lists one$($case.Size), but it was not found (or not usable) next to the collection or where the collector saved it."
+        $expected = "No memory dump to offer: $($case.Note).`r`n  To have it analyzed, $($case.Remedy), then run the builder again.`r`n  Memory dump not analyzed: the one collection_manifest.csv lists$($case.Size) -- it was not found (or not usable) next to the collection or where the collector saved it."
         if ($case.Name -like "no *") { $expected = "" }
         Assert-Equal -Name "offer step without a dump, $($case.Name): $(if ($expected) { 'what the manifest lists, how to have the dump analyzed, and the line for the report' } else { 'nothing logged' })" -Expected "$expected|False" -Actual "$($log.Trim())|$($log.Contains('-MemoryDumpPath'))"
     }
@@ -774,7 +774,7 @@ try {
     $log = ((Get-TestLog) -replace '(?m)^\[[0-9: -]+\] ', '').Trim()
     $expected = "No memory dump to offer: collection_manifest.csv lists one in the collection (Memory\memory_dump.dmp), which the collector moves next to the zip as ${nameArm}_memory_dump.dmp when it zips the collection.`r`n" +
         "  The collection is from a Windows ARM64 computer, so the dump does not need to be copied here.`r`n" +
-        "  Memory dump not analyzed: collection_manifest.csv lists one (7.99 GB): a Windows ARM64 dump (the collection's systeminfo.txt says ARM64), which Volatility 3 cannot analyze; examine it in WinDbg."
+        "  Memory dump not analyzed: the one collection_manifest.csv lists (7.99 GB) -- Volatility 3 cannot read Windows ARM64 dumps; examine it in WinDbg."
     Assert-Equal -Name "offer step without a dump, an ARM64 collection: no copy advice, WinDbg named once, and the line for the report (the size as the collector gives it)" -Expected $expected -Actual $log
     # The size in that line: bytes under 100 MB, else GB with two decimals
     # (as the memory prompt and the collector's summary give it)
@@ -851,7 +851,7 @@ try {
     Assert-Equal -Name "Parse-Memory: the dump time from the header is logged" -Expected "True|True" -Actual "$($log.Contains("Found memory dump: $armDump (0 GB, ARM64)"))|$($log.Contains("Dump time: $captureText UTC (crash dump header)"))"
     # ... and the line the findings report reads (Coverage.Notes), WinDbg
     # named once
-    Assert-Equal -Name "Parse-Memory, an ARM64 dump: the 'Memory dump not analyzed' line for the report, WinDbg named once" -Expected "True|1" -Actual "$($log.Contains("  Memory dump not analyzed: ${nameC}_memory_dump.dmp (8192 bytes): a Windows ARM64 dump, which Volatility 3 cannot analyze; examine it in WinDbg."))|$(([regex]::Matches($log, 'WinDbg')).Count)"
+    Assert-Equal -Name "Parse-Memory, an ARM64 dump: the 'Memory dump not analyzed' line for the report, WinDbg named once" -Expected "True|1" -Actual "$($log.Contains("  Memory dump not analyzed: ${nameC}_memory_dump.dmp (8192 bytes) -- Volatility 3 cannot read Windows ARM64 dumps; examine it in WinDbg."))|$(([regex]::Matches($log, 'WinDbg')).Count)"
     # An x64 dump without Volatility 3 in tools\: the download hint and the
     # line for the report. The hint names the builder's folder
     # ($PSScriptRoot), which a function made from text has not: this
@@ -868,7 +868,7 @@ try {
         $log = Get-TestLog
     }
     finally { ${function:Find-VolatilityExe} = $realFindVolatility }
-    Assert-Equal -Name "Parse-Memory, no vol.exe: the download hint and the 'Memory dump not analyzed' line for the report" -Expected "True|True" -Actual "$($log.Contains('Volatility 3 not found in tools\ directory.'))|$($log.Contains("  Memory dump not analyzed: ${nameK}_memory_dump.dmp (8192 bytes): Volatility 3 (vol.exe) is not in the builder's tools\volatility3\ folder."))"
+    Assert-Equal -Name "Parse-Memory, no vol.exe: the download hint and the 'Memory dump not analyzed' line for the report" -Expected "True|True" -Actual "$($log.Contains('Volatility 3 not found in tools\ directory.'))|$($log.Contains("  Memory dump not analyzed: ${nameK}_memory_dump.dmp (8192 bytes) -- Volatility 3 (vol.exe) is not in the builder's tools\volatility3\ folder."))"
     # Without -MemoryDumpPath: the dump where the collector saved it, on
     # another drive (collection_manifest.csv)
     New-TestDump -Path $driveK -Machine 0xAA64 -SystemTime $captureFileTime -LastWriteUtc $endUtc
@@ -911,17 +911,17 @@ try {
     New-TestDump -Path $offerX64Dump -SystemTime $captureFileTime -LastWriteUtc $endUtc
     $offerCases = @(
         @{ Name = "an ARM64 dump: not offered"; Collection = $nameOfferArm; Answers = @(); Prompts = 0; Sources = "USB"
-            Lines = @("Memory dump detected: $offerArmDump (Windows ARM64), not offered for analysis.")
-            NotAnalyzed = "${nameOfferArm}_memory_dump.dmp (8192 bytes): a Windows ARM64 dump, which Volatility 3 cannot analyze; examine it in WinDbg." },
+            Lines = @("Memory dump detected: $offerArmDump (Windows ARM64)")
+            NotAnalyzed = "${nameOfferArm}_memory_dump.dmp (8192 bytes) -- Volatility 3 cannot read Windows ARM64 dumps; examine it in WinDbg." },
         @{ Name = "no vol.exe: not offered"; Collection = $nameOfferX64; NoVol = $true; Answers = @(); Prompts = 0; Sources = "USB"
             Lines = @("Memory dump detected ($offerX64Dump) but Volatility 3 not found in tools\ directory.")
-            NotAnalyzed = "${nameOfferX64}_memory_dump.dmp (8192 bytes): Volatility 3 (vol.exe) is not in the builder's tools\volatility3\ folder." },
+            NotAnalyzed = "${nameOfferX64}_memory_dump.dmp (8192 bytes) -- Volatility 3 (vol.exe) is not in the builder's tools\volatility3\ folder." },
         @{ Name = "answer 2"; Collection = $nameOfferX64; Answers = @("2"); Prompts = 1; Sources = "USB"
             Lines = @("  Found: $offerX64Dump (8192 bytes)", "Memory analysis skipped (answer 2 at the memory prompt).")
-            NotAnalyzed = "${nameOfferX64}_memory_dump.dmp (8192 bytes): skipped at the memory prompt (run the builder again and answer 1 to analyze it)." },
+            NotAnalyzed = "${nameOfferX64}_memory_dump.dmp (8192 bytes) -- skipped at the memory prompt; run the builder again and answer 1 to analyze it." },
         @{ Name = "the end of redirected input: as 2"; Collection = $nameOfferX64; Answers = @(); Prompts = 1; Sources = "USB"
             Lines = @("Memory analysis skipped (answer 2 at the memory prompt).")
-            NotAnalyzed = "${nameOfferX64}_memory_dump.dmp (8192 bytes): skipped at the memory prompt (run the builder again and answer 1 to analyze it)." },
+            NotAnalyzed = "${nameOfferX64}_memory_dump.dmp (8192 bytes) -- skipped at the memory prompt; run the builder again and answer 1 to analyze it." },
         @{ Name = "an invalid answer, then 1: asked again, then analyzed"; Collection = $nameOfferX64; Answers = @("x", "1"); Prompts = 2; Sources = "USB,Memory"
             Lines = @("  Found: $offerX64Dump (8192 bytes)", "Memory analysis enabled."); NotAnalyzed = "" }
     )

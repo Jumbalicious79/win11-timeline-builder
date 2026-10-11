@@ -72,6 +72,9 @@ namespace TimelineReport
         public KeySpec GroupBy;
         public int ThresholdCount;
         public long ThresholdWindowTicks;
+        // threshold.distinct: count distinct values of this key in the window
+        // (a row with an empty value counts on its own); null = count rows
+        public KeySpec ThresholdDistinct;
         public MatchSpec EscalateMatch;
         public long EscalateWindowTicks;
         public KeySpec EscalateKey;
@@ -98,6 +101,9 @@ namespace TimelineReport
         public bool MemoryOnly;
         // The only times are dates a task's author wrote (Engine.Summarize)
         public bool AuthorTimesOnly;
+        // The only times are ones the triage collector itself caused during
+        // the collection (Engine.Summarize)
+        public bool CollectorTimesOnly;
         // A roll-up group (Engine.Fold): how many groups it stands for, and their keys
         public int FoldedGroups;
         public List<string> FoldedKeys = new List<string>();
@@ -588,8 +594,11 @@ namespace TimelineReport
         }
 
         // Rows of one group that fall in a window of windowTicks holding at
-        // least count rows (sorted by time, then row)
-        static List<int> ApplyThreshold(RowTable t, List<int> rows, int count, long windowTicks)
+        // least count rows (sorted by time, then row). With a distinct key,
+        // the window must hold at least count distinct values of it (case-
+        // insensitive; a row whose value is empty counts on its own): a file
+        // renamed with three USN records then counts once.
+        static List<int> ApplyThreshold(RowTable t, List<int> rows, int count, long windowTicks, KeySpec distinct, int[] timeouts)
         {
             List<int> timed = new List<int>();
             foreach (int r in rows)
@@ -602,14 +611,29 @@ namespace TimelineReport
                 int c = ticks[a].CompareTo(ticks[b]);
                 return c != 0 ? c : a.CompareTo(b);
             });
+            string[] keys = null;
+            Dictionary<string, int> inWindow = null;
+            if (distinct != null)
+            {
+                keys = new string[timed.Count];
+                for (int k = 0; k < timed.Count; k++) keys[k] = GetKey(t, timed[k], distinct, null, timeouts);
+                inWindow = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            }
             bool[] keep = new bool[timed.Count];
             int left = 0;
             int markedUntil = -1;
+            int values = 0;
             for (int right = 0; right < timed.Count; right++)
             {
                 long tr = ticks[timed[right]];
-                while (tr - ticks[timed[left]] > windowTicks) left++;
-                if (right - left + 1 >= count)
+                if (keys != null) values += AddDistinct(inWindow, keys[right], 1);
+                while (tr - ticks[timed[left]] > windowTicks)
+                {
+                    if (keys != null) values += AddDistinct(inWindow, keys[left], -1);
+                    left++;
+                }
+                int held = keys != null ? values : right - left + 1;
+                if (held >= count)
                 {
                     for (int k = Math.Max(left, markedUntil + 1); k <= right; k++) keep[k] = true;
                     markedUntil = right;
@@ -622,6 +646,22 @@ namespace TimelineReport
             }
             kept.Sort();
             return kept;
+        }
+
+        // Adds (delta 1) or removes (delta -1) one row's value in a window;
+        // returns the change in the number of distinct values (an empty
+        // value is its own)
+        static int AddDistinct(Dictionary<string, int> inWindow, string key, int delta)
+        {
+            if (string.IsNullOrEmpty(key)) return delta;
+            int n;
+            inWindow.TryGetValue(key, out n);
+            int now = n + delta;
+            if (now <= 0) inWindow.Remove(key);
+            else inWindow[key] = now;
+            if (n == 0 && now > 0) return 1;
+            if (n > 0 && now <= 0) return -1;
+            return 0;
         }
 
         // Why the rule must stop now (too many regex timeouts, or out of time),
@@ -706,7 +746,7 @@ namespace TimelineReport
             {
                 if (rule.ThresholdCount > 0)
                 {
-                    List<int> qualifying = ApplyThreshold(t, g.Rows, rule.ThresholdCount, rule.ThresholdWindowTicks);
+                    List<int> qualifying = ApplyThreshold(t, g.Rows, rule.ThresholdCount, rule.ThresholdWindowTicks, rule.ThresholdDistinct, timeouts);
                     if (qualifying.Count == 0) continue;
                     g.Rows = qualifying;
                 }
@@ -856,6 +896,29 @@ namespace TimelineReport
             return details != null && details.IndexOf(AuthorSuppliedTimeMark, StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
+        // The builder's note on a row whose time is one the triage collector
+        // itself caused during the collection: the Defender Exclusions key's
+        // last-write time, which the collector's own temporary exclusion of its
+        // output folder sets, on the rows of the other exclusions in that key
+        // ("Exclusions\Paths key last write, when the triage collector added
+        // its own exclusion during the collection; this exclusion is older")
+        // and on the collector's own row ("... (when the triage collector
+        // added this exclusion)")
+        public static readonly string[] CollectorTimeMarks = new string[] {
+            "when the triage collector added its own exclusion during the collection",
+            "when the triage collector added this exclusion"
+        };
+
+        public static bool IsCollectorCausedTime(string details)
+        {
+            if (string.IsNullOrEmpty(details)) return false;
+            foreach (string mark in CollectorTimeMarks)
+            {
+                if (details.IndexOf(mark, StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            }
+            return false;
+        }
+
         // A source the builder's Memory parser writes (Volatility 3 on the
         // memory dump): Memory-Processes, Memory-Network, Memory-CommandLine,
         // Memory-Services
@@ -870,10 +933,21 @@ namespace TimelineReport
         // whose time is author-supplied does not set the first and last time
         // when the group has a row with a time Windows recorded (a forged old
         // date would otherwise date the whole lead); when it has none, those
-        // dates are the times and AuthorTimesOnly is set. SnapshotOnly: every
+        // dates are the times and AuthorTimesOnly is set. A row whose time the
+        // triage collector caused (IsCollectorCausedTime) does not set them
+        // either when the group has another row; with only such rows (and no
+        // author-supplied ones), CollectorTimesOnly is set. SnapshotOnly: every
         // row is a Snapshot row. MemoryOnly: every row is from a Memory-*
         // source (the memory dump), whatever its event type.
         public static void Summarize(RowTable t, GroupResult g, int maxEvidence)
+        {
+            Summarize(t, g, maxEvidence, null);
+        }
+
+        // As above; with a distinct key (the rule's threshold.distinct) the
+        // evidence takes the first row of each distinct value before any
+        // second row of one (a renamed file once, not once per USN record)
+        public static void Summarize(RowTable t, GroupResult g, int maxEvidence, KeySpec distinct)
         {
             List<int> all = new List<int>(g.Rows.Count + g.EscalationRows.Count);
             all.AddRange(g.Rows);
@@ -891,6 +965,8 @@ namespace TimelineReport
             long last = -1;
             long authorFirst = -1;
             long authorLast = -1;
+            long collectorFirst = -1;
+            long collectorLast = -1;
             foreach (int r in all)
             {
                 if (t.EventTypeId[r] != snapshotType) snapshotOnly = false;
@@ -903,14 +979,26 @@ namespace TimelineReport
                     if (tk > authorLast) authorLast = tk;
                     continue;
                 }
+                if (IsCollectorCausedTime(t.Details[r]))
+                {
+                    if (collectorFirst < 0 || tk < collectorFirst) collectorFirst = tk;
+                    if (tk > collectorLast) collectorLast = tk;
+                    continue;
+                }
                 if (first < 0 || tk < first) first = tk;
                 if (tk > last) last = tk;
             }
             g.AuthorTimesOnly = first < 0 && authorFirst >= 0;
+            g.CollectorTimesOnly = first < 0 && authorFirst < 0 && collectorFirst >= 0;
             if (g.AuthorTimesOnly)
             {
                 first = authorFirst;
                 last = authorLast;
+            }
+            else if (g.CollectorTimesOnly)
+            {
+                first = collectorFirst;
+                last = collectorLast;
             }
             g.FirstTicks = first;
             g.LastTicks = last;
@@ -928,7 +1016,28 @@ namespace TimelineReport
             for (int e = 0; e < escalation.Count && picked.Count < maxEvidence; e++) picked.Add(escalation[e]);
             List<int> own = new List<int>(g.Rows);
             own.Sort();
-            for (int r = 0; r < own.Count && picked.Count < maxEvidence; r++) picked.Add(own[r]);
+            if (distinct != null)
+            {
+                // First the earliest row of each distinct value, then the rest
+                int[] timeouts = new int[1];
+                HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                HashSet<int> taken = new HashSet<int>();
+                for (int r = 0; r < own.Count && picked.Count < maxEvidence; r++)
+                {
+                    string key = GetKey(t, own[r], distinct, null, timeouts);
+                    if (key.Length > 0 && !seen.Add(key)) continue;
+                    picked.Add(own[r]);
+                    taken.Add(own[r]);
+                }
+                for (int r = 0; r < own.Count && picked.Count < maxEvidence; r++)
+                {
+                    if (!taken.Contains(own[r])) picked.Add(own[r]);
+                }
+            }
+            else
+            {
+                for (int r = 0; r < own.Count && picked.Count < maxEvidence; r++) picked.Add(own[r]);
+            }
             picked.Sort();
             g.EvidenceRows = picked.ToArray();
         }
@@ -1665,6 +1774,7 @@ function Import-ReportRules {
     $severities = @("High", "Medium", "Info")
     $groupKinds = @("rule", "description", "user", "source", "eventType", "capture")
     $sameKeyKinds = @("none", "user", "source", "description", "eventType")
+    $distinctKinds = @("description", "user", "source", "eventType")
 
     # --- Lists: name -> literal values, used in patterns as {{list:<name>}} ---
     $lists = @{}
@@ -1798,14 +1908,20 @@ function Import-ReportRules {
         $thresholdJson = Get-ReportEngineMember $ruleJson "threshold"
         if ($null -ne $thresholdJson) {
             if (-not (Test-ReportEngineJsonObject $thresholdJson)) { throw (Format-ReportEngineRuleError -File $file -Where "$where.threshold" -Problem "must be an object { ""count"": N, ""windowMinutes"": M }") }
-            Assert-ReportEngineMembers -Object $thresholdJson -Allowed @("count", "windowMinutes") -File $file -Where "$where.threshold"
+            Assert-ReportEngineMembers -Object $thresholdJson -Allowed @("count", "windowMinutes", "distinct") -File $file -Where "$where.threshold"
             $count = Get-ReportEngineMember $thresholdJson "count"
             $window = Get-ReportEngineMember $thresholdJson "windowMinutes"
             if (-not (Test-ReportEngineInteger $count) -or [int]$count -lt 1) { throw (Format-ReportEngineRuleError -File $file -Where "$where.threshold.count" -Problem "must be a whole number of 1 or more") }
             if (-not (Test-ReportEngineNumber $window) -or [double]$window -le 0) { throw (Format-ReportEngineRuleError -File $file -Where "$where.threshold.windowMinutes" -Problem "must be a number greater than 0") }
             $compiled.ThresholdCount = [int]$count
             $compiled.ThresholdWindowTicks = [long]([double]$window * [TimeSpan]::TicksPerMinute)
-            $threshold = [PSCustomObject]@{ Count = [int]$count; WindowMinutes = [double]$window }
+            # distinct (optional): count distinct values of a column or a
+            # Details key in the window instead of rows
+            $distinct = Get-ReportEngineMember $thresholdJson "distinct"
+            if ($null -ne $distinct) {
+                $compiled.ThresholdDistinct = ConvertTo-ReportEngineKeySpec -Text $distinct -Kinds $distinctKinds -File $file -Where "$where.threshold.distinct"
+            }
+            $threshold = [PSCustomObject]@{ Count = [int]$count; WindowMinutes = [double]$window; Distinct = $(if ($null -ne $distinct) { [string]$distinct } else { "" }) }
         }
 
         $escalate = $null
@@ -2018,7 +2134,7 @@ function Invoke-ReportRules {
         $groupsBeforeFold = $result.Groups.Count
         [TimelineReport.Engine]::Fold($table, $result, $rule.MaxFindings)
         foreach ($group in $result.Groups) {
-            [TimelineReport.Engine]::Summarize($table, $group, $rule.MaxEvidence)
+            [TimelineReport.Engine]::Summarize($table, $group, $rule.MaxEvidence, $rule.Compiled.ThresholdDistinct)
             $severity = $rule.Severity
             $escalated = $group.EscalationRows.Count -gt 0
             if ($escalated -and (Get-ReportEngineSeverityRank $rule.Escalate.Severity) -gt (Get-ReportEngineSeverityRank $severity)) {
@@ -2051,7 +2167,11 @@ function Invoke-ReportRules {
             # type) is MemoryOnly and says just that ($script:ReportMemoryOnlyNote),
             # not CapturedDuringCollection. DuringCollection stays: it comes
             # from a time Windows recorded (a process's creation time in the dump).
-            $fromCollection = ($startTicks -ge 0 -and $group.FirstTicks -ge $startTicks)
+            # A lead dated only by times the collector itself caused (the
+            # Defender Exclusions key it changed) is not "during the
+            # collection": its card says what the time is instead
+            $collectorTimesOnly = [bool]$group.CollectorTimesOnly
+            $fromCollection = ($startTicks -ge 0 -and $group.FirstTicks -ge $startTicks -and -not $collectorTimesOnly)
             $memoryOnly = [bool]$group.MemoryOnly
             $findings.Add([PSCustomObject]@{
                 Id                       = ""
@@ -2079,10 +2199,12 @@ function Invoke-ReportRules {
                 CapturedDuringCollection = ($fromCollection -and $group.SnapshotOnly -and -not $memoryOnly)
                 MemoryOnly               = $memoryOnly
                 MemoryOnlyNote           = $(if ($memoryOnly) { $script:ReportMemoryOnlyNote } else { "" })
-                # A lead whose only times are a task author's dates is not
-                # dated by activity either (left out of the activity window)
-                ActivityTime             = ([bool]$rule.ActivityTime -and -not $group.AuthorTimesOnly)
+                # A lead whose only times are a task author's dates, or times
+                # the collector caused, is not dated by activity either (left
+                # out of the activity window)
+                ActivityTime             = ([bool]$rule.ActivityTime -and -not $group.AuthorTimesOnly -and -not $collectorTimesOnly)
                 TimesAuthorSupplied      = [bool]$group.AuthorTimesOnly
+                TimesCollectorCaused     = $collectorTimesOnly
                 FoldedGroups             = $group.FoldedGroups
                 FoldedKeys               = $foldedKeys
             })
@@ -2292,6 +2414,25 @@ function Read-ReportEngineBuilderLog {
     $info.MissingInputFiles = [Math]::Max($missingLogged, $missingBanner)
     $info.UnexpectedErrors = [Math]::Max($errorLines, $errorBanner)
     return $info
+}
+
+# The builder's "Memory dump not analyzed: <what> -- <why>" text, split for
+# the report: What (the dump and its size), Why (the reason, then advice
+# after "; ") and Short (the reason alone, without asides in parentheses).
+# Older builders wrote "<what>: <why>" or "<what>, but <why>", and worded
+# the ARM64 reason "a Windows ARM64 dump, which Volatility 3 cannot
+# analyze": that is reworded the current way.
+function Split-ReportEngineMemoryDumpText {
+    param([string]$Text)
+    $what = "$Text".Trim()
+    $why = ""
+    # The last " -- ": a file name may hold one, the builder's reasons do not
+    if ($what -match '^(.+) -- (.+)$') { $what = $Matches[1]; $why = $Matches[2] }
+    elseif ($what -match '^(.+?\)?)(?::\s+|,\s+but\s+)(.+)$') { $what = $Matches[1]; $why = $Matches[2] }
+    $why = $why.Trim().TrimEnd('.').Trim()
+    if ($why -match '^a Windows ARM64 dump\b.*\bVolatility 3 cannot analyze\b') { $why = "Volatility 3 cannot read Windows ARM64 dumps; examine it in WinDbg" }
+    $short = ($why -split ';')[0] -replace '\s*\([^()]*\)', ''
+    return [PSCustomObject]@{ What = $what.Trim(); Why = $why; Short = $short.Trim() }
 }
 
 function New-ReportEngineMatch {
@@ -2622,12 +2763,17 @@ function New-ReportModel {
     if ($builderLog.UnnamedSids -gt 0) {
         $notes.Add("$($builderLog.UnnamedSids) account SID(s) in the User column have no name (the SOFTWARE hive's ProfileList and bam_entries.csv were not read in this run, or do not list them): Rows per user can list such an account under its SID, apart from its name.")
     }
-    # The builder logs "Memory dump not analyzed: <what and why>" for a dump
+    # The builder logs "Memory dump not analyzed: <what> -- <why>" for a dump
     # of the collection that it found (or that collection_manifest.csv
     # lists) but did not analyze: Windows ARM64, skipped at its prompt, no
-    # Volatility 3, or not found
+    # Volatility 3, or not found. The note names the dump and says why (and
+    # what to do); the caveat gives the reason only.
+    $memoryDump = $null
     if ($builderLog.MemoryDumpNotAnalyzed) {
-        $notes.Add("A memory dump of this collection was not analyzed: $($builderLog.MemoryDumpNotAnalyzed)")
+        $memoryDump = Split-ReportEngineMemoryDumpText $builderLog.MemoryDumpNotAnalyzed
+        $noteText = "Memory dump not analyzed: $($memoryDump.What)"
+        if ($memoryDump.Why) { $noteText += " -- $($memoryDump.Why)" }
+        $notes.Add("$noteText.")
     }
 
     # --- Caveats: what this report can't tell you ---
@@ -2674,9 +2820,10 @@ function New-ReportModel {
     if ($builderLog.UsnDropped) {
         $caveats.Add("The oldest USN journal entries were dropped (-MaxUsnEntries): older file changes are not in the timeline.")
     }
-    if ($builderLog.MemoryDumpNotAnalyzed) {
+    if ($memoryDump) {
         # (not "exists": the reason can be that it was not found)
-        $caveats.Add("A memory dump of this collection was not analyzed (see Evidence coverage): the programs, network connections and command lines in memory are not in this report.")
+        $reason = if ($memoryDump.Short) { " ($($memoryDump.Short))" } else { "" }
+        $caveats.Add("A memory dump of this collection was not analyzed$reason, so the programs, network connections and command lines in memory are not in this report.")
     }
     if ($builderLog.StartDate -or $builderLog.EndDate) {
         $range = @(@($builderLog.StartDate, $builderLog.EndDate) | Where-Object { $_ }) -join " to "
