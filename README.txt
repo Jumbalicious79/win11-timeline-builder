@@ -30,12 +30,19 @@ Required directory structure:
     win11-timeline-builder\       <-- this repo
       timeline-builder.ps1
       Run-TimelineBuilder.bat
-      report\                     <-- findings report rules and renderer
+      lib\                        <-- the builder's own scripts
+        report\                   <-- findings report rules and renderer
                                       (needed for report.pdf)
+        memory\                   <-- the debugger engine helper (Windows
+                                      ARM64 memory dumps)
       reports\                    <-- timelines save here
       tools\                      <-- auto-downloaded on first run
         sqlite3\                  <-- browser history parser
         TimelineExplorer\         <-- forensic CSV viewer
+        dbgeng\                   <-- optional: Microsoft's debugger engine
+                                      DLLs for ARM64 dumps
+        symbols\                  <-- auto-downloaded: Windows kernel
+                                      symbols for ARM64 dumps
 
   (Copy each repository folder whole; the lists show the main parts.)
 
@@ -67,9 +74,10 @@ no dependencies, no command-line knowledge needed.
 
   1. COLLECT: Run triage-collector on the target system
   2. ANALYZE: Run timeline-builder on the collection (this tool)
-  3. REVIEW: choose a viewer from the menu: the color-coded Excel workbook,
-     Timeline Explorer (downloaded on first use), both, or Open report (the
-     findings report PDF)
+  3. REVIEW: choose a viewer from the menu: Excel + findings report (the
+     color-coded Excel workbook and the findings report PDF, opened
+     together), Excel, Timeline Explorer (downloaded on first use), Excel +
+     Timeline Explorer, or Open report (the findings report alone)
 
 ### Live System (Dirty Forensics)
 
@@ -81,7 +89,8 @@ For incident response, triage, or non-legal investigations:
   4. Unplug the USB, take it to your analysis workstation
   5. Double-click Run-TimelineBuilder.bat -- it auto-finds the triage zips
   6. Pick a collection; the timeline and the findings report are built, then
-     choose a viewer: Excel, Timeline Explorer, Both, Open report or None
+     choose a viewer: Excel + findings report (both at once), Excel,
+     Timeline Explorer, Excel + Timeline Explorer, Open report or None
 
 ### Forensic Image (Clean Forensics)
 
@@ -113,9 +122,15 @@ Both tools are designed to live side-by-side on a USB drive:
     win11-timeline-builder\
       timeline-builder.ps1
       Run-TimelineBuilder.bat
-      report\                     <-- findings report rules and renderer
+      lib\                        <-- the builder's own scripts
+        report\                   <-- findings report rules and renderer
+        memory\                   <-- the debugger engine helper (ARM64 dumps)
       tools\                      <-- auto-downloaded: sqlite3, Timeline Explorer
         volatility3\              <-- optional: vol.exe for memory analysis
+        dbgeng\                   <-- optional: Microsoft's debugger engine
+                                      DLLs for ARM64 dumps
+        symbols\                  <-- auto-downloaded: Windows kernel
+                                      symbols for ARM64 dumps
       reports\                    <-- timelines save here
 
   Copy both repository folders whole (the list shows the main parts).
@@ -126,7 +141,11 @@ and cached in the tools\ directory for future use. For memory capture and
 analysis, extract Magnet DumpIt into the collector's tools\dumpit\ and
 Volatility 3 into the builder's tools\volatility3\. Both folders are in the
 repos with a README.txt explaining where to get the tool; the tools
-themselves are never committed.
+themselves are never committed. A memory dump from a Windows ARM64 computer
+needs no Volatility 3: the builder reads it with Microsoft's debugger engine,
+which is part of Windows, and the first time it analyzes a dump of a Windows
+build it downloads that kernel's symbol file (about 10 MB) into
+tools\symbols\, where later runs find it.
 
 
 ## Quick Start
@@ -151,9 +170,11 @@ themselves are never committed.
     7. Writes the findings report: report.pdf, report.html and findings.csv
        -- leads to review, each linked to its rows in the Excel file (see
        "Findings Report")
-    8. Asks how you want to view: Excel (colored), Timeline Explorer, Both,
-       Open report, None (the numbers change when there is no Excel file or
-       no report; a number that is not listed is asked again)
+    8. Asks how you want to view: Excel + findings report (the colored
+       workbook and the report PDF, opened together), Excel (colored),
+       Timeline Explorer, Excel + Timeline Explorer, Open report, None (the
+       numbers change when there is no Excel file or no report; a number
+       that is not listed is asked again)
 
   You can also pass a collection folder or a collection .zip directly (or
   drop either on the .bat), optionally followed by a comma-separated
@@ -225,16 +246,22 @@ themselves are never committed.
   saved it, and a drive that has another letter now (e.g. a USB drive on
   the analysis machine) is searched under its new letter. With
   Volatility 3 in tools\, the builder offers to analyze it (see parser
-  #15). When the manifest lists a dump the builder cannot find or use, it
+  #15). A dump from a Windows ARM64 computer is offered too: Volatility 3
+  cannot read ARM64 memory, so the builder reads it with Microsoft's
+  debugger engine (part of Windows) -- the processes and their command
+  lines, users and full paths, DLLs, kernel drivers, handles, executable
+  private memory, registry hives, console history, network connections
+  and services (see "ARM64 memory dumps"). The first ARM64 dump of
+  each Windows kernel version needs internet access once, for the kernel's
+  symbol file (about 10 MB, kept in tools\symbols\; see "Windows kernel
+  symbols"). When the manifest lists a dump the builder cannot find or use, it
   says what to do: connect the drive, or copy the dump next to the zip
   under the name it gives (<zip name>_memory_dump.dmp or .raw), then run
-  the .bat again. A dump from a Windows ARM64 computer is never offered:
-  Volatility 3 cannot analyze ARM64 memory (open the dump in WinDbg), and
-  for an ARM64 collection (its systeminfo.txt says so) the builder does not
-  ask for the dump to be copied. A dump that is found (or listed) but not
-  analyzed -- ARM64, answered 2 at the prompt, no vol.exe, not found -- is
-  named in the findings report's Evidence coverage notes, with the reason,
-  and in its "What this report can't tell you" box.
+  the .bat again. A dump that is found (or listed) but not analyzed --
+  answered 2 at the prompt, no vol.exe, no kernel symbol file for an ARM64
+  dump, not found -- is named in the findings report's Evidence coverage
+  notes, with the reason, and in its "What this report can't tell you"
+  box; so is any part of an ARM64 dump that could not be read.
 
 ### PowerShell (Admin)
 
@@ -301,10 +328,13 @@ themselves are never committed.
                   Browser, ScheduledTasks, Services, Network, USB, Persistence,
                   UsnJournal, Amcache, PowerShellHistory, SystemInfo,
                   AntiVirus, Email, SRUM, Memory
-                  Note: Memory is opt-in. Requires Volatility 3 in tools\ and
-                  a memory dump where the collector saved it (also on
-                  another drive), in or next to the collection, or
-                  -MemoryDumpPath (see parser #15). Adds 5-30 minutes.
+                  Note: Memory is opt-in. Requires a memory dump where the
+                  collector saved it (also on another drive), in or next
+                  to the collection, or -MemoryDumpPath, and Volatility 3
+                  in tools\ for an x64 or x86 dump; a Windows ARM64 dump
+                  is read with Microsoft's debugger engine (part of
+                  Windows; see parser #15). Adds 5-30 minutes with
+                  Volatility 3, under a minute for an ARM64 dump.
   -Keywords       Strings to flag in the timeline, as an array or a
                   comma-separated string ("mimikatz,psexec"). Spaces around
                   each keyword are trimmed and empty items ignored. Matching is
@@ -315,10 +345,14 @@ themselves are never committed.
                   are kept (older ones are dropped first). Default 0 =
                   unlimited. The USN journal is usually the largest source;
                   see "Known Limitations" for the Excel row limit.
-  -Viewer         Viewer to open at the end without the menu: Excel,
-                  TimelineExplorer, Both, Report (the findings report:
-                  report.pdf, or report.html when no PDF was made) or None
-                  (for scripts and automation).
+  -Viewer         Viewer to open at the end without the menu:
+                  ExcelAndReport (the Excel workbook and the findings report
+                  together; when one of them was not made, the other is
+                  opened and the log says which is missing), Excel,
+                  TimelineExplorer, Both (Excel and Timeline Explorer),
+                  Report (the findings report: report.pdf, or report.html
+                  when no PDF was made) or None (for scripts and
+                  automation).
   -NoExcel        CSV only: don't generate timeline.xlsx (ImportExcel is then
                   not needed). The findings report is still written; its row
                   numbers are then rows of timeline.csv. With -ReportOnly:
@@ -346,9 +380,9 @@ themselves are never committed.
                   its steps is logged, that step skipped, and the report
                   still made, as in a full run).
   -ReportRules    Rules file for the findings report (default:
-                  report\report-rules.json next to the script). See "Report
-                  rules file". A missing or invalid file is logged as a
-                  warning and the run finishes without a report (with
+                  lib\report\report-rules.json next to the script). See
+                  "Report rules file". A missing or invalid file is logged
+                  as a warning and the run finishes without a report (with
                   -ReportOnly it is an error).
   -MftDays        $MFT file-system events: only times within this many days
                   before the collection are added. Default 7; 0 = all. A
@@ -424,6 +458,57 @@ installed as PowerShell modules -- no manual installation needed.
 
   Eric Zimmerman's tools: https://ericzimmerman.github.io/
 
+### Windows kernel symbols (for ARM64 memory dumps)
+  Purpose:    Microsoft's debugger engine needs the symbol file (PDB) of
+              the exact Windows kernel in a Windows ARM64 memory dump to
+              find its processes (parser #15). Downloaded only when such a
+              dump is analyzed, and only that one file.
+  Source:     https://msdl.microsoft.com/download/symbols (Microsoft's
+              public symbol server), as
+              https://msdl.microsoft.com/download/symbols/<name>/<ID>/<name>
+              (<name> is ntkrnlmp.pdb on current Windows; <ID> is the
+              file's GUID and age, read from the kernel image in the dump)
+  Size:       About 10 MB (9.7 MB for build 26100 on ARM64)
+  Cached at:  tools\symbols\<name>\<ID>\<name>, once per Windows kernel
+              version: the dumps of a computer share it until a Windows
+              update brings a new kernel (most monthly updates do)
+  Privacy:    The request is the only thing that leaves the computer, and
+              it names only that symbol file: the kernel's file name and
+              its GUID and age, which are the same for every computer
+              running that kernel version. Nothing else about the dump,
+              the collection or the examined computer is sent. Like any
+              web request it comes from your public IP address. Its user
+              agent is fixed, "Microsoft-Symbol-Server/10.0.0.0" (the one
+              Microsoft's own symbol client sends), so it does not carry
+              the analysis computer's Windows or PowerShell version or its
+              language. The debugger engine itself never contacts a symbol
+              server: its symbol path is a local folder, and
+              _NT_SYMBOL_PATH is ignored.
+  Proxy:      The system's proxy settings (as Internet Explorer/Edge use
+              them); a proxy that needs a sign-in is not supported.
+  Offline:    Without internet access the dump is reported as not analyzed,
+              and the log names the URL and the path: download the file on
+              another computer, copy it to that path under tools\symbols\,
+              and run the builder again.
+  Integrity:  The download is checked (size, the PDB signature) and kept
+              only when the debugger engine accepts it for the kernel in
+              the dump (the same GUID and age); a cached file that does
+              not match is deleted and downloaded again. When the engine
+              does not accept a file it has just downloaded, the internet
+              is not the problem: the engine may be too old for the dump
+              (or the file was damaged on the way). The dump is reported
+              as not analyzed with that reason, and a newer engine can be
+              put in tools\dbgeng\ (see "Microsoft debugger engine" under
+              Optional Tools).
+  No folder:  When neither tools\symbols\ nor the run's work folder can be
+              written, the dump is reported as not analyzed with that
+              reason: make tools\symbols\ writable, or give a -WorkDir
+              that can be written.
+  Deleting:   tools\symbols\ can be deleted at any time (it is downloaded
+              again when needed). WinDbg can use the same folder:
+              -y "srv*<builder>\tools\symbols*https://msdl.microsoft.com/download/symbols"
+  More:       tools\symbols\README.txt
+
 All downloads happen once. On subsequent runs, cached copies are reused.
 Download zips are deleted from %TEMP% after extraction; the work folder
 (extracted collection, scratch copies) is deleted at the end of every run.
@@ -440,8 +525,9 @@ The script creates a timestamped report folder next to the script:
         timeline.csv                 -- The unified timeline (~110 MB for
                                         ~300K events with the $MFT and USN
                                         journal)
-        timeline.xlsx                -- Color-coded Excel version (~12 MB); its
-                                        first sheet "Findings" links to the
+        timeline.xlsx                -- Color-coded Excel version (~12 MB): the
+                                        full timeline on its first sheet, plus
+                                        a "Findings" sheet that links to the
                                         rows of each finding
         report.pdf                   -- Findings report (printed by Microsoft Edge)
         report.html                  -- The same report as one offline HTML file
@@ -450,13 +536,26 @@ The script creates a timestamped report folder next to the script:
         collection_info.json         -- Copied from the collection (for -ReportOnly)
         collection_log.txt           -- Copied from the collection (for -ReportOnly)
         report_log.txt               -- Log of -ReportOnly runs (only after one)
-    report\
-      report-rules.json              -- The findings report's rules (data)
-      TimelineReport.Engine.ps1      -- Rules engine and report model
-      TimelineReport.Render.ps1      -- report.html and report.pdf
+    lib\
+      report\
+        report-rules.json            -- The findings report's rules (data)
+        TimelineReport.Engine.ps1    -- Rules engine and report model
+        TimelineReport.Render.ps1    -- report.html and report.pdf
+      memory\
+        TimelineDbgEng.ps1           -- Reads Windows ARM64 memory dumps with
+                                        Microsoft's debugger engine (run in a
+                                        PowerShell process of its own)
+        TimelineDbgEng.Reader.ps1    -- Its shared memory-reading layer
+        TimelineDbgEng.<area>.ps1    -- Its areas (process details, DLLs,
+                                        drivers, handles, registry, console
+                                        history, services, network, ...)
+        TimelineMemoryRows.ps1       -- The builder's rows of the areas'
+                                        entries
     tools\
       sqlite3\                       -- Auto-downloaded, cached
       TimelineExplorer\              -- Auto-downloaded on first use, cached
+      symbols\                       -- Windows kernel symbols for ARM64
+                                        dumps, once per kernel version
 
 The report files are written next to the timeline: with -OutputFile, in
 that file's folder (the builder log stays in reports\timeline_<timestamp>\).
@@ -473,7 +572,9 @@ See "Findings Report".
       in\                            -- the extracted collection zip
       scratch\                       -- copies for reg load, sqlite3 and
                                         the SRUM reader, Volatility 3
-                                        output
+                                        output, and the debugger engine's
+                                        empty symbol and extension folders
+                                        (dbgeng\, for an ARM64 dump)
 
   It is deleted at the end of every run, also after an error or Ctrl+C. A
   folder left by a run that was killed (window closed, crash) is deleted by
@@ -609,8 +710,10 @@ gets it):
   - SRUM: the last hourly SRUM record of each UTC day
   - Defender DetectionHistory and quarantine entries: the times stored in
     the files
-  - Memory dump (Volatility 3): process creation and connection times kept
-    in memory; rows without one get the capture time (the SystemTime in the
+  - Memory dump (Volatility 3, or the Windows debugger engine for a Windows
+    ARM64 dump): process creation and connection times kept in memory, and
+    for a Windows ARM64 dump also DLL load times, driver unload times and a
+    Run key's last-write time; rows without one get the capture time (the SystemTime in the
     header of a 64-bit crash dump, else the dump file's last-write time; see
     "Snapshot rows" and parser #15)
 
@@ -625,7 +728,9 @@ gets it):
   time as their Timestamp. The memory dump is read the same way: services
   and process command lines found in memory, and processes or connections
   without a valid time of their own, are Snapshot rows at the time the
-  memory was captured (parser #15). A few context rows are Snapshot rows at
+  memory was captured (parser #15); so are a Windows ARM64 dump's kernel
+  modules, handles, executable private memory, registry hives, console
+  commands and DLLs without a load time. A few context rows are Snapshot rows at
   a time of their own: a security product reported ON to Security Center
   (event time), the Outlook attachment folder and the triage collector's
   own Defender exclusion (registry key last-write time). Snapshot rows are
@@ -655,7 +760,12 @@ gets it):
     SID stays in Details as UserSID=<SID>, unless a Details field already
     holds it (for example BAM's SID=, the firewall's ModifyingUser= or a
     scheduled task's UserId=). A SID with no name is left as it is; the
-    log lists such SIDs.
+    log lists such SIDs. For a SID neither of them names, the account name
+    a Windows ARM64 memory dump's logon sessions hold is used (the process
+    rows' LogonAccount=, put in this same form; a SID whose processes name
+    two different accounts gets none), so a run with only -Sources Memory
+    still names the dump's user accounts; the log then has a "User column:
+    N account name(s) from the memory dump's logon sessions" line.
   - The built-in accounts are NT AUTHORITY\SYSTEM (also for SYSTEM,
     LocalSystem and S-1-5-18), NT AUTHORITY\LOCAL SERVICE and NT
     AUTHORITY\NETWORK SERVICE, and Window Manager\DWM-n and Font Driver
@@ -749,8 +859,9 @@ they find as leads to review. Next to the timeline:
                      "Collector" block (FindingId "Collector", Severity "Not
                      flagged") lists the rows left out of the rules
   report-model.json  Everything the report shows, as data (for scripts)
-  timeline.xlsx      Gets a first sheet "Findings" and a "Finding" column
-                     (see below)
+  timeline.xlsx      Gets a "Findings" sheet after the Timeline sheet and a
+                     "Finding" column (see below); it still opens on the
+                     full Timeline sheet
 
 -NoReport turns the report off. -ReportOnly rebuilds it later from an
 existing timeline, for example after the rules were tuned. A problem with
@@ -811,7 +922,13 @@ once more.
      no 4104 script blocks, no Sysmon, the USN journal's span, ...),
      collector errors and warnings (or that the collector's log is
      missing), notes (among them a memory dump of the collection that was
-     not analyzed, and why), and the Integrity leads
+     not analyzed, and why, or what was read from a Windows ARM64 dump, per
+     area what a live copy left unreadable ("Memory dump coverage") and,
+     when the ways of finding its processes disagreed, how many each found),
+     and the Integrity leads (among them, in a Windows ARM64 dump, a process
+     that looks hidden from Windows' process list, a renamed process, a
+     driver hidden from the kernel's module list, a program image in
+     executable private memory and DLLs mapped but not in the loader's lists)
   3  Antivirus verdicts       4  Access       5  Persistence
   6  Execution                7  Initial access       8  File system
      (and "Other leads" when a rule uses another category)
@@ -855,9 +972,9 @@ once more.
                            the severity (that row is among the evidence);
                            rows set aside by the allowlist; "Captured in
                            the memory dump" when every row of the lead
-                           comes from the memory dump (Memory-Processes,
-                           Memory-Network, Memory-CommandLine,
-                           Memory-Services): it keeps its severity and is a
+                           comes from the memory dump (any Memory-*
+                           Source, see "Leads seen only in the memory
+                           dump"): it keeps its severity and is a
                            lead like any other; "Every row is from during
                            the collection" (maybe the collector itself: its
                            first event time is at or after the collection
@@ -901,10 +1018,13 @@ once more.
 
 ### Leads seen only in the memory dump
 
-  A lead whose rows all come from the memory dump -- the Memory-Processes,
-  Memory-Network, Memory-CommandLine and Memory-Services rows the Memory
-  parser reads with Volatility 3, whatever their event type -- says
-  exactly that: "Captured in the memory dump". Its rows are the state when
+  A lead whose rows all come from the memory dump -- every Memory-* Source:
+  the Memory-Processes, Memory-Network, Memory-CommandLine and
+  Memory-Services rows the Memory parser reads with Volatility 3 or the
+  Windows debugger engine, and for a Windows ARM64 dump also
+  Memory-Modules, Memory-PrivateCode, Memory-Drivers, Memory-Handles,
+  Memory-Registry and Memory-ConsoleHistory, whatever their event type --
+  says exactly that: "Captured in the memory dump". Its rows are the state when
   the dump was taken (stamped with the dump's capture time) unless the dump
   records a time of its own, such as a process's creation time. The note
   is the same everywhere:
@@ -992,12 +1112,28 @@ once more.
   time does not match -- a memory-only lead on that process (the .bat run
   from Downloads) keeps the "possibly the collector" card note.
 
-  Memory network and service
-  rows (Memory-Network, Memory-Services) of these processes are always kept
-  and checked -- no rule reads them, and a stale socket can belong to an
-  earlier process that reused the PID. Volatility 3's pslist reports a
+  The other rows a Windows ARM64 dump gives a process -- its DLLs
+  (Memory-Modules), the handles it holds (Memory-Handles), its executable
+  private memory (Memory-PrivateCode) and, for a console host, the console
+  commands it keeps (Memory-ConsoleHistory) -- carry PID= and
+  ProcessCreated= (the process's create time): they are left out with a
+  left-out process only when that time is its own, to the millisecond, so
+  a later process that reused the PID keeps its rows. Kernel drivers
+  (Memory-Drivers) and registry hives and Run values (Memory-Registry)
+  belong to no process and are never left out. The summary ("Collector's
+  own processes in the memory dump: N (not flagged), with M row(s) of
+  theirs from other memory sources") counts these rows apart.
+
+  Memory service rows (Memory-Services) of these processes are always kept
+  and checked, and so are Volatility's network rows (Memory-Network of an
+  x64 dump): a stale socket can belong to an earlier process that reused
+  the PID. A network row of a Windows ARM64 dump names its owner's create
+  time (OwnerCreated=), so it is left out with its process only when that
+  time is the left-out process's. Volatility 3's pslist reports a
   process's create time cut to the whole second, so the recorded 100-ns start
-  time is matched against its own second. A typical double-click records
+  time is matched against its own second. The Windows debugger engine (a
+  Windows ARM64 dump) gives the full 100-ns create time, which the timeline
+  keeps to the millisecond: it is matched within that millisecond. A typical double-click records
   about four processes (PowerShell, cmd, conhost, DumpIt) plus any
   short-lived children still listed by pslist (csc.exe/cvtres.exe from
   Add-Type, systeminfo.exe); with Windows Terminal as the default terminal a
@@ -1012,7 +1148,12 @@ once more.
   in the memory dump" note, and a memory-only lead seen only during the
   collection is flagged on its card as possibly the collector ("check that
   it is not the triage collector, its launcher or the memory capture tool"),
-  since this collection cannot tell them apart. The same holds for a current
+  since this collection cannot tell them apart. "During the collection" is
+  judged by the create time of the process a row belongs to (at or after a
+  minute before the collection start): a process row's own time, the
+  process row of a command line, or the ProcessCreated= (OwnerCreated=) of
+  a Windows ARM64 dump's DLL, handle, private memory, console or network
+  row. The same holds for a current
   collection whose recorded processes were not recognized in the dump. The
   note in Evidence coverage gives the reason the IDs are not known:
   collection_info.json was not available, could not be read (the builder
@@ -1021,7 +1162,9 @@ once more.
 
 ### The workbook: Findings sheet and Finding column
 
-  timeline.xlsx opens on its first sheet, "Findings": for each finding a
+  timeline.xlsx opens on its first sheet, "Timeline": the full timeline,
+  every row of timeline.csv. Its second sheet, "Findings", lists for each
+  finding a
   bold summary row in the severity's color (count, first and last time,
   group, escalation, how many rows are listed, and notes such as
   "Captured in the memory dump"), then one row per evidence
@@ -1107,8 +1250,8 @@ once more.
 
 ### Report rules file
 
-  The rules are data: report\report-rules.json, or another file given with
-  -ReportRules. Keyword lists (attacker tools, LOLBins, staging folders,
+  The rules are data: lib\report\report-rules.json, or another file given
+  with -ReportRules. Keyword lists (attacker tools, LOLBins, staging folders,
   download cradles, ...) live only in this file: Defender's AMSI blocks
   PowerShell code that contains such names, so never move them into a .ps1
   file, and edit the JSON in a text editor, not through PowerShell commands
@@ -1237,9 +1380,12 @@ once more.
       repository and pass it with -ReportRules, so an update does not
       overwrite it.
     - Check the effect with -ReportOnly: it needs no new collection.
-    - tests\Test-ReportRules.ps1 checks report\report-rules.json against
-      tests\fixtures\report\rules\cases.csv (a matching and a near-miss row
-      for every rule); add cases there when you change a rule.
+    - tests\Test-ReportRules.ps1 checks lib\report\report-rules.json
+      against every tests\fixtures\report\rules\cases*.csv (cases.csv, and
+      cases-memory-<area>.csv for the rules of the ARM64 memory areas: a
+      matching and a near-miss row for every rule that is switched on); add
+      cases there when you change a rule. A rule with "enabled": false is
+      not run and not listed in the report's "Rules used".
 
   Memory command lines where a script host runs a script, HTA or DLL from a
   staging folder (Downloads, Users\Public, PerfLogs, the Recycle Bin) are
@@ -1259,7 +1405,12 @@ once more.
   but they do not catch a variable that hides the folder name
   (%PUBLIC%\x.vbs), a short (8.3) name (\DOWNLO~1\), forward slashes
   (C:/Users/Public/...) or a caret-split cmd path; a run from one of those
-  forms is not flagged.
+  forms is not flagged. On a Windows ARM64 dump, EXEC-STAGING also flags a
+  process row (Memory-Processes) whose ImagePath= -- the kernel's own
+  record of the program file the process was started from, which the
+  process cannot change -- is in one of those folders, keyed by the
+  process name, so its process and command line rows are one lead; its
+  CurrentDirectory= or PebImagePath= in the folder does not count.
 
   Where the shipped rules differ from the rule plan, on purpose:
     - EXEC-STAGING leaves out Temp folders (the plan's R13 lists them):
@@ -1923,9 +2074,10 @@ Parses command history:
     stores no per-command times; all commands get the time of the history
     file's last write (when the last command was added)
 
-### 15. Memory Dump (opt-in, requires Volatility 3)
-Analyzes memory dumps captured by the triage collector using Volatility 3:
-the crash dump from DumpIt (<collection>_memory_dump.dmp) or a raw image
+### 15. Memory Dump (opt-in; Volatility 3, or Microsoft's debugger engine for Windows ARM64 dumps)
+Analyzes memory dumps captured by the triage collector using Volatility 3
+(Windows ARM64 dumps: Microsoft's debugger engine, see "ARM64 memory dumps"
+below): the crash dump from DumpIt (<collection>_memory_dump.dmp) or a raw image
 (<collection>_memory_dump.raw). The collector saves it next to the zip, as
 it is too large to zip, or on another drive (its -MemoryOutputPath, or the
 drive picked at its memory prompt: <drive>\TriageMemory\). The dump is
@@ -1977,7 +2129,10 @@ looked for in this order:
   the manifest's SHA-256 for it.
 Opt-in only -- not included in default Sources. Add "Memory" to -Sources to enable.
 Without it, the builder offers to analyze a dump it finds when vol.exe is
-in tools\; the offer shows the dump's full path when it is outside the
+in tools\ (for a Windows ARM64 dump: when the debugger engine is there,
+which is part of Windows; the offer says what it reads, how long it takes
+and that the kernel's symbol file is downloaded once per Windows kernel
+version); the offer shows the dump's full path when it is outside the
 collection, and says when collection_manifest.csv gave the place (and the
 path it lists, when the drive has another letter now). When no dump is
 found and the manifest lists one, the offer step says what became of it
@@ -1988,21 +2143,23 @@ collection folder, next to the folder under its name), then run the
 builder again. With Memory in -Sources, the parser's warning says the
 same (also for a collection whose manifest lists no dump) and adds
 -MemoryDumpPath.
-Requires vol.exe in tools\volatility3\ (see tools\volatility3\README.txt).
-Windows ARM64 dumps are detected from the dump header and skipped:
-Volatility 3 analyzes Intel x86/x64 Windows memory only (use WinDbg). When
-no dump is found for a collection whose systeminfo.txt says ARM64, the
-offer step says so instead of asking for the dump to be copied next to
-the zip. A dump of the collection that is found or listed but not
-analyzed (ARM64, answered 2 at the prompt, no vol.exe, not found) gets a
-log line "Memory dump not analyzed: <dump> (<size>) -- <reason>[; <what
-to do>]", for example "... -- Volatility 3 cannot read Windows ARM64
-dumps; examine it in WinDbg." The findings report shows that line in its
-Evidence coverage notes, and the reason alone in its caveat ("A memory
-dump of this collection was not analyzed (Volatility 3 cannot read Windows
-ARM64 dumps), so the programs, network connections and command lines in
-memory are not in this report."). -ReportOnly reads the older wording
-("<dump> (<size>): <reason>") the same way.
+Requires vol.exe in tools\volatility3\ (see tools\volatility3\README.txt)
+for an x64 or x86 dump. Volatility 3 analyzes Intel x86/x64 Windows memory
+only: a Windows ARM64 dump (detected from the dump header) is read with
+Microsoft's debugger engine instead -- its processes and command lines, the
+same rows as below, and more (users, DLLs, drivers, handles, the registry
+in memory, console history, network connections and services; see "ARM64
+memory dumps"). A dump of the collection
+that is found or listed but not analyzed (answered 2 at the prompt, no
+vol.exe, an ARM64 dump the debugger engine could not read, not found) gets
+a log line "Memory dump not analyzed: <dump> (<size>) -- <reason>[; <what
+to do>]", for example "... -- skipped at the memory prompt; run the
+builder again and answer 1 to analyze it." The findings report shows that
+line in its Evidence coverage notes, and the reason alone in its caveat ("A
+memory dump of this collection was not analyzed (skipped at the memory
+prompt), so the programs, network connections and command lines in memory
+are not in this report."). -ReportOnly reads the older wording ("<dump>
+(<size>): <reason>") the same way.
   - windows.pslist: Running processes with creation timestamps, PIDs, parent
     PIDs (ProcessCreation at the creation time)
   - windows.netscan: Network connections with protocol, addresses, ports,
@@ -2026,7 +2183,895 @@ acquisition ended). The log shows it as "Dump time: <UTC> (crash dump
 header)" or "(dump file last-write time)", and per plugin "windows.pslist:
 N entries (T timed, S snapshot)". The Source column distinguishes memory
 rows (Memory-Processes, Memory-Network, Memory-CommandLine,
-Memory-Services).
+Memory-Services; for a Windows ARM64 dump also Memory-Modules,
+Memory-PrivateCode, Memory-Drivers, Memory-Handles, Memory-Registry and
+Memory-ConsoleHistory).
+
+### ARM64 memory dumps (Windows debugger engine)
+Volatility 3 cannot read Windows ARM64 memory (it has no ARM64 support for
+Windows). For a dump whose header says ARM64 (DumpIt on a Windows on Arm
+computer), the Memory parser uses Microsoft's debugger engine -- the engine
+of WinDbg -- instead:
+  - The engine: dbgeng.dll with dbghelp.dll and dbgmodel.dll, part of
+    Windows (C:\Windows\System32), so nothing has to be installed.
+    tools\dbgeng\<arm64|amd64|x86>\ (the processor architecture of the
+    PowerShell that runs the builder) may hold a newer copy from
+    Microsoft's NuGet package (see "Microsoft debugger engine" under
+    Optional Tools); it is used only when dbgeng.dll, dbghelp.dll and
+    dbgmodel.dll are there and every DLL in that folder (subfolders too) has
+    a valid signature from Microsoft, otherwise the log has a warning and
+    the engine of Windows is used. The DLLs are always loaded by their full
+    path, never searched for. The builder runs the engine in a PowerShell
+    process of its own (lib\memory\TimelineDbgEng.ps1), so a damaged dump
+    that crashes or hangs the engine cannot stop the builder: that process
+    is ended after 15 minutes. The helper sends the processes and command
+    lines as soon as it has read them, before the other areas run (a
+    checkpoint line, "TBDBG|PCEND|<processes>|<command lines>"): when it
+    crashes or hangs after that (in one of the areas below; a crash of the
+    engine's native code cannot be caught inside the helper), the builder
+    keeps those rows, logs a warning ("The debugger engine helper stopped
+    with exit code 0xC0000005 after it had sent the processes and command
+    lines: they are used, the other memory areas are not read.") and every
+    area is "not read (the helper stopped with exit code ...)" or "not read
+    (the helper did not finish within 15 minutes)". When it stops before
+    that point, the dump is reported as not analyzed.
+  - What is read (the same rows as Volatility's plugins, Source
+    Memory-Processes and Memory-CommandLine):
+      processes, as windows.pslist: PID, parent PID, name (the full file
+        name and much more when the ProcessDetails area read them, see
+        "Process users and paths" below), threads, session
+        and the exact create time (to 100 ns; the timeline keeps
+        milliseconds); exited processes still in the list are listed too
+        (Threads=0). System, smss.exe and the other processes without a
+        session have none (an empty SessionId), as with Volatility; the
+        others have the session id of their session space when the kernel's
+        symbols describe it, else that of their process token (the symbols
+        of Windows 11 24H2 on ARM64 have no _MM_SESSION_SPACE), decided for
+        each process.
+      How the processes are found: in the kernel's own structures, three
+        ways -- its process list (nt!PsActiveProcessHead, then each
+        EPROCESS's ActiveProcessLinks) walked forwards, the same list walked
+        backwards, and its process ID table (nt!PspCidTable, which holds
+        every process and thread by its ID) -- and every process that any of
+        them found is listed, once. Each process's fields are read from its
+        EPROCESS at the offsets the kernel's symbol file gives (the engine's
+        dt command); an entry that is not a process (memory that was
+        reused) is never listed. Why: DumpIt copies memory while Windows
+        runs, so a process that starts or ends during the copy can leave the
+        list inconsistent (an entry whose link back does not point to the
+        entry before it). The debugger engine's own process list
+        (dx @$cursession.Processes, what WinDbg shows) ends at the first
+        such link, and Windows adds new processes at the end of the list:
+        that list missed the newest processes, the collector's own among
+        them (two real dumps: 183 of 192 and 168 of 175 processes, one of
+        the 168 a row made of reused memory). The walks go on past an
+        inconsistent link and count it; the process ID table does not use
+        the list at all.
+      Each process row says which ways found it, in Details:
+        FoundBy=ListForward,ListBackward,ProcessIdTable (or the ways that
+        did). A process found by fewer ways is listed all the same, as
+        Volatility's windows.pslist would list what the list holds.
+      The log says what each way found ("Processes found: 192; the kernel's
+        process list walked forwards 192 (1 inconsistent link), backwards
+        191 (1 inconsistent link), in its process ID table 192, in the
+        debugger engine's own list 183"). When the ways disagree, it has a
+        warning that the findings report shows as an Evidence coverage
+        note, so an analyst can judge the dump's process rows:
+          Memory dump process list: the kernel's list of processes was
+            inconsistent in 1 place, as when memory is copied while Windows
+            runs and processes start or end during the copy. 192 processes
+            were found, 191 of them by all three ways (walking the kernel's
+            process list forwards, walking it backwards, and its process ID
+            table), 1 missed by walking backwards. The debugger engine's own
+            process list (dx @$cursession.Processes in WinDbg) has 183
+            entries and stops at the first inconsistent link.
+        ("8 missed by walking forwards" when the forward walk stopped at
+        memory that was reused). Copying memory explains a process missing
+        from the list only when it ended or started during the copy. A
+        process that neither walk found, only the process ID table, is
+        named by its PID ("1 only in the process ID table (PID 7100,
+        created after the capture started)", or "PID 7000, which had
+        exited"). What copying does not explain comes first in the warning,
+        and its row is marked (Details Anomaly=):
+          Anomaly=NotInProcessList: a process that neither walk found, only
+            the process ID table, although it was created before the capture
+            started (the time in the dump's header) and has no exit time,
+            while a walk reached the end of the list. A process leaves the
+            list only when it ends, so this is what a process hidden from
+            the list (unlinked from it, as rootkits do) looks like: "PID 7300
+            is in neither walk of the kernel's process list, only in its
+            process ID table, yet it was created before the capture started
+            and has no exit time. Copying memory does not explain that, ...".
+            When both walks stopped early, or the dump's header has no
+            capture time, such a process is named but not marked.
+          Anomaly=ProcessIdChanged: a process whose own process ID is 0
+            (only the idle process has it, and it is in neither the list
+            nor the table), not a multiple of 4, or not the ID the process
+            ID table holds it under (TableId= on its row). It is listed with
+            the ID it has, and the warning names it by PID and address.
+          Both marks are judged by the process's own create time against
+            the capture: its start (the time in the dump's header) and its
+            end (the dump file's last-write time, when the copy finished).
+            A process created more than 120 seconds before the start, one
+            without a create time, and one created after the end (2 seconds
+            are allowed for rounded file times) is marked; the warning says
+            which ("PID 5016 at 0x..., held in the process ID table under ID
+            7776, without a create time", "... created after the capture
+            ended") and adds "Capture churn is a process created between
+            the capture's start and end ... or shortly before: one without
+            a create time, or created after the capture ended, is not." A
+            process ID that is not a multiple of 4, or 0 for a process the
+            table does not hold under another ID, is marked whenever it was
+            created: a stale entry of the table cannot give it.
+        Capture churn: a process created while memory was being copied, or
+        at most 120 seconds before the header's time, is not marked when
+        the process ID table holds it under another ID or both walks missed
+        it. The process ID table and a process's memory are copied at
+        different moments, and on a computer busy with short-lived processes
+        one that ends in between leaves its ID or its memory to a new
+        process, so the table can hold a new process under the ID of one
+        that is not in the dump (a stale entry), and the walks can miss it.
+        Its row keeps FoundBy= and TableId=, and the warning counts it: "6
+        processes are capture churn, started while memory was being copied
+        (or at most 120 seconds before it), with stale process ID table
+        entries (PID 16252 at 0x..., held in the process ID table under ID
+        2256; ...). The process ID table and a process's memory are copied
+        at different moments, ..., so copying memory explains this; they
+        are not marked." Why 120 seconds: a process created before the
+        capture started shows up so only when it ended during the copy, so
+        how long before the start it can have been created is set by how
+        long the computer's short-lived processes live, not by when the
+        capture tool starts (0.05 to 0.27 s before the header's time in four
+        real ARM64 dumps). In a real dump of a computer busy with polling
+        loops that waited 5 and 10 seconds, the six processes the table
+        held under another ID had been created during the copy but one,
+        0.78 s before the header's time; the processes that had ended (an
+        exit time in the dump) in the four real dumps had lived 0.1 to 24.1
+        seconds, apart from ones that ran for hours, and one 60.3 seconds:
+        created 36.7 s before the header's time, it ended during the copy,
+        the case the margin is for. 120 seconds is twice the longest; a
+        process hidden from the list is normally minutes to hours old. When only the table has such a
+        process, the warning's list of those processes says "created after
+        the capture started" or "created at most 120 seconds before the
+        capture started".
+        What this relies on: a process's create time is in its own memory,
+        where a rootkit that can change its process ID or unlink it can
+        change that too. A create time of 0, or one after the capture
+        ended, is marked; one that a rootkit keeps within the capture's
+        start and end (or the 120 seconds before) is taken as capture churn
+        and not marked, though the warning still names the process with its
+        address and the table's ID, and its row keeps TableId=. On a
+        computer that runs processes which live longer than 120 seconds and
+        end during the copy (a slower polling loop, an application closed
+        while the memory was copied), a process created earlier can still
+        be marked: its exit time, parent and command line show what it was.
+        Without the capture start (the dump's header has no time), nothing
+        is marked: a process ID that does not fit is named ("... have a
+        process ID that does not fit (...). Whether copying memory explains
+        that cannot be judged without the capture's start time (the time in
+        the dump's header), so they are not marked."). Without the capture
+        end (the dump file's last-write time is before the header's time),
+        a process created after the start is named the same way ("...
+        cannot be judged without the capture's end time (the dump file's
+        last-write time), as it was created after the capture started, so
+        it is not marked.").
+        An entry of the process ID table that holds a process also held
+        under its own ID (the table changed during the copy) gives TableId=
+        and a sentence in the warning, but no mark. An object of the process
+        type whose own fields do not look like a process's (memory that was
+        reused) is never listed; the counts say how many entries of the
+        table were left out that way. The findings report's
+        INTEG-PROCESS-HIDDEN rule (High, Integrity) makes a lead of every
+        marked row.
+        When the kernel's symbols do not describe these structures (the log
+        says why), or they do but no process is found in them (the log says
+        so in a plain line, with why each way found none), the debugger
+        engine's own list is used instead, with a warning; when that list
+        reports itself corrupted ("corrupted linked list"), the "Memory dump
+        process list" warning says that the newest processes can be
+        missing, and it is then the only such warning.
+      command lines, as windows.cmdline: read from each process's own
+        memory exactly as stored (quotes, tabs, line breaks, any
+        character). None for the kernel's own processes (System, Registry,
+        Memory Compression: no PEB), and none for a process whose command
+        line is paged out of memory or that has exited -- where Volatility
+        writes "Required memory at ... is not valid", this writes no row.
+  - The areas: beyond the processes and command lines, the helper reads
+    more of the dump, from the same kernel symbol file (nothing else is
+    downloaded). Each area is code of its own in lib\memory\
+    (TimelineDbgEng.<area>.ps1) on a shared reading layer
+    (TimelineDbgEng.Reader.ps1: reads through a page cache of at most
+    64 MB, structure offsets only from the kernel's symbol file, a
+    process's memory regions walked with the copy's inconsistencies
+    counted). The areas run after the command lines (which the helper has
+    already sent to the builder by then, see above), one after the other in
+    a fixed order, each with a time limit; then their results are combined
+    and only then written. An area that fails, or whose file is missing or
+    was blocked, is "not read" and the others go on; the processes and
+    command lines are never affected, not even when the helper process
+    itself dies in an area. The builder makes the rows of the
+    areas (lib\memory\TimelineMemoryRows.ps1: Snapshot rows at the capture
+    time unless an entry has a valid time of its own, Details as
+    "Key=value | Key=value", and every row of a process with
+    "PID=<n> | ProcessCreated=<its create time>", by which the findings
+    report leaves the collector's own processes out). The log has one line
+    per area (read, partly read or not read with why, its entries and
+    seconds), and for an area read with gaps that a live copy leaves, an
+    information line that the findings report shows as a coverage note:
+      Memory dump coverage: <area> -- <what could not be read>
+    The areas, in the order they run (an area whose file is missing says
+    "not read (lib\memory\<file> is missing)", one whose file an antivirus
+    blocked "not read (lib\memory\<file> could not be loaded [<why>])", and
+    one whose file loaded without its code "not read (not built yet)"; a
+    rule summary follows the list):
+      Process users and paths (ProcessDetails; lib\memory\
+        TimelineDbgEng.Tokens.ps1 and TimelineDbgEng.ImagePaths.ps1): for
+        each process, its token and where its program is. No rows of its
+        own: the Memory-Processes and Memory-CommandLine rows get more.
+          The token (EPROCESS.Token), read whole from kernel memory, where
+          a live copy does not change it: its user (the User column of
+          both rows: the SID, which the User pass names, see "User
+          column" above), its integrity level, its elevation and its
+          enabled privileges; the logon session it belongs to gives the
+          account name ("<Authority>\<Account>") and whether it is half of
+          a split token (an administrator's UAC token pair). Only offsets
+          from the kernel's symbol file are used, plus the fixed meaning
+          of a few bits (the token's filtered, UIAccess and LowBox flags,
+          two group attributes and the privilege numbers of the Windows
+          SDK headers). A token is used only when its pointers are kernel
+          addresses, it has at most 1024 groups and its SIDs are SIDs
+          (revision 1, at most 15 sub-authorities); a logon session only
+          when its logon id is the token's. What fails is counted, never
+          guessed.
+          The program: the kernel's own record of the file the process
+          was started from (EPROCESS.SeAuditProcessCreationInfo,
+          "\Device\HarddiskVolume3\Windows\System32\svchost.exe"), the
+          image's file object as a cross-check, and the process's own PEB
+          (its ImagePathName and current folder, in its own memory, which
+          it can change). The volume's device name becomes its drive
+          letter as the processes show it: a process whose PEB path
+          ("C:\...") and kernel path are the same after the drive and the
+          device teaches the pair; a device two drive letters were learned
+          for (or the other way round) keeps its device name. The process
+          name on both rows becomes the full file name (Windows keeps only
+          the first 14 characters in EPROCESS.ImageFileName, and Volatility
+          shows those) when the short name starts the kernel's file name.
+        Memory-Processes rows get, after the fields they had (Threads=,
+        SessionId=, CreateTime=, FoundBy=, TableId=, Anomaly=), each when
+        it was read:
+          Integrity=System|High|Medium|Low|Untrusted (also MediumPlus,
+            Protected, or the RID in hex)
+          Elevation=Default|Full|Limited  Default: no linked token; Full
+            and Limited: the elevated and the filtered half of an
+            administrator's token
+          Elevated=Yes|No  Yes for Full, or Default with the Administrators
+            group enabled (SYSTEM)
+          AdminGroup=Enabled|DenyOnly|Absent (Disabled when the group is
+            there but neither)
+          TokenSession=<n>  LogonId=0x<the token's logon session id>
+          AppContainer=Yes, UIAccess=Yes  only when set
+          Protection=PPL-<signer>|PP-<signer>  a protected process
+            (PPL-Antimalware, PP-WinTcb, ...)
+          Privileges=<the enabled ones of SeDebugPrivilege, SeTcbPrivilege,
+            SeLoadDriverPrivilege, SeCreateTokenPrivilege,
+            SeAssignPrimaryTokenPrivilege, SeBackupPrivilege,
+            SeRestorePrivilege, SeTakeOwnershipPrivilege>  (SeImpersonate
+            is left out: every service has it)
+          LogonAccount=<Authority>\<Account>  ImagePath=<the kernel's
+            program path, with its drive letter>  CurrentDirectory=<path>
+          PebImagePath=<path>  only when the PEB's path differs from
+            ImagePath (a \??\ prefix and case aside): \SystemRoot\ forms,
+            a path through a junction, an 8.3 name
+        Three more Anomaly= tokens, joined with the process scan's:
+          ImageNameChanged  the short name in memory does not start the
+            kernel's file name: a name changed in memory (ASCII names with
+            a program path only; System and the minimal processes are not
+            judged). The row keeps the short name.
+          PebImageNameMismatch  the PEB's file name differs from the
+            kernel's (a folder-only difference, 8.3 names and an
+            unreadable PEB are never judged)
+          SystemChildOfUser  a SYSTEM (or System-integrity) process whose
+            parent, by PPID, is in the dump, was created before it and had
+            not ended, and runs as a user account at Medium or lower
+        Rules: ACCESS-SYSTEM-CHILD-OF-USER (High), INTEG-PROCESS-NAME-
+        CHANGED (High), INTEG-PROCESS-PEB-MISMATCH (Medium), on those
+        tokens, and ACCESS-DEBUG-PRIV-USER (Info, a user account's process
+        with SeDebugPrivilege enabled); EXEC-STAGING also reads ImagePath=.
+        On the three real ARM64 collections the first three had no hit;
+        the Info rule had the collector's own PowerShell and DumpIt (left
+        out where collection_info.json records them) and elevated programs
+        of the computer's user. The collector's processes read as High,
+        Full, elevated.
+        The log: a counts line ("ProcessDetails: processes 195, tokens read
+        195, logon sessions read 195, kernel paths read 192, full names
+        longer than the short name 46, ..., ImageNameChanged 0, ...") and,
+        when something could not be read, the coverage line ("Memory dump
+        coverage: process users and paths -- the PEB of 7 processes could
+        not be read, as when a process has ended or its memory was paged
+        out"). Under a second for an 8 GB dump (0.1-0.2 s measured).
+      DLLs (Modules): each process's DLLs, from the loader's own lists (the
+        64-bit one and, for a 32-bit process, its 32-bit one) and from the
+        images mapped into its memory (its VADs, with the file behind each
+        mapping). Source Memory-Modules: one row per process and DLL outside
+        the Windows folder (its Temp folder counts as outside), and per
+        image that is mapped but missing from the loader's lists; the other
+        DLLs (about 9,500 per dump) are only counted in the log. A row is a
+        ModuleLoad event at the loader's own load time of the DLL when that
+        lies in the process's lifetime, else a Snapshot row. Details: PID,
+        ProcessCreated, Path (the mapped file, with the drive letter the
+        loader's own paths give), Base, Size, LoadReason (the loader's
+        reason, such as StaticDependency or DynamicLoad), FoundBy
+        (LoaderList, LoaderList32, ImageMapping), and where they apply
+        Protection and Managed=Yes (for an image in no loader list: the
+        mapping's protection, ReadOnly for a resource-only load such as
+        reading a file's icon; a .NET assembly, which the .NET runtime maps
+        itself), Anomaly and LoaderPath (the loader's path when it is not
+        Path). Anomaly=:
+          NotInLoaderLists  mapped but in no loader list; judged only in a
+                            process whose loader lists were read to their end
+          NoImageMapping    a loader entry with no image mapped at its base;
+                            judged only when the process's memory-region tree
+                            added up
+          NameMismatch      the loader's file name is not the mapped file's
+                            (8.3 short names are not judged)
+        A protected process (an anti-malware engine maps files to scan them)
+        is never judged: its mapped-only images are only counted. Rules:
+        EXEC-MODULE-USERPATH (Medium: a DLL from Downloads, Users\Public,
+        PerfLogs, the Recycle Bin or a Temp folder, not a resource-only
+        load), INTEG-MODULE-UNLINKED-USERPATH (Medium: an image mapped as code
+        from a user folder that no loader list has; not a resource-only load,
+        a .NET assembly, .mui, .winmd or a Windows Store app),
+        INTEG-MODULE-UNLINKED (Info: the same outside the Windows and user
+        folders) and INTEG-MODULE-NAME-MISMATCH (Info). A process whose loader
+        list is gone (it exited) or paged out is not judged, nor are the
+        loader entries of a process whose memory-region tree did not add up
+        (memory copied while Windows runs); the "Memory dump coverage: DLLs"
+        line counts both. Measured on three 8 GB ARM64 dumps: 8,700-9,900
+        loader entries, 9,300-10,200 image mappings, 380-460 rows, 0.3-3 s.
+      Executable private memory (PrivateCode): memory a process can run code
+        from that has no file behind it (private memory regions with an
+        execute protection), the memory Volatility's malfind plugin looks
+        at. Source Memory-PrivateCode, one Snapshot row per region: PID,
+        ProcessCreated, Start, Size, Protection (Execute, ExecuteRead,
+        ExecuteReadWrite, ExecuteWriteCopy), FirstBytes (PE: the first page
+        starts with a program header, MZ or PE with the MZ erased; Zero;
+        Data; Unreadable: not in the dump), JitHost (Yes: the process has a
+        run-time compiler loaded -- .NET, a script or browser engine, Java,
+        the x86/x64 emulator of Windows on Arm -- which makes such memory as
+        it runs; No; Unknown: its modules were not read),
+        ProcessProtected=Yes for a protected process, and Anomaly=PeHeader
+        with a program header. Rules: INTEG-PRIVATE-CODE-PE (High: a program
+        header in such memory) and INTEG-PRIVATE-CODE (Info: such memory in a
+        process without a run-time compiler, not a protected one). Measured
+        on three 8 GB ARM64 dumps: 19-21 regions in 3-4 processes, none with
+        a program header, well under 0.1 s (it reuses the DLLs area's walk of
+        the memory regions).
+      Kernel drivers (Drivers; lib\memory\TimelineDbgEng.Drivers.ps1, with
+        the kernel object decoding of TimelineDbgEng.Objects.ps1): the
+        kernel's module list (nt!PsLoadedModuleList) walked forwards and
+        backwards like the process list, and every driver object of the
+        object directories \Driver and \FileSystem (an object's type is
+        decoded from its header with the kernel's per-boot cookie, its name
+        from its name header; all offsets from the kernel's symbol file).
+        Source Memory-Drivers, no User (a kernel module belongs to no
+        process):
+          Kernel module in memory: <file name>  (Snapshot)
+            Path=<its path, \SystemRoot\, \??\ and the volume's device name
+            as a drive letter> | Base=0x.. | Size=0x.. |
+            FoundBy=ModuleList[,DriverObject] [| DriverObject=\Driver\<n>
+            or \FileSystem\<n>, those that use it] [| Anomaly=NotInModuleList]
+          Kernel module unloaded: <file name>  (DriverUnload at its unload
+            time) Base=0x.. | Size=0x.. | FoundBy=UnloadedDriverList
+        Anomaly=NotInModuleList: a driver object whose module entry is in
+        neither walk of the list and whose code lies in no listed module --
+        a driver unlinked from the list, as kernel rootkits do. Judged one
+        way only (the kernel, hal and the libraries have no driver object and
+        are never flagged), and only when a walk reached the list's end; a
+        driver that also removed its driver object is not found this way.
+        Not marked either when an unload record (below) covers the driver
+        object's address with an unload time at or after 120 seconds before
+        the capture started (the process scan's capture churn margin): a
+        driver unloaded while the memory was copied, whose driver object was
+        copied before the unload and the module list after it. The log
+        counts such driver objects ("driver objects of drivers unloaded
+        during the capture") and a coverage note says so.
+        The recently unloaded drivers are the kernel's own record of the last
+        50 (nt!MmUnloadedDrivers): name, address range and time. The 24H2
+        symbols do not describe that record, so its long-standing layout
+        (name, start, end, time; 0x28 bytes) is used, every slot is checked,
+        and the whole list is dropped when most slots fail; on Windows 11
+        24H2 its time is the time since boot, added to nt!KeBootTime.
+        Rules: INTEG-DRIVER-HIDDEN (High) on NotInModuleList and
+        PERSIST-DRIVER-USERPATH (Medium) for a module under \Users\,
+        \ProgramData\, a Temp folder or another user-writable folder. Measured
+        on three 8 GB ARM64 dumps: 193/193/192 modules, 157/157/156 driver
+        objects (9 of them without a module entry), none hidden, none
+        explained by an unload record, every module under C:\Windows\
+        (DumpIt's driver too), 18/14/10 unloaded drivers; about 1 s.
+      Handles (Handles; lib\memory\TimelineDbgEng.Handles.ps1): every
+        process's handle table (EPROCESS.ObjectTable, one to three levels of
+        4 KB pages) is decoded, each handle's object and type with it --
+        about 74,000-81,000 handles per dump, counted per type in the log --
+        but only a subset becomes rows, at most about 1,000 per dump. Source
+        Memory-Handles, Snapshot rows, User the holder's token SID:
+          Handle in memory: <Type> <target> (PID: n, Process: <holder>)
+          PID=<holder> | ProcessCreated=<its create time> |
+          Type=Process|Thread|File|Key|Mutant | Handle=0x.. | Access=0x<mask>
+          | Target=<process, file path, key path or name> [| TargetPID=n |
+          TargetProcess=<name> | TargetCreated=..] [| TargetTID=n]
+          [| Handles=<n of them>] [| Anomaly=..]
+        The subset: a Process handle with rights to change another process
+        (memory operation and write, thread creation, or all access) or a
+        Thread handle with set-context, where the holder is neither the
+        target's parent nor its child and is not the System process (one
+        row per holder, target and type, with their rights together; a
+        thread handle is folded into the row of a process handle to the same
+        process); a File in a user-writable folder (Downloads, Users\Public,
+        PerfLogs, the Recycle Bin, a Temp folder) or a Startup folder; a Key
+        under Run, RunOnce, Winlogon, a key under Image File Execution
+        Options (the loader keeps that key itself open in every process),
+        or the Services key and a service's own key, its path from the key
+        control block chain; and a named Mutant (mutex). Each is listed once
+        per process, and at most 50 File and 50 Mutant entries (25 Key
+        entries) per process and 1,000 File, 2,000 Mutant and 500 Key
+        entries per dump are listed: a process that makes many named objects
+        cannot flood the timeline. The rest are counted ("named mutexes only
+        counted" in the log) and a coverage note says how many in how many
+        processes; on the three real dumps no cap was reached. Anomaly=:
+          WriteAccessUnrelated  the holder runs as a user account (S-1-5-21-
+                                or S-1-12-1-...) and the target is not in its
+                                process family: not started by it or its
+                                children (any depth), not of its console when
+                                it is a console host, not another process of
+                                the same program, user and parent
+          TargetHasPeCode       the target has executable private memory that
+                                starts with a program header (the joins, with
+                                the executable private memory area)
+        Rule: INTEG-HANDLE-WRITE-ACCESS (Medium, Integrity) on
+        WriteAccessUnrelated -- switched off: on the three real ARM64
+        collections it had 2, 3 and 0 rows the collector does not explain
+        (thread handles with all access held by installed applications to
+        another application's thread). The rows keep the Anomaly for the
+        analyst, and the rule can be switched on in a copy of the rules
+        file. Measured on three 8 GB ARM64 dumps: 80,724/76,115/73,818
+        handles in 188/182/173 tables, 955/939/887 rows (340/332/309
+        process, 3/7/0 thread, 8/8/7 file, 57/53/50 key, 547/539/521
+        mutex rows), 2.5-3.8 s.
+        Processes reached only through a handle: every Process handle's
+        object that no way of the process scan found (forward walk, backward
+        walk, process ID table) is read and judged as the scan judges a
+        process missing from the kernel's list, the classic cross view of a
+        process hidden by unlinking it. A process object (its type, a
+        process ID Windows gives, kernel addresses in its list links and
+        token) without an exit time, created more than 120 seconds before
+        the capture started, becomes a Memory-Processes row of its own:
+        "Process in memory: <name> (PID: n, PPID: n)", Details "Threads=
+        SessionId= FoundBy=HandleTable Anomaly=NotInProcessList
+        HeldBy=<PIDs of the processes holding the handles>", a lead of
+        INTEG-PROCESS-HIDDEN; a coverage note says how many. One that has
+        exited (a handle keeps an ended process's object), was created
+        during the copy or in the 120 seconds before it, or cannot be judged
+        (no capture start, no create time, or a process scan that did not
+        read the process ID table, such as the debugger engine's own list)
+        is only counted in the log. On
+        the three real dumps no Process handle reached a process object
+        outside the scan.
+      Registry hives (Registry): the registry in memory; Source
+        Memory-Registry. On Windows 11 the hives' data is mapped into the
+        Registry process, so it is read there (in the process each hive's
+        view map names). What it reads:
+          - the kernel's hive list, walked both ways like the process list:
+            one Snapshot row per hive, "Registry hive in memory: <root
+            path>", with Details File= (the hive's file; \??\ and known
+            devices as drive letters, \SystemRoot\ as it is), Readable=
+            (the share of the hive's 4 KB blocks that is in the dump, from
+            the page tables: the blocks themselves are not read), Root=
+            Read|Unreadable|NotRead (its root key, from the hive's base
+            block, its root key control block or its first cell), FoundBy=
+            HiveListForward,HiveListBackward and Offset= (the hive's
+            _CMHIVE, for WinDbg); User is the SID of a user's hive;
+          - the Run, RunOnce and Policies\Explorer\Run keys (also under
+            Wow6432Node) of the SOFTWARE hive and of each user's hive
+            (HKU\<SID>, and .DEFAULT, the system account's): one row per
+            value, "Run key value in memory: <name> [<key>]",
+            PersistenceChange at the key's last write time (an older value
+            keeps that time), with Details "OnDisk=<below> | Key=<key> |
+            Time=key last write [| Data=Unreadable] | Command=<the data as
+            the collector's run_keys.csv writes it, not expanded>"
+            (Data=Unreadable when the value is there but its data is not in
+            the dump): the builder's own fields first and the value's data
+            last, so text in the data (" | OnDisk=Yes", say) never comes
+            before them; User is the hive's SID;
+          - SYSTEM\<current control set>\Services: ImagePath, ServiceDll
+            (of its Parameters key), Start, Type, ObjectName and
+            DisplayName of each service key, with no rows of its own: the
+            services area's rows are combined with it.
+        SAM and SECURITY (by root path or file name) are listed by name
+        only: none of their data is read, nor of a hive whose root path is
+        not in the dump.
+        OnDisk= compares a Run value with the collection's copy of the same
+        hive's Run key (the dump is parsed last): Yes when it has a value of
+        that name with the same data, Changed when it has one with other
+        data, No when the collection read that hive's Run keys and has no
+        value of that name, Unknown when it did not (the hive is read live
+        through the collector's run_keys.csv or run_keys.txt, HKLM and the
+        loaded users' hives, and through a user's collected NTUSER.DAT,
+        which the builder loads only when run as Administrator; neither is
+        there when -Sources leaves out Persistence and Registry). PERSIST-RUNKEY-SUSPICIOUS and PERSIST-RUNKEY-STAGING
+        also look at these rows, except OnDisk=Yes ones (the on-disk row
+        with the same command makes that lead), and
+        PERSIST-RUNKEY-MEMORY-ONLY (Medium, Persistence) makes a lead of
+        each OnDisk=No value. The rules read OnDisk= only at the start of
+        Details, where no other source's rows have it: a Run value whose
+        data holds " | OnDisk=Yes" (on disk or in memory) still makes its
+        lead.
+        A live copy leaves much of the hives out (35-55% of their blocks
+        were in the dumps this was built on): a key is called absent only
+        when the subkey lists above it were read in full, else it was "not
+        in the dump", and nothing missing from memory is ever a lead. The
+        coverage note says how much of the hives was in the dump; the log
+        has the counts (hives, root keys by source, Run keys read, absent
+        and not in the dump, Run values, Services subkeys, blocks, cells)
+        and the seconds per part, about 1-2 s in all on an 8 GB dump.
+      Console history (Console): commands typed in console windows; Source
+        Memory-ConsoleHistory (lib\memory\TimelineDbgEng.Console.ps1).
+        Every console host (conhost.exe, and OpenConsole.exe) keeps one
+        command history per program that used the console window: what
+        was typed at a cmd.exe prompt, an answer to "set /p", a line read
+        by any console program. Commands typed at a PowerShell prompt are
+        not kept there (PSReadLine keeps them, and the builder reads its
+        ConsoleHost_history.txt), nor is the text shown in the window.
+        No symbol file describes these structures: their layout is that of
+        Microsoft's open-source console code (github.com/microsoft/terminal,
+        src\host\history.h and src\server\ProcessHandle.h), confirmed on
+        Windows 11 ARM64 dumps. The list is found in the console host's
+        writable image data (the image base from the process's PEB, the
+        PE section table) and taken only when its nodes form a closed ring
+        with consistent back links and plausible histories. A console host
+        whose image header or PEB is not in the dump gets the list's offset
+        (and image base) from another console host, checked the same way.
+        When no console host whose data is all in the dump has such a list,
+        the area is not read ("the console's command history was not found
+        where this Windows version is known to keep it"), never wrong rows.
+        One Snapshot row per command at the dump's capture time (a command
+        has no time of its own):
+          Console command in memory: <program> (conhost PID: <n>)
+          PID=<console host> | ProcessCreated=<its create time> |
+          App=<program the command was typed into> | ClientPID=<its
+          process ID, or empty> | Index=<0 = oldest> | HistoryCount=<n> |
+          FoundBy=ConsoleHistoryList | Args=<the command>
+        The User column is the console host's token SID (when the process
+        users are read). ClientPID is given only while the program is
+        attached to the console and is a process of the dump with that
+        program name. The command comes last, so text typed in it never
+        stands before the console host's own PID= and ProcessCreated=, by
+        which the findings report leaves the collector's own console out
+        (option C). The log line counts the console hosts, lists,
+        histories, attached and confirmed clients and commands, and what
+        was not in the dump; a console host whose history was not in the
+        dump (paged out, or the console had closed) makes the area partly
+        read, with a "Memory dump coverage" note. About 0.1 s for an 8 GB
+        dump. The command-content rules (EXEC-PS-ENCODED,
+        EXEC-PS-DOWNLOAD, EXEC-PS-DOWNLOAD-FILE, EXEC-LOLBIN-URL,
+        EXEC-PS-AMSI-CRED, EXEC-DEFENDER-TAMPER-CMD) read these rows as
+        they read the memory command lines; the rules that key on program
+        names and paths (EXEC-STAGING, EXEC-HACKTOOL-RAN, INITIAL-EMAIL-*)
+        do not.
+      Services (Services): the service control manager's list in the
+        memory of services.exe, as Volatility's windows.svcscan gives it on
+        x64 dumps (lib\memory\TimelineDbgEng.Services.ps1); Source
+        Memory-Services, one Snapshot row per service at the capture time
+        (a service record has no time of its own):
+          Description  Service in memory: <display name> (<name>)
+          Details      State=<SERVICE_RUNNING, SERVICE_STOPPED, ...>
+                       StartType=<SERVICE_AUTO_START, ...> Binary=<the
+                       program the service control manager runs; for a
+                       driver its driver object, \Driver\<name> or
+                       \FileSystem\<name>, as Volatility gives it>
+                       PID=<the process of a service that is not stopped>,
+                       then Type=<its type flags, comma-separated> Order=<n>
+                       FoundBy=<ScmList: the list; MemoryScan: found by a
+                       search of services.exe's memory; ,Registry: joined
+                       with the registry in memory; Registry alone: from the
+                       registry, when the list could not be read>
+                       [Anomaly=<HostNotListed: its process ID is not a
+                       process of the dump; NoRegistryKey: not stopped, but
+                       the SYSTEM hive's Services key in memory, read in
+                       full, has no key of its name>] and, when known,
+                       Account= RegistryBinary=<the key's ImagePath>
+                       ServiceDll=<its Parameters\ServiceDll>, these last
+                       (their values can hold spaces)
+          User         the token user of the service's process (from the
+                       process users and paths area; empty when not known)
+        How it is read: services.exe is taken from the processes (the one
+        wininit.exe started first), its image base from its PEB, and the
+        list's first and last records from a pair of pointers in its .data
+        section; the list is walked forward, and backward from its end when
+        a page that a live copy left out stops the walk (then the area is
+        partly read and its coverage note says how many records were read).
+        When the list's ends are not found, services.exe's private memory is
+        searched for the records, and only a record whose neighbours link
+        back to it is taken (stale copies are left out). The record layout
+        is in no symbol file: it is the one published for 64-bit Windows 11
+        build 26100 and later (MemProcFS's offsets), checked on three ARM64
+        dumps (615 services each, the list whole, the process ID of every
+        running service a process of the dump). A dump whose records fail
+        the self-check (the states, start types, types and names of nine in
+        ten records) is "not read (the service records are not in the layout
+        this helper knows ...)", never given rows from a wrong layout. The
+        registry in memory is joined when the registry hives area offers
+        the Services key. Under a second for an 8 GB dump.
+        The findings report: PERSIST-SERVICE-MEMORY-SUSPICIOUS (Medium,
+        Persistence) for a service whose Binary= or RegistryBinary= runs
+        cmd /c, PowerShell, a LOLBin, a program from a user-writable folder
+        or from an ADMIN$ share, or whose ServiceDll= is in a user-writable
+        folder (the patterns of PERSIST-SERVICE-SUSPICIOUS; it also reads
+        Volatility's x64 rows); PERSIST-SERVICE-REMOTEACCESS (Medium) also
+        reads the name, display name and binary of these rows;
+        INTEG-SERVICE-NO-REGISTRY-KEY (Medium, Integrity: Anomaly=
+        NoRegistryKey), switched on after it was measured with the registry
+        in memory joined (615 of 615 services joined with their key, none
+        missing, on each of the three real ARM64 collections).
+      Network connections (Network): TCP connections, listeners and UDP
+        endpoints, as Volatility's windows.netscan gives them on x64 dumps;
+        Source Memory-Network, the same rows ("Memory network: <proto>
+        <local>:<port> -> <foreign>:<port> (<state>)", NetworkConnection at
+        the time the endpoint was made, else Snapshot; Details "PID=<n>
+        Process=<owner>"). tcpip.sys keeps them in kernel memory that no
+        symbol file describes, so they are found the way Volatility finds
+        them: by the tag of each pool allocation (TTcb a connection, TcpL a
+        listener, UdpA a UDP endpoint), in one read-only pass over the dump
+        file itself (lib\memory\TimelineDbgEng.PoolScan.ps1), start to end,
+        16 MB at a time, on a thread of its own while the other areas run
+        (a match whose pool header gives another allocation size than the
+        object's is counted and dropped right there, so memory filled with
+        these tags cannot take the place of real objects under the pass's
+        cap of 8192 hits per tag):
+        about 10 seconds for an 8 GB dump on an internal SSD, longer from a
+        USB drive. The pass has the area's time limit, 300 seconds; past it,
+        what the part read holds is listed and the area is partly read
+        ("the pass over the dump file stopped at its time limit of 300 s
+        after N% of it"). Only a full memory dump is scanned (DumpIt writes
+        one); another kind is "not read (the dump file is not a full memory
+        dump [dump type N])". The objects' fields are at offsets no symbol
+        file gives: a table per Windows build (lib\memory\
+        TimelineDbgEng.Network.ps1; Windows 11 24H2 and 25H2, builds 26100
+        to 26299), used only when the dump's objects pass self-checks (their
+        allocation size, their address family object, a known TCP state,
+        plausible create times, owners that are listed processes). A kind
+        that fails them is not listed and the coverage note says so; a
+        Windows build outside the table is "not read (the network objects
+        of Windows build N are not known to this builder)". Appended to
+        Details, in the same space style:
+          FoundBy=PoolScan PoolTag=<TTcb|TcpL|UdpA> Stale=<Yes|No>
+          [Duplicate=Yes] [RemoteScope=<Public|Private|Loopback|LinkLocal|Other>]
+          [OwnerCreated=<the owner's create time>] [Anomaly=OwnerHidden]
+          [OwnerPath=<the owner's program path>]
+        A scan of memory also finds objects that were freed. Stale=Yes: the
+        entry is closed (CLOSED, DELETE_TCB), its owner has exited, or its
+        owner memory is no longer that process (not a process object, or a
+        process started after the entry was made; PID and Process are then
+        empty). Stale rows are never flagged. RemoteScope (connections
+        only): Public, an address on the internet; Private, 10/8,
+        172.16/12, 192.168/16, 100.64/10 and fc00::/7; Loopback; LinkLocal;
+        Other, unspecified, multicast, broadcast and reserved or
+        documentation ranges. Anomaly=OwnerHidden: the owner is a process
+        row with Anomaly=NotInProcessList, or a process object no way of the
+        process scan found, without an exit time and created more than 120
+        seconds before the capture started (the process scan's capture
+        churn margin: a process that ended and was deleted while memory was
+        copied can leave its object copied before its exit; the log counts
+        owners within the margin). A listener's foreign address is 0.0.0.0:0
+        or :: port 0, a UDP endpoint's *:0 with an empty state. The User
+        column is the owner's account (from the process details area). The
+        owner's name and path (Process=, OwnerPath=) come from memory: a
+        " <Key>=" in them is written " <Key>%3D" (as "|" becomes %7C
+        elsewhere), so a name cannot add a field of its own such as
+        " Stale=Yes". Duplicate=Yes: the pass also finds whole-page copies
+        of pool pages (the dump file's own cache pages, for example), each a
+        snapshot of another moment of the capture; the second and later
+        copies of an object (the same owner, create time and ports at
+        another physical address) are listed with Duplicate=Yes, never
+        flagged, and a coverage note says how many (32/7/4 on the three real
+        dumps). Counted in the log only: connections in TIME_WAIT
+        (TcTW; their local address is not read, and the coverage note says
+        how many), sockets (AfdE), and objects of other sizes with these
+        tags. The log has "The pass over the dump file: 8.0 GB in N s (the
+        whole file), Windows build 26100, allocation sizes checked during
+        the pass" and the area's counts. Leads:
+          INTEG-NET-OWNER-HIDDEN (High): a connection of a hidden process
+            (never a Stale=Yes or Duplicate=Yes row, nor those of the next
+            two rules)
+          EXEC-NET-LISTENER-USERPATH (Medium): a listener or UDP endpoint of
+            a program in a user-writable folder (OwnerPath=)
+          EXEC-NET-SCRIPTHOST-PUBLIC (Medium, switched off): an ESTABLISHED
+            connection to a public address owned by a script host or a
+            built-in Windows tool; switched off because the real collections
+            it was measured on had a lead the collector does not explain
+            ("enabled": true in a copy of the rules file switches it on)
+        The collector's own processes' network rows are left out of the
+        rules by PID= and OwnerCreated= (see "The collector's own processes
+        in the memory dump"). Nothing is downloaded: tcpip.pdb (public
+        symbols only) would tell live connections from freed ones exactly,
+        and is not used.
+  - How the areas are combined: they run in a fixed order, and a later
+    area uses what an earlier one found. Every row of a process gets the
+    process's token user (the User column) and full name from the process
+    users and paths area, which runs first; the Services area joins each
+    service with its key of the registry in memory (RegistryBinary=,
+    ServiceDll=, Account=, NoRegistryKey); the Network area judges each
+    connection's owner against the processes (Stale=, OwnerHidden,
+    OwnerPath=); the Console area takes a history's client process from the
+    console host's own record of it. After every area, the joins
+    (lib\memory\TimelineDbgEng.Joins.ps1) add TargetHasPeCode to a handle
+    row whose target has a program image in its executable private memory,
+    with a "Joins: ..." count line in the log.
+  - The findings rules of the areas (lib\report\report-rules.json; each
+    described with its area above). A new Medium or High rule was switched
+    on only when the builder, run on three real ARM64 collections (8 GB
+    dumps of Windows 11 24H2, two of them with the collector's own process
+    IDs recorded), gave it no hit that the collector does not explain; Info
+    rules show noisy signals for the analyst. Hits per collection, newest
+    first (12-21 / 00-08 / 10-47; "off" rules measured switched on):
+      ACCESS-SYSTEM-CHILD-OF-USER       High    on   0/0/0
+      INTEG-PROCESS-NAME-CHANGED        High    on   0/0/0
+      INTEG-PROCESS-PEB-MISMATCH        Medium  on   0/0/0
+      ACCESS-DEBUG-PRIV-USER            Info    on   2/1/2 leads (elevated
+                                                     programs; on 10-47 the
+                                                     collector's own, marked as
+                                                     possibly the collector)
+      INTEG-PRIVATE-CODE-PE             High    on   0/0/0
+      INTEG-PRIVATE-CODE                Info    on   2/2/1 leads
+      EXEC-MODULE-USERPATH              Medium  on   0/0/0
+      INTEG-MODULE-UNLINKED-USERPATH    Medium  on   0/0/0
+      INTEG-MODULE-UNLINKED             Info    on   0/0/0
+      INTEG-MODULE-NAME-MISMATCH        Info    on   2/2/0 leads
+      INTEG-DRIVER-HIDDEN               High    on   0/0/0
+      PERSIST-DRIVER-USERPATH           Medium  on   0/0/0
+      INTEG-HANDLE-WRITE-ACCESS         Medium  off  2/3/0 (thread handles
+                                                     between installed apps)
+      PERSIST-RUNKEY-MEMORY-ONLY        Medium  on   0/0/0
+      INTEG-NET-OWNER-HIDDEN            High    on   0/0/0
+      EXEC-NET-LISTENER-USERPATH        Medium  on   0/0/0
+      EXEC-NET-SCRIPTHOST-PUBLIC        Medium  off  1/0/1 (one PowerShell
+                                                     with a public connection)
+      PERSIST-SERVICE-MEMORY-SUSPICIOUS Medium  on   0/0/0
+      INTEG-SERVICE-NO-REGISTRY-KEY     Medium  on   0/0/0
+    Existing rules that also read these rows: EXEC-STAGING (a process's
+    ImagePath=), the command-content rules (console history, see Console),
+    PERSIST-RUNKEY-SUSPICIOUS and PERSIST-RUNKEY-STAGING (Run values in
+    memory), PERSIST-SERVICE-REMOTEACCESS (services in memory) and
+    INTEG-PROCESS-HIDDEN (processes). A switched-off rule is switched on
+    with "enabled": true in a copy of the rules file (-ReportRules).
+  - What a Windows ARM64 dump still does not give (each is a deliberate
+    limit, said here so that its absence is not read as a finding):
+      - connections in TIME_WAIT and sockets: counted, not listed; and a
+        closed connection is told from a live one by its state and owner
+        only (Stale=Yes), not exactly (that would need tcpip.pdb, a download
+        this builder does not make)
+      - handles: only the subset described under Handles becomes rows; the
+        others are counted per type in the log
+      - the registry in memory: only the hives, the Run, RunOnce and
+        Policies\Explorer\Run values and the Services key are read, and only
+        what is in the dump (35-55% of the hives' pages on the real dumps);
+        SAM and SECURITY are listed by name and never read
+      - console windows: the commands a console host keeps, not the text
+        on the screen (that would need conhost.pdb); PowerShell's own
+        history is read from disk (PowerShellHistory)
+      - a 32-bit DLL known only to a WoW64 process's 32-bit loader list has
+        no load time (a Snapshot row)
+      - a driver that unlinked itself from the module list and also removed
+        its driver object is not found
+      - the network objects, service records and console history have no
+        symbol file: their layouts are known for Windows 11 builds 26100 to
+        26299 (network), build 26100 and later (services) and the open-source
+        console code (console history); a dump whose objects fail the
+        layout's self-checks gives "not read (...)" for that area, never
+        rows from a wrong layout
+      - Windows x64 and x86 dumps are read with Volatility 3, unchanged:
+        processes, network connections, command lines and services, not
+        these areas
+  - Kernel symbols: the engine needs the symbol file of the dump's exact
+    Windows kernel. The builder reads its name and ID from the kernel image
+    in the dump and takes the file from tools\symbols\, or downloads it once
+    per Windows kernel version from Microsoft's symbol server (about 10 MB;
+    see "Windows kernel symbols"). Without internet access, the log names
+    the URL and where to copy the file; when the engine does not accept the
+    file it downloaded, or no folder for it can be written, the reason says
+    so instead.
+  - Time: 12-15 seconds for the helper on an 8 GB dump on an internal disk
+    (measured on three 8 GB ARM64 dumps, in both PowerShell editions; peak
+    memory of the helper process 340-410 MB): opening the dump
+    and the processes about 3 s, the areas about 9 s one after the other,
+    and the pass over the dump file for the network connections (5-8 s
+    here; it is disk-bound, so a USB drive takes longer) on a thread of its
+    own beside them. Plus the kernel symbol file's download the first time
+    (about 15 seconds). Each area has a time limit (30 s; DLLs and handles
+    60 s; the pass over the dump file 300 s): an area that reaches it is
+    partly read, with a coverage note, and the others go on. The whole
+    helper is stopped after 15 minutes (the processes and command lines it
+    sent before the areas are kept, see above). Memory: the page cache
+    holds at most 64 MB and the pass reads 16 MB at a time.
+  - The log: "Windows ARM64 dump: analyzing it with Microsoft's debugger
+    engine", the engine ("Debugger engine: dbgeng.dll <version> from
+    <folder> (part of Windows)"), the symbol file, what each way found
+    ("Processes found: ...", and the "Memory dump process list" warning
+    when they disagree, see above), the counts
+    ("Processes (windows.pslist rows): N entries (T timed, S snapshot);
+    session ids for K" and "Command lines (windows.cmdline rows): M
+    entries; none for A kernel process(es) without a PEB, U not readable
+    (paged out or exited), E empty"), each area's counts (for example
+    "Handles: handles 80724, handle tables read 188, ..."), the joins
+    ("Joins: handle entries whose target has a program header in its
+    executable private memory 0"), the rows of each Source ("Memory-Modules
+    rows (Module entries): 462 of 462 entries (381 timed, 81 snapshot)"), a
+    line per area ("DLLs: read, 462 entries, 3.4 s"), "Debugger engine
+    analysis took N s", then the line the findings report reads, with what
+    was read and what not:
+      Memory dump analyzed with the Windows debugger engine: <dump> (<size>)
+        -- read processes, command lines, DLLs, ...; not read handles
+        (<why>), ...
+    ("not read command lines (could not be read [<why>])" when the command
+    lines failed), and the "Memory dump coverage" lines. The report shows
+    each as an Evidence coverage note; its caveat names what was not read
+    ("The memory dump is a Windows ARM64 dump, read with the Windows
+    debugger engine: these were not read from it, so they are not in this
+    report -- <what> (<why>), ..."), and when they were read, network
+    connections (a scan of memory that can include closed connections and
+    second copies of the same object, Stale=Yes and Duplicate=Yes) and
+    the registry in memory (partial: a key missing there is no proof it was
+    absent) have caveats of their own. For -ReportOnly on a timeline of an
+    older builder, whose line says "processes and command lines only;
+    network connections and services are not read from Windows ARM64
+    dumps", the caveat is that builder's ("only its processes and command
+    lines are in this report, not its network connections or services").
+  - When it is not analyzed, the "Memory dump not analyzed" line gives one
+    of these reasons:
+      the Windows debugger engine (dbgeng.dll) is not in <folder>; see
+        "ARM64 memory dumps" in README.txt
+      the debugger engine helper lib\memory\TimelineDbgEng.ps1 is missing,
+        an antivirus may have removed it; copy the whole
+        win11-timeline-builder folder again
+      the builder's lib\memory\TimelineMemoryRows.ps1 is missing (or could
+        not be loaded), an antivirus may have removed it; copy the whole
+        win11-timeline-builder folder again
+      the Windows debugger engine could not open it (<error>)
+      <what is wrong with the kernel image> (the Windows debugger engine
+        needs the kernel's symbol file)
+      the Windows kernel symbol file could not be downloaded from
+        Microsoft's symbol server (<error>); connect to the internet and run
+        the builder again, or see "Windows kernel symbols" in README.txt
+      the Windows debugger engine did not accept the kernel symbol file
+        from Microsoft's symbol server (this engine may be too old for the
+        dump); put a newer engine in tools\dbgeng\ and run the builder
+        again, see "Microsoft debugger engine" in README.txt
+      no folder for the Windows kernel symbol file could be written
+        (<error>); make tools\symbols\ next to the builder writable, or use
+        a -WorkDir that can be written, and run the builder again
+      the Windows debugger engine listed no processes in it (<the engine's
+        error>)
+      the Windows debugger engine stopped (<error>, or an exit code such as
+        0xC0000005), or did not finish within 15 minutes
+  - More with WinDbg: the log ends with a command for the dump with the
+    builder's symbol cache, to look further than the builder reads ("To
+    look further than the builder reads, open the dump in WinDbg; ..."):
+      kdARM64.exe -z "D:\Cases\TriageCollection_2026-10-11_00-08_memory_dump.dmp" -y "srv*C:\Tools\win11-timeline-builder\tools\symbols*https://msdl.microsoft.com/download/symbols"
+    then, at its kd> prompt: !process 0 0 (processes), lm (modules), !handle
+    (handles), dx @$cursession.Processes, and q to quit. In a dump copied
+    while Windows ran, WinDbg's own process list can end early ("WARNING:
+    corrupted linked list found"): the builder's rows and its "Memory dump
+    process list" note then have processes WinDbg does not list (see "How
+    the processes are found" above). kdARM64.exe is the
+    command-line debugger of the WinDbg app (winget install Microsoft.WinDbg;
+    see Microsoft's WinDbg documentation for where it is installed), or use
+    kd.exe of Debugging Tools for Windows (Windows SDK), Debuggers\arm64\
+    on an ARM64 computer or Debuggers\x64\ on an x64 one, with the same
+    options. Opening the dump in the WinDbg app works too.
+  - -ReportOnly on a timeline from an older builder, which could not
+    analyze ARM64 dumps ("Volatility 3 cannot read Windows ARM64 dumps;
+    examine it in WinDbg"): its note and caveat say "the builder that made
+    this timeline could not analyze Windows ARM64 dumps; build the timeline
+    again to analyze it with the Windows debugger engine".
 
 ### 16. System Info
 Parses systeminfo.txt and the firewall rule list:
@@ -2191,20 +3236,39 @@ tools. Artifact SRUM:
 
 After the timeline builds, the script presents a viewer menu:
 
-  [1] Excel -- rows pre-colored by EventType, ready to analyze
+  [1] Excel + findings report -- the color-coded workbook and the
+      findings report (PDF), opened together (recommended)
+  [2] Excel -- rows pre-colored by EventType, ready to analyze
       (Logon=Green, Execution=Orange, Persistence=Red, Network=Blue, etc.)
-  [2] Timeline Explorer -- powerful forensic CSV viewer (no colors,
+  [3] Timeline Explorer -- powerful forensic CSV viewer (no colors,
       requires manual conditional formatting setup per session)
-  [3] Both -- open Excel (colored) and Timeline Explorer side by side
-  [4] Open report -- the findings report (PDF): leads to review,
+  [4] Excel + Timeline Explorer -- open both side by side
+  [5] Open report -- the findings report (PDF): leads to review,
       each with its timeline rows (plain-English summary first)
-  [5] None -- just save the files, don't open anything
+  [6] None -- just save the files, don't open anything
 
-Options that do not apply are left out and the rest renumbered: Excel and
-Both without a workbook, Open report without a report (-NoReport, or a
-report that could not be written). Open report opens report.pdf, or
-report.html when no PDF was made. -Viewer Excel|TimelineExplorer|Both|
-Report|None skips the menu.
+Options that do not apply are left out and the rest renumbered: Excel +
+findings report needs both the workbook and the report; Excel and Excel +
+Timeline Explorer need the workbook (not with -NoExcel, or when the
+workbook could not be written); Open report needs the report (-NoReport,
+or a report that could not be written). Without a report the menu is:
+
+  [1] Excel  [2] Timeline Explorer  [3] Excel + Timeline Explorer  [4] None
+
+and without a workbook:
+
+  [1] Timeline Explorer  [2] Open report  [3] None
+
+The report opens as report.pdf, or report.html when no PDF was made. A
+number that is not listed is asked again; at the end of redirected input
+nothing is opened.
+
+-Viewer skips the menu: ExcelAndReport (the workbook and the report; when
+one of them was not made, the other is opened and the log says which is
+missing), Excel, TimelineExplorer, Both (Excel and Timeline Explorer, menu
+entry "Excel + Timeline Explorer"), Report or None. Excel is started first,
+then the report; neither is waited for, and one that cannot be opened is
+logged and does not stop the other.
 
 The output files are always generated regardless of viewer choice:
   - timeline.csv   -- plain CSV for any tool (Timeline Explorer, SIEM, etc.)
@@ -2213,7 +3277,19 @@ The output files are always generated regardless of viewer choice:
     "Findings Report")
 
 
-### Option 1: Excel (recommended for most users)
+### Option 1: Excel and the findings report (recommended)
+
+Opens the workbook in Excel and the findings report in your PDF viewer
+(report.html in the browser when no PDF was made) at the same time. Read
+the report's summary page and lead cards first, then work through the rows
+in Excel: each card names its timeline rows, and the report's links point
+into timeline.xlsx (the Findings sheet links every lead to its rows, and the
+Timeline sheet's Finding column filters them; see "The workbook: Findings
+sheet and Finding column"). -Viewer ExcelAndReport does the same without
+the menu.
+
+
+### Option 2: Excel
 
 The .xlsx file has every row pre-colored by EventType using the ImportExcel
 PowerShell module. No manual formatting needed -- open it and start analyzing.
@@ -2249,7 +3325,7 @@ differences" above.
   If you used -Keywords, filter the Flagged column to TRUE for quick hits.
 
 
-### Option 2: Timeline Explorer (Eric Zimmerman)
+### Option 3: Timeline Explorer (Eric Zimmerman)
 
 A powerful forensic CSV viewer designed for timeline analysis. Downloaded
 automatically on first selection and cached for future use.
@@ -2273,11 +3349,13 @@ automatically on first selection and cached for future use.
   option exists -- it applies the same color scheme automatically.
 
 
-### Option 3: Both
+### Option 4: Excel + Timeline Explorer (-Viewer Both)
 
 Opens Excel (colored) and Timeline Explorer side by side. Useful when you
 want the visual color-coding in Excel and the forensic filtering power of
-Timeline Explorer at the same time.
+Timeline Explorer at the same time. Before this menu had the Excel +
+findings report choice, this entry was called "Both"; -Viewer Both still
+selects it.
 
 
 ### Other options for reading the output:
@@ -2311,10 +3389,12 @@ Timeline Explorer at the same time.
      every row of a lead. Leads are reasons to look, not a verdict.
 
   5. CHOOSE a viewer when prompted
+     Excel + findings report: both at once (the report's leads next to
+     the rows)
      Excel: pre-colored rows, ready to analyze immediately
      Timeline Explorer: powerful forensic CSV viewer (manual color setup)
-     Both: side by side for maximum flexibility
-     Open report: the findings report
+     Excel + Timeline Explorer: side by side for maximum flexibility
+     Open report: the findings report alone
 
   6. TRIAGE in your chosen viewer
      Filter the Finding column for a lead's id to see all of its rows
@@ -2501,6 +3581,24 @@ Timeline Explorer at the same time.
     does not keep the file's dates (most copies do) gives the time of the
     copy instead.
 
+  - Windows ARM64 memory dumps -- Read with Microsoft's debugger engine:
+    the processes and their command lines, users and paths, DLLs, kernel
+    drivers, a subset of the handles, executable private memory, the
+    registry in memory (partly: what the dump holds), console history,
+    network connections and services, with the limits listed under
+    "ARM64 memory dumps" (parser #15). The first ARM64 dump of each Windows kernel version needs
+    internet access once, for the kernel's symbol file (or a copy of it
+    placed in tools\symbols\ by hand; the log says where); without it the
+    dump is reported as not analyzed. A command line that is paged out of
+    memory, or of a process that has exited, has no row (Volatility writes
+    a "not valid" text there). The Windows debugger engine that comes with
+    older Windows versions is not tested with Windows 11 ARM64 dumps: if it
+    cannot read one (or does not accept its kernel symbol file), the reason
+    is in the log and the report, and a newer engine can be put in
+    tools\dbgeng\ (see Optional Tools). An x64
+    PowerShell cannot load an ARM64 engine: on an ARM64 computer run the
+    builder from the ARM64 PowerShell (Run-TimelineBuilder.bat does).
+
   - Memory dump on another drive -- collection_manifest.csv records where
     the collector saved the dump as a path on the machine that ran the
     collector (e.g. D:\TriageMemory\<collection>_memory_dump.dmp). The
@@ -2633,7 +3731,8 @@ Timeline Explorer at the same time.
     the findings report is written as report.html only
   - Internet connection on first run (to install ImportExcel module and
     auto-download sqlite3.exe; Timeline Explorer downloaded on first use
-    if selected). After first run, cached copies are used offline.
+    if selected) and, once per Windows kernel version, for an ARM64 memory
+    dump's kernel symbol file. After that, cached copies are used offline.
 
 
 ## Third-Party Dependencies (Auto-Downloaded)
@@ -2679,12 +3778,26 @@ installation or configuration is needed.
   Cached at:  tools\TimelineExplorer\
   Size:       ~86 MB (zip)
   Used by:    Opened when chosen from the viewer menu (Timeline Explorer or
-              Both), or with -Viewer TimelineExplorer / Both
+              Excel + Timeline Explorer), or with -Viewer TimelineExplorer /
+              Both
   Requires:   .NET 9 Runtime (Timeline Explorer will prompt to install if missing)
 
 Both zips are downloaded to %TEMP%, extracted, and the zip is deleted. If
 download fails (no internet, firewall), the script continues -- browser
 parsing is skipped, and the timeline CSV can be opened manually.
+
+### Windows kernel symbol file (ARM64 memory dumps)
+  Purpose:    Lets Microsoft's debugger engine find the processes in a
+              Windows ARM64 memory dump. Downloaded only when such a dump
+              is analyzed.
+  Author:     Microsoft
+  Source:     https://msdl.microsoft.com/download/symbols (Microsoft's
+              public symbol server)
+  Cached at:  tools\symbols\ (once per Windows kernel version)
+  Size:       About 10 MB
+  Used by:    Parser #15 (Memory Dump), Windows ARM64 dumps only -- opt-in.
+              What the request sends, and what happens offline: see
+              "Windows kernel symbols" under "Auto-Downloaded Dependencies".
 
 
 ## Optional Tools (User-Provided)
@@ -2708,7 +3821,7 @@ parsing is skipped, and the timeline CSV can be opened manually.
        tools\volatility3\vol.exe exists (x64 build; runs under emulation
        on Windows on ARM)
     Volatility 3 analyzes Intel x86/x64 Windows memory only; ARM64 dumps
-    are skipped with a note.
+    are read with Microsoft's debugger engine instead (see below).
 
   The Memory parser is opt-in. Add "Memory" to -Sources to enable it.
   If vol.exe is not found, the parser logs download instructions and skips.
@@ -2732,6 +3845,39 @@ parsing is skipped, and the timeline CSV can be opened manually.
   processes and connections without a valid time of their own (see parser
   #15). Volatility's JSON output goes to the work folder's scratch\ and is
   deleted after each plugin.
+
+### Microsoft debugger engine (ARM64 memory dumps)
+  Purpose:    Reads Windows ARM64 memory dumps (processes, command lines
+              and the other areas: users, DLLs, drivers, handles, private
+              memory, registry, console history, network connections,
+              services), which Volatility 3 cannot read (parser #15,
+              "ARM64 memory dumps")
+  Author:     Microsoft (the engine of WinDbg)
+  Needed:     Nothing to install: dbgeng.dll, dbghelp.dll and dbgmodel.dll
+              are part of Windows (C:\Windows\System32), and the builder uses
+              them. The kernel's symbol file is downloaded once per Windows
+              kernel version (see "Windows kernel symbols").
+  Optional:   tools\dbgeng\<arch>\, a newer engine from Microsoft's NuGet
+              package, for an older Windows whose own engine cannot read a
+              dump of a newer one. <arch> is the processor architecture of the
+              PowerShell that runs the builder: arm64, amd64 or x86.
+  Setup (details: tools\dbgeng\README.txt):
+    1. Open https://www.nuget.org/packages/Microsoft.Debugging.Platform.DbgEng
+       and choose "Download package" (a .nupkg file; rename it to .zip)
+    2. Copy every file of its content\<arch>\ folder (dbgeng.dll,
+       dbghelp.dll, dbgmodel.dll, dbgcore.dll, msdia140.dll, ...) into
+       win11-timeline-builder\tools\dbgeng\<arch>\
+    The symbol server package (Microsoft.Debugging.Platform.SymSrv) is not
+    needed: the builder downloads the one symbol file itself, and the engine
+    never gets a symbol server.
+  Signature:  The folder is used only when dbgeng.dll, dbghelp.dll and
+              dbgmodel.dll are in it and every DLL in it (subfolders too)
+              has a valid Authenticode signature from Microsoft (the builder
+              runs as Administrator). Otherwise the log warns, naming the
+              file, and the engine of Windows is used.
+  License:    Microsoft's license for the package (Windows SDK terms); not
+              redistributed with this repo
+  Used by:    Parser #15 (Memory Dump), Windows ARM64 dumps only -- opt-in
 
 
 ## Tests
@@ -2774,8 +3920,9 @@ parsing is skipped, and the timeline CSV can be opened manually.
   devices, the Memory parser (where it finds the dump, the dump's capture
   time and the rows made from Volatility's output), the ShimCache rows of
   the PowerShellHistory parser, the run summary's counts per artifact,
-  how the builder handles its input (secrets, zip input) and its console
-  window (QuickEdit). CI runs them after Test-Parsers.ps1 in both
+  how the builder handles its input (secrets, zip input), its console
+  window (QuickEdit) and the viewer menu at the end of a run. CI runs them
+  after Test-Parsers.ps1 in both
   PowerShell versions (GitHub Actions runners are elevated):
 
   tests\Test-EventLogParsers.ps1 -- Part 1 feeds the Security, System
@@ -3004,18 +4151,25 @@ parsing is skipped, and the timeline CSV can be opened manually.
   zip or folder); only the parser, run with -Sources ...,Memory from
   PowerShell, names -MemoryDumpPath, and the offer step says nothing for a
   collection whose manifest lists no dump. The offer step also logs the
-  "Memory dump not analyzed" line the findings report reads; for a
-  collection from a Windows ARM64 computer (its systeminfo.txt) it gives
-  no copy advice and names WinDbg; the dump of a zip whose top folder was
-  renamed is named after the folder's original name. It runs the offer
-  itself (the builder's block for a run without Memory in -Sources, as
-  from the .bat) on a zip with its dump next to it: an ARM64 dump is not
-  offered, no vol.exe, answer 2, the end of redirected input (as 2), an
-  invalid answer and then 1 (asked again); each dump that is not analyzed
-  gets the "Memory dump not analyzed" line, which the findings report's
-  own log reader must read back, with the size the prompt shows (bytes,
-  or GB with two decimals), and WinDbg is named once. The Memory parser
-  gives that line too (ARM64, no vol.exe). Then it
+  "Memory dump not analyzed" line the findings report reads, also for a
+  collection from a Windows ARM64 computer (the same copy advice); the dump
+  of a zip whose top folder was renamed is named after the folder's
+  original name. It runs the offer itself (the builder's block for a run
+  without Memory in -Sources, as from the .bat) on a zip with its dump
+  next to it: an ARM64 dump is offered with Microsoft's debugger engine
+  (what it reads and what not, the time, the one-time symbol download;
+  also without vol.exe, which is not looked for; an engine in tools\dbgeng
+  named) and not offered without an engine, no vol.exe for an x64 dump,
+  answer 2, the end of redirected input (as 2), an invalid answer and then
+  1 (asked again); each dump that is not analyzed gets the "Memory dump
+  not analyzed" line, which the findings report's own log reader must read
+  back, with the size the prompt shows (bytes, or GB with two decimals).
+  The Memory parser gives that line too (no vol.exe; an ARM64 dump the
+  debugger engine could not read), and for an ARM64 dump it read the
+  "analyzed with the Windows debugger engine" line (also "processes
+  only"), read back by the report's log reader, and the WinDbg command
+  (kdARM64.exe -z ... -y srv*<tools\symbols>*...), with no Volatility 3.
+  Then it
   reads synthetic dump headers: the architecture and the capture time
   (64-bit SystemTime used; zero, before 1980, more than a day after the
   last write, cut off, 32-bit and raw fall back to the last-write time;
@@ -3032,6 +4186,286 @@ parsing is skipped, and the timeline CSV can be opened manually.
   run on an x64 dump: the rows at the header's capture time (not the
   file's last write), the counts per plugin in the log, and the warning
   for a plugin without output. Volatility 3 is not run; no admin needed.
+  The debugger engine for Windows ARM64 dumps
+  (lib\memory\TimelineDbgEng.ps1, its functions loaded from its syntax
+  tree; the two functions it shares with the builder must be the same): the architecture folder name;
+  Find-DbgEngine (System32; copies of System32's catalog-signed DLLs in
+  tools\dbgeng\<arch>\ used, in their load order; an unsigned DLL in a
+  subfolder or a missing dbghelp.dll refused with a warning naming it; no
+  dbgeng.dll; another architecture); the C# host on the computer's own
+  engine (it compiles, loads dbgeng.dll by full path, runs a command, gives
+  the output of a failing one, throws for a fake ARM64 dump and a missing
+  file and releases the file, refuses a second engine folder in the same
+  process); the dx text parser (the echo, quoted values, engine errors and
+  damaged rows as bad items, a backtick in an index, a query that fails as
+  a whole with the engine's own error text, an empty list, the engine's
+  "corrupted linked list" warning kept once); paging (100 items a page,
+  bad items counted, the item cap, a failing page); the queries (paged,
+  tagged, -1 for a process without a session in both session queries, no
+  "!" command among everything the helper sends, no attacker-tool name of
+  report-rules.json in the helper); the
+  kernel's symbol file name and key from a fake kernel image, and every
+  refusal (no MZ, e_lfanew, PE32, the debug directory, no RSDS record, a
+  path or another name, age 0, "? nt" not resolved); the symbol cache and
+  download with a stub (the exact URL and path, the cache reused, an HTML
+  page, a short file and no network refused with nothing left, a stale
+  download of an earlier run deleted, another run's file kept, a cache
+  that cannot be made or whose files cannot be written, no folder at all,
+  a ; in the path; the real download function's request with a stand-in
+  for Invoke-WebRequest: the URL, the file and the fixed user agent
+  Microsoft-Symbol-Server/10.0.0.0); "(pdb symbols)"; names and command
+  lines read from a fake memory map (CR, LF, tab, quotes, |, non-ASCII,
+  32,767 characters, NUL, an odd length, an unpaired surrogate, empty, no
+  PEB, paged out, another process's address space). A whole analysis on a
+  fake kernel -- 146 processes, each an EPROCESS at the offsets of a canned
+  "dt -v nt!_EPROCESS", in a process list and a level-1 process ID table
+  with threads and an entry of another process's ID among them, with
+  tokens and session spaces -- goes through the builder's protocol reader
+  into the rows: the edge rows exactly (no session for System, Registry and
+  smss.exe, session 0 and 1 from the token, none for a token that is not
+  in the dump), 146 pslist and 141 cmdline rows, the log lines (what each
+  way found, no warning), the structures read (dt, the list head, the
+  process ID table, the engine's own list counted once, its dx pages not
+  read), the same under de-DE. Memory copied while Windows ran: a process
+  that ended during the copy (a stale link forwards to it; still in the
+  process ID table) gives every row of the consistent dump and its own,
+  the counts and the "Memory dump process list" warning, which the
+  findings report's log reader reads back; every row's FoundBy= (all three
+  ways, or the ways that found it); a link forwards into reused memory
+  (the forward walk stops; the backward walk and the table find the rest;
+  no row of the reused memory); a list that loops and a process only in
+  the process ID table created after the capture started (each process
+  once, it named by PID, not marked); a process hidden from the list
+  (unlinked cleanly, only in the table, created before the capture, no
+  exit time: its rows, Anomaly=NotInProcessList, the warning that names it
+  first and says copying does not explain it, read back by the report),
+  the same without a capture start (named, not marked) and with both walks
+  stopped early (not marked, the warning says why); process IDs changed in
+  memory (0, one not a multiple of 4, System's 4: every process listed with
+  the ID it has, Anomaly=ProcessIdChanged and TableId=, named first, "as
+  they were created before the capture started"); capture churn (three
+  processes only in the table under the ID of a process not in the dump,
+  created 20 s after the capture started, 0.78 s and 90 s before it:
+  TableId=, not marked, counted as capture churn in the warning, never
+  "does not explain"; one created 125 s before it, outside the 120-second
+  margin, is marked NotInProcessList and ProcessIdChanged); no capture
+  start (changed IDs and churn alike listed with TableId=, none marked,
+  the warning says they cannot be judged); create times capture churn
+  cannot have (none, and a day after the capture ended: held in the table
+  under another ID, marked ProcessIdChanged; unlinked from the list,
+  marked NotInProcessList; the warning says their times, never that
+  copying explains them); IDs a stale table entry cannot give on
+  processes created during the copy (not a multiple of 4, and 0 without a
+  table entry: marked; 0 held under another ID: churn); no capture end
+  (the file's last write before the header's time: no end passed, a
+  process created after the start not judged, those before it churn);
+  the create-time and verdict tables; the singular wording; a
+  stale entry of the process ID table (TableId=, not marked) and one whose
+  object only starts like a process (counted, no row, no warning); the
+  scan finding nothing (list head and table not in the dump: a plain line,
+  then the engine's own list, its warning the only "Memory dump process
+  list" line, matching the rows); symbols with
+  _MM_SESSION_SPACE (its ids, the token's where a session space is not in
+  the dump); no process ID table in the symbols (both walks, no warning);
+  the note's wording without the table and with more than 10 PIDs; the
+  layout's refusals (fields of another type named) and a capped walk. The
+  idle process is in neither the fake list nor the table, as in a real
+  kernel. The same 146 processes as canned
+  dx output (two pages with bad items, a duplicate and the idle process;
+  one unreadable session id) for the debugger engine's own list, used when
+  the symbols do not describe the process structure: the same rows, the
+  warning, its "corrupted linked list" as the report's warning, a process
+  query that fails (the engine's error in the reason), session ids decided
+  for each process (the session query failing as a whole, or giving only
+  the processes without a session, as the symbols of Windows 11 24H2 on
+  ARM64 do: the token's for the others). Then the symbol file reused, a
+  damaged cached file downloaded again, no internet (the reason and the
+  offline advice), a downloaded file the engine does not accept and no
+  folder for it (each its own reason, neither with the offline or internet
+  advice), command lines that cannot be read (the processes only), a dump
+  that cannot be opened, an error while reading (the session always
+  closed). The helper as a process of
+  its own: the real helper on a fake ARM64 dump (the engine of Windows
+  cannot open it), canned entries with every kind of character through the
+  pipe, arguments with spaces, [ ], non-ASCII and a trailing backslash, a
+  crash (exit code 0xC0000005), an error (its message), a hang (ended after
+  the time limit), output without its end, no helper, no engine; a crash
+  and a hang after the helper's checkpoint (its processes and command
+  lines kept as rows, every area "not read" with why, the warning).
+  Nothing is downloaded; no real dump is opened.
+
+  tests\Test-MemoryFoundation.ps1 -- the shared layer of the Windows ARM64
+  memory areas, on synthetic memory (no dump, no admin): every area file of
+  lib\memory\ is there, parses and has only functions, and their C#
+  compiles with the helper's as one unit (a fragment that does not compile
+  is left out with the compiler's reason, in a process of its own); no
+  extension command and no attacker-tool name in lib\memory\; the reads and
+  strings of the reader over a sparse memory map, the page cache, the
+  sticky process switch, refused processes and the cache limit; layouts from
+  canned "dt -v" output (missing fields and types, bitfields, symbols, each
+  type asked once), a process from its EPROCESS bytes, the VAD walker on a
+  synthetic tree (address order, image file names cached per control area,
+  a loop, a node not in the dump, order and parent errors, the cap,
+  VadCount, an empty tree); entries and their E lines (Base64 of UTF-8),
+  the area dispatcher (the fixed order, "not built yet", a missing file,
+  an area that fails before or after its entries, the time limit, the raw
+  pass started and disposed, the joins after every area, no areas without
+  the reader); the protocol (P, C, the checkpoint PCEND with two counts,
+  E, AREA, END with three counts; written in one go or in two parts, the
+  same lines) read back by the builder, bad E, AREA, PCEND and END lines;
+  the builder's process
+  merge, User and ExtraDetails on the four Volatility-shaped row kinds,
+  the rows of the areas' entries, and the "analyzed with" and coverage texts.
+
+  tests\Test-MemoryTokens.ps1 -- the ProcessDetails area (users and
+  paths of the processes of a Windows ARM64 dump) on synthetic memory
+  through tests\MemoryTestKit.ps1, with the kernel's types as canned "dt -v"
+  output: tokens with their groups, privileges and logon sessions (SYSTEM,
+  the two halves of an administrator's split token, an AppContainer with
+  UIAccess, a protected process), the kernel's and the PEB's program paths,
+  the device-to-drive map (and a device with two drive letters), the three
+  anomalies with their near misses (a reused PID, an elevated parent,
+  non-ASCII and 8.3 names, System, a minimal process, a junction,
+  \SystemRoot\), every guard (no token, a token not in the dump, too many
+  groups, a SID that is not one, a logon session of another logon id, an
+  address space that is gone), the time cap and missing symbols. Then the
+  builder's side: the entries through the protocol onto the process and
+  command line rows (full names, User, the Details fields in their order,
+  anomalies joined), two processes of one PID, and the logon sessions'
+  account names as fallback names for the User column (ProfileList and
+  bam_entries.csv win, a SID with two accounts gets none).
+
+  tests\Test-MemoryTokens.ps1, Test-MemoryModules.ps1,
+  Test-MemoryKernelObjects.ps1, Test-MemoryRegistry.ps1,
+  Test-MemoryConsole.ps1, Test-MemoryNetwork.ps1, Test-MemoryServices.ps1
+  -- one per memory area, on synthetic memory through
+  tests\MemoryTestKit.ps1 (no dump in CI), each described here.
+
+  tests\Test-MemoryKernelObjects.ps1 -- the kernel drivers and handles
+  areas and their shared object decoding, on a synthetic kernel with the
+  layouts of Windows 11 24H2 ARM64 as canned "dt -v" output: object headers
+  (the type index mixed with the header cookie and the header's address,
+  names, an empty name, full names), the object directory and its symbolic
+  links (\SystemRoot, \??\C:, \Device\BootDevice) as drive-letter paths;
+  the drivers area (the module list both ways, the driver objects of
+  \Driver and \FileSystem, a hidden driver, a driver object whose entry
+  moved, one without a module, the walks cut one way and both ways, the
+  recently unloaded drivers with times since boot and absolute ones, a slot
+  that fails its checks, a list whose layout does not fit, a hidden driver
+  whose unload record is from the capture's churn margin (not marked) and
+  one unloaded an hour before (marked)); the handles
+  area (one- and two-level handle tables, a page not in the dump, every row
+  kind and what is left out: rights that cannot change a process, parent
+  and child, the System process, thread handles folded into a process row,
+  the process family of the anomaly, a target outside the scan, file names
+  with drive letters and relative names, key paths through hive mount
+  points, Image File Execution Options and Services keys, named and unnamed
+  mutexes, objects not in the dump, the holder's SID read from its token,
+  the lookup for the joins, the caps of named entries (60 named mutexes in
+  one process, 50 listed, the rest counted and noted), process objects that
+  only handles reach (one hidden, with its holders; one exited, one created
+  30 s before the capture, one with a process ID Windows does not give,
+  one without the fields to judge it; nothing judged without the capture
+  start)); the join that adds TargetHasPeCode (TimelineDbgEng.Joins.ps1);
+  missing symbols and the time limit; then the builder's rows
+  (Memory-Drivers, Memory-Handles through the protocol, and the hidden
+  process as a Memory-Processes row) and the findings rules on them
+  (INTEG-DRIVER-HIDDEN, PERSIST-DRIVER-USERPATH, INTEG-PROCESS-HIDDEN, and
+  the switched-off INTEG-HANDLE-WRITE-ACCESS switched on for the test).
+  Its rules' cases are in
+  tests\fixtures\report\rules\cases-memory-kernelobjects.csv.
+
+  tests\Test-MemoryConsole.ps1 -- the console history area: it builds console hosts in a sparse memory map as
+  Microsoft's console code lays them out (a PE section table, the list of
+  histories in the writable data, history nodes, strings in place and
+  behind pointers, the record of an attached client) and checks: the
+  commands oldest first, decoys that are not lists left out, a client
+  process ID only when the dump has that process with that program name, a
+  console host without its image header or PEB (the offset and image base
+  from another host), a list page, a command or a whole address space not
+  in the dump (counted, partly read, the note says why), two lists in one
+  host, no list at all (not read), no PEB in the kernel's symbols, no
+  console host, the time limit, OpenConsole.exe; then the E lines read back
+  by the builder, the rows (Snapshot at the capture time, Details with the
+  command last, the report's DetailParser reading the console host's own
+  PID= even when the command holds " | PID="), and the six command-content
+  rules taking Memory-ConsoleHistory rows in report-rules.json.
+
+  tests\Test-MemoryModules.ps1 -- the DLLs and executable private memory
+  areas on synthetic memory: canned "dt -v" output, six
+  processes (a 64-bit one with DLLs in and out of its loader list, a
+  protected one, a WoW64 one with a 32-bit list, one whose list is cut
+  short, an exited one, one without a PEB), VAD trees with image mappings
+  (file names, volumes, PE and CLR headers) and private regions; the
+  entries, counts and coverage notes, a tree that does not add up, the
+  missing-symbol and time-limit paths, the entries through the protocol
+  into Memory-Modules and Memory-PrivateCode rows, and those rows through
+  the real report rules. Its rules' own cases are in
+  tests\fixtures\report\rules\cases-memory-modules.csv.
+
+  tests\Test-MemoryRegistry.ps1 -- the registry area on synthetic memory:
+  hives written cell by cell (key nodes, values, lh, lf, li and ri subkey
+  lists, big data), their cell maps in kernel memory and their bins in the
+  Registry process, the structures as 'dt' text with other offsets than
+  Windows 11's. It checks the hive list walked both ways, the files, the
+  root key from each of its three sources, that no page of SAM's or
+  SECURITY's cell map, bins, base block or key control block is read, the
+  Run values, the Services key offered to the joins, a key not in the dump
+  against one that is absent, the time limit, the reasons it is not read,
+  and then the rows through the builder's protocol reader, OnDisk= against
+  Persistence-RunKeys and Registry-UserRunKey rows (first in Details, the
+  value's data last), and the Run key rules on them. Its rules' cases are in
+  tests\fixtures\report\rules\cases-memory-registry.csv, and
+  tests\fixtures\memory\canned-registry.txt gives tests\Test-ReportBuilder.ps1
+  a hive and a Run value.
+
+  tests\Test-MemoryNetwork.ps1 -- the network connections area: the dump
+  file's layout (runs, physical addresses, a file cut short, the dumps it
+  does not scan), the pass over the dump file on small synthetic full
+  memory dumps written to %TEMP% (each tag at its offset, a match of
+  another allocation size counted and not kept, a copy across the pass's
+  16 MB reads, a run's end, the cap of 8192 hits per tag, a flood of
+  matches of another size that does not crowd out a real object, the time
+  limit, passes that cannot start), the Network area on synthetic kernel
+  memory (connections, listeners and UDP endpoints in IPv4 and IPv6;
+  Stale=Yes for a closed entry, an exited owner, owner memory that is not
+  a process or is a later process's; OwnerHidden for a hidden listed owner
+  and for a process object found only through the connection, not for one
+  created within the capture churn margin; Duplicate=Yes for a whole-page
+  copy of a connection; the self-checks, a Windows build the table does
+  not know, the time limit, the counts and notes), its entries through the
+  protocol into the builder's rows, an owner's name and path holding
+  " <Key>=" written " <Key>%3D", and those rows through the report
+  engine's Details parser and the network rules. The switched-off
+  EXEC-NET-SCRIPTHOST-PUBLIC is switched on in memory for its cases
+  (tests\fixtures\memory\net-rules-switched-off.csv); the other rules'
+  cases are in tests\fixtures\report\rules\cases-memory-network.csv.
+
+  tests\Test-MemoryServices.ps1 -- the Services area on synthetic memory
+  (no dump, no admin): a services.exe whose PEB and PE sections lead to the
+  list's first and last records (beside pairs of pointers that only look
+  like them), five records with their image records and strings. The list
+  read whole and in list order with every field; the E lines and the
+  builder's Memory-Services rows; the join with an object shaped as the
+  registry area's Services key (read in full, in part, not read); a record
+  not in the dump (the walks forward and backward, partly read); the search
+  of services.exe's memory when the list's ends are not found (a stale copy
+  left out); the image base from the memory regions when the PEB is not in
+  the dump; records of another layout (not read, or the registry alone);
+  no services.exe, its memory not in the dump, the time limit, two
+  services.exe; the rules PERSIST-SERVICE-MEMORY-SUSPICIOUS and
+  INTEG-SERVICE-NO-REGISTRY-KEY on the rows and
+  on tests\fixtures\report\rules\cases-memory-services.csv.
+
+  tests\MemoryTestKit.ps1 -- what these tests share (dot-sourced): it loads
+  the helper's and the area files' functions (and with -Builder the
+  builder's and lib\memory\TimelineMemoryRows.ps1's) from their syntax
+  trees, compiles their C#, and gives a sparse memory map with readers over
+  it, layouts and canned "dt -v" output, a stand-in engine, a context of
+  processes, an area run as the helper runs it, the protocol lines captured,
+  and the canned entries of tests\fixtures\memory\canned-*.txt (which
+  tests\Test-ReportBuilder.ps1's canned ARM64 helper also sends through the
+  builder; see that folder's README.txt).
 
   tests\Test-ShimCacheParser.ps1 -- loads the builder's functions and runs
   the PowerShellHistory parser (which also reads BAM and the ShimCache) on
@@ -3078,12 +4512,26 @@ parsing is skipped, and the timeline CSV can be opened manually.
   exit code instead of calling exit, so its finally block runs). The
   console the test runs in is never changed. No admin needed.
 
+  tests\Test-ViewerMenu.ps1 -- loads the builder's Invoke-TimelineViewer
+  and checks what it opens at the end of a run, with stand-ins for
+  Start-Process, Read-Host, the log and Timeline Explorer (nothing is
+  started): the menu's entries, numbers and colors for each mix of files
+  (the workbook and the report both made: Excel + findings report first,
+  in green; no report; no workbook; neither), PDF or HTML named, what each
+  answer starts (Excel before the report), a number that is not listed
+  asked again, the end of redirected input (nothing opened), every
+  -Viewer value with and without the files (ExcelAndReport opens what was
+  made and logs which file is missing), and that Excel or the report
+  failing to open does not stop the other. In the builder's syntax tree:
+  -Viewer's ValidateSet values, each handled by the function and each
+  named in this README's -Viewer entry. No admin needed.
+
   Four scripts test the findings report (CI runs them after the parser
   tests, in both PowerShell versions). The first three need no admin and do
   not run the builder:
 
   tests\Test-ReportEngine.ps1 -- the rules engine and report model
-  (report\TimelineReport.Engine.ps1) on synthetic rows and rules in
+  (lib\report\TimelineReport.Engine.ps1) on synthetic rows and rules in
   tests\fixtures\report\engine\: every match condition, lists, grouping,
   threshold windows, escalation, the allowlist, numbering, evidence limits,
   maxFindings roll-ups, activityTime, the stop of a rule whose pattern
@@ -3106,7 +4554,28 @@ parsing is skipped, and the timeline CSV can be opened manually.
   line, in the current and the older wording) in the notes, with the
   reason and advice after one colon, and a caveat that gives the reason as
   one short phrase and does not say the dump exists (it may not have been
-  found). threshold.distinct counts distinct values (records of one file
+  found); a log of a builder that could not analyze Windows ARM64 dumps
+  says the timeline can be built again for that, and a Windows ARM64 dump
+  read with the debugger engine (its "analyzed with the Windows debugger
+  engine" line, also "processes only") gives that note and a caveat with
+  no "not analyzed" note or caveat: for an older builder's line ("network
+  connections and services are not read") the caveat that they are not in
+  the report, for this builder's line ("-- read ...; not read <area>
+  (<why>), ...") a caveat built from its "not read" part, the fixed
+  sentences about network connections (closed ones are Stale=Yes, never
+  flagged) and the partial registry in memory, and the plain caveat when
+  nothing was left unread; each "Memory dump coverage" line as a note of
+  its own, not a warning; its "Memory dump process list" warning (the
+  ways of finding the processes disagreed) gives a note of its own after
+  that one, with one colon, and no such line no such note. Option C for
+  the other memory sources: the DLL, handle, console and network rows of
+  the collector's left-out processes (by PID and create time) are left
+  out and counted in the summary, a reused create time or an impostor's
+  rows stay leads, and on an older collection without CollectorProcesses
+  a lead of a process (or its process row) started around the collection
+  is marked as possibly the collector (SuspectRows), one started hours
+  before is not.
+  threshold.distinct counts distinct values (records of one file
   once; a row without the value on its own) and lists each value once in
   the evidence first. "evidence": "latest" lists the latest rows after the
   one that raised the severity, and findings.csv says "latest N rows
@@ -3159,9 +4628,11 @@ parsing is skipped, and the timeline CSV can be opened manually.
   field with no usable entry -- [] or {} --, no field, a mounted image)
   gives its own note.
 
-  tests\Test-ReportRules.ps1 -- loads report\report-rules.json with the
-  engine and checks it against tests\fixtures\report\rules\cases.csv: rows
-  in timeline format, in the shapes the parsers write now (memory command
+  tests\Test-ReportRules.ps1 -- loads lib\report\report-rules.json with
+  the engine and checks it against every tests\fixtures\report\rules\
+  cases*.csv (cases.csv first, then the others by name, as one timeline; a
+  failure names the file and its line):
+  rows in timeline format, in the shapes the parsers write now (memory command
   lines as Snapshot rows, author-supplied task dates, task actions written
   with environment variables (%TEMP%, %PUBLIC%, ...), Security 4698/4702
   Command/Arguments rows, ShimCache FileLastModified rows, the User
@@ -3236,7 +4707,8 @@ parsing is skipped, and the timeline CSV can be opened manually.
   and severities, row numbers that point at the right timeline rows),
   report-model.json, report.html, report.pdf (skipped without Edge), the
   copied collection_info.json and collection_log.txt, and the workbook: the
-  first sheet is Findings, every row links to its Timeline row, the
+  first and selected sheet is the full Timeline and the second is Findings,
+  every Findings row links to its Timeline row, the
   Finding column tags exactly the rows of each finding, and the Timeline
   sheet's columns are at most 80 wide (the log says "with row colors", and
   opening Excel logs no repair note). Then -ReportOnly
@@ -3267,7 +4739,17 @@ parsing is skipped, and the timeline CSV can be opened manually.
   are flagged again and the older-collector note appears; and a copy whose
   collection_info.json also lists the attacker's process as a Child: it is
   not left out, and the builder log, report-model.json and report.html say
-  to check whether collection_info.json was altered; -ReportOnly with -ReportRules
+  to check whether collection_info.json was altered; a copy of the builder
+  whose debugger engine helper (lib\memory\TimelineDbgEng.ps1) returns
+  canned entries (with the areas' canned entries of
+  tests\fixtures\memory\canned-*.txt and their AREA lines), run with
+  -MemoryDumpPath on a synthetic Windows ARM64 dump header (the engine
+  lookup, the helper in a process of its own, its output and the builder's
+  rows of the entries are real): the engine and the "analyzed with the
+  Windows debugger engine" lines (what was read and what not), the rows,
+  the notes (coverage notes too) and caveats in report-model.json, the
+  memory-only lead "Captured in the memory dump", also after -ReportOnly;
+  -ReportOnly with -ReportRules
   and -NoExcel
   (the workbook is called stale; -WorkDir and -MemoryDumpPath are ignored
   with one warning), a missing rules file, -NoReport, -ReportOnly in a
@@ -3285,7 +4767,7 @@ parsing is skipped, and the timeline CSV can be opened manually.
   missing or readable collection_info.json is told apart (an empty
   CollectorProcesses stays an empty field). It needs admin
   like the builder, or -BuilderPath with
-  a copy without the admin check that has the report\ folder beside it.
+  a copy without the admin check that has the lib\ folder beside it.
   Like a user run, the builder installs ImportExcel from the PowerShell
   Gallery when it is missing; if it cannot, the workbook checks are SKIPPED.
 
@@ -3316,6 +4798,7 @@ parsing is skipped, and the timeline CSV can be opened manually.
     powershell -ExecutionPolicy Bypass -File tests\Test-SummaryCounts.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-ScheduledTasks.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-ConsoleMode.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-ViewerMenu.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers.ps1 -AllowSystemChanges
     powershell -ExecutionPolicy Bypass -File tests\Test-EventLogParsers2.ps1 -AllowSystemChanges
     powershell -ExecutionPolicy Bypass -File tests\Test-RegistryParsers.ps1 -AllowSystemChanges
@@ -3357,6 +4840,14 @@ parsing is skipped, and the timeline CSV can be opened manually.
   msedge.exe           Microsoft Edge in headless mode prints report.html
                        to report.pdf (a temporary profile folder in %TEMP%,
                        deleted afterwards; no network access is needed).
+
+  dbgeng.dll,          Microsoft's debugger engine (with dbghelp.dll and
+  dbghelp.dll,         dbgmodel.dll in C:\Windows\System32) reads Windows
+  dbgmodel.dll         ARM64 memory dumps: the processes, their command
+                       lines and the other areas (parser #15, "ARM64
+                       memory dumps"). Loaded by full path in a
+                       PowerShell process of its own
+                       (lib\memory\TimelineDbgEng.ps1).
 
   PowerShell cmdlets   Import-Csv, Export-Csv, Expand-Archive,
                        Invoke-WebRequest, ConvertFrom-Json.
@@ -3403,6 +4894,23 @@ parsing is skipped, and the timeline CSV can be opened manually.
                        used by the Memory parser to analyze RAM dumps.
                        https://github.com/volatilityfoundation/volatility3
 
+  Microsoft Debugging  The debugger engine of WinDbg (dbgeng.dll, part of
+  Tools for Windows    Windows) reads Windows ARM64 memory dumps, with the
+                       kernel symbols of Microsoft's public symbol server.
+                       https://learn.microsoft.com/windows-hardware/drivers/debugger/
+
+  Windows Terminal     Microsoft's open-source console code (src\host\history.h,
+                       src\server\ProcessHandle.h) gives the layout of the
+                       console's command history read from Windows ARM64 dumps.
+                       https://github.com/microsoft/terminal
+
+  MemProcFS            Ulf Frisk's published offsets of the network objects
+                       and the service control manager's records for Windows
+                       11 build 26100 are used as facts (checked on real
+                       dumps; no code is copied) to read them from Windows
+                       ARM64 dumps.
+                       https://github.com/ufrisk/MemProcFS
+
   log2timeline/plaso   The timeline-building concept and CSV output format are
                        inspired by the plaso/log2timeline project, the gold
                        standard for forensic super-timelines.
@@ -3426,6 +4934,9 @@ needs esentutl, it writes entries to this machine's Application event log
 
 One-time actions (first run only):
   - Installs ImportExcel PowerShell module (CurrentUser scope)
+  - Writes the Windows kernel symbol file into tools\symbols\ the first time
+    an ARM64 memory dump of a new Windows kernel version is analyzed (kept
+    for later runs)
 
 Temporary actions (all cleaned up automatically, also after an error or Ctrl+C):
   - Extracts a collection zip (browse mode, or a .zip as -InputPath) into the
@@ -3441,6 +4952,12 @@ Temporary actions (all cleaned up automatically, also after an error or Ctrl+C):
     made writable) -- deleted after processing
   - Writes Volatility 3's JSON output (Memory parser) into the work folder
     -- deleted after each plugin
+  - For a Windows ARM64 memory dump: runs lib\memory\TimelineDbgEng.ps1 in
+    a PowerShell process of its own, with empty symbol and extension folders
+    in the work folder (scratch\dbgeng\; the kernel symbol file too when
+    tools\symbols\ cannot be written) -- deleted after the analysis; the
+    process is ended if it is still running after 15 minutes or when the
+    run stops
   - Downloads zip files to %TEMP% (first run) -- deleted after extraction
   - Gives Microsoft Edge a temporary profile folder,
     %TEMP%\timeline-report-edge-<id>, to print report.pdf -- deleted after

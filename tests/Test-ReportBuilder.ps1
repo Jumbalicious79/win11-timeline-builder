@@ -5,9 +5,9 @@
 # and BAM rows) and checks what the report adds next to the timeline:
 # findings.csv, report-model.json, report.html, report.pdf (skipped only
 # when Microsoft Edge is missing), the copied collection_info.json and
-# collection_log.txt and, when the workbook was made, its first sheet
-# "Findings" (hyperlinks to the Timeline rows) and the Timeline sheet's
-# "Finding" column. Then:
+# collection_log.txt and, when the workbook was made, its sheets (it opens
+# on the full Timeline sheet; the second sheet "Findings" has hyperlinks to
+# the Timeline rows) and the Timeline sheet's "Finding" column. Then:
 #   -ReportOnly rebuilds the report in the same folder (one Findings sheet
 #      and one Finding column, the same findings, no administrator rights
 #      needed, no error output -- Windows PowerShell printed a Test-Path
@@ -43,8 +43,8 @@
 #
 # Needs Administrator rights, like the builder (GitHub Actions Windows
 # runners are elevated). For a local run without them, pass -BuilderPath
-# with a copy of the builder that has no admin check, with the report\
-# folder beside it (e.g. under the git-ignored reports\ folder). Like a user
+# with a copy of the builder that has no admin check, with the lib\ folder
+# beside it (e.g. under the git-ignored reports\ folder). Like a user
 # run, the builder installs ImportExcel from the PowerShell Gallery when it
 # is missing; if that is not possible, the workbook checks are SKIPPED.
 # Exit code 0 = pass, 1 = fail.
@@ -144,6 +144,8 @@ function Read-TestWorkbook {
             }
         }
         $timeline = $package.Workbook.Worksheets["Timeline"]
+        $timelineSelected = [bool]$timeline.View.TabSelected
+        $activeTab = [int]$package.Workbook.View.ActiveTab
         $headers = @(for ($c = 1; $c -le $timeline.Dimension.End.Column; $c++) { [string]$timeline.Cells[1, $c].Value })
         $findingColumn = [Array]::IndexOf($headers, "Finding") + 1
         $timelineRows = @(for ($r = 2; $r -le $timeline.Dimension.End.Row; $r++) {
@@ -155,6 +157,8 @@ function Read-TestWorkbook {
         return [PSCustomObject]@{
             Sheets           = $sheets
             FindingsSelected = $findingsSelected
+            TimelineSelected = $timelineSelected
+            ActiveTab        = $activeTab
             FindingsRows     = $findingsRows.ToArray()
             Headers          = $headers
             TimelineRows     = $timelineRows
@@ -310,7 +314,7 @@ $reportsBefore = @(Get-ChildItem -LiteralPath $reportsDir -Directory -ErrorActio
 $workDir = Join-Path ([System.IO.Path]::GetTempPath()) ("timeline-report-test-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $workDir | Out-Null
 try {
-    . (Join-Path $repoRoot "report\TimelineReport.Render.ps1")
+    . (Join-Path $repoRoot "lib\report\TimelineReport.Render.ps1")
     $edge = Find-ReportPdfEdge
 
     # --- 0. What the report says about the collection (the builder's
@@ -434,7 +438,7 @@ try {
         }
     }
 
-    # The workbook: first sheet Findings, hyperlinks, Finding column
+    # The workbook: Timeline first and selected, Findings second, hyperlinks, Finding column
     $workbook = $null
     $firstFindingColumn = @()
     if (-not (Test-Path -LiteralPath $xlsxPath)) {
@@ -448,7 +452,7 @@ try {
         }
         else {
             Write-TestResult -Succeeded ($model.Workbook.Available -and $html.Contains('href="./timeline.xlsx"')) -Message "the report links to the workbook"
-            Write-TestResult -Succeeded ($workbook.Sheets[0] -eq "Findings" -and $workbook.Sheets -contains "Timeline" -and $workbook.FindingsSelected) -Message "the workbook's first (and selected) sheet is Findings ($($workbook.Sheets -join ', '))"
+            Write-TestResult -Succeeded (($workbook.Sheets -join ",") -eq "Timeline,Findings" -and $workbook.TimelineSelected -and -not $workbook.FindingsSelected -and $workbook.ActiveTab -eq 0) -Message "the workbook opens on the full Timeline sheet (first and only selected); Findings is the second sheet ($($workbook.Sheets -join ', '); active tab $($workbook.ActiveTab))"
             $summaryRows = @($workbook.FindingsRows | Where-Object { $_.RowType -eq "Summary" })
             $evidenceRows = @($workbook.FindingsRows | Where-Object { $_.RowType -ne "Summary" })
             Write-TestResult -Succeeded ($summaryRows.Count -eq $expected.Count -and (@($summaryRows | ForEach-Object { $_.Finding }) -join ",") -eq ($ids -join ",")) -Message "the Findings sheet has a summary row per finding"
@@ -493,15 +497,16 @@ try {
     Write-TestResult -Succeeded ($rebuiltModel.Collection.ComputerName -eq "REPORT-FIXTURE" -and $rebuiltModel.Collection.CollectorUser -eq "FIXTURE\analyst") -Message "-ReportOnly reads the copied collection_info.json"
     if ($workbook) {
         $rebuiltWorkbook = Read-TestWorkbook -Path $xlsxPath
-        Write-TestResult -Succeeded ($rebuiltModel.Workbook.Available -and $rebuiltWorkbook.Sheets[0] -eq "Findings" -and @($rebuiltWorkbook.Sheets | Where-Object { $_ -eq "Findings" }).Count -eq 1 -and
-            @($rebuiltWorkbook.Headers | Where-Object { $_ -eq "Finding" }).Count -eq 1) -Message "-ReportOnly replaces the Findings sheet and the Finding column (no duplicates)"
+        Write-TestResult -Succeeded ($rebuiltModel.Workbook.Available -and ($rebuiltWorkbook.Sheets -join ",") -eq "Timeline,Findings" -and $rebuiltWorkbook.TimelineSelected -and
+            -not $rebuiltWorkbook.FindingsSelected -and $rebuiltWorkbook.ActiveTab -eq 0 -and
+            @($rebuiltWorkbook.Headers | Where-Object { $_ -eq "Finding" }).Count -eq 1) -Message "-ReportOnly replaces the Findings sheet and the Finding column (no duplicates); the workbook still opens on the full Timeline sheet"
         Write-TestResult -Succeeded ((@($rebuiltWorkbook.TimelineRows | ForEach-Object { $_.Finding }) -join "|") -eq ($firstFindingColumn -join "|")) -Message "-ReportOnly writes the same Finding column"
         $rebuiltWidths = @(Get-TestTimelineWidths -Path $xlsxPath)
         Write-TestResult -Succeeded (@($rebuiltWidths | Where-Object { $_ -eq "Details=80" }).Count -eq 1 -and @($rebuiltWidths | Where-Object { [double]($_ -replace '^.*=', '') -gt 80 }).Count -eq 0) -Message "-ReportOnly caps the Timeline sheet's column widths of an older workbook at 80 ($($rebuiltWidths -join ', '))"
     }
 
     # --- 2b. A lead seen only in the memory dump: a copy of the builder (with
-    # report\ beside it, in this test's folder) whose Find-VolatilityExe gives
+    # lib\ beside it, in this test's folder) whose Find-VolatilityExe gives
     # a stub that prints canned Volatility 3 output, run with -MemoryDumpPath
     # on a synthetic x64 crash dump header captured during the collection.
     # fixture-stage.exe runs from C:\Users\Public only in the dump (a
@@ -510,7 +515,7 @@ try {
     $memBuilderDir = Join-Path $workDir "memory-builder"
     $volDir = Join-Path $memBuilderDir "vol"
     New-Item -ItemType Directory -Path $volDir | Out-Null
-    Copy-Item -LiteralPath (Join-Path $builderDir "report") -Destination (Join-Path $memBuilderDir "report") -Recurse
+    Copy-Item -LiteralPath (Join-Path $builderDir "lib") -Destination (Join-Path $memBuilderDir "lib") -Recurse
     $volStub = Join-Path $volDir "vol-canned.cmd"
     [System.IO.File]::WriteAllText($volStub, "@echo off`r`nif not exist `"%~dp0%5.json`" (`r`n  echo No output for %5 1>&2`r`n  exit /b 1`r`n)`r`ntype `"%~dp0%5.json`"`r`n")
     $cannedOutput = @{
@@ -644,6 +649,126 @@ try {
         Write-TestResult -Succeeded ($editRun.ExitCode -eq 0 -and $editLead -and $editNote -and $editLog -and $editHtml.Contains("Check whether collection_info.json was altered after the collection.")) -Message "collector: an entry added to collection_info.json for the attacker's process is rejected (its lead stays, the 6 collector processes are still left out) and the log, the model and report.html say to check whether the file was altered (exit $($editRun.ExitCode))"
     }
 
+    # --- 2d. A Windows ARM64 dump, read with Microsoft's debugger engine: a
+    # copy of the builder (with lib\ beside it) whose debugger engine
+    # helper (lib\memory\TimelineDbgEng.ps1) returns canned entries instead of
+    # reading the dump, run with -MemoryDumpPath on a synthetic ARM64 crash
+    # dump header. The builder's own path is real: the engine lookup, the
+    # helper in a PowerShell process of its own, its output read back, the
+    # rows (the same entries as the memory run of 2b, and the areas' canned
+    # entries of tests\fixtures\memory\canned-*.txt with their AREA lines), the
+    # log lines the report reads. The report gets the "analyzed with the Windows debugger
+    # engine" note and caveat (not the "not analyzed" ones), the memory-only
+    # lead still says "Captured in the memory dump", and -ReportOnly keeps
+    # them ---
+    $armBuilderDir = Join-Path $workDir "arm64-builder"
+    New-Item -ItemType Directory -Path $armBuilderDir | Out-Null
+    Copy-Item -LiteralPath (Join-Path $builderDir "lib") -Destination (Join-Path $armBuilderDir "lib") -Recurse
+    Copy-Item -LiteralPath $builder -Destination (Join-Path $armBuilderDir "timeline-builder.ps1")
+    $helperText = [System.IO.File]::ReadAllText((Join-Path $builderDir "lib\memory\TimelineDbgEng.ps1"))
+    $helperAnchor = "function Read-DbgEngDump {"
+    # The areas' canned entries (tests\fixtures\memory\canned-*.txt, read by
+    # the test kit's Read-TestCannedEntries in the helper's process): an area
+    # that no file names is not built yet, as the helper's stubs say
+    $cannedHelper = @'
+function Read-DbgEngDump {
+    param([string]$DumpPath, [string]$EngineFolder, [string[]]$EngineDlls, [string]$SymbolCache, [string]$JobFolder)
+    Write-DbgEngLog "  Kernel symbols: (canned for the test)"
+    $result = New-DbgEngResult
+    $result.Processes = @([PSCustomObject]@{ PID = [long]4321; PPID = [long]3000; ImageFileName = "fixture-stage."; Offset = "0xffffa00000001000"; Threads = [long]3; SessionId = [long]1; CreateTime = "2026-03-02T11:30:00.1234567+00:00"; ExitTime = $null })
+    $result.CommandLines = @(
+        [PSCustomObject]@{ PID = [long]4321; Process = "fixture-stage.exe"; Args = '"C:\Users\Public\fixture-stage.exe" -connect 203.0.113.7' },
+        [PSCustomObject]@{ PID = [long]4400; Process = "fixture-invoice.exe"; Args = "C:\Users\alice\Downloads\fixture-invoice.exe /quiet" }
+    )
+    $result.SessionIds = 1
+    . '<KIT>'
+    $canned = Read-TestCannedEntries -Path '<FIXTURES>'
+    $result.Entries = $canned.Entries
+    $result.Areas = @(foreach ($area in @(Get-DbgEngAreas)) {
+            $named = @($canned.Areas | Where-Object { $_.Name -eq $area.Name })
+            if ($named.Count -gt 0) { $named[0] } else { New-DbgEngAreaSummary -Name $area.Name -State "NotRead" -Note "not built yet" }
+        })
+    return $result
+}
+
+function Read-DbgEngDumpReal {
+'@
+    $memoryKit = Join-Path $PSScriptRoot "MemoryTestKit.ps1"
+    $memoryFixtures = Join-Path $PSScriptRoot "fixtures\memory"
+    $cannedHelper = $cannedHelper.Replace("<KIT>", $memoryKit.Replace("'", "''")).Replace("<FIXTURES>", $memoryFixtures.Replace("'", "''"))
+    # What the builder and the report must then say: from the same canned
+    # areas, with the helper's and the builder's own functions
+    . $memoryKit
+    [void](Import-MemoryTestFunctions -Path (Join-Path $builderDir "lib\memory\TimelineDbgEng.ps1"))
+    [void](Import-MemoryTestFunctions -Path (Join-Path $builderDir "lib\memory\TimelineMemoryRows.ps1"))
+    $cannedData = Read-TestCannedEntries -Path $memoryFixtures
+    $cannedAreas = @(foreach ($area in @(Get-DbgEngAreas)) {
+            $named = @($cannedData.Areas | Where-Object { $_.Name -eq $area.Name })
+            if ($named.Count -gt 0) { $named[0] } else { New-DbgEngAreaSummary -Name $area.Name -State "NotRead" -Note "not built yet" }
+        })
+    $cannedReadText = Get-DbgEngReadText -Areas $cannedAreas
+    $cannedCoverage = @(Get-DbgEngCoverageTexts -Areas $cannedAreas)
+    $helperAnchorFound = ([regex]::Matches($helperText, [regex]::Escape($helperAnchor))).Count -eq 1
+    if (-not $helperAnchorFound) { Write-TestResult -Succeeded $false -Message "the debugger engine helper has no single Read-DbgEngDump to replace for the ARM64 run" }
+    else {
+        [System.IO.File]::WriteAllText((Join-Path $armBuilderDir "lib\memory\TimelineDbgEng.ps1"), $helperText.Replace($helperAnchor, $cannedHelper))
+        $armDump = Join-Path $workDir "arm64 memory.dmp"
+        $armBytes = New-Object byte[] 0x2000
+        [Array]::Copy([System.Text.Encoding]::ASCII.GetBytes("PAGEDU64"), 0, $armBytes, 0, 8)
+        [Array]::Copy([BitConverter]::GetBytes([uint32]0xAA64), 0, $armBytes, 0x30, 4)
+        $armCapture = [datetime]::new(2026, 3, 2, 12, 3, 0, [System.DateTimeKind]::Utc)
+        [Array]::Copy([BitConverter]::GetBytes([long]$armCapture.ToFileTimeUtc()), 0, $armBytes, 0xFA8, 8)
+        [System.IO.File]::WriteAllBytes($armDump, $armBytes)
+        [System.IO.File]::SetLastWriteTimeUtc($armDump, $armCapture.AddMinutes(2))
+        $armRunDir = Join-Path $workDir "arm64-run"
+        New-Item -ItemType Directory -Path $armRunDir | Out-Null
+        $savedBuilder3 = $builder
+        try {
+            $builder = Join-Path $armBuilderDir "timeline-builder.ps1"
+            Write-Host "Running the builder copy with a Windows ARM64 memory dump ..."
+            $armRun = Invoke-TimelineBuilder -Arguments @("-InputPath", $collection, "-Sources", "Persistence,PowerShellHistory,Memory", "-MemoryDumpPath", $armDump,
+                "-OutputFile", (Join-Path $armRunDir "timeline.csv"), "-Viewer", "None")
+        }
+        finally { $builder = $savedBuilder3 }
+        $armRows = @()
+        if (Test-Path -LiteralPath (Join-Path $armRunDir "timeline.csv")) { $armRows = @(Import-Csv -LiteralPath (Join-Path $armRunDir "timeline.csv")) }
+        $analyzedLine = "Memory dump analyzed with the Windows debugger engine: arm64 memory.dmp (8192 bytes) -- $cannedReadText"
+        $armWarnings = @($armRun.Output | Where-Object { $_ -match 'WARNING:' -and $_ -match 'memory|debugger|engine|symbol|report|finding|rule|workbook|PDF' -and -not ($_ -match 'PDF not created' -and -not $edge) })
+        $armLogged = @($armRun.Output | Where-Object { $_.EndsWith("  $analyzedLine") }).Count -eq 1 -and @($armRun.Output | Where-Object { $_ -match '  Debugger engine: dbgeng\.dll \S+ from .+ \(part of Windows\)$' }).Count -eq 1 -and
+            @($armRun.Output | Where-Object { $_ -match 'Kernel symbols: \(canned for the test\)$' }).Count -eq 1
+        if ($armRun.ExitCode -ne 0 -or @($armRows | Where-Object { $_.Source -eq "Memory-Processes" }).Count -ne 1 -or @($armRows | Where-Object { $_.Source -eq "Memory-CommandLine" }).Count -ne 2 -or $armWarnings.Count -gt 0 -or -not $armLogged) {
+            Write-TestResult -Succeeded $false -Message "the ARM64 run did not exit with 0, log the engine and the helper's line and add the dump's rows without a memory or report warning (exit code $($armRun.ExitCode)) $($armWarnings -join ' / ')"
+            $armRun.Output | Select-Object -Last 30 | ForEach-Object { Write-Host "  | $_" }
+        }
+        else { Write-TestResult -Succeeded $true -Message "the ARM64 run: the engine and the helper's log line, the 'analyzed with the Windows debugger engine' line, one pslist and two cmdline rows" }
+        # The ARM64 caveat says what was not read; a scan of network objects and
+        # the registry in memory have a caveat of their own when read
+        $cannedNotRead = if ($cannedReadText.Contains("; not read ")) { $cannedReadText.Substring($cannedReadText.IndexOf("; not read ") + 11) } else { "" }
+        $armCaveats = @(if ($cannedNotRead) { "The memory dump is a Windows ARM64 dump, read with the Windows debugger engine: these were not read from it, so they are not in this report -- $cannedNotRead." } else { "The memory dump is a Windows ARM64 dump, read with the Windows debugger engine, not with Volatility 3." })
+        $cannedReadPart = ($cannedReadText -split '; not read ')[0]
+        if ($cannedReadPart -match '(?:^read |, )network connections(?:,|$)') { $armCaveats += "Network connections in the memory dump come from a scan of memory for connection objects and can include closed ones (Stale=Yes) and second copies of the same object (Duplicate=Yes), neither flagged." }
+        if ($cannedReadPart -match '(?:^read |, )registry hives(?:,|$)') { $armCaveats += "The registry in the memory dump is partial: a key or value missing there is not proof that it was absent." }
+        $armCaveat = $armCaveats -join " / "
+        $armNotesExpected = (@("$analyzedLine.") + @($cannedCoverage | ForEach-Object { "Memory dump coverage: $_." })) -join " / "
+        foreach ($pass in @("ARM64 run", "ARM64 run, -ReportOnly")) {
+            if ($pass -like "*-ReportOnly") {
+                # -ReportOnly reads the run's log next to the timeline (with
+                # -OutputFile it stayed in the copy's reports\timeline_<time>\)
+                $armLog = @(Get-ChildItem -LiteralPath (Join-Path $armBuilderDir "reports") -Filter "timeline_builder_log.txt" -Recurse -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1)
+                if ($armLog.Count -eq 1) { Copy-Item -LiteralPath $armLog[0].FullName -Destination (Join-Path $armRunDir "timeline_builder_log.txt") }
+                else { Write-TestResult -Succeeded $false -Message "the ARM64 run's timeline_builder_log.txt was not found under the copy's reports\" }
+                $armRebuild = Invoke-TimelineBuilder -Arguments @("-ReportOnly", $armRunDir, "-Viewer", "None")
+                if ($armRebuild.ExitCode -ne 0 -or $armRebuild.Errors.Count -gt 0) { Write-TestResult -Succeeded $false -Message "-ReportOnly on the ARM64 run did not exit with 0 (exit code $($armRebuild.ExitCode)) $($armRebuild.Errors -join ' / ')" }
+            }
+            $armModel = $null
+            if (Test-Path -LiteralPath (Join-Path $armRunDir "report-model.json")) { $armModel = Get-Content -LiteralPath (Join-Path $armRunDir "report-model.json") -Raw | ConvertFrom-Json }
+            $armNotes = @($armModel.Coverage.Notes | Where-Object { $_ -match '^Memory dump' })
+            $armModelCaveats = @($armModel.Caveats | Where-Object { $_ -match 'memory dump' })
+            Write-TestResult -Succeeded ($armModel -and ($armNotes -join " / ") -ceq $armNotesExpected -and ($armModelCaveats -join " / ") -ceq $armCaveat) -Message "${pass}: report-model.json has the 'analyzed with the Windows debugger engine' note (what was read and not), the coverage notes and the ARM64 caveats, no 'not analyzed' note or caveat ($($armNotes -join ' / ') | $($armModelCaveats -join ' / '))"
+            Test-MemoryOnlyLead -Folder $armRunDir -Label $pass
+        }
+    }
+
     # --- 3. -ReportOnly with another rules file, workbook left alone ---
     $xlsxHashBefore = $null
     if (Test-Path -LiteralPath $xlsxPath) { $xlsxHashBefore = (Get-FileHash -LiteralPath $xlsxPath).Hash }
@@ -736,14 +861,14 @@ try {
     Write-TestResult -Succeeded ($noTimeline.ExitCode -eq 1 -and @($noTimeline.Output | Where-Object { $_ -match '-ReportOnly needs a timeline\.csv' }).Count -eq 1) -Message "-ReportOnly on a folder without timeline.csv exits with 1 and says why"
 
     # --- 7. An unexpected error during -ReportOnly: a copy of the builder
-    # (with report\ beside it, in this test's folder) with one injected
+    # (with lib\ beside it, in this test's folder) with one injected
     # change. A statement-terminating error in the rebuild's body is logged
     # and only its statement is skipped (the report is still made, exit code
     # 0); a rebuild that stops before it gives its exit code, or an error
     # thrown out of it, gives exit code 1, never 0 ---
     $injectDir = Join-Path $workDir "inject"
     New-Item -ItemType Directory -Path $injectDir | Out-Null
-    Copy-Item -LiteralPath (Join-Path $builderDir "report") -Destination (Join-Path $injectDir "report") -Recurse
+    Copy-Item -LiteralPath (Join-Path $builderDir "lib") -Destination (Join-Path $injectDir "lib") -Recurse
     $builderText = [System.IO.File]::ReadAllText($builder)
     # A .NET exception whose message names the file in both PowerShell
     # editions (Windows PowerShell's [int]::Parse message has no value)

@@ -1,0 +1,5 @@
+# The Driver entries of the canned drivers area (TimelineDbgEng.Drivers.ps1): a
+# loaded kernel module with its driver object and a recently unloaded driver
+#AREA	Drivers	Read
+Driver	State=Loaded	Name=fixture-kmod.sys	Path=C:\Windows\System32\drivers\fixture-kmod.sys	Base=0xfffff80012340000	Size=0x8000	FoundBy=ModuleList,DriverObject	DriverObject=\Driver\fixture-kmod
+Driver	State=Unloaded	Name=fixture-gone.sys	Base=0xfffff80012350000	Size=0x4000	Time=2026-03-02T11:00:00.0000000+00:00	FoundBy=UnloadedDriverList

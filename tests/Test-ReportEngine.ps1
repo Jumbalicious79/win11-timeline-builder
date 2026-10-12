@@ -1,6 +1,6 @@
 # =============================================================
 # Report engine test (Phase 3)
-# Loads report\TimelineReport.Engine.ps1 and checks it on the synthetic
+# Loads lib\report\TimelineReport.Engine.ps1 and checks it on the synthetic
 # fixtures in tests\fixtures\report\engine\ (rules.json, timeline.csv,
 # collection_info.json, collection_log.txt, timeline_builder_log.txt):
 #   - every rule feature: match / anyOf / not* conditions, lists, groupBy
@@ -75,7 +75,7 @@ function New-TestTextFile {
     [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding($false)))
 }
 
-. (Join-Path $repoRoot "report\TimelineReport.Engine.ps1")
+. (Join-Path $repoRoot "lib\report\TimelineReport.Engine.ps1")
 
 $workDir = Join-Path ([System.IO.Path]::GetTempPath()) ("report-engine-test-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $workDir | Out-Null
@@ -633,7 +633,7 @@ try {
     # The shipped rules import with no error, and no compiled condition is an
     # empty regex (one that would match every row)
     $shippedErrors = $null
-    $shipped = Import-ReportRules -Path (Join-Path $repoRoot "report\report-rules.json") -ErrorVariable shippedErrors
+    $shipped = Import-ReportRules -Path (Join-Path $repoRoot "lib\report\report-rules.json") -ErrorVariable shippedErrors
     $emptyConditions = New-Object System.Collections.Generic.List[string]
     $conditionNames = @("Source", "EventType", "Description", "Details", "User", "NotSource", "NotEventType", "NotDescription", "NotDetails", "NotUser")
     foreach ($shippedRule in $shipped.Rules) {
@@ -865,20 +865,31 @@ try {
     Assert-Equal "$($passed.Incomplete)|$($passed.MissingInputFiles)|$($passed.UnexpectedErrors)|$(@($passed.Lines).Count)" "True|5|0|1" -Message "the builder's own counts (-MissingInputFiles) without a log"
     Assert-Equal "$($model.Coverage.TimelineCompleteness.Incomplete)|$(@($model.Caveats | Where-Object { $_ -match 'incomplete' }).Count)" "False|0" -Message "a complete run: no incomplete caveat"
 
-    # --- A memory dump the builder found but did not analyze (Windows ARM64,
-    # skipped at its prompt, no Volatility 3, or not found) ---
+    # --- A memory dump the builder found but did not analyze (skipped at its
+    # prompt, no Volatility 3, no kernel symbol file for an ARM64 dump, or
+    # not found) ---
     # The note (Evidence coverage) names the dump and gives the reason and
     # advice with one colon; the caveat (page 1) gives the reason as one
     # short phrase. A log from an older builder ("<dump>: <why>", "<dump>,
-    # but <why>") reads the same way.
+    # but <why>") reads the same way; one that could not analyze Windows
+    # ARM64 dumps at all says the timeline can be built again for that.
     $memoryCaveatTail = ", so the programs, network connections and command lines in memory are not in this report."
-    $arm64Note = "Memory dump not analyzed: T_memory_dump.dmp (7.99 GB) -- Volatility 3 cannot read Windows ARM64 dumps; examine it in WinDbg."
-    $arm64Caveat = "A memory dump of this collection was not analyzed (Volatility 3 cannot read Windows ARM64 dumps)$memoryCaveatTail"
+    $arm64Note = "Memory dump not analyzed: T_memory_dump.dmp (7.99 GB) -- the builder that made this timeline could not analyze Windows ARM64 dumps; build the timeline again to analyze it with the Windows debugger engine."
+    $arm64Caveat = "A memory dump of this collection was not analyzed (the builder that made this timeline could not analyze Windows ARM64 dumps)$memoryCaveatTail"
     $missingCaveat = "A memory dump of this collection was not analyzed (it was not found next to the collection or where the collector saved it)$memoryCaveatTail"
     $memoryCases = @(
-        @("ARM64", "T_memory_dump.dmp (7.99 GB) -- Volatility 3 cannot read Windows ARM64 dumps; examine it in WinDbg.", $arm64Note, $arm64Caveat),
-        @("ARM64, older builder", "T_memory_dump.dmp (7.99 GB): a Windows ARM64 dump, which Volatility 3 cannot analyze; examine it in WinDbg.", $arm64Note, $arm64Caveat),
-        @("not found", "the dump listed in collection_manifest.csv (7.99 GB) -- it was not found (or not usable) next to the collection or where the collector saved it.",
+        @("ARM64, older builder", "T_memory_dump.dmp (7.99 GB) -- Volatility 3 cannot read Windows ARM64 dumps; examine it in WinDbg.", $arm64Note, $arm64Caveat),
+        @("ARM64, oldest builder", "T_memory_dump.dmp (7.99 GB): a Windows ARM64 dump, which Volatility 3 cannot analyze; examine it in WinDbg.", $arm64Note, $arm64Caveat),
+        @("ARM64, no kernel symbol file", "T_memory_dump.dmp (7.99 GB) -- the Windows kernel symbol file could not be downloaded from Microsoft's symbol server (No such host is known - msdl.microsoft.com); connect to the internet and run the builder again, or see ""Windows kernel symbols"" in README.txt.",
+            "Memory dump not analyzed: T_memory_dump.dmp (7.99 GB) -- the Windows kernel symbol file could not be downloaded from Microsoft's symbol server (No such host is known - msdl.microsoft.com); connect to the internet and run the builder again, or see ""Windows kernel symbols"" in README.txt.",
+            "A memory dump of this collection was not analyzed (the Windows kernel symbol file could not be downloaded from Microsoft's symbol server)$memoryCaveatTail"),
+        @("ARM64, kernel symbol file not accepted by the engine", "T_memory_dump.dmp (7.99 GB) -- the Windows debugger engine did not accept the kernel symbol file from Microsoft's symbol server (this engine may be too old for the dump); put a newer engine in tools\dbgeng\ and run the builder again, see ""Microsoft debugger engine"" in README.txt.",
+            "Memory dump not analyzed: T_memory_dump.dmp (7.99 GB) -- the Windows debugger engine did not accept the kernel symbol file from Microsoft's symbol server (this engine may be too old for the dump); put a newer engine in tools\dbgeng\ and run the builder again, see ""Microsoft debugger engine"" in README.txt.",
+            "A memory dump of this collection was not analyzed (the Windows debugger engine did not accept the kernel symbol file from Microsoft's symbol server)$memoryCaveatTail"),
+        @("ARM64, no folder for the kernel symbol file", "T_memory_dump.dmp (7.99 GB) -- no folder for the Windows kernel symbol file could be written (Access to the path 'X' is denied); make tools\symbols\ next to the builder writable, or use a -WorkDir that can be written, and run the builder again.",
+            "Memory dump not analyzed: T_memory_dump.dmp (7.99 GB) -- no folder for the Windows kernel symbol file could be written (Access to the path 'X' is denied); make tools\symbols\ next to the builder writable, or use a -WorkDir that can be written, and run the builder again.",
+            "A memory dump of this collection was not analyzed (no folder for the Windows kernel symbol file could be written)$memoryCaveatTail"),
+        @("not found","the dump listed in collection_manifest.csv (7.99 GB) -- it was not found (or not usable) next to the collection or where the collector saved it.",
             "Memory dump not analyzed: the dump listed in collection_manifest.csv (7.99 GB) -- it was not found (or not usable) next to the collection or where the collector saved it.", $missingCaveat),
         @("not found, older builder", "collection_manifest.csv lists one (7.99 GB), but it was not found (or not usable) next to the collection or where the collector saved it.",
             "Memory dump not analyzed: collection_manifest.csv lists one (7.99 GB) -- it was not found (or not usable) next to the collection or where the collector saved it.", $missingCaveat),
@@ -900,7 +911,46 @@ try {
         $colons = @(@($memoryNotes) + @($memoryCaveats) | Where-Object { ([regex]::Matches($_, ':\s')).Count -gt 1 })
         Assert-Equal "$($memoryNotes -join ' / ')|$($memoryCaveats -join ' / ')|$($colons.Count)" "$($case[2])|$($case[3])|0" -Message "a memory dump not analyzed ($($case[0])): one note with the dump and why, one caveat with the reason, no double colon"
     }
-    Assert-Equal "$(@($model.Coverage.Notes | Where-Object { $_ -match '^Memory dump not analyzed|memory dump of this collection' }).Count)|$(@($model.Caveats | Where-Object { $_ -match 'memory dump of this collection' }).Count)" "0|0" -Message "no such log line: no memory-dump note or caveat"
+    Assert-Equal "$(@($model.Coverage.Notes | Where-Object { $_ -match '^Memory dump not analyzed|memory dump of this collection|^Memory dump analyzed' }).Count)|$(@($model.Caveats | Where-Object { $_ -match 'memory dump of this collection|Windows ARM64 dump' }).Count)" "0|0" -Message "no such log line: no memory-dump note or caveat"
+
+    # --- A Windows ARM64 dump read with Microsoft's debugger engine ---
+    # The builder's "Memory dump analyzed with the Windows debugger engine"
+    # line: a note with the dump and what was read, a caveat that network
+    # connections and services are not in the report, no "not analyzed" note
+    # or caveat; the processes alone when the command lines could not be read
+    $engineCases = @(
+        @("processes and command lines", "T_memory_dump.dmp (7.99 GB) -- processes and command lines only; network connections and services are not read from Windows ARM64 dumps.",
+            "The memory dump is a Windows ARM64 dump, read with the Windows debugger engine: only its processes and command lines are in this report, not its network connections or services."),
+        @("processes only", "T_memory_dump.dmp (7.99 GB) -- processes only, its command lines could not be read [the command did not finish within 300 s]; network connections and services are not read from Windows ARM64 dumps.",
+            "The memory dump is a Windows ARM64 dump, read with the Windows debugger engine: only its processes are in this report, not its command lines (they could not be read), network connections or services.")
+    )
+    foreach ($case in $engineCases) {
+        $engineLog = Join-Path $workDir "engine_builder_log.txt"
+        New-TestTextFile $engineLog ("[2026-02-02 01:00:00] === Windows 11 Forensic Timeline Builder Started ===`r`n" +
+            "[2026-02-02 01:00:05]   Windows ARM64 dump: analyzing it with Microsoft's debugger engine (Volatility 3 cannot read ARM64 memory)`r`n" +
+            "[2026-02-02 01:00:09]   Memory dump analyzed with the Windows debugger engine: $($case[1])`r`n" +
+            "[2026-02-02 01:00:09]   For more (handles, drivers and other kernel objects), open the dump in WinDbg; its command-line debugger, with the builder's symbol cache: kdARM64.exe -z ""C:\x\T_memory_dump.dmp"" -y ""srv*C:\t\tools\symbols*https://msdl.microsoft.com/download/symbols""`r`n")
+        $engineModel = New-ReportModel -Rows $userRows -BuilderLogPath $engineLog
+        $engineNotes = @($engineModel.Coverage.Notes | Where-Object { $_ -match '^Memory dump' })
+        $engineCaveats = @($engineModel.Caveats | Where-Object { $_ -match 'memory dump' })
+        $colons = @(@($engineNotes) + @($engineCaveats) | Where-Object { ([regex]::Matches($_, ':\s')).Count -gt 1 })
+        Assert-Equal "$($engineNotes -join ' / ')|$($engineCaveats -join ' / ')|$($colons.Count)" "Memory dump analyzed with the Windows debugger engine: $($case[1])|$($case[2])|0" -Message "an ARM64 dump read with the Windows debugger engine ($($case[0])): the note says what was read, the caveat what is not in the report, no 'not analyzed' note or caveat, no double colon"
+    }
+    # The builder's "Memory dump process list" warning (the ways it finds
+    # the processes of an ARM64 dump disagreed: memory copied while Windows
+    # ran): a note of its own after the engine's, with how many each way
+    # found; the warning is counted with the builder's others. Without the
+    # line, no such note.
+    $processListText = "the kernel's list of processes was inconsistent in 1 place, as when memory is copied while Windows runs and processes start or end during the copy. 192 processes were found, 191 of them by all three ways (walking the kernel's process list forwards, walking it backwards, and its process ID table), 1 missed by walking backwards. The debugger engine's own process list (dx @`$cursession.Processes in WinDbg) has 183 entries and stops at the first inconsistent link."
+    $processListLog = Join-Path $workDir "process_list_builder_log.txt"
+    New-TestTextFile $processListLog ("[2026-02-02 01:00:00] === Windows 11 Forensic Timeline Builder Started ===`r`n" +
+        "[2026-02-02 01:00:06] WARNING:   Memory dump process list: $processListText`r`n" +
+        "[2026-02-02 01:00:09]   Memory dump analyzed with the Windows debugger engine: $($engineCases[0][1])`r`n")
+    $processListModel = New-ReportModel -Rows $userRows -BuilderLogPath $processListLog
+    $processListNotes = @($processListModel.Coverage.Notes | Where-Object { $_ -match '^Memory dump' })
+    $processListColons = @($processListNotes | Where-Object { ([regex]::Matches($_, ':\s')).Count -gt 1 })
+    Assert-Equal "$($processListNotes -join ' / ')|$($processListColons.Count)|$($processListModel.Coverage.BuilderWarnings.Count)" "Memory dump analyzed with the Windows debugger engine: $($engineCases[0][1]) / Memory dump process list: $processListText|0|1" -Message "an ARM64 dump whose process list was inconsistent: the builder's warning as a note of its own after the engine's, one colon, the warning counted"
+    Assert-Equal "$(@($engineModel.Coverage.Notes | Where-Object { $_ -match '^Memory dump process list' }).Count)" "0" -Message "no 'Memory dump process list' line: no such note"
 
     # =========================================================
     # report-model.json
@@ -1208,6 +1258,85 @@ try {
     $imgState = Find-ReportCollectorRows -Rows $treeRows -CollectionInfo ([PSCustomObject]@{ Mode = "MountedImage"; CollectionInfoState = "Read" })
     Assert-Equal $imgState.State "NotApplicable" -Message "collector state: a mounted image is NotApplicable"
 
+    # =========================================================
+    # The other per-process memory sources of a Windows ARM64 dump (DLLs,
+    # handles, executable private memory, console history, network): a row
+    # is left out when its PID= is a left-out process's and its
+    # ProcessCreated= (Memory-Network OwnerCreated=) is that process's create
+    # time to the millisecond; a reused PID with another create time is kept,
+    # and Memory-Drivers, Memory-Registry and Memory-Services rows never are.
+    # In a collection that did not record the collector, such rows of a
+    # process started around the collection make a memory-only lead
+    # CollectorSuspect.
+    # =========================================================
+    function New-TestOwnedRow { param([string]$Source, [string]$Description, [string]$Details)
+        return @{ Timestamp = "2026-05-15 12:03:30.000"; Source = $Source; EventType = "Snapshot"; Description = $Description; User = ""; Details = $Details; Artifact = "MemoryDump"; RawPath = "" } }
+    $ownedRows = @($colRows) + @(
+        (New-TestOwnedRow -Source "Memory-Modules" -Description "Module in memory: fixture-a.dll (PID: 9120, Process: powershell.exe)" -Details "PID=9120 | ProcessCreated=2026-05-15 12:02:58.000 | Path=C:\Users\Public\fixture-a.dll"),
+        (New-TestOwnedRow -Source "Memory-Handles" -Description "Handle in memory: Mutant fixture (PID: 10232, Process: DumpIt.exe)" -Details "PID=10232 | ProcessCreated=2026-05-15 12:03:30.000 | Type=Mutant | Target=fixture"),
+        (New-TestOwnedRow -Source "Memory-ConsoleHistory" -Description "Console command in memory: cmd.exe (conhost PID: 8848)" -Details "Args=fixture.bat | PID=8848 | ProcessCreated=2026-05-15 12:02:56.000 | App=cmd.exe"),
+        (New-TestOwnedRow -Source "Memory-Network" -Description "Memory network: TCPv4 10.0.0.5:6 -> 1.2.3.4:443 (ESTABLISHED)" -Details "PID=9120 Process=powershell.exe FoundBy=PoolScan Stale=No OwnerCreated=2026-05-15 12:02:58.000"),
+        (New-TestOwnedRow -Source "Memory-PrivateCode" -Description "Executable private memory: 0x1000 at 0x10000 (PID: 9120, Process: powershell.exe)" -Details "PID=9120 | ProcessCreated=2026-05-15 12:01:00.000 | Start=0x10000"),
+        (New-TestOwnedRow -Source "Memory-Modules" -Description "Module in memory: fixture-b.dll (PID: 9120, Process: powershell.exe)" -Details "PID=9120 | ProcessCreated=2026-05-15 12:02:58.001 | Path=C:\Users\Public\fixture-b.dll"),
+        (New-TestOwnedRow -Source "Memory-Modules" -Description "Module in memory: fixture-c.dll (PID: 1234, Process: powershell.exe)" -Details "PID=1234 | ProcessCreated=2026-05-15 12:03:10.000 | Path=C:\Users\Public\fixture-c.dll"),
+        (New-TestOwnedRow -Source "Memory-Drivers" -Description "Kernel module in memory: fixture.sys" -Details "PID=9120 | ProcessCreated=2026-05-15 12:02:58.000 | Path=C:\Windows\System32\drivers\fixture.sys"),
+        (New-TestOwnedRow -Source "Memory-Registry" -Description "Run key value in memory: fixture [HKLM\Software\Microsoft\Windows\CurrentVersion\Run]" -Details "PID=9120 | ProcessCreated=2026-05-15 12:02:58.000 | Command=fixture.exe"),
+        (New-TestOwnedRow -Source "Memory-Services" -Description "Service in memory: Fixture (FixtureSvc)" -Details "State=SERVICE_RUNNING PID=9120 ProcessCreated=2026-05-15 12:02:58.000")
+    )
+    $owned = Find-ReportCollectorRows -Rows $ownedRows -CollectionInfo $colInfo
+    $ownedOut = @(for ($i = $colRows.Count; $i -lt $ownedRows.Count; $i++) { if ($owned.Excluded[$i]) { $ownedRows[$i].Description.Substring(0, $ownedRows[$i].Description.IndexOf(':')) + "@" + ($i + 2) } })
+    Assert-Equal ($ownedOut -join "|") "Module in memory@$($colRows.Count + 2)|Handle in memory@$($colRows.Count + 3)|Console command in memory@$($colRows.Count + 4)|Memory network@$($colRows.Count + 5)" -Message "collector, other memory sources: the DLL, handle, console and network rows of left-out processes (PID and create time) are left out"
+    Write-TestResult -Succeeded (-not $owned.Excluded[$colRows.Count + 4] -and -not $owned.Excluded[$colRows.Count + 5] -and -not $owned.Excluded[$colRows.Count + 6]) -Message "collector, other memory sources: a reused PID with another create time, a create time 1 ms off, and another process's row are kept"
+    Write-TestResult -Succeeded (-not $owned.Excluded[$colRows.Count + 7] -and -not $owned.Excluded[$colRows.Count + 8] -and -not $owned.Excluded[$colRows.Count + 9]) -Message "collector, other memory sources: Memory-Drivers, Memory-Registry and Memory-Services rows are never left out"
+    $ownedCollector = @($owned.Processes | Where-Object { $_.Pid -eq 9120 })[0]
+    Assert-Equal "$($owned.OtherRows)|$($owned.RowCount - $col.RowCount)|$($owned.Summary)|$(@($ownedCollector.RowNumbers) -contains ($colRows.Count + 2))" "4|4|Collector's own processes in the memory dump: 6 (not flagged), with 4 row(s) of theirs from other memory sources|True" -Message "collector, other memory sources: counted apart in the summary, the rows in the process's row numbers"
+    $ownedModel = New-ReportModel -Rows $ownedRows -Findings @() -CollectionInfo $colInfo -CollectorRows $owned
+    Write-TestResult -Succeeded ($ownedModel.Coverage.CollectorProcesses.RowCount -eq $owned.RowCount -and @($ownedModel.Coverage.Notes | Where-Object { $_ -match "with 4 row\(s\) of theirs from other memory sources" }).Count -eq 1) -Message "collector, other memory sources: the model's coverage counts and notes the extra rows"
+    $moduleRulesPath = Join-Path $workDir "module-rules.json"
+    New-TestTextFile $moduleRulesPath '{ "schemaVersion": 1, "rules": [ { "id": "ANYMODULE", "title": "Module {{group}}", "category": "Execution", "severity": "Medium", "why": "w", "groupBy": "capture", "match": { "source": "^Memory-Modules$", "description": "^Module in memory: (?<key>[^ ]+) " } } ] }'
+    $moduleRules = Import-ReportRules -Path $moduleRulesPath
+    $moduleLeads = @(Invoke-ReportRules -Rows $ownedRows -Rules $moduleRules -CollectionInfo $colInfo -CollectorRows $owned)
+    Assert-Equal (@($moduleLeads | ForEach-Object { "$($_.GroupKey):$([bool]$_.CollectorSuspect)" } | Sort-Object) -join ",") "fixture-b.dll:False,fixture-c.dll:False" -Message "collector, other memory sources: the rules skip the collector's DLL row; the reused-time and the impostor's rows are leads, not marked as possibly the collector"
+    $oldCollection = [PSCustomObject]@{ Mode = "Live"; CollectionStartUtc = $collStart }
+    $oldOwnedRows = @($ownedRows) + @((New-TestOwnedRow -Source "Memory-Modules" -Description "Module in memory: fixture-old.dll (PID: 5000, Process: explorer.exe)" -Details "PID=5000 | ProcessCreated=2026-05-15 08:00:00.000 | Path=C:\Users\Public\fixture-old.dll"))
+    $oldLeads = @(Invoke-ReportRules -Rows $oldOwnedRows -Rules $moduleRules -CollectionInfo $oldCollection)
+    Assert-Equal (@($oldLeads | ForEach-Object { "$($_.GroupKey):$([bool]$_.CollectorSuspect)" } | Sort-Object) -join ",") "fixture-a.dll:True,fixture-b.dll:True,fixture-c.dll:True,fixture-old.dll:False" -Message "collector, other memory sources, an older collection: a DLL lead of a process started around the collection is marked as possibly the collector (by ProcessCreated=), one started hours before is not"
+    # The Memory-Processes rows themselves (a Windows ARM64 dump's process rows
+    # carry the token's user and privileges, so a rule can flag the
+    # collector's own process row): in an older collection, a lead on the row
+    # of a process started around the collection is marked as possibly the
+    # collector; one started hours before, or a Snapshot row, is not
+    $procRulesPath = Join-Path $workDir "proc-rules.json"
+    New-TestTextFile $procRulesPath '{ "schemaVersion": 1, "rules": [ { "id": "ANYPROCROW", "title": "Process {{group}}", "category": "Access", "severity": "Info", "why": "w", "groupBy": "capture", "match": { "source": "^Memory-Processes$", "description": "^Process in memory: (?<key>[^ ]+) " } } ] }'
+    $procRows = @($colRows) + @((New-TestProc -Time "2026-05-15 08:00:00.000" -Name "explorer.exe" -ProcId 5000 -Ppid 4000))
+    $procLeads = @(Invoke-ReportRules -Rows $procRows -Rules (Import-ReportRules -Path $procRulesPath) -CollectionInfo $oldCollection)
+    Assert-Equal (@($procLeads | Where-Object { @("DumpIt.exe", "explorer.exe", "evil.exe") -contains $_.GroupKey } | ForEach-Object { "$($_.GroupKey):$([bool]$_.CollectorSuspect)" } | Sort-Object) -join ",") "DumpIt.exe:True,evil.exe:False,explorer.exe:False" -Message "collector, process rows, an older collection: a lead on the process row of a process started around the collection is marked as possibly the collector; one started hours before, or a Snapshot row, is not"
+
+    # =========================================================
+    # The builder's line for a Windows ARM64 dump read with the Windows
+    # debugger engine, as this builder writes it ("-- read ...; not read
+    # <area> (<why>), ...") and its "Memory dump coverage" lines: one note
+    # each (one colon), the caveat of what was not read, and the caveats of
+    # the network scan and the registry in memory when they were read
+    # =========================================================
+    $readLine = "T_memory_dump.dmp (7.99 GB) -- read processes, command lines, DLLs, network connections, registry hives; not read handles (stopped at its time limit of 60 s), services (not built yet)"
+    $coverageLine = "DLLs -- the loader lists of 2 processes could not be read; 36 processes' memory-region trees were inconsistent, as when memory is copied while Windows runs"
+    $readLog = Join-Path $workDir "read_builder_log.txt"
+    New-TestTextFile $readLog ("[2026-02-02 01:00:00] === Windows 11 Forensic Timeline Builder Started ===`r`n" +
+        "[2026-02-02 01:00:09]   Memory dump analyzed with the Windows debugger engine: $readLine`r`n" +
+        "[2026-02-02 01:00:09]   Memory dump coverage: $coverageLine`r`n" +
+        "[2026-02-02 01:00:09]   Memory dump coverage: $coverageLine`r`n")
+    $readModel = New-ReportModel -Rows $userRows -BuilderLogPath $readLog
+    $readNotes = @($readModel.Coverage.Notes | Where-Object { $_ -match '^Memory dump' })
+    $readCaveats = @($readModel.Caveats | Where-Object { $_ -match 'memory dump' })
+    $readColons = @(@($readNotes) + @($readCaveats) | Where-Object { ([regex]::Matches($_, ':\s')).Count -gt 1 })
+    Assert-Equal "$($readNotes -join ' / ')|$($readModel.Coverage.BuilderWarnings.Count)" "Memory dump analyzed with the Windows debugger engine: $readLine. / Memory dump coverage: $coverageLine.|0" -Message "an ARM64 dump read with this builder: the note says what was read and what not, each coverage line once as a note of its own, not a warning"
+    Assert-Equal "$($readCaveats -join ' / ')|$($readColons.Count)" ("The memory dump is a Windows ARM64 dump, read with the Windows debugger engine: these were not read from it, so they are not in this report -- handles (stopped at its time limit of 60 s), services (not built yet). / " +
+        "Network connections in the memory dump come from a scan of memory for connection objects and can include closed ones (Stale=Yes) and second copies of the same object (Duplicate=Yes), neither flagged. / The registry in the memory dump is partial: a key or value missing there is not proof that it was absent.|0") -Message "an ARM64 dump read with this builder: the caveat names what was not read, and the network scan and the registry in memory have caveats of their own; one colon each"
+    $allLog = Join-Path $workDir "all_builder_log.txt"
+    New-TestTextFile $allLog ("[2026-02-02 01:00:09]   Memory dump analyzed with the Windows debugger engine: T_memory_dump.dmp (7.99 GB) -- read processes, command lines, DLLs`r`n")
+    $allModel = New-ReportModel -Rows $userRows -BuilderLogPath $allLog
+    Assert-Equal "$(@($allModel.Caveats | Where-Object { $_ -match 'memory dump' }) -join ' / ')" "The memory dump is a Windows ARM64 dump, read with the Windows debugger engine, not with Volatility 3." -Message "an ARM64 dump with nothing left unread: the plain caveat, no network or registry caveat"
     if ($script:failures -gt 0) {
         Write-Host "FAIL: $($script:failures) of $($script:checks) check(s) failed" -ForegroundColor Red
         exit 1

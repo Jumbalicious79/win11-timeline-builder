@@ -1,7 +1,7 @@
 # =============================================================
 # Report renderer test
 # Renders the synthetic report models in tests\fixtures\report\render\ with
-# report\TimelineReport.Render.ps1 and checks:
+# lib\report\TimelineReport.Render.ps1 and checks:
 #   - report.html is one self-contained offline file: ASCII only, CRLF line
 #     endings, no BOM, a Content-Security-Policy, no scripts, images, frames
 #     or external links (every href is "#..." or the relative "./" workbook
@@ -140,7 +140,7 @@ function Test-PdfXref {
     return "ok ($checked objects)"
 }
 
-. (Join-Path $repoRoot "report\TimelineReport.Render.ps1")
+. (Join-Path $repoRoot "lib\report\TimelineReport.Render.ps1")
 
 # A folder name with spaces exercises quoting and file:/// URL escaping
 $workDir = Join-Path ([System.IO.Path]::GetTempPath()) ("report render test " + [guid]::NewGuid().ToString("N"))
@@ -245,7 +245,7 @@ try {
         Workbook = [ordered]@{ FileName = "my timeline #1.xlsx"; Available = $true; TimelineSheet = "Timeline"; FindingsSheet = "Findings" }
         Files = [ordered]@{ TimelineCsv = "timeline.csv"; FindingsCsv = "findings.csv" }
     }
-    $memoryHtmlPath = Join-Path $workDir "memory\report.html"
+    $memoryHtmlPath = Join-Path $workDir "in-memory-model\report.html"
     Export-ReportHtml -Model $memoryModel -Path $memoryHtmlPath -NoFileHashes
     $memory = [System.IO.File]::ReadAllText($memoryHtmlPath)
     Write-TestResult -Succeeded ($memory.Contains("Report made 2026-10-08 14:20 UTC") -and $memory.Contains("2026-10-07 14:20:05 UTC") -and $memory.Contains("In-memory lead")) -Message "an in-memory model (dictionaries, [datetime] values in UTC and local time) renders"

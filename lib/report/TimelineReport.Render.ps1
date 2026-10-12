@@ -337,7 +337,10 @@ function New-ReportHtmlContext {
     if (-not $findingsSheet) { $findingsSheet = "Findings" }
     $hostName = [string](Get-ReportHtmlField -Object $collection -Name "ComputerName")
     $timeZoneId = [string](Get-ReportHtmlField -Object $collection -Name "TargetTimeZoneId")
-    $rules = Get-ReportHtmlList -Object $Model -Name "Rules"
+    # The rules that ran: a rule switched off in the rules file ("enabled":
+    # false, such as a skeleton not yet measured on real data) is in the
+    # model's list but was not run
+    $rules = @(foreach ($rule in (Get-ReportHtmlList -Object $Model -Name "Rules")) { if ((Get-ReportHtmlField $rule "Enabled") -ne $false) { $rule } })
     # Without the workbook, row numbers are those of timeline.csv (header = 1)
     $timelineCsv = [System.IO.Path]::GetFileName([string](Get-ReportHtmlField -Object (Get-ReportHtmlField -Object $Model -Name "Files") -Name "TimelineCsv"))
     if (-not $timelineCsv) { $timelineCsv = "timeline.csv" }

@@ -1,0 +1,5 @@
+# The PrivateCode area's canned entry (work package WP2): one executable
+# private region of the canned process (PID 4321) in a process with a
+# run-time compiler (JitHost=Yes), which no rule flags.
+#AREA	PrivateCode	Read
+PrivateCode	PID=4321	ProcessCreated=2026-03-02 11:30:00.123	Process=fixture-stage.	Start=0x1000000	Size=0x10000	Protection=ExecuteReadWrite	FirstBytes=Data	JitHost=Yes

@@ -965,7 +965,8 @@ namespace TimelineReport
         }
 
         // A source the builder's Memory parser writes (Volatility 3 on the
-        // memory dump): Memory-Processes, Memory-Network, Memory-CommandLine,
+        // memory dump, or Microsoft's debugger engine on a Windows ARM64
+        // dump): Memory-Processes, Memory-Network, Memory-CommandLine,
         // Memory-Services
         public static bool IsMemorySource(string source)
         {
@@ -1172,6 +1173,10 @@ namespace TimelineReport
         // memory-only leads are marked as possibly the collector.
         public List<int> SuspectPids = new List<int>();
         public int RowCount;
+        // Of RowCount, the rows of the other per-process memory sources
+        // (Memory-Modules, Memory-Handles, Memory-PrivateCode,
+        // Memory-ConsoleHistory, Memory-Network; see OwnerTimeKey)
+        public int OtherRows;
     }
 
     // Recognizes the collector's own processes among the memory-dump rows and
@@ -1227,7 +1232,9 @@ namespace TimelineReport
             // and the recorded 100-ns time is compared to its own floored second.
             if (dumpTicks % TimeSpan.TicksPerSecond == 0) return dumpTicks == FloorToSecond(recordedTicks);
             // A build that keeps the sub-second part: allow ~1 ms (the rounding
-            // Volatility applies, 100 ns to microseconds)
+            // Volatility applies, 100 ns to microseconds; Microsoft's debugger
+            // engine, for Windows ARM64 dumps, gives the 100-ns time, which the
+            // timeline keeps to the millisecond)
             long d = dumpTicks - recordedTicks;
             long tolerance = TimeSpan.TicksPerMillisecond + 100;
             return d >= -tolerance && d <= tolerance;
@@ -1238,6 +1245,49 @@ namespace TimelineReport
             int value;
             if (int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out value)) return value;
             return -1;
+        }
+
+        // The other per-process memory sources (rows of a Windows ARM64 dump
+        // read with the Windows debugger engine) and the Details key of their
+        // owner process's create time: PID= and this time name the process.
+        // Memory-Drivers, Memory-Registry and Memory-Services rows belong to
+        // no process of their own and are never left out.
+        static readonly Dictionary<string, string> OwnerTimeKeys = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            { "Memory-Modules", "ProcessCreated" },
+            { "Memory-Handles", "ProcessCreated" },
+            { "Memory-PrivateCode", "ProcessCreated" },
+            { "Memory-ConsoleHistory", "ProcessCreated" },
+            { "Memory-Network", "OwnerCreated" }
+        };
+
+        // The owner time key of a source, or null
+        public static string OwnerTimeKey(string source)
+        {
+            string key;
+            if (source != null && OwnerTimeKeys.TryGetValue(source, out key)) return key;
+            return null;
+        }
+
+        static long ToMillisecond(long ticks)
+        {
+            if (ticks < 0) return ticks;
+            return ticks - (ticks % TimeSpan.TicksPerMillisecond);
+        }
+
+        // The PID and owner create time (UTC ticks, to the millisecond) of a
+        // row of one of the other per-process memory sources; false when it
+        // is not one, or either is missing
+        static bool OwnerOf(RowTable t, int i, out int pid, out long ownerTicks)
+        {
+            pid = -1;
+            ownerTicks = -1;
+            string key = OwnerTimeKey(t.Sources[t.SourceId[i]]);
+            if (key == null) return false;
+            string details = t.Details[i];
+            pid = ParseInt(DetailParser.Get(details, "PID"));
+            ownerTicks = ToMillisecond(RowTable.ParseTicks(DetailParser.Get(details, key)));
+            return pid >= 0 && ownerTicks >= 0;
         }
 
         // The roles the collector writes (Select-CollectorProcesses and the
@@ -1617,12 +1667,14 @@ namespace TimelineReport
             }
 
             // Rows left out: the Memory-Processes row of each left-out process
-            // (its own row, not a decoy's under the same id), and a
+            // (its own row, not a decoy's under the same id), a
             // Memory-CommandLine row whose pid is one left-out process (name
-            // matches, and the pid is on exactly one pslist row). Never the
-            // Memory-Network or Memory-Services rows: no rule reads them, and
-            // netscan can show a stale socket of an earlier process that
-            // reused the id.
+            // matches, and the pid is on exactly one pslist row), and the
+            // rows of the other per-process memory sources that name the
+            // process by PID and its create time (below). Never the
+            // Memory-Services rows, nor a Memory-Network row without its
+            // owner's create time (Volatility's): netscan can show a stale
+            // socket of an earlier process that reused the id.
             Dictionary<int, CollectorProcess> procByPid = new Dictionary<int, CollectorProcess>();
             foreach (PslistRow p in pslist)
             {
@@ -1657,6 +1709,25 @@ namespace TimelineReport
                 }
                 proc.RowNumbers.Add(c.Index + 2);
             }
+            // The rows of the other per-process memory sources (DLLs, handles,
+            // executable private memory, console history, network): left out
+            // when their PID is a left-out process's and their owner's create
+            // time (ProcessCreated=, Memory-Network OwnerCreated=) is that
+            // process's own, to the millisecond. A later process that reused
+            // the id has another create time, and its rows are kept.
+            for (int i = 0; i < t.Count; i++)
+            {
+                int pid;
+                long ownerTicks;
+                if (result.Excluded[i] || !OwnerOf(t, i, out pid, out ownerTicks)) continue;
+                CollectorProcess proc;
+                PslistRow canon;
+                if (!procByPid.TryGetValue(pid, out proc) || !canonical.TryGetValue(pid, out canon)) continue;
+                if (canon.CreateTicks < 0 || ToMillisecond(canon.CreateTicks) != ownerTicks) continue;
+                result.Excluded[i] = true;
+                result.OtherRows++;
+                proc.RowNumbers.Add(i + 2);
+            }
             int rowCount = 0;
             for (int i = 0; i < result.Excluded.Length; i++) { if (result.Excluded[i]) rowCount++; }
             result.RowCount = rowCount;
@@ -1666,13 +1737,15 @@ namespace TimelineReport
 
         // Memory-CommandLine rows whose process (by PID, from its pslist
         // ProcessCreation row) started at or after the collection start minus
-        // a minute. In a collection that did not record the collector's own
+        // a minute, and such Memory-Processes ProcessCreation rows
+        // themselves. In a collection that did not record the collector's own
         // process IDs, a memory-only lead on such a row may be the collector
         // itself (it started when the collection did), so it is flagged on
         // its card. A process that started well before the collection (an
-        // attacker payload already running) is not. Returns a bool[] over
-        // the rows; all false when the start is unknown or there are no
-        // command-line rows.
+        // attacker payload already running) is not. The rows of the other
+        // per-process memory sources (OwnerTimeKey) are judged by the
+        // create time they carry. Returns a bool[] over the rows; all false
+        // when the start is unknown or there are no such rows.
         public static bool[] SuspectRows(RowTable t, long collectionStartTicks)
         {
             return SuspectRows(t, collectionStartTicks, null);
@@ -1688,8 +1761,22 @@ namespace TimelineReport
             int processSource = Array.IndexOf(t.Sources, "Memory-Processes");
             int commandSource = Array.IndexOf(t.Sources, "Memory-CommandLine");
             int creationType = Array.IndexOf(t.EventTypes, "ProcessCreation");
-            if (commandSource < 0) return suspect;
             long threshold = collectionStartTicks - 60L * TimeSpan.TicksPerSecond;
+            // The other per-process memory sources (DLLs, handles, ...) name
+            // their process's create time themselves (ProcessCreated=,
+            // OwnerCreated=): the same test on that time
+            for (int i = 0; i < t.Count; i++)
+            {
+                int ownerPid;
+                long ownerTicks;
+                if (!OwnerOf(t, i, out ownerPid, out ownerTicks)) continue;
+                if (only != null && !only.Contains(ownerPid)) continue;
+                if (ownerTicks >= threshold) suspect[i] = true;
+            }
+            // The Memory-Processes ProcessCreation rows: their own time is the
+            // process's create time (the same test; a Windows ARM64 dump's
+            // process rows carry the token's user and privileges, so a lead
+            // can be on the collector's own process row)
             Dictionary<int, long> createByPid = new Dictionary<int, long>();
             if (processSource >= 0 && creationType >= 0)
             {
@@ -1703,8 +1790,10 @@ namespace TimelineReport
                     int pid = ParseInt(m.Groups["pid"].Value);
                     long existing;
                     if (!createByPid.TryGetValue(pid, out existing) || tk < existing) createByPid[pid] = tk;
+                    if ((only == null || only.Contains(pid)) && tk >= threshold) suspect[i] = true;
                 }
             }
+            if (commandSource < 0) return suspect;
             for (int i = 0; i < t.Count; i++)
             {
                 if (t.SourceId[i] != commandSource) continue;
@@ -2836,8 +2925,9 @@ and the builder's CollectionInfoState: "Read", "Missing" or "Unreadable").
 Applied only for a Live collection with recorded processes and a timeline
 that has memory rows; otherwise it returns a result that excludes nothing
 (older collections behave as before). Returns State, Recorded, Anchored,
-Count, RowCount, Summary, Processes, Rows (the left-out rows as report row
-objects), NotInDump, Mismatched (each with OutsideTree), OutsideTree (how
+Count, RowCount (OtherRows of them from the per-process memory sources other
+than Memory-Processes and Memory-CommandLine), Summary, Processes, Rows (the
+left-out rows as report row objects), NotInDump, Mismatched (each with OutsideTree), OutsideTree (how
 many entries the collector would not have written), SuspectPids, Excluded (a
 bool[] over the rows) and HasMemoryRows.
 State says why nothing may have been recognized: "NotApplicable" (not a
@@ -2893,7 +2983,7 @@ function Find-ReportCollectorRows {
     }
     if ($state -ne "Recorded") {
         return [PSCustomObject]@{
-            State = $state; Recorded = $false; Anchored = $false; Count = 0; RowCount = 0; Summary = ""; HasMemoryRows = $false
+            State = $state; Recorded = $false; Anchored = $false; Count = 0; RowCount = 0; OtherRows = 0; Summary = ""; HasMemoryRows = $false
             Processes = [object[]]@(); Rows = [object[]]@(); NotInDump = [object[]]@(); Mismatched = [object[]]@()
             OutsideTree = 0; SuspectPids = [int[]]@(); Excluded = [bool[]]@()
         }
@@ -2935,7 +3025,11 @@ function Find-ReportCollectorRows {
     if ($result.Recorded -and $result.HasMemoryRows) {
         # None recognized: the collector's own PowerShell process (the anchor)
         # was not matched or not accepted, so nothing is left out
-        if ($count -gt 0) { $summary = "Collector's own processes in the memory dump: $count (not flagged)" }
+        if ($count -gt 0) {
+            $summary = "Collector's own processes in the memory dump: $count (not flagged)"
+            # Their rows of the other memory sources (DLLs, handles, ...)
+            if ($result.OtherRows -gt 0) { $summary += ", with $($result.OtherRows) row(s) of theirs from other memory sources" }
+        }
         else { $summary = "Collector's own processes in the memory dump: none recognized (nothing left out)" }
     }
     return [PSCustomObject]@{
@@ -2945,6 +3039,7 @@ function Find-ReportCollectorRows {
         HasMemoryRows = [bool]$result.HasMemoryRows
         Count         = $count
         RowCount      = $result.RowCount
+        OtherRows     = [int]$result.OtherRows
         Summary       = $summary
         Processes     = [object[]]$processes
         Rows          = [object[]]$leftOutRows.ToArray()
@@ -3316,6 +3411,17 @@ function Read-ReportEngineBuilderLog {
         # A memory dump of the collection that the run did not analyze: what
         # and why ("" when there is none, or it was analyzed)
         MemoryDumpNotAnalyzed = ""
+        # A Windows ARM64 dump read with Microsoft's debugger engine: the
+        # dump and what was read from it ("" when there is none)
+        MemoryDumpEngine = ""
+        # Its process list, when the ways of finding the processes disagreed
+        # (a dump copied while Windows ran): how many each way found ("" when
+        # they agreed)
+        MemoryDumpProcessList = ""
+        # What a live copy left unreadable in the areas that were read
+        # ("Memory dump coverage: <area> -- <note>" lines: the text after the
+        # colon, each once)
+        MemoryDumpCoverage = @()
     }
     $text = Read-ReportEngineLogText $Path
     if ($null -eq $text) { return $info }
@@ -3325,6 +3431,7 @@ function Read-ReportEngineBuilderLog {
     $missingBanner = 0
     $errorLines = 0
     $errorBanner = 0
+    $coverage = New-Object System.Collections.Generic.List[string]
     foreach ($line in ($text -split "\r?\n")) {
         if ($line -match '^\[[^\]]*\] (?:ERROR|WARNING): ') { $problems.Add($line.TrimEnd()) }
         if ($line -match '^\[[^\]]*\] Sources\s+: (.+?)\s*$') { $info.Sources = $Matches[1] }
@@ -3340,7 +3447,11 @@ function Read-ReportEngineBuilderLog {
         elseif ($line -match '^\[[^\]]*\]\s+User column: (\d+) SID\(s\) not named') { $info.UnnamedSids = [int]$Matches[1] }
         elseif (-not $info.ExaminedComputerName -and $line -match '^\[[^\]]*\]\s+Examined computer name \(SYSTEM hive\): (.+?)\s*$') { $info.ExaminedComputerName = $Matches[1] }
         elseif (-not $info.MemoryDumpNotAnalyzed -and $line -match '^\[[^\]]*\]\s+Memory dump not analyzed: (.+?)\s*$') { $info.MemoryDumpNotAnalyzed = $Matches[1] }
+        elseif (-not $info.MemoryDumpEngine -and $line -match '^\[[^\]]*\]\s+Memory dump analyzed with the Windows debugger engine: (.+?)\s*$') { $info.MemoryDumpEngine = $Matches[1] }
+        elseif (-not $info.MemoryDumpProcessList -and $line -match '^\[[^\]]*\]\s+(?:WARNING:\s+)?Memory dump process list: (.+?)\s*$') { $info.MemoryDumpProcessList = $Matches[1] }
+        elseif ($line -match '^\[[^\]]*\]\s+Memory dump coverage: (.+?)\s*$' -and -not $coverage.Contains($Matches[1])) { $coverage.Add($Matches[1]) }
     }
+    $info.MemoryDumpCoverage = $coverage.ToArray()
     $info.ProblemLines = $problems.ToArray()
     $info.MissingInputFiles = [Math]::Max($missingLogged, $missingBanner)
     $info.UnexpectedErrors = [Math]::Max($errorLines, $errorBanner)
@@ -3350,9 +3461,11 @@ function Read-ReportEngineBuilderLog {
 # The builder's "Memory dump not analyzed: <what> -- <why>" text, split for
 # the report: What (the dump and its size), Why (the reason, then advice
 # after "; ") and Short (the reason alone, without asides in parentheses).
-# Older builders wrote "<what>: <why>" or "<what>, but <why>", and worded
-# the ARM64 reason "a Windows ARM64 dump, which Volatility 3 cannot
-# analyze": that is reworded the current way.
+# Older builders wrote "<what>: <why>" or "<what>, but <why>", and could not
+# analyze Windows ARM64 dumps at all ("a Windows ARM64 dump, which
+# Volatility 3 cannot analyze", later "Volatility 3 cannot read Windows
+# ARM64 dumps; examine it in WinDbg"): for -ReportOnly on such a timeline,
+# that reason says the timeline can be built again to analyze the dump.
 function Split-ReportEngineMemoryDumpText {
     param([string]$Text)
     $what = "$Text".Trim()
@@ -3361,7 +3474,9 @@ function Split-ReportEngineMemoryDumpText {
     if ($what -match '^(.+) -- (.+)$') { $what = $Matches[1]; $why = $Matches[2] }
     elseif ($what -match '^(.+?\)?)(?::\s+|,\s+but\s+)(.+)$') { $what = $Matches[1]; $why = $Matches[2] }
     $why = $why.Trim().TrimEnd('.').Trim()
-    if ($why -match '^a Windows ARM64 dump\b.*\bVolatility 3 cannot analyze\b') { $why = "Volatility 3 cannot read Windows ARM64 dumps; examine it in WinDbg" }
+    if ($why -match '^a Windows ARM64 dump\b.*\bVolatility 3 cannot analyze\b' -or $why -match '^Volatility 3 cannot read Windows ARM64 dumps\b') {
+        $why = "the builder that made this timeline could not analyze Windows ARM64 dumps; build the timeline again to analyze it with the Windows debugger engine"
+    }
     $short = ($why -split ';')[0] -replace '\s*\([^()]*\)', ''
     return [PSCustomObject]@{ What = $what.Trim(); Why = $why; Short = $short.Trim() }
 }
@@ -3702,9 +3817,10 @@ function New-ReportModel {
     }
     # The builder logs "Memory dump not analyzed: <what> -- <why>" for a dump
     # of the collection that it found (or that collection_manifest.csv
-    # lists) but did not analyze: Windows ARM64, skipped at its prompt, no
-    # Volatility 3, or not found. The note names the dump and says why (and
-    # what to do); the caveat gives the reason only.
+    # lists) but did not analyze: skipped at its prompt, no Volatility 3, no
+    # debugger engine or kernel symbol file for a Windows ARM64 dump, or not
+    # found. The note names the dump and says why (and what to do); the
+    # caveat gives the reason only.
     $memoryDump = $null
     if ($builderLog.MemoryDumpNotAnalyzed) {
         $memoryDump = Split-ReportEngineMemoryDumpText $builderLog.MemoryDumpNotAnalyzed
@@ -3712,6 +3828,23 @@ function New-ReportModel {
         if ($memoryDump.Why) { $noteText += " -- $($memoryDump.Why)" }
         $notes.Add("$noteText.")
     }
+    # A Windows ARM64 dump read with Microsoft's debugger engine ("Memory
+    # dump analyzed with the Windows debugger engine: <dump> -- processes and
+    # command lines only; ..."): what was read, and (the caveat) what was not
+    $memoryEngine = "$($builderLog.MemoryDumpEngine)".Trim()
+    if ($memoryEngine) { $notes.Add("Memory dump analyzed with the Windows debugger engine: $($memoryEngine.TrimEnd('.')).") }
+    # What a live copy left unreadable in the areas that were read ("Memory
+    # dump coverage: <area> -- <note>", information lines: some of that is
+    # normal in every live capture), one note each
+    foreach ($coverageText in @($builderLog.MemoryDumpCoverage)) {
+        if ("$coverageText".Trim()) { $notes.Add("Memory dump coverage: $("$coverageText".Trim().TrimEnd('.')).") }
+    }
+    # Its process list, when the ways the builder finds the processes
+    # disagreed ("Memory dump process list: ..."; a dump copied while
+    # Windows ran): how many each way found, for the analyst to judge the
+    # dump's process rows
+    $memoryProcessList = "$($builderLog.MemoryDumpProcessList)".Trim()
+    if ($memoryProcessList) { $notes.Add("Memory dump process list: $($memoryProcessList.TrimEnd('.')).") }
     # The collector's own processes in the memory dump, left out of the rules
     $memoryRowsPresent = @($stats.Sources | Where-Object { $_.Source -like "Memory-*" }).Count -gt 0
     $collectorRecorded = ($null -ne $CollectorRows -and [bool]$CollectorRows.Recorded -and [bool]$CollectorRows.HasMemoryRows)
@@ -3792,6 +3925,32 @@ function New-ReportModel {
         # (not "exists": the reason can be that it was not found)
         $reason = if ($memoryDump.Short) { " ($($memoryDump.Short))" } else { "" }
         $caveats.Add("A memory dump of this collection was not analyzed$reason, so the programs, network connections and command lines in memory are not in this report.")
+    }
+    if ($memoryEngine) {
+        # This builder's line says what was read and what not ("-- read
+        # processes, command lines, ...; not read handles (<why>), ..."); an
+        # older builder's read processes and command lines only, or the
+        # processes only (kept for -ReportOnly on its timelines)
+        if ($memoryEngine -match ' -- read (?<read>.+?)(?:; not read (?<notread>.+?))?\.?$') {
+            $readPart = $Matches["read"]
+            $notReadPart = "$($Matches['notread'])".Trim()
+            if ($notReadPart) {
+                $caveats.Add("The memory dump is a Windows ARM64 dump, read with the Windows debugger engine: these were not read from it, so they are not in this report -- $notReadPart.")
+            }
+            else { $caveats.Add("The memory dump is a Windows ARM64 dump, read with the Windows debugger engine, not with Volatility 3.") }
+            if ($readPart -match '(?:^|, )network connections(?:,|$)') {
+                $caveats.Add("Network connections in the memory dump come from a scan of memory for connection objects and can include closed ones (Stale=Yes) and second copies of the same object (Duplicate=Yes), neither flagged.")
+            }
+            if ($readPart -match '(?:^|, )registry hives(?:,|$)') {
+                $caveats.Add("The registry in the memory dump is partial: a key or value missing there is not proof that it was absent.")
+            }
+        }
+        elseif ($memoryEngine -match '\bprocesses only\b') {
+            $caveats.Add("The memory dump is a Windows ARM64 dump, read with the Windows debugger engine: only its processes are in this report, not its command lines (they could not be read), network connections or services.")
+        }
+        else {
+            $caveats.Add("The memory dump is a Windows ARM64 dump, read with the Windows debugger engine: only its processes and command lines are in this report, not its network connections or services.")
+        }
     }
     if ($builderLog.StartDate -or $builderLog.EndDate) {
         $range = @(@($builderLog.StartDate, $builderLog.EndDate) | Where-Object { $_ }) -join " to "

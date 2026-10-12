@@ -54,9 +54,11 @@ param(
     [ValidateRange(0, 36500)]
     [int]$MftDays = 7,
 
-    # Viewer to open at the end without asking (for scripts and automation)
+    # Viewer to open at the end without asking (for scripts and automation):
+    # ExcelAndReport (the workbook and the findings report together), Excel,
+    # TimelineExplorer, Both (Excel and Timeline Explorer), Report or None
     [Parameter(Mandatory = $false)]
-    [ValidateSet("Excel", "TimelineExplorer", "Both", "Report", "None")]
+    [ValidateSet("ExcelAndReport", "Excel", "TimelineExplorer", "Both", "Report", "None")]
     [string]$Viewer,
 
     # CSV only: don't generate timeline.xlsx (ImportExcel isn't needed)
@@ -75,7 +77,7 @@ param(
     [Parameter(ParameterSetName = "ReportOnly", Mandatory = $true)]
     [string]$ReportOnly,
 
-    # Rules file for the findings report (default: report\report-rules.json)
+    # Rules file for the findings report (default: lib\report\report-rules.json)
     [Parameter(Mandatory = $false)]
     [string]$ReportRules,
 
@@ -103,7 +105,7 @@ param(
 
 # --- The builder's own folder: no [ ] * ? in its path ---
 # The timeline, the workbook and the report are written under reports\ next
-# to the script, and tools\ and report\ are read from there, with commands
+# to the script, and tools\ and lib\ are read from there, with commands
 # that read [ ], * and ? as wildcards (Export-Csv, ImportExcel): from such a
 # folder the run would end without a timeline.csv. Checked first, for every
 # mode.
@@ -993,21 +995,22 @@ $script:xmlInvalidRegex = New-Object System.Text.RegularExpressions.Regex($scrip
 # =============================================================
 # Findings report (report.html, report.pdf, findings.csv)
 # =============================================================
-# The rules engine and report model (report\TimelineReport.Engine.ps1) and the
-# renderer (report\TimelineReport.Render.ps1) are dot-sourced here, at script
-# level, so their functions and compiled helper stay available. The rules
-# are data (report\report-rules.json, or -ReportRules): keyword lists such as
-# attacker-tool names live only there, never in a .ps1 file (Defender's AMSI
-# blocks PowerShell code that holds such names). A report problem never fails
-# the timeline: it is logged as a warning and the run goes on.
-$script:reportRulesFile = Join-Path $PSScriptRoot "report\report-rules.json"
+# The rules engine and report model (lib\report\TimelineReport.Engine.ps1)
+# and the renderer (lib\report\TimelineReport.Render.ps1) are dot-sourced
+# here, at script level, so their functions and compiled helper stay
+# available. The rules are data (lib\report\report-rules.json, or
+# -ReportRules): keyword lists such as attacker-tool names live only there,
+# never in a .ps1 file (Defender's AMSI blocks PowerShell code that holds
+# such names). A report problem never fails the timeline: it is logged as a
+# warning and the run goes on.
+$script:reportRulesFile = Join-Path $PSScriptRoot "lib\report\report-rules.json"
 if ($ReportRules) { $script:reportRulesFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ReportRules) }
 $script:reportScriptsLoaded = $false
 $script:reportLoadError = ""
 if (-not $NoReport) {
     try {
-        . (Join-Path $PSScriptRoot "report\TimelineReport.Engine.ps1")
-        . (Join-Path $PSScriptRoot "report\TimelineReport.Render.ps1")
+        . (Join-Path $PSScriptRoot "lib\report\TimelineReport.Engine.ps1")
+        . (Join-Path $PSScriptRoot "lib\report\TimelineReport.Render.ps1")
         $script:reportScriptsLoaded = $true
     }
     catch { $script:reportLoadError = $_.Exception.Message }
@@ -1142,7 +1145,7 @@ function Invoke-TimelineReportRules {
     Log ""
     Log "--- Running Report Rules ---"
     if (-not $script:reportScriptsLoaded) {
-        Log-Warning "  The report scripts in report\ could not be loaded ($($script:reportLoadError)) -- no findings report."
+        Log-Warning "  The report scripts in lib\report\ could not be loaded ($($script:reportLoadError)) -- no findings report."
         return $null
     }
     if (-not (Test-Path -LiteralPath $RulesPath -PathType Leaf)) {
@@ -1269,11 +1272,12 @@ function Limit-TimelineColumnWidth {
 }
 
 # Adds the report's findings to an open workbook (EPPlus package from
-# ImportExcel): a FIRST sheet "Findings" -- per finding a summary row, then
-# one row per evidence row, each linked to its row on the Timeline sheet --
-# and a "Finding" column on the Timeline sheet with the finding ids of every
-# matching row, to filter on. A Findings sheet and Finding column from an
-# earlier run (-ReportOnly) are replaced. Throws on failure.
+# ImportExcel): a sheet "Findings" AFTER the Timeline sheet -- per finding a
+# summary row, then one row per evidence row, each linked to its row on the
+# Timeline sheet -- and a "Finding" column on the Timeline sheet with the
+# finding ids of every matching row, to filter on. The workbook still opens
+# on the Timeline sheet, the full timeline. A Findings sheet and Finding
+# column from an earlier run (-ReportOnly) are replaced. Throws on failure.
 function Add-TimelineReportWorkbookSheets {
     param($Package, [object[]]$Findings, $CollectorRows)
     $invariant = [System.Globalization.CultureInfo]::InvariantCulture
@@ -1334,7 +1338,9 @@ function Add-TimelineReportWorkbookSheets {
     # --- The Findings sheet ---
     if ($workbook.Worksheets["Findings"]) { $workbook.Worksheets.Delete("Findings") }
     $sheet = $workbook.Worksheets.Add("Findings")
-    $workbook.Worksheets.MoveToStart("Findings")
+    # The Timeline sheet stays first: the workbook is the full timeline, the
+    # Findings sheet a guide into it
+    $workbook.Worksheets.MoveAfter("Findings", "Timeline")
     $headers = @("Finding", "Severity", "Row type", "Timeline row", "Time (UTC)", "Title", "Description", "Source", "Event type", "User", "Category", "Rule")
     $widths = @(9, 9, 11, 12, 23, 45, 90, 28, 16, 20, 13, 28)
     for ($c = 0; $c -lt $headers.Count; $c++) {
@@ -1430,16 +1436,20 @@ function Add-TimelineReportWorkbookSheets {
     $sheet.Cells[1, 1, ($row - 1), $headers.Count].AutoFilter = $true
     $sheet.View.FreezePanes(2, 1)
 
-    # Open the workbook on the Findings sheet, the only selected tab. The
+    # Open the workbook on the Timeline sheet, the only selected tab. The
     # attribute is set in the sheet XML: EPPlus 4.5's View.TabSelected setter
     # does not select a sheet.
+    $timelineTab = 0
+    $tab = 0
     foreach ($worksheet in $workbook.Worksheets) {
+        if ($worksheet.Name -eq "Timeline") { $timelineTab = $tab }
+        $tab++
         $namespaces = New-Object System.Xml.XmlNamespaceManager($worksheet.WorksheetXml.NameTable)
         $namespaces.AddNamespace("d", "http://schemas.openxmlformats.org/spreadsheetml/2006/main")
         $sheetView = $worksheet.WorksheetXml.SelectSingleNode("//d:sheetViews/d:sheetView", $namespaces)
-        if ($sheetView) { $sheetView.SetAttribute("tabSelected", $(if ($worksheet.Name -eq "Findings") { "1" } else { "0" })) }
+        if ($sheetView) { $sheetView.SetAttribute("tabSelected", $(if ($worksheet.Name -eq "Timeline") { "1" } else { "0" })) }
     }
-    $workbook.View.ActiveTab = 0
+    $workbook.View.ActiveTab = $timelineTab
 }
 
 # -ReportOnly: adds the findings to an existing workbook (it must hold the
@@ -1618,17 +1628,37 @@ function Get-TimelineExplorer {
 
 # --- Let the user choose how to view the results ---
 # -Choice is -Viewer (empty: ask with a menu). -ReportPath is report.pdf, or
-# report.html when no PDF was made (empty: no report).
+# report.html when no PDF was made (empty: no report). The first choice
+# opens the workbook and the findings report together; choices that do not
+# apply (no workbook, no report) are left out and the rest renumbered.
+# Excel is started first, then the report; neither is waited for, and one
+# that cannot be started is logged and does not stop the other.
 function Invoke-TimelineViewer {
     param([string]$Choice, [string]$CsvPath, [string]$XlsxPath, [bool]$XlsxAvailable, [string]$ReportPath)
     if ($Choice) {
         # -Viewer given: no menu (scripts, automation, tests)
         $selectedAction = switch ($Choice) {
+            "ExcelAndReport"   { "excelreport" }
             "Excel"            { "excel" }
             "TimelineExplorer" { "te" }
             "Both"             { "both" }
             "Report"           { "report" }
             default            { "none" }
+        }
+        # Excel and the report: open what was made, and say what was not
+        if ($selectedAction -eq "excelreport") {
+            if (-not $XlsxAvailable -and -not $ReportPath) {
+                Log-Warning "  -Viewer ${Choice}: no Excel file was generated and no findings report was written, so nothing is opened."
+                $selectedAction = "none"
+            }
+            elseif (-not $XlsxAvailable) {
+                Log-Warning "  -Viewer ${Choice}: no Excel file was generated, so only the findings report is opened."
+                $selectedAction = "report"
+            }
+            elseif (-not $ReportPath) {
+                Log-Warning "  -Viewer ${Choice}: no findings report was written, so only Excel is opened."
+                $selectedAction = "excel"
+            }
         }
         if (($selectedAction -eq "excel" -or $selectedAction -eq "both") -and -not $XlsxAvailable) {
             Log-Warning "  -Viewer ${Choice}: no Excel file was generated, so Excel is not opened."
@@ -1649,10 +1679,20 @@ function Invoke-TimelineViewer {
         Write-Host ""
 
         $menuOptions = @()
+        $reportKind = if ($ReportPath -match '\.pdf$') { "PDF" } else { "HTML" }
+
+        # Both files made: the workbook and the report together come first
+        if ($XlsxAvailable -and $ReportPath) {
+            $menuOptions += @{ Key = "1"; Label = "Excel + findings report"; Action = "excelreport" }
+            Write-Host "  [1] Excel + findings report -- the color-coded workbook and the" -ForegroundColor Green
+            Write-Host "       findings report ($reportKind), opened together (recommended)" -ForegroundColor DarkGray
+        }
 
         if ($XlsxAvailable) {
-            $menuOptions += @{ Key = "1"; Label = "Excel (color-coded .xlsx)"; Action = "excel" }
-            Write-Host "  [1] Excel -- rows pre-colored by EventType, ready to analyze" -ForegroundColor Green
+            $excelOptionNum = $menuOptions.Count + 1
+            $excelColor = if ($excelOptionNum -eq 1) { "Green" } else { "White" }
+            $menuOptions += @{ Key = "$excelOptionNum"; Label = "Excel (color-coded .xlsx)"; Action = "excel" }
+            Write-Host "  [$excelOptionNum] Excel -- rows pre-colored by EventType, ready to analyze" -ForegroundColor $excelColor
             Write-Host "       (Logon=Green, Execution=Orange, Persistence=Red, Network=Blue, etc.)" -ForegroundColor DarkGray
         }
 
@@ -1661,15 +1701,16 @@ function Invoke-TimelineViewer {
         Write-Host "  [$teOptionNum] Timeline Explorer -- powerful forensic CSV viewer (no colors," -ForegroundColor White
         Write-Host "       requires manual conditional formatting setup per session)" -ForegroundColor DarkGray
 
+        # -Viewer Both; named for what it opens, so that it is not taken for
+        # the first choice (Excel and the report)
         if ($XlsxAvailable) {
             $bothOptionNum = $menuOptions.Count + 1
-            $menuOptions += @{ Key = "$bothOptionNum"; Label = "Both"; Action = "both" }
-            Write-Host "  [$bothOptionNum] Both -- open Excel (colored) and Timeline Explorer side by side" -ForegroundColor White
+            $menuOptions += @{ Key = "$bothOptionNum"; Label = "Excel + Timeline Explorer"; Action = "both" }
+            Write-Host "  [$bothOptionNum] Excel + Timeline Explorer -- open both side by side" -ForegroundColor White
         }
 
         if ($ReportPath) {
             $reportOptionNum = $menuOptions.Count + 1
-            $reportKind = if ($ReportPath -match '\.pdf$') { "PDF" } else { "HTML" }
             $menuOptions += @{ Key = "$reportOptionNum"; Label = "Open report"; Action = "report" }
             Write-Host "  [$reportOptionNum] Open report -- the findings report ($reportKind): leads to review," -ForegroundColor White
             Write-Host "       each with its timeline rows (plain-English summary first)" -ForegroundColor DarkGray
@@ -1681,7 +1722,7 @@ function Invoke-TimelineViewer {
         Write-Host ""
 
         # The number of options changes (no Excel without a workbook, no
-        # Open report without a report), so a wrong number says so. At the
+        # report choice without a report), so a wrong number says so. At the
         # end of redirected input (Read-Host returns $null) nothing is opened.
         $maxOption = $menuOptions.Count
         do {
@@ -1695,8 +1736,10 @@ function Invoke-TimelineViewer {
         Log "  Viewer selection: $($($menuOptions | Where-Object { $_.Key -eq $viewerChoice }).Label)"
     }
 
-    # --- Launch selected viewer(s) ---
-    if ($selectedAction -eq "excel" -or $selectedAction -eq "both") {
+    # --- Launch selected viewer(s): Excel first, then the report. Each is
+    # started without waiting, in its own try/catch, so one that fails does
+    # not stop the other ---
+    if ($selectedAction -eq "excel" -or $selectedAction -eq "both" -or $selectedAction -eq "excelreport") {
         Log ""
         Log "--- Opening Color-Coded Timeline in Excel ---"
         try {
@@ -1732,7 +1775,7 @@ function Invoke-TimelineViewer {
         }
     }
 
-    if ($selectedAction -eq "report") {
+    if ($selectedAction -eq "report" -or $selectedAction -eq "excelreport") {
         Log ""
         Log "--- Opening the Findings Report ---"
         try {
@@ -1788,7 +1831,7 @@ function Invoke-TimelineReportOnly {
         if ($ignoredParameters.Count -gt 0) { Log-Warning "-ReportOnly parses nothing, so these are ignored: $($ignoredParameters -join ', ')" }
         Log ""
         if (-not $script:reportScriptsLoaded) {
-            Log-Error "The report scripts in report\ could not be loaded: $($script:reportLoadError)"
+            Log-Error "The report scripts in lib\report\ could not be loaded: $($script:reportLoadError)"
             return 1
         }
         $reportOnlyTimer = [System.Diagnostics.Stopwatch]::StartNew()
@@ -16597,7 +16640,7 @@ function Parse-PowerShellHistory {
 }
 
 # ----------------------------------------------------------
-# 15. Memory Dump Parser (Volatility 3)
+# 15. Memory Dump Parser (Volatility 3; Windows ARM64 dumps: Microsoft's debugger engine)
 # ----------------------------------------------------------
 $script:memoryDumpPathWarned = $false   # Find-MemoryDump has reported a bad -MemoryDumpPath
 $script:memoryDumpNotices = New-Object 'System.Collections.Generic.HashSet[string]'   # the lines Find-MemoryDump has logged in this run
@@ -16994,17 +17037,9 @@ function Write-NoMemoryDumpToOffer {
     $notFound = Get-MemoryDumpNotFoundText -Listed $listed
     $sizeText = Get-MemoryDumpSizeText -Bytes $listed.SizeBytes
     Log ""
-    if (Test-CollectionArm64) {
-        # Copying the dump next to the zip would not help: it is not offered
-        Log "No memory dump to offer: $($notFound.Note)."
-        Log "  The collection is from a Windows ARM64 computer, so the dump does not need to be copied here."
-        Write-MemoryDumpNotAnalyzed -What "the dump listed in collection_manifest.csv$($sizeText)" -Why (Get-MemoryDumpArm64Reason)
-    }
-    else {
-        Log "No memory dump to offer: $($notFound.Note)."
-        Log "  To have it analyzed, $($notFound.Remedy), then run the builder again."
-        Write-MemoryDumpNotAnalyzed -What "the dump listed in collection_manifest.csv$($sizeText)" -Why "it was not found (or not usable) next to the collection or where the collector saved it"
-    }
+    Log "No memory dump to offer: $($notFound.Note)."
+    Log "  To have it analyzed, $($notFound.Remedy), then run the builder again."
+    Write-MemoryDumpNotAnalyzed -What "the dump listed in collection_manifest.csv$($sizeText)" -Why "it was not found (or not usable) next to the collection or where the collector saved it"
     Log ""
 }
 
@@ -17027,26 +17062,6 @@ function Get-MemoryDumpSizeText {
 function Write-MemoryDumpNotAnalyzed {
     param([string]$What, [string]$Why)
     Log "  Memory dump not analyzed: $What -- $Why."
-}
-
-# Why a Windows ARM64 dump is not analyzed (Volatility 3 reads only Intel
-# x86/x64 Windows memory), for Write-MemoryDumpNotAnalyzed
-function Get-MemoryDumpArm64Reason {
-    return "Volatility 3 cannot read Windows ARM64 dumps; examine it in WinDbg"
-}
-
-# $true when the collection comes from a Windows ARM64 computer: its
-# systeminfo.txt (live collections, the only ones with a memory dump) says
-# "System Type: ARM64-based PC".
-function Test-CollectionArm64 {
-    foreach ($file in @(Find-ArtifactFiles -BasePath $InputPath -FileNames @("systeminfo.txt"))) {
-        try {
-            $values = ConvertFrom-SystemInfoText -Lines (Get-Content -LiteralPath $file.FullName -ErrorAction Stop)
-            if ("$($values['System Type'])" -match 'ARM64') { return $true }
-        }
-        catch { Write-Verbose "Could not read $($file.FullName): $($_.Exception.Message)" }
-    }
-    return $false
 }
 
 # A memory dump as the user is shown it: "<path in the collection> in the
@@ -17178,7 +17193,11 @@ function Get-MemoryFieldText {
 #   process's own memory, which the process can change, and a service
 #   record is the service's state; neither says when something happened.
 # A time that is there but not valid is kept in Details (CreateTime=,
-# Created=). Returns the row counts: Entries, Timed and Snapshot.
+# Created=). An entry of the Windows debugger engine (ARM64 dumps) may also
+# have User (the User column: the process token's SID) and ExtraDetails
+# (appended to Details after the fields above; lib\memory\
+# TimelineMemoryRows.ps1 sets both); Volatility's entries have neither.
+# Returns the row counts: Entries, Timed and Snapshot.
 function Add-MemoryPluginRows {
     param(
         [string]$Plugin,
@@ -17216,10 +17235,19 @@ function Add-MemoryPluginRows {
                     if ($created.Text) { $details += " CreateTime=$($created.Text)" }
                     $snapshot++
                 }
+                # Microsoft's debugger engine path only (lib\memory\TimelineDbgEng.ps1):
+                # which ways found the process in the kernel's structures, the
+                # ID the process ID table holds it under when that is not its
+                # own, and what copying memory does not explain (the findings
+                # report's INTEG-PROCESS-HIDDEN rule reads Anomaly=)
+                if ($entry.FoundBy) { $details += " FoundBy=$($entry.FoundBy)" }
+                if ($entry.TableId) { $details += " TableId=$($entry.TableId)" }
+                if ($entry.Anomaly) { $details += " Anomaly=$($entry.Anomaly)" }
+                if ($entry.ExtraDetails) { $details += " $("$($entry.ExtraDetails)".Trim())" }
 
                 Add-TimelineEntry -Timestamp $ts -Source $Source -EventType $eventType `
                     -Description "Process in memory: $name (PID: $procId, PPID: $ppid)" `
-                    -Details $details `
+                    -User ([string]$entry.User) -Details $details `
                     -Artifact "MemoryDump" -RawPath $DumpPath
             }
             "windows.netscan" {
@@ -17241,10 +17269,11 @@ function Add-MemoryPluginRows {
                     if ($created.Text) { $details += " Created=$($created.Text)" }
                     $snapshot++
                 }
+                if ($entry.ExtraDetails) { $details += " $("$($entry.ExtraDetails)".Trim())" }
 
                 Add-TimelineEntry -Timestamp $ts -Source $Source -EventType $eventType `
                     -Description "Memory network: $proto $localAddr -> $foreignAddr ($state)" `
-                    -Details $details `
+                    -User ([string]$entry.User) -Details $details `
                     -Artifact "MemoryDump" -RawPath $DumpPath
             }
             "windows.cmdline" {
@@ -17252,10 +17281,12 @@ function Add-MemoryPluginRows {
                 $procName = if ($entry.Process) { $entry.Process } else { "" }
                 $cmdArgs = if ($entry.Args) { $entry.Args } else { "" }
                 if (-not $cmdArgs -or $cmdArgs -eq "N/A") { continue }
+                $details = "Args=$cmdArgs"
+                if ($entry.ExtraDetails) { $details += " $("$($entry.ExtraDetails)".Trim())" }
 
                 Add-TimelineEntry -Timestamp $ts -Source $Source -EventType $eventType `
                     -Description "Process command line: $procName (PID: $procId)" `
-                    -Details "Args=$cmdArgs" `
+                    -User ([string]$entry.User) -Details $details `
                     -Artifact "MemoryDump" -RawPath $DumpPath
                 $snapshot++
             }
@@ -17266,10 +17297,12 @@ function Add-MemoryPluginRows {
                 $state = if ($entry.State) { $entry.State } else { "" }
                 $start = if ($entry.Start) { $entry.Start } else { "" }
                 $procId = Get-MemoryFieldText $entry.PID
+                $details = "State=$state StartType=$start Binary=$binary PID=$procId"
+                if ($entry.ExtraDetails) { $details += " $("$($entry.ExtraDetails)".Trim())" }
 
                 Add-TimelineEntry -Timestamp $ts -Source $Source -EventType $eventType `
                     -Description "Service in memory: $display ($svcName)" `
-                    -Details "State=$state StartType=$start Binary=$binary PID=$procId" `
+                    -User ([string]$entry.User) -Details $details `
                     -Artifact "MemoryDump" -RawPath $DumpPath
                 $snapshot++
             }
@@ -17294,8 +17327,550 @@ function Find-VolatilityExe {
     return $null
 }
 
+# --- Windows ARM64 dumps: Microsoft's debugger engine ----------------------
+# Volatility 3 cannot read Windows ARM64 memory. For an ARM64 dump the
+# builder runs lib\memory\TimelineDbgEng.ps1 in a PowerShell process of its
+# own (the same PowerShell, so the same processor architecture): it loads the
+# debugger engine (dbgeng.dll, part of Windows, or a copy signed by
+# Microsoft in tools\dbgeng\<arch>\) by full path, takes the kernel's symbol
+# file from tools\symbols\ or downloads it once from Microsoft's symbol
+# server, and reads the processes and their command lines. The engine is
+# native code: a crash or a hang on a damaged dump ends that process, not
+# the builder (whose rows are not written yet), and the process is ended
+# after $script:dbgEngTimeoutSeconds. Its output comes back as protocol
+# lines (Receive-DbgEngWorkerLine); the rows are made here, by
+# Add-MemoryPluginRows, exactly as from Volatility's windows.pslist and
+# windows.cmdline, and the rows of the helper's other areas (process
+# details, DLLs, drivers, handles, executable private memory, registry,
+# console history, network, services) by lib\memory\TimelineMemoryRows.ps1,
+# dot-sourced here at script level (without it an ARM64 dump is not
+# analyzed, and the reason names it).
+$script:dbgEngTimeoutSeconds = 900
+$script:dbgEngRowsLoadError = ""
+try { . (Join-Path $PSScriptRoot "lib\memory\TimelineMemoryRows.ps1") }
+catch { $script:dbgEngRowsLoadError = $_.Exception.Message }
+# The entries of this run's ARM64 dump by kind (for the hooks after the
+# parsers, such as Register-DbgEngLogonNames before the User column pass)
+$script:dbgEngEntries = @{}
+
+# The builder's tools\ folder. A function of its own so the tests can put
+# another folder in its place.
+function Get-BuilderToolsFolder {
+    return (Join-Path $PSScriptRoot "tools")
+}
+
+# The helper script that runs the debugger engine (a function of its own so
+# the tests can put another script in its place)
+function Get-DbgEngWorkerPath {
+    return (Join-Path $PSScriptRoot "lib\memory\TimelineDbgEng.ps1")
+}
+
+# The NuGet content folder name for this PowerShell PROCESS's processor
+# architecture (not the dump's, not the machine's): an x64 PowerShell on an
+# ARM64 computer loads amd64 DLLs. "" when there is none.
+function Get-DbgEngArchitecture {
+    param([string]$ProcessArchitecture = $env:PROCESSOR_ARCHITECTURE)
+    switch ("$ProcessArchitecture".ToUpperInvariant()) {
+        "ARM64" { return "arm64" }
+        "AMD64" { return "amd64" }
+        "X86" { return "x86" }
+    }
+    return ""
+}
+
+# "" when the folder holds dbgeng.dll, dbghelp.dll and dbgmodel.dll and
+# every DLL in it (subfolders too: the engine loads extension DLLs from
+# there) has a valid Authenticode signature from Microsoft; else why not.
+# The builder runs as Administrator, so a DLL planted there must never load.
+function Test-DbgEngFolderSigned {
+    param([string]$Folder)
+    foreach ($name in @("dbgeng.dll", "dbghelp.dll", "dbgmodel.dll")) {
+        if (-not (Test-Path -LiteralPath (Join-Path $Folder $name) -PathType Leaf)) {
+            return "$name is missing there (copy every DLL of the package's content folder)"
+        }
+    }
+    foreach ($dll in @(Get-ChildItem -LiteralPath $Folder -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Extension -eq ".dll" })) {
+        $relative = $dll.FullName.Substring($Folder.TrimEnd('\').Length + 1)
+        $signature = $null
+        try { $signature = Get-AuthenticodeSignature -LiteralPath $dll.FullName -ErrorAction Stop }
+        catch { return "$relative could not be checked ($(Get-DbgEngShortError (Get-DbgEngErrorText $_)))" }
+        $certificate = $signature.SignerCertificate
+        if ("$($signature.Status)" -ne "Valid" -or -not $certificate -or
+            $certificate.Subject -notmatch '(^|,\s*)O=Microsoft Corporation(,|$)' -or $certificate.Issuer -notmatch '(^|,\s*)O=Microsoft Corporation(,|$)') {
+            return "$relative is not signed by Microsoft (signature: $($signature.Status))"
+        }
+    }
+    return ""
+}
+
+# Which debugger engine to load: tools\dbgeng\<arch>\ (user-supplied DLLs
+# from Microsoft's NuGet package, all signed by Microsoft), else the one
+# that is part of Windows (System32; from a 32-bit PowerShell Windows gives
+# the SysWOW64 one). Never searched for by name. Returns Path (dbgeng.dll,
+# "" when there is none), Folder, Source ("Windows" or
+# "tools\dbgeng\<arch>"), Version, Dlls (loaded in this order, by full
+# path), Warning (why tools\dbgeng\<arch>\ was not used) and Reason (why
+# there is none).
+function Find-DbgEngine {
+    param(
+        [string]$ToolsFolder = (Get-BuilderToolsFolder),
+        [string]$ProcessArchitecture = $env:PROCESSOR_ARCHITECTURE,
+        [string]$SystemFolder = (Join-Path $env:SystemRoot "System32")
+    )
+    $result = [PSCustomObject]@{ Path = ""; Folder = ""; Source = ""; Version = ""; Dlls = @(); Warning = ""; Reason = "" }
+    $arch = Get-DbgEngArchitecture $ProcessArchitecture
+    if ($arch) {
+        $toolsEngine = Join-Path $ToolsFolder "dbgeng\$arch"
+        if (Test-Path -LiteralPath (Join-Path $toolsEngine "dbgeng.dll") -PathType Leaf) {
+            $problem = Test-DbgEngFolderSigned -Folder $toolsEngine
+            if ($problem) { $result.Warning = "tools\dbgeng\$arch\ is not used: $problem. The debugger engine that is part of Windows is used instead." }
+            else {
+                $result.Folder = $toolsEngine
+                $result.Source = "tools\dbgeng\$arch"
+                # Its own copies first, so the engine never binds to the
+                # System32 ones by name
+                $result.Dlls = @("dbghelp.dll", "dbgcore.dll", "msdia140.dll", "dbgmodel.dll", "dbgeng.dll")
+            }
+        }
+    }
+    if (-not $result.Folder) {
+        if (-not (Test-Path -LiteralPath (Join-Path $SystemFolder "dbgeng.dll") -PathType Leaf)) {
+            $result.Reason = "the Windows debugger engine (dbgeng.dll) is not in $SystemFolder"
+            return $result
+        }
+        $result.Folder = $SystemFolder
+        $result.Source = "Windows"
+        $result.Dlls = @("dbgeng.dll")
+    }
+    $result.Path = Join-Path $result.Folder "dbgeng.dll"
+    try { $result.Version = ("$((Get-Item -LiteralPath $result.Path -Force -ErrorAction Stop).VersionInfo.FileVersion)" -split '\s')[0] }
+    catch { Write-Verbose "No version of $($result.Path): $($_.Exception.Message)" }
+    return $result
+}
+
+# The message of an error: of the innermost exception (a .NET method's own
+# message, not PowerShell's "Exception calling ..." around it). The same
+# function is in lib\memory\TimelineDbgEng.ps1.
+function Get-DbgEngErrorText {
+    param($ErrorRecord)
+    $exception = $ErrorRecord.Exception
+    while ($exception.InnerException) { $exception = $exception.InnerException }
+    return $exception.Message
+}
+
+# A short, single-line form of an error message for a reason in the log:
+# no ";", " -- ", ": " or parentheses (the report splits the line on them),
+# at most 120 characters. The same function is in
+# lib\memory\TimelineDbgEng.ps1.
+function Get-DbgEngShortError {
+    param([string]$Message)
+    $text = (("$Message" -split "\r?\n") | Where-Object { $_.Trim() } | Select-Object -First 1)
+    $text = "$text".Trim().Replace(";", ",").Replace(" -- ", " - ").Replace(": ", " - ").Replace("(", "[").Replace(")", "]").TrimEnd('.')
+    if ($text.Length -gt 120) { $text = $text.Substring(0, 117) + "..." }
+    return $text
+}
+
+# The command an analyst with WinDbg can run for more than the builder
+# reads (handles, drivers, ...), with this dump and the builder's symbol
+# cache (WinDbg's own symbol server client fills it the same way):
+# kdARM64.exe (the WinDbg app's command-line debugger for ARM64 Windows), or
+# kd.exe on another processor architecture (Debugging Tools for Windows)
+function Get-DbgEngWinDbgCommand {
+    param([string]$DumpPath, [string]$ProcessArchitecture = $env:PROCESSOR_ARCHITECTURE)
+    $debugger = if ("$ProcessArchitecture" -eq "ARM64") { "kdARM64.exe" } else { "kd.exe" }
+    return "$debugger -z `"$DumpPath`" -y `"srv*$(Join-Path (Get-BuilderToolsFolder) 'symbols')*https://msdl.microsoft.com/download/symbols`""
+}
+
+# The PowerShell that runs the helper: this one ($PSHOME, so the same
+# edition and processor architecture), never a GUI host such as the ISE
+function Get-DbgEngWorkerHost {
+    if ($PSVersionTable.PSEdition -eq "Core") { return (Join-Path $PSHOME "pwsh.exe") }
+    return (Join-Path $PSHOME "powershell.exe")
+}
+
+# A command-line argument in quotes (paths have no " in them; a trailing
+# backslash is doubled, or it would escape the closing quote)
+function ConvertTo-DbgEngProcessArgument {
+    param([string]$Text)
+    return '"' + ($Text -replace '(\\+)$', '$1$1') + '"'
+}
+
+# What the helper sent: its result values (Reason, PartialReason and the
+# counts), the pslist and cmdline entries, the areas' entries (Entries:
+# kind -> a list of PSCustomObjects, one property per key; EntryCount: all
+# of them) and what each area read (Areas: Name, State, Rows, Seconds,
+# Note), Checkpoint (its PCEND line came, with the numbers of P and C lines
+# it names: the processes and command lines are whole even when the helper
+# stopped later), Ended (its END line came, with the numbers of P, C and E
+# lines it names), BadLines (protocol lines that could not be read), and how
+# its process ended
+function New-DbgEngWorkerState {
+    return [PSCustomObject]@{
+        Values = @{}; Processes = (New-Object System.Collections.Generic.List[object]); CommandLines = (New-Object System.Collections.Generic.List[object])
+        Entries = @{}; EntryCount = 0; Areas = (New-Object System.Collections.Generic.List[object])
+        Checkpoint = $false; Ended = $false; BadLines = 0; ExitCode = $null; TimedOut = $false; ErrorText = ""; StartError = ""
+    }
+}
+
+# A text field of a protocol line (Base64 of UTF-8)
+function ConvertFrom-DbgEngBase64 {
+    param([string]$Text)
+    if (-not $Text) { return "" }
+    return [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Text))
+}
+
+# A number field of a protocol line: $null when empty
+function ConvertFrom-DbgEngWorkerNumber {
+    param([string]$Text)
+    if (-not $Text) { return $null }
+    return [long]::Parse($Text, [System.Globalization.NumberStyles]::AllowLeadingSign, [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+# One line of the helper's output: "TBDBG|LOG|<I, W or S>|<text>" is logged
+# here (Log, Log-Warning, Log-Success), "TBDBG|R|<name>|<value>" is a result
+# value, "TBDBG|P|..." a windows.pslist entry (with the helper's FoundBy,
+# TableId and Anomaly), "TBDBG|C|..." a windows.cmdline entry,
+# "TBDBG|E|<Kind>|<Key>:<value>|..." an entry of an area (keys: a letter,
+# then letters and digits, each once), "TBDBG|AREA|<area>|<Read, Partial or
+# NotRead>|<rows>|<seconds>|<note>" what an area read,
+# "TBDBG|PCEND|<processes>|<command lines>" the checkpoint after the
+# processes and command lines (before the areas run),
+# "TBDBG|END|<processes>|<command lines>|<entries>" the end. Other lines
+# (PowerShell's own output) are ignored.
+function Receive-DbgEngWorkerLine {
+    param([string]$Line, $State)
+    $at = "$Line".IndexOf("TBDBG|")
+    if ($at -lt 0) { return }
+    $fields = $Line.Substring($at + 6).TrimEnd().Split('|')
+    try {
+        switch ($fields[0]) {
+            "LOG" {
+                $text = ConvertFrom-DbgEngBase64 $fields[2]
+                if ($fields[1] -eq "W") { Log-Warning $text }
+                elseif ($fields[1] -eq "S") { Log-Success $text }
+                else { Log $text }
+            }
+            "R" { $State.Values[$fields[1]] = ConvertFrom-DbgEngBase64 $fields[2] }
+            "P" {
+                if ($fields.Count -ne 12) { throw "a process line with $($fields.Count) fields" }
+                $created = ConvertFrom-DbgEngBase64 $fields[7]
+                $exited = ConvertFrom-DbgEngBase64 $fields[8]
+                $State.Processes.Add([PSCustomObject]@{
+                        PID = (ConvertFrom-DbgEngWorkerNumber $fields[1]); PPID = (ConvertFrom-DbgEngWorkerNumber $fields[2]); ImageFileName = (ConvertFrom-DbgEngBase64 $fields[6])
+                        Offset = $fields[5]; Threads = (ConvertFrom-DbgEngWorkerNumber $fields[3]); SessionId = (ConvertFrom-DbgEngWorkerNumber $fields[4])
+                        CreateTime = $(if ($created) { $created } else { $null }); ExitTime = $(if ($exited) { $exited } else { $null })
+                        FoundBy = (ConvertFrom-DbgEngBase64 $fields[9]); TableId = (ConvertFrom-DbgEngBase64 $fields[10]); Anomaly = (ConvertFrom-DbgEngBase64 $fields[11])
+                    })
+            }
+            "C" {
+                if ($fields.Count -ne 4) { throw "a command line line with $($fields.Count) fields" }
+                $State.CommandLines.Add([PSCustomObject]@{ PID = (ConvertFrom-DbgEngWorkerNumber $fields[1]); Process = (ConvertFrom-DbgEngBase64 $fields[2]); Args = (ConvertFrom-DbgEngBase64 $fields[3]) })
+            }
+            "E" {
+                if ($fields.Count -lt 2 -or $fields[1] -cnotmatch '^[A-Za-z][A-Za-z0-9]{0,63}$') { throw "an entry line without a kind" }
+                $values = [ordered]@{}
+                for ($i = 2; $i -lt $fields.Count; $i++) {
+                    $colon = $fields[$i].IndexOf(':')
+                    $key = if ($colon -gt 0) { $fields[$i].Substring(0, $colon) } else { "" }
+                    if ($key -cnotmatch '^[A-Za-z][A-Za-z0-9]{0,63}$' -or $values.Contains($key)) { throw "an entry line with a field that is not <key>:<value> or a key twice" }
+                    $values[$key] = ConvertFrom-DbgEngBase64 $fields[$i].Substring($colon + 1)
+                }
+                $kind = $fields[1]
+                if (-not $State.Entries.ContainsKey($kind)) { $State.Entries[$kind] = New-Object System.Collections.Generic.List[object] }
+                $State.Entries[$kind].Add([PSCustomObject]$values)
+                $State.EntryCount++
+            }
+            "AREA" {
+                if ($fields.Count -ne 6 -or $fields[1] -cnotmatch '^[A-Za-z][A-Za-z0-9]{0,63}$' -or @("Read", "Partial", "NotRead") -cnotcontains $fields[2]) { throw "an area line that cannot be read" }
+                $State.Areas.Add([PSCustomObject]@{
+                        Name = $fields[1]; State = $fields[2]; Rows = [long](ConvertFrom-DbgEngWorkerNumber $fields[3])
+                        Seconds = [double]::Parse($fields[4], [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture); Note = (ConvertFrom-DbgEngBase64 $fields[5])
+                    })
+            }
+            "PCEND" {
+                if ($fields.Count -eq 3 -and $fields[1] -eq "$($State.Processes.Count)" -and $fields[2] -eq "$($State.CommandLines.Count)") { $State.Checkpoint = $true }
+                else { $State.BadLines++ }
+            }
+            "END" {
+                if ($fields.Count -eq 4 -and $fields[1] -eq "$($State.Processes.Count)" -and $fields[2] -eq "$($State.CommandLines.Count)" -and $fields[3] -eq "$($State.EntryCount)") { $State.Ended = $true }
+                else { $State.BadLines++ }
+            }
+            default { $State.BadLines++ }
+        }
+    }
+    catch { $State.BadLines++ }
+}
+
+# Runs the helper script in a PowerShell process of its own and reads its
+# output line by line (Receive-DbgEngWorkerLine), so its log lines appear
+# as they come. The process shares this console (Ctrl+C reaches it too); it
+# is ended after -TimeoutSeconds, and when this run stops (Ctrl+C) while it
+# is running. Windows PowerShell gets its default module path (a path of
+# PowerShell 7's modules would load the wrong ones). Returns the state
+# (New-DbgEngWorkerState) with ExitCode, TimedOut, ErrorText (its stderr)
+# and StartError. A function of its own so the tests can run the helper's
+# functions in their own process instead.
+function Start-DbgEngWorker {
+    param([string]$WorkerPath, [System.Collections.IDictionary]$Arguments, [string]$WorkingDirectory, [int]$TimeoutSeconds = 900)
+    $state = New-DbgEngWorkerState
+    $argumentText = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File " + (ConvertTo-DbgEngProcessArgument $WorkerPath)
+    foreach ($name in @($Arguments.Keys)) { $argumentText += " -$name " + (ConvertTo-DbgEngProcessArgument ([string]$Arguments[$name])) }
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = Get-DbgEngWorkerHost
+    $startInfo.Arguments = $argumentText
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    if ($WorkingDirectory) { $startInfo.WorkingDirectory = $WorkingDirectory }
+    if ($PSVersionTable.PSEdition -ne "Core" -and $startInfo.EnvironmentVariables.ContainsKey("PSModulePath")) { $startInfo.EnvironmentVariables.Remove("PSModulePath") }
+    $process = $null
+    try { $process = [System.Diagnostics.Process]::Start($startInfo) }
+    catch {
+        $state.StartError = Get-DbgEngShortError (Get-DbgEngErrorText $_)
+        return $state
+    }
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $errorTask = $process.StandardError.ReadToEndAsync()
+        $lineTask = $process.StandardOutput.ReadLineAsync()
+        while ($true) {
+            if ($lineTask.Wait(200)) {
+                $line = $lineTask.Result
+                if ($null -eq $line) { break }
+                Receive-DbgEngWorkerLine -Line $line -State $state
+                $lineTask = $process.StandardOutput.ReadLineAsync()
+            }
+            elseif ($timer.Elapsed.TotalSeconds -ge $TimeoutSeconds) { $state.TimedOut = $true; break }
+        }
+        if (-not $state.TimedOut -and -not $process.WaitForExit([int][Math]::Max(1000, ($TimeoutSeconds - $timer.Elapsed.TotalSeconds) * 1000))) { $state.TimedOut = $true }
+        if ($state.TimedOut) {
+            try { $process.Kill() } catch { Write-Verbose "Ending the debugger engine helper: $($_.Exception.Message)" }
+            [void]$process.WaitForExit(10000)
+        }
+        else {
+            $process.WaitForExit()
+            $state.ExitCode = $process.ExitCode
+        }
+        if ($errorTask.Wait(5000)) { $state.ErrorText = [string]$errorTask.Result }
+    }
+    finally {
+        # Ctrl+C (or an error) while it runs: it is ended with this run
+        if (-not $process.HasExited) {
+            try { $process.Kill() } catch { Write-Verbose "Ending the debugger engine helper: $($_.Exception.Message)" }
+            [void]$process.WaitForExit(10000)
+        }
+        $process.Dispose()
+    }
+    return $state
+}
+
+# The message of the helper's error output (PowerShell's error text without
+# its position lines), short, for a reason; "" for none. Windows PowerShell
+# gives the message first ("<script>.ps1 : <message>", or the message
+# alone), PowerShell 7 as the last "| <message>" line under the code line.
+function Get-DbgEngWorkerErrorLine {
+    param([string]$Text)
+    $lines = @(("$Text" -split "\r?\n") | ForEach-Object { ($_ -replace '\x1b\[[0-9;?]*[A-Za-z]', '').Trim() } | Where-Object { $_ })
+    $barLines = @($lines | Where-Object { $_ -match '^\|\s+[^~\s]' })
+    if ($barLines.Count -gt 0) { return (Get-DbgEngShortError ($barLines[-1] -replace '^\|\s+', '')) }
+    foreach ($line in $lines) {
+        if ($line -match '^(At |\+|~|Line \|)' -or $line -match '^[-\w]+\s*:\s*$') { continue }
+        if ($line -match '^\S.*?\.ps1\s*:\s+(.+)$') { $line = $Matches[1] }
+        return (Get-DbgEngShortError $line)
+    }
+    return ""
+}
+
+# An exit code as the log gives it: decimal, or hex for a Windows error
+# such as 0xC0000005 (an access violation)
+function Format-DbgEngExitCode {
+    param($ExitCode)
+    if ($null -eq $ExitCode) { return "unknown" }
+    $code = [long]$ExitCode
+    if ($code -lt 0 -or $code -gt 0xFFFF) { return "0x" + ([uint32]($code -band 0xFFFFFFFFL)).ToString("X8") }
+    return "$code"
+}
+
+# The builder's rows of the helper's entries (a function of its own so the
+# tests can put another file in its place)
+function Get-DbgEngRowsPath {
+    return (Join-Path $PSScriptRoot "lib\memory\TimelineMemoryRows.ps1")
+}
+
+# A Windows ARM64 dump: its processes and command lines with Microsoft's
+# debugger engine, as the rows Volatility's windows.pslist and
+# windows.cmdline give (Add-MemoryPluginRows), and the rows of the helper's
+# areas (lib\memory\TimelineMemoryRows.ps1). Returns Entries (rows added),
+# Processes and CommandLines (rows of each), AreaRows (rows of the areas'
+# entries), Areas (what each area read: Name, State, Rows, Seconds, Note),
+# ReadText (what was read and what not, for the "analyzed with" line),
+# CoverageTexts (for the "Memory dump coverage" lines), Reason when nothing
+# was added (for "Memory dump not analyzed: <dump> -- <reason>") and
+# PartialReason when the processes were read but not the command lines.
+function Invoke-DbgEngMemoryAnalysis {
+    param([string]$DumpPath, $DumpInfo)
+    $result = [PSCustomObject]@{
+        Entries = 0; Processes = 0; CommandLines = 0; AreaRows = 0; Areas = @(); ReadText = ""; CoverageTexts = @(); Reason = ""; PartialReason = ""
+    }
+    $engine = Find-DbgEngine
+    if ($engine.Warning) { Log-Warning "  $($engine.Warning)" }
+    if (-not $engine.Path) {
+        $result.Reason = "$($engine.Reason); see ""ARM64 memory dumps"" in README.txt"
+        return $result
+    }
+    $where = if ($engine.Source -eq "Windows") { "part of Windows" } else { "signed by Microsoft" }
+    Log "  Debugger engine: dbgeng.dll $($engine.Version) from $($engine.Folder) ($where)"
+    $worker = Get-DbgEngWorkerPath
+    if (-not (Test-Path -LiteralPath $worker -PathType Leaf)) {
+        $result.Reason = "the debugger engine helper lib\memory\TimelineDbgEng.ps1 is missing, an antivirus may have removed it; copy the whole win11-timeline-builder folder again"
+        return $result
+    }
+    # The rows of the helper's entries: dot-sourced with the builder
+    if (-not (Get-Command -Name "Add-DbgEngEntryRows" -CommandType Function -ErrorAction SilentlyContinue)) {
+        if (-not (Test-Path -LiteralPath (Get-DbgEngRowsPath) -PathType Leaf)) {
+            $result.Reason = "the builder's lib\memory\TimelineMemoryRows.ps1 is missing, an antivirus may have removed it; copy the whole win11-timeline-builder folder again"
+        }
+        else {
+            $why = if ($script:dbgEngRowsLoadError) { " [$(Get-DbgEngShortError $script:dbgEngRowsLoadError)]" } else { "" }
+            $result.Reason = "the builder's lib\memory\TimelineMemoryRows.ps1 could not be loaded$why, an antivirus may have blocked it; copy the whole win11-timeline-builder folder again"
+        }
+        return $result
+    }
+    $timeout = 900
+    if ($script:dbgEngTimeoutSeconds -gt 0) { $timeout = [int]$script:dbgEngTimeoutSeconds }
+    $jobFolder = Join-Path (Get-ScratchFolder) "dbgeng"
+    # When the capture started (DumpIt writes it in the dump's header) and
+    # ended (the dump file's last write): the helper judges a process
+    # missing from the kernel's process list, or held in its process ID
+    # table under another ID, by them (one created during the copy or
+    # shortly before it is capture churn, not marked). Without the header's
+    # time nothing is marked; a last-write time before it is not an end.
+    $captureStart = ""
+    $captureEnd = ""
+    if ($DumpInfo.TimeSource -eq "crash dump header" -and $DumpInfo.CaptureTimeUtc) {
+        $startUtc = [datetime]::SpecifyKind([datetime]$DumpInfo.CaptureTimeUtc, [DateTimeKind]::Utc)
+        $captureStart = $startUtc.ToString("o", [System.Globalization.CultureInfo]::InvariantCulture)
+        if ($DumpInfo.LastWriteUtc) {
+            $endUtc = [datetime]::SpecifyKind([datetime]$DumpInfo.LastWriteUtc, [DateTimeKind]::Utc)
+            if ($endUtc -ge $startUtc) { $captureEnd = $endUtc.ToString("o", [System.Globalization.CultureInfo]::InvariantCulture) }
+        }
+    }
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $state = $null
+    try {
+        [void][System.IO.Directory]::CreateDirectory($jobFolder)
+        $state = Start-DbgEngWorker -WorkerPath $worker -WorkingDirectory $jobFolder -TimeoutSeconds $timeout -Arguments ([ordered]@{
+                DumpPath = $DumpPath; EngineFolder = $engine.Folder; EngineDlls = (@($engine.Dlls) -join ",")
+                SymbolCache = (Join-Path (Get-BuilderToolsFolder) "symbols"); JobFolder = $jobFolder; CaptureStart = $captureStart; CaptureEnd = $captureEnd
+            })
+    }
+    catch {
+        $result.Reason = "the debugger engine helper could not be run ($(Get-DbgEngShortError (Get-DbgEngErrorText $_)))"
+        return $result
+    }
+    finally { Remove-Item -LiteralPath $jobFolder -Recurse -Force -ErrorAction SilentlyContinue }
+    if ($state.StartError) {
+        $result.Reason = "the debugger engine helper could not be started ($($state.StartError))"
+        return $result
+    }
+    $limit = "$timeout seconds"
+    if ($timeout -ge 120) { $limit = "$([int][Math]::Ceiling($timeout / 60)) minutes" }
+    $stoppedWhy = ""
+    $detail = ""
+    if ($state.TimedOut) { $stoppedWhy = "did not finish within $limit" }
+    elseif (-not $state.Ended) {
+        $detail = "exit code $(Format-DbgEngExitCode $state.ExitCode)"
+        $errorLine = Get-DbgEngWorkerErrorLine $state.ErrorText
+        if ($errorLine) { $detail += " - $errorLine" }
+        $stoppedWhy = "stopped with $detail"
+    }
+    if ($stoppedWhy) {
+        # Stopped in an area, after its checkpoint: the processes and
+        # command lines are whole and are used; nothing of the areas is
+        # (their entries come only after all of them)
+        if (-not ($state.Checkpoint -and -not $state.Values["Reason"] -and $state.Processes.Count -gt 0)) {
+            if ($state.TimedOut) { $result.Reason = "the Windows debugger engine did not finish within $limit" }
+            else { $result.Reason = "the Windows debugger engine stopped ($detail)" }
+            return $result
+        }
+        Log-Warning "  The debugger engine helper $stoppedWhy after it had sent the processes and command lines: they are used, the other memory areas are not read."
+        $state.Entries = @{}
+        $state.EntryCount = 0
+        $state.Areas = New-Object System.Collections.Generic.List[object]
+        $areaWhy = if ($state.TimedOut) { "the helper did not finish within $limit" } else { "the helper stopped with exit code $(Format-DbgEngExitCode $state.ExitCode)" }
+        foreach ($label in @(Get-DbgEngAreaLabels)) {
+            $state.Areas.Add([PSCustomObject]@{ Name = $label.Name; State = "NotRead"; Rows = [long]0; Seconds = [double]0; Note = $areaWhy })
+        }
+    }
+    $values = $state.Values
+    if ($values["Reason"]) {
+        $result.Reason = $values["Reason"]
+        return $result
+    }
+    if ($state.Processes.Count -eq 0) {
+        $result.Reason = "the Windows debugger engine listed no processes in it"
+        return $result
+    }
+    # The process details (Proc entries) onto their processes, before their
+    # rows are made (lib\memory\TimelineMemoryRows.ps1)
+    $script:dbgEngEntries = $state.Entries
+    if ($state.Entries.ContainsKey("Proc")) {
+        $merge = Merge-DbgEngProcessEntries -Processes $state.Processes.ToArray() -ProcEntries $state.Entries["Proc"].ToArray()
+        $unmatchedText = if ($merge.Unmatched -gt 0) { "; $($merge.Unmatched) without a process" } else { "" }
+        Log "    Process details: $($merge.Merged) process(es)$unmatchedText"
+    }
+    try { Set-DbgEngProcessRowFields -Processes $state.Processes.ToArray() -CommandLines $state.CommandLines.ToArray() }
+    catch { Log-Warning "  The process details could not be added to the process rows: $(Get-DbgEngShortError (Get-DbgEngErrorText $_))" }
+    # Process objects reached only through a handle and found by no way of
+    # the process scan (HandleProcess entries): process rows of their own
+    try {
+        $handleProcesses = Add-DbgEngHandleProcesses -Processes $state.Processes -Entries $state.Entries
+        if ($handleProcesses -gt 0) { Log "    Processes reached only through a handle, missing from the kernel's process list and process ID table: $handleProcesses (process rows with FoundBy=HandleTable Anomaly=NotInProcessList)" }
+    }
+    catch { Log-Warning "  The processes found through handles could not be added to the process rows: $(Get-DbgEngShortError (Get-DbgEngErrorText $_))" }
+    $counts = Add-MemoryPluginRows -Plugin "windows.pslist" -Source "Memory-Processes" -Entries $state.Processes.ToArray() `
+        -CaptureTimeUtc $DumpInfo.CaptureTimeUtc -AcquisitionEndUtc $DumpInfo.LastWriteUtc -DumpPath $DumpPath
+    $badNote = ""
+    if ([int]$values["BadItems"] -gt 0) { $badNote = "; $($values['BadItems']) list item(s) could not be read" }
+    Log "    Processes (windows.pslist rows): $($counts.Entries) entries ($($counts.Timed) timed, $($counts.Snapshot) snapshot)$badNote; session ids for $($values['SessionIds'])"
+    $cmdCounts = Add-MemoryPluginRows -Plugin "windows.cmdline" -Source "Memory-CommandLine" -Entries $state.CommandLines.ToArray() `
+        -CaptureTimeUtc $DumpInfo.CaptureTimeUtc -AcquisitionEndUtc $DumpInfo.LastWriteUtc -DumpPath $DumpPath
+    if ($values["PartialReason"]) {
+        $result.PartialReason = $values["PartialReason"]
+        Log-Warning "  Command lines (windows.cmdline rows): none; $($result.PartialReason)"
+    }
+    else {
+        Log "    Command lines (windows.cmdline rows): $($cmdCounts.Entries) entries; none for $($values['NoPeb']) kernel process(es) without a PEB, $($values['Unreadable']) not readable (paged out or exited), $($values['Empty']) empty; $($values['Seconds']) s"
+    }
+    # The rows of the areas' entries, and what each area read
+    $areaRows = 0
+    foreach ($kind in @(Add-DbgEngEntryRows -Entries $state.Entries -CaptureTimeUtc $DumpInfo.CaptureTimeUtc -AcquisitionEndUtc $DumpInfo.LastWriteUtc -DumpPath $DumpPath)) {
+        if ($kind.Unknown) { Log "    $($kind.Received) $($kind.Kind) entries of the helper have no rows in this builder"; continue }
+        if ($kind.Error) { Log-Warning "  $($kind.Source) rows: stopped after $($kind.Rows) of $($kind.Received) entries ($(Get-DbgEngShortError $kind.Error))" }
+        else { Log "    $($kind.Source) rows ($($kind.Kind) entries): $($kind.Rows) of $($kind.Received) entries ($($kind.Timed) timed, $($kind.Snapshot) snapshot)" }
+        $areaRows += $kind.Rows
+    }
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    foreach ($label in @(Get-DbgEngAreaLabels)) {
+        $area = @($state.Areas | Where-Object { $_.Name -eq $label.Name }) | Select-Object -First 1
+        if ($null -eq $area) { Log "    $($label.Label): not reported by the helper"; continue }
+        $stateText = switch ($area.State) { "Read" { "read" } "Partial" { "partly read" } default { "not read ($($area.Note))" } }
+        Log "    $($label.Label): $stateText, $($area.Rows) entries, $(([double]$area.Seconds).ToString('0.0', $invariant)) s"
+    }
+    if ($state.BadLines -gt 0) { Log-Warning "  $($state.BadLines) line(s) of the debugger engine helper's output could not be read." }
+    Log "    Debugger engine analysis took $(([math]::Round($timer.Elapsed.TotalSeconds, 1)).ToString([System.Globalization.CultureInfo]::InvariantCulture)) s"
+    $result.Processes = $counts.Entries
+    $result.CommandLines = $cmdCounts.Entries
+    $result.AreaRows = $areaRows
+    $result.Entries = $counts.Entries + $cmdCounts.Entries + $areaRows
+    $result.Areas = $state.Areas.ToArray()
+    $result.ReadText = Get-DbgEngReadText -Areas $result.Areas -PartialReason $result.PartialReason
+    $result.CoverageTexts = @(Get-DbgEngCoverageTexts -Areas $result.Areas)
+    return $result
+}
+
 function Parse-Memory {
-    Log "--- Parsing Memory Dump (Volatility 3) ---"
+    Log "--- Parsing Memory Dump ---"
 
     $memParsed = $false
 
@@ -17318,16 +17893,34 @@ function Parse-Memory {
     # The time of the Snapshot rows (entries without a valid time of their own)
     Log "  Dump time: $($dumpInfo.CaptureTimeUtc.ToString('yyyy-MM-dd HH:mm:ss.fff', [System.Globalization.CultureInfo]::InvariantCulture)) UTC ($($dumpInfo.TimeSource))"
 
-    # Volatility 3's Windows support is for Intel x86/x64 memory only
     $dumpText = "$([System.IO.Path]::GetFileName($dumpPath))$(Get-MemoryDumpSizeText -Bytes (Get-Item -LiteralPath $dumpPath -Force).Length)"
+    Log "  Analyzing in-place (not copied to temp)"
+
+    # Volatility 3's Windows support is for Intel x86/x64 memory only: a
+    # Windows ARM64 dump is read with Microsoft's debugger engine (processes
+    # and command lines). The findings report reads the "analyzed with the
+    # Windows debugger engine" line (a coverage note and a caveat) or the
+    # "Memory dump not analyzed" line.
     if ($dumpArch -eq "ARM64") {
-        Log-Warning "  This is a Windows ARM64 memory dump. Volatility 3 cannot analyze Windows ARM64 memory, so memory analysis is skipped."
-        Write-MemoryDumpNotAnalyzed -What $dumpText -Why (Get-MemoryDumpArm64Reason)
+        Log "  Windows ARM64 dump: analyzing it with Microsoft's debugger engine (Volatility 3 cannot read ARM64 memory)"
+        $engineResult = Invoke-DbgEngMemoryAnalysis -DumpPath $dumpPath -DumpInfo $dumpInfo
+        if ($engineResult.Entries -gt 0) {
+            # What was read and what not (the report's coverage note and
+            # caveat), and per area what a live copy left unreadable (an
+            # information line each: some of that is normal)
+            Log "  Memory dump analyzed with the Windows debugger engine: $dumpText -- $($engineResult.ReadText)"
+            foreach ($coverage in @($engineResult.CoverageTexts)) { Log "  Memory dump coverage: $coverage" }
+            Log-Success "  Memory analysis complete: $($engineResult.Entries) entries from $dumpSizeGB GB dump"
+        }
+        else {
+            Log-Warning "  Memory analysis skipped: $($engineResult.Reason)."
+            Write-MemoryDumpNotAnalyzed -What $dumpText -Why $engineResult.Reason
+        }
+        Log "  To look further than the builder reads, open the dump in WinDbg; its command-line debugger, with the builder's symbol cache: $(Get-DbgEngWinDbgCommand -DumpPath $dumpPath)"
         Log "  Memory parsing complete."
         Log ""
         return
     }
-    Log "  Analyzing in-place (not copied to temp)"
 
     # --- Find Volatility 3 ---
     $volExe = Find-VolatilityExe
@@ -18601,21 +19194,19 @@ if ($Sources -notcontains "Memory") {
         $detectedDumpSize = Get-MemoryDumpSizeText -Bytes (Get-Item -LiteralPath $detectedDump -Force).Length
         $detectedDumpText = "$([System.IO.Path]::GetFileName($detectedDump))$detectedDumpSize"
     }
-    if ($detectedDump -and (Get-MemoryDumpInfo -Path $detectedDump).Architecture -eq "ARM64") {
-        # Volatility 3 cannot analyze Windows ARM64 memory: don't offer it
-        # (the next line says why, and names WinDbg)
-        Log ""
-        Log "Memory dump detected: $(Get-MemoryDumpDisplayName $detectedDump) (Windows ARM64)"
-        Write-MemoryDumpNotAnalyzed -What $detectedDumpText -Why (Get-MemoryDumpArm64Reason)
-        Log ""
-        $detectedDump = $null
-    }
-
-    # If dump found, check if Volatility 3 is available
+    # If dump found, check that what reads it is available: Volatility 3 for
+    # an x64 or x86 dump, Microsoft's debugger engine for a Windows ARM64
+    # dump (Volatility 3 cannot read ARM64 memory)
     if ($detectedDump) {
-        $volAvailable = [bool](Find-VolatilityExe)
+        $detectedArm64 = (Get-MemoryDumpInfo -Path $detectedDump).Architecture -eq "ARM64"
+        $dumpEngine = $null
+        if ($detectedArm64) {
+            $dumpEngine = Find-DbgEngine
+            $readerAvailable = [bool]$dumpEngine.Path
+        }
+        else { $readerAvailable = [bool](Find-VolatilityExe) }
 
-        if ($volAvailable) {
+        if ($readerAvailable) {
             Write-Host ""
             Write-Host "========================================" -ForegroundColor Cyan
             Write-Host "  Memory Dump Detected" -ForegroundColor Cyan
@@ -18628,11 +19219,28 @@ if ($Sources -notcontains "Memory") {
             } elseif ($script:memoryDumpFromManifest) {
                 Write-Host "  (where the collector saved it, as collection_manifest.csv says)" -ForegroundColor Green
             }
-            Write-Host "  Volatility 3 is available in tools\" -ForegroundColor Green
-            Write-Host ""
-            Write-Host "  Memory analysis extracts processes, network connections," -ForegroundColor White
-            Write-Host "  command lines, and services from the RAM dump." -ForegroundColor White
-            Write-Host "  Adds 5-30 minutes depending on dump size." -ForegroundColor DarkGray
+            if ($detectedArm64) {
+                $engineWhere = "(dbgeng.dll, part of Windows)"
+                if ($dumpEngine.Source -ne "Windows") { $engineWhere = "(dbgeng.dll in $($dumpEngine.Source)\)" }
+                Write-Host "  A Windows ARM64 dump: Volatility 3 cannot read it, so the builder uses" -ForegroundColor Green
+                Write-Host "  Microsoft's debugger engine $engineWhere." -ForegroundColor Green
+                Write-Host ""
+                Write-Host "  Memory analysis adds the processes (user, program path, parent, start" -ForegroundColor White
+                Write-Host "  time), their command lines and DLLs, kernel drivers, handles," -ForegroundColor White
+                Write-Host "  executable private memory, the registry in memory, console history," -ForegroundColor White
+                Write-Host "  network connections and services from the RAM dump." -ForegroundColor White
+                Write-Host "  Takes under a minute. The first time for each Windows kernel version" -ForegroundColor DarkGray
+                Write-Host "  (most Windows updates bring a new one) it downloads the kernel's" -ForegroundColor DarkGray
+                Write-Host "  symbol file (about 10 MB) from Microsoft's symbol server into" -ForegroundColor DarkGray
+                Write-Host "  tools\symbols\; the request names only that file (see README.txt)." -ForegroundColor DarkGray
+            }
+            else {
+                Write-Host "  Volatility 3 is available in tools\" -ForegroundColor Green
+                Write-Host ""
+                Write-Host "  Memory analysis extracts processes, network connections," -ForegroundColor White
+                Write-Host "  command lines, and services from the RAM dump." -ForegroundColor White
+                Write-Host "  Adds 5-30 minutes depending on dump size." -ForegroundColor DarkGray
+            }
             Write-Host ""
             Write-Host "  [1] Yes -- analyze memory dump (recommended for IR)" -ForegroundColor Green
             Write-Host "  [2] No  -- skip, build timeline from disk artifacts only" -ForegroundColor White
@@ -18655,6 +19263,11 @@ if ($Sources -notcontains "Memory") {
                 Write-MemoryDumpNotAnalyzed -What $detectedDumpText -Why "skipped at the memory prompt; run the builder again and answer 1 to analyze it"
                 Log ""
             }
+        } elseif ($detectedArm64) {
+            Log ""
+            Log "Memory dump detected ($(Get-MemoryDumpDisplayName $detectedDump), Windows ARM64) but Microsoft's debugger engine is not available: $($dumpEngine.Reason)."
+            Write-MemoryDumpNotAnalyzed -What $detectedDumpText -Why "$($dumpEngine.Reason); see ""ARM64 memory dumps"" in README.txt"
+            Log ""
         } else {
             Log ""
             Log "Memory dump detected ($(Get-MemoryDumpDisplayName $detectedDump)) but Volatility 3 not found in tools\ directory."
@@ -18738,6 +19351,13 @@ if ($entryCount -eq 0) {
 # system's only in a live collection (a mounted image is collected on
 # another machine).
 if ((Get-CollectionInfo).Mode -eq "Live") { Add-TimelineMachineName (Get-CollectionInfo).ComputerName }
+# The account names a Windows ARM64 dump's logon sessions hold
+# (lib\memory\TimelineMemoryRows.ps1): fallback names only, so the
+# SOFTWARE hive's ProfileList and bam_entries.csv still win
+if (Get-Command -Name "Register-DbgEngLogonNames" -CommandType Function -ErrorAction SilentlyContinue) {
+    try { Register-DbgEngLogonNames -Entries $script:dbgEngEntries }
+    catch { Log-Warning "The account names of the memory dump could not be registered: $($_.Exception.Message)" }
+}
 $userPass = Update-TimelineUserColumn -Entries $script:timelineEntries -SidNames (Get-TimelineSidNames) -MachineNames @((Get-TimelineUserContext).MachineNames)
 Log "  User column: $($userPass.Rows) row(s) changed to one form per account ($($userPass.Transitions.Count) distinct value(s)); $($userPass.SidRows) row(s) whose SID got a name keep it in Details (UserSID=)"
 if ($userPass.Unresolved.Count -gt 0) {
@@ -19011,8 +19631,9 @@ if (-not $skipExcel -and (Get-Module -ListAvailable -Name ImportExcel)) {
             }
         }
 
-        # Findings report: a first sheet "Findings" that links to the
-        # evidence rows, and a "Finding" column on the Timeline sheet
+        # Findings report: a "Findings" sheet after the Timeline sheet that
+        # links to the evidence rows, and a "Finding" column on the Timeline
+        # sheet (the workbook opens on the Timeline sheet)
         if ($reportState) {
             try {
                 Add-TimelineReportWorkbookSheets -Package $excelPkg -Findings $reportState.Findings -CollectorRows $reportState.CollectorRows

@@ -1,12 +1,15 @@
-# Reports (generated at runtime)
+# Reports (generated at runtime). The builder's own scripts live in lib\
+# (lib\report\, lib\memory\) and are committed.
 reports/
 
 # Work folder fallback (used only when %LOCALAPPDATA% cannot be written)
 /work/
 
-# Tools: auto-downloaded (sqlite3, Timeline Explorer) or user-provided
-# (Volatility 3) -- never committed. Only each tool folder's README.txt is
-# tracked, so a clone has the expected tools\<tool>\ layout.
+# Tools: auto-downloaded (sqlite3, Timeline Explorer, the Windows kernel
+# symbol files of tools\symbols\) or user-provided (Volatility 3, the
+# debugger engine DLLs of tools\dbgeng\<arch>\) -- never committed. Only each
+# tool folder's README.txt is tracked, so a clone has the expected
+# tools\<tool>\ layout.
 tools/**
 !tools/**/
 !tools/*/README.txt
