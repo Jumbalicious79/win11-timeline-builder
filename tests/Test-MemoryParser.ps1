@@ -81,7 +81,16 @@
 # NotInProcessList, named first in the warning; not marked without a
 # capture start or when both walks stopped early; process IDs changed to 0,
 # to one not a multiple of 4 and to another process's: Anomaly=
-# ProcessIdChanged and TableId=), the process ID table changed during the
+# ProcessIdChanged and TableId=), capture churn (processes created during
+# the copy, 0.78 s and 90 s before it, only in the table under another
+# ID: TableId=, not marked, counted in the warning; one created 125 s
+# before it is marked), no capture start (nothing marked, the warning says
+# it cannot be judged), create times churn cannot have (none, or after the
+# capture ended: marked ProcessIdChanged in the list and NotInProcessList
+# unlinked), IDs a stale table entry cannot give (not a multiple of 4, 0
+# without a table entry: marked even when created during the copy), no
+# capture end (a process created after the start not judged), the
+# create-time and verdict tables, the process ID table changed during the
 # copy (a stale entry) and an object that only starts like a process, the
 # scan finding nothing (one warning, the engine's own list's), session ids
 # per process (_MM_SESSION_SPACE or the token), the layout's refusals, and
@@ -1904,6 +1913,17 @@ try {
     New-TestProcess -Index 150 -ProcId 7000 -ParentId 4000 -Create $capture.AddMinutes(-5) -Exit $capture.AddMinutes(-4) -Threads 0 -Name "gone.exe" -CommandLine "x" -NoParameters
     New-TestProcess -Index 152 -ProcId 7100 -ParentId 4000 -Create $capture.AddSeconds(30) -Exit 0 -Threads 1 -Name "new.exe" -CommandLine "new.exe /n"
     New-TestProcess -Index 153 -ProcId 7300 -ParentId 4000 -Create $capture.AddHours(-3) -Exit 0 -Threads 5 -Name "hidden.exe" -CommandLine "hidden.exe -q"
+    # Capture churn (the shape of a real dump of a computer busy with
+    # short-lived processes): processes that only the process ID table has,
+    # under the ID of a process that is not in the dump, created 20 s after
+    # the capture started (churn1.exe), 0.78 s and 90 s before it
+    # (churn2.exe, loop.exe: within the 120-second churn margin) and 125 s
+    # before it (early.exe, outside it: judged); their links point to
+    # themselves
+    New-TestProcess -Index 155 -ProcId 7400 -ParentId 4000 -Create $capture.AddSeconds(20) -Exit 0 -Threads 4 -Name "churn1.exe" -CommandLine "churn1.exe 1"
+    New-TestProcess -Index 156 -ProcId 7404 -ParentId 4000 -Create $capture.AddMilliseconds(-780) -Exit 0 -Threads 4 -Name "churn2.exe" -CommandLine "churn2.exe 2"
+    New-TestProcess -Index 157 -ProcId 7408 -ParentId 4000 -Create $capture.AddSeconds(-125) -Exit 0 -Threads 4 -Name "early.exe" -CommandLine "early.exe 3"
+    New-TestProcess -Index 158 -ProcId 7412 -ParentId 4000 -Create $capture.AddSeconds(-90) -Exit 0 -Threads 4 -Name "loop.exe" -CommandLine "loop.exe 4"
     $reused = New-Object byte[] 0x900
     $reused[0] = 28
     Set-TestUInt64 -Bytes $reused -Offset $fakeOffsets.UniqueProcessId -Value ([uint64]0x123456789)
@@ -1924,7 +1944,7 @@ try {
         Add-TestRegion -Process 0 -Start $threadAddress -Bytes $thread
         , @($threadId, $threadAddress)
     }
-    Set-TestLinks -Index 153 -Flink (Get-TestLinkAddress 153) -Blink (Get-TestLinkAddress 153)
+    foreach ($selfLinked in @(153, 155, 156, 157, 158)) { Set-TestLinks -Index $selfLinked -Flink (Get-TestLinkAddress $selfLinked) -Blink (Get-TestLinkAddress $selfLinked) }
     $defaultOrder = [int[]](0..145)
     # Every process at its ID, and the threads
     $defaultCid = @($procs | Where-Object { $_.Index -le 145 -and $_.ProcId -gt 0 } | ForEach-Object { , @($_.ProcId, $_.E) }) + @($threadEntries)
@@ -2004,7 +2024,7 @@ try {
         param([System.Collections.IDictionary]$Arguments)
         $script:testWorkerState = New-DbgEngWorkerState
         $script:workerArguments = $Arguments
-        $workerResult = Read-DbgEngDump -DumpPath $Arguments["DumpPath"] -EngineFolder $Arguments["EngineFolder"] -EngineDlls @("$($Arguments['EngineDlls'])" -split ',') -SymbolCache $Arguments["SymbolCache"] -JobFolder $Arguments["JobFolder"] -CaptureStart $Arguments["CaptureStart"]
+        $workerResult = Read-DbgEngDump -DumpPath $Arguments["DumpPath"] -EngineFolder $Arguments["EngineFolder"] -EngineDlls @("$($Arguments['EngineDlls'])" -split ',') -SymbolCache $Arguments["SymbolCache"] -JobFolder $Arguments["JobFolder"] -CaptureStart $Arguments["CaptureStart"] -CaptureEnd $Arguments["CaptureEnd"]
         Write-DbgEngWorkerResult $workerResult
         $script:testWorkerState.ExitCode = 0
         return $script:testWorkerState
@@ -2082,7 +2102,7 @@ try {
     $idle = @($run.Rows | Where-Object { $_ -match 'Idle' })
     Assert-Equal -Name "debugger engine, a whole analysis: 146 pslist and 141 cmdline rows, a 32,767-character command line whole, no command line row for kernel, exited, empty and partly paged-out processes, no idle process" -Expected "146|141|1|32772|0|0" -Actual "$(@($run.Rows | Where-Object { $_.StartsWith('Memory-Processes|') }).Count)|$(@($run.Rows | Where-Object { $_.StartsWith('Memory-CommandLine|') }).Count)|$($longRow.Count)|$(if ($longRow.Count) { $longRow[0].Details.Length })|$($noRows.Count)|$($idle.Count)"
     Assert-Equal -Name "debugger engine, a whole analysis: the result, one session opened and closed, one download, the work folder removed, the dump as RawPath on every row" -Expected "287|146|141|||1|1|1|False|0" -Actual "$($run.Result.Entries)|$($run.Result.Processes)|$($run.Result.CommandLines)|$($run.Result.Reason)|$($run.Result.PartialReason)|$($run.Opened)|$($run.Closed)|$($run.Downloads)|$($run.JobLeft)|$(@($run.Entries | Where-Object { $_.RawPath -ne $engineDump -or $_.Artifact -ne 'MemoryDump' }).Count)"
-    Assert-Equal -Name "debugger engine: the helper's arguments (the engine, the symbol cache in tools\, the work folder, the capture start from the dump header in UTC) and the empty symbol and extension folders" -Expected "C:\stub|dbgeng.dll|$engineDump|True|True|$symbolRoot|$(Join-Path $script:runScratchDir 'dbgeng')|2026-10-11T00:09:00.0000000Z" -Actual "$($script:openedWith)|$($script:workerArguments['SymbolCache'])|$($script:workerArguments['JobFolder'])|$($script:workerArguments['CaptureStart'])"
+    Assert-Equal -Name "debugger engine: the helper's arguments (the engine, the symbol cache in tools\, the work folder, the capture start from the dump header and its end from the file's last write, in UTC) and the empty symbol and extension folders" -Expected "C:\stub|dbgeng.dll|$engineDump|True|True|$symbolRoot|$(Join-Path $script:runScratchDir 'dbgeng')|2026-10-11T00:09:00.0000000Z|2026-10-11T00:11:00.0000000Z" -Actual "$($script:openedWith)|$($script:workerArguments['SymbolCache'])|$($script:workerArguments['JobFolder'])|$($script:workerArguments['CaptureStart'])|$($script:workerArguments['CaptureEnd'])"
     $expectedLog = @(
         "  Debugger engine: dbgeng.dll 10.0.26100.1 from C:\stub (part of Windows)",
         "  Downloading the Windows kernel symbol file (about 10 MB) from Microsoft's symbol server: https://msdl.microsoft.com/download/symbols/ntkrnlmp.pdb/$kernelKey/ntkrnlmp.pdb",
@@ -2202,7 +2222,7 @@ try {
     Set-TestUInt64 -Bytes $script:blocks[142] -Offset $fakeOffsets.UniqueProcessId -Value ([uint64]4)
     $changedRun = Invoke-TestEngineRun
     Reset-TestKernel
-    $changedNote = "3 processes have a process ID that Windows did not give them (PID 0 at 0xffffa0000008c000, an ID only the idle process has, held in the process ID table under ID 6560; PID 6566 at 0xffffa0000008d000, not a multiple of 4 as Windows gives them, held in the process ID table under ID 6564; PID 4 at 0xffffa0000008e000, held in the process ID table under ID 6568). Copying memory does not explain that, and a process whose ID was changed in memory, to hide or disguise it, looks like this. 146 processes were found, 146 of them by all three ways (walking the kernel's process list forwards, walking it backwards, and its process ID table)."
+    $changedNote = "3 processes have a process ID that Windows did not give them (PID 0 at 0xffffa0000008c000, an ID only the idle process has, held in the process ID table under ID 6560; PID 6566 at 0xffffa0000008d000, not a multiple of 4 as Windows gives them, held in the process ID table under ID 6564; PID 4 at 0xffffa0000008e000, held in the process ID table under ID 6568). Copying memory does not explain that, as they were created before the capture started, and a process whose ID was changed in memory, to hide or disguise it, looks like this. 146 processes were found, 146 of them by all three ways (walking the kernel's process list forwards, walking it backwards, and its process ID table)."
     $changedRows = @(
         "Memory-Processes|2026-10-10 23:59:00.000|ProcessCreation|Process in memory: proc140.exe (PID: 0, PPID: 4000)||Threads=2 SessionId=1 FoundBy=$allWays TableId=6560 Anomaly=ProcessIdChanged",
         "Memory-Processes|2026-10-10 23:59:00.000|ProcessCreation|Process in memory: proc141.exe (PID: 6566, PPID: 4000)||Threads=2 SessionId=1 FoundBy=$allWays TableId=6564 Anomaly=ProcessIdChanged",
@@ -2210,6 +2230,121 @@ try {
     )
     $changedMissing = @($changedRows | Where-Object { $changedRun.Rows -cnotcontains $_ })
     Assert-Equal -Name "process IDs changed in memory (0, 6566, System's 4): 146 rows, each marked with the table's ID, what each way found, the warning names them first, read back by the findings report" -Expected "|146|3|True|$changedNote" -Actual "$($changedMissing -join ' / ')|$(@($changedRun.Rows | Where-Object { $_.StartsWith('Memory-Processes|') }).Count)|$(@($changedRun.Rows | Where-Object { $_.Contains('Anomaly=') }).Count)|$($changedRun.Log.Contains("    Processes found: 146; the kernel's process list walked forwards 146, backwards 146, in its process ID table 146, in the debugger engine's own list 146`r`n"))|$((Read-ReportEngineBuilderLog -Path $changedRun.LogFile).MemoryDumpProcessList)"
+
+    # Capture churn (a real dump's shape, of a computer busy with short-lived
+    # processes): three processes only in the process ID table, each under
+    # the ID of a process that is not in the dump, one created 20 s after
+    # the capture started and two 0.78 s and 90 s before it (within the
+    # 120-second churn margin): listed with FoundBy= and TableId=, not
+    # marked, and counted as capture churn in the warning (never "copying
+    # memory does not explain"), which the findings report reads back
+    $churnAddress = @{}
+    foreach ($i in 155..158) { $churnAddress[$i] = $eprocessBase + [uint64]($i * 0x1000) }
+    $churnCid = $defaultCid + @(@(7500, $churnAddress[155]), @(7600, $churnAddress[156]), @(7800, $churnAddress[158]))
+    Set-TestCidTable -Entries $churnCid
+    $churnRun = Invoke-TestEngineRun
+    Reset-TestKernel
+    $churnNote = "3 processes are capture churn, started while memory was being copied (or at most 120 seconds before it), with stale process ID table entries (PID 7400 at 0xffffa0000009b000, held in the process ID table under ID 7500; PID 7404 at 0xffffa0000009c000, held in the process ID table under ID 7600; PID 7412 at 0xffffa0000009e000, held in the process ID table under ID 7800). The process ID table and a process's memory are copied at different moments, and a short-lived process that ends in between leaves its ID or its memory to a new process, so copying memory explains this; they are not marked. 149 processes were found, 146 of them by all three ways (walking the kernel's process list forwards, walking it backwards, and its process ID table), 3 only in the process ID table (PID 7400, created after the capture started; PID 7404, created at most 120 seconds before the capture started; PID 7412, created at most 120 seconds before the capture started). The debugger engine's own process list (dx @`$cursession.Processes in WinDbg) has 146 entries."
+    $churnRows = @(
+        "Memory-Processes|2026-10-11 00:09:20.000|ProcessCreation|Process in memory: churn1.exe (PID: 7400, PPID: 4000)||Threads=4 SessionId=1 FoundBy=ProcessIdTable TableId=7500",
+        "Memory-Processes|2026-10-11 00:08:59.220|ProcessCreation|Process in memory: churn2.exe (PID: 7404, PPID: 4000)||Threads=4 SessionId=1 FoundBy=ProcessIdTable TableId=7600",
+        "Memory-Processes|2026-10-11 00:07:30.000|ProcessCreation|Process in memory: loop.exe (PID: 7412, PPID: 4000)||Threads=4 SessionId=1 FoundBy=ProcessIdTable TableId=7800",
+        "Memory-CommandLine|$captureRowTime|Snapshot|Process command line: churn1.exe (PID: 7400)||Args=churn1.exe 1",
+        "Memory-CommandLine|$captureRowTime|Snapshot|Process command line: churn2.exe (PID: 7404)||Args=churn2.exe 2",
+        "Memory-CommandLine|$captureRowTime|Snapshot|Process command line: loop.exe (PID: 7412)||Args=loop.exe 4"
+    )
+    Assert-Equal -Name "capture churn (created 20 s after the capture started, 0.78 s and 90 s before it, only in the process ID table under another ID): every row of the consistent dump and their own, FoundBy= and TableId=, no Anomaly=" -Expected ((@($run.Rows) + $churnRows | Sort-Object) -join "`n") -Actual (Get-TestSortedRows $churnRun)
+    Assert-Equal -Name "capture churn: what each way found, the warning counts them as capture churn and says copying explains it (not 'does not explain'), read back by the findings report" -Expected "True|True|False|$churnNote" -Actual "$($churnRun.Log.Contains("    Processes found: 149; the kernel's process list walked forwards 146, backwards 146, in its process ID table 149, in the debugger engine's own list 146`r`n"))|$($churnRun.Log.Contains("WARNING:   Memory dump process list: $churnNote`r`n"))|$($churnRun.Log.Contains('does not explain'))|$((Read-ReportEngineBuilderLog -Path $churnRun.LogFile).MemoryDumpProcessList)"
+    # Just outside the churn margin (created 125 s before the capture
+    # started, only in the table under another ID, no exit time, the walks
+    # complete): judged as before, both marks, named first
+    Set-TestCidTable -Entries ($defaultCid + @(, @(7700, $churnAddress[157])))
+    $earlyRun = Invoke-TestEngineRun
+    Reset-TestKernel
+    $earlyNote = "PID 7408 is in neither walk of the kernel's process list, only in its process ID table, yet it was created before the capture started and has no exit time. Copying memory does not explain that, as a process leaves the list only when it ends, and a process hidden from the list (unlinked from it) looks exactly like this. 1 process has a process ID that Windows did not give it (PID 7408 at 0xffffa0000009d000, held in the process ID table under ID 7700). Copying memory does not explain that, as it was created before the capture started, and a process whose ID was changed in memory, to hide or disguise it, looks like this. 147 processes were found, 146 of them by all three ways (walking the kernel's process list forwards, walking it backwards, and its process ID table), 1 only in the process ID table (PID 7408). The debugger engine's own process list (dx @`$cursession.Processes in WinDbg) has 146 entries."
+    Assert-Equal -Name "a process created 125 s before the capture started (outside the churn margin), only in the table under another ID: marked NotInProcessList and ProcessIdChanged, named first, read back by the findings report" -Expected "1|1|$earlyNote" -Actual "$(@($earlyRun.Rows | Where-Object { $_.EndsWith('Process in memory: early.exe (PID: 7408, PPID: 4000)||Threads=4 SessionId=1 FoundBy=ProcessIdTable TableId=7700 Anomaly=NotInProcessList,ProcessIdChanged') }).Count)|$(@($earlyRun.Rows | Where-Object { $_.Contains('Anomaly=') }).Count)|$((Read-ReportEngineBuilderLog -Path $earlyRun.LogFile).MemoryDumpProcessList)"
+    # No capture start (the dump's time is its file's): process IDs changed
+    # in long-lived processes and the churn alike are listed with TableId=,
+    # named, and not marked; the warning says they cannot be judged
+    $engineDumpInfo.TimeSource = "dump file last-write time"
+    Set-TestUInt64 -Bytes $script:blocks[140] -Offset $fakeOffsets.UniqueProcessId -Value ([uint64]0)
+    Set-TestUInt64 -Bytes $script:blocks[141] -Offset $fakeOffsets.UniqueProcessId -Value ([uint64]6566)
+    Set-TestUInt64 -Bytes $script:blocks[142] -Offset $fakeOffsets.UniqueProcessId -Value ([uint64]4)
+    Set-TestCidTable -Entries $churnCid
+    try { $noStartChangedRun = Invoke-TestEngineRun }
+    finally { $engineDumpInfo.TimeSource = $savedSource; Reset-TestKernel }
+    $noStartChangedNote = "6 processes have a process ID that does not fit (PID 0 at 0xffffa0000008c000, an ID only the idle process has, held in the process ID table under ID 6560; PID 6566 at 0xffffa0000008d000, not a multiple of 4 as Windows gives them, held in the process ID table under ID 6564; PID 4 at 0xffffa0000008e000, held in the process ID table under ID 6568; PID 7400 at 0xffffa0000009b000, held in the process ID table under ID 7500; PID 7404 at 0xffffa0000009c000, held in the process ID table under ID 7600; PID 7412 at 0xffffa0000009e000, held in the process ID table under ID 7800). Whether copying memory explains that cannot be judged without the capture's start time (the time in the dump's header), so they are not marked. 149 processes were found, 146 of them by all three ways (walking the kernel's process list forwards, walking it backwards, and its process ID table), 3 only in the process ID table (PID 7400; PID 7404; PID 7412). The debugger engine's own process list (dx @`$cursession.Processes in WinDbg) has 146 entries."
+    Assert-Equal -Name "no capture start: changed process IDs and capture churn listed with TableId=, none marked, the warning says they cannot be judged (no 'does not explain'), read back by the findings report" -Expected "||6|0|False|$noStartChangedNote" -Actual "$($script:workerArguments['CaptureStart'])|$($script:workerArguments['CaptureEnd'])|$(@($noStartChangedRun.Rows | Where-Object { $_.Contains(' TableId=') }).Count)|$(@($noStartChangedRun.Rows | Where-Object { $_.Contains('Anomaly=') }).Count)|$($noStartChangedRun.Log.Contains('does not explain'))|$((Read-ReportEngineBuilderLog -Path $noStartChangedRun.LogFile).MemoryDumpProcessList)"
+    # A create time capture churn cannot have (none, or after the capture
+    # ended: the dump file's last write) on processes in the list that the
+    # table holds under another ID: marked, as before the churn margin
+    # existed; the warning says the time, never that copying explains it
+    $oddCid = @($defaultCid | Where-Object { $_[0] -ne 5016 -and $_[0] -ne 5020 }) + @(@(7776, ($eprocessBase + [uint64](7 * 0x1000))), @(7780, ($eprocessBase + [uint64](8 * 0x1000))))
+    Set-TestCidTable -Entries $oddCid
+    $oddRun = Invoke-TestEngineRun
+    Reset-TestKernel
+    $oddTimeSentence = "Capture churn is a process created between the capture's start and end (the time in the dump's header and the dump file's last-write time) or shortly before: one without a create time, or created after the capture ended, is not."
+    $oddNote = "2 processes have a process ID that Windows did not give them (PID 5016 at 0xffffa00000007000, held in the process ID table under ID 7776, without a create time; PID 5020 at 0xffffa00000008000, held in the process ID table under ID 7780, created after the capture ended). Copying memory does not explain that, and a process whose ID was changed in memory, to hide or disguise it, looks like this. $oddTimeSentence 146 processes were found, 146 of them by all three ways (walking the kernel's process list forwards, walking it backwards, and its process ID table)."
+    $oddRows = @(
+        "Memory-Processes|$captureRowTime|Snapshot|Process in memory: notime.exe (PID: 5016, PPID: 4000)||Threads=1 SessionId=1 FoundBy=$allWays TableId=7776 Anomaly=ProcessIdChanged",
+        "Memory-Processes|$captureRowTime|Snapshot|Process in memory: future.exe (PID: 5020, PPID: 4000)||Threads=1 SessionId=1 CreateTime=2026-10-12 00:11:01.000 FoundBy=$allWays TableId=7780 Anomaly=ProcessIdChanged"
+    )
+    Assert-Equal -Name "process IDs changed on processes without a create time and created a day after the capture ended (in the list, held in the table under another ID): both marked ProcessIdChanged, the warning says their times and that they are not capture churn, read back by the findings report" -Expected "|2|False|$oddNote" -Actual "$(@($oddRows | Where-Object { $oddRun.Rows -cnotcontains $_ }) -join ' / ')|$(@($oddRun.Rows | Where-Object { $_.Contains('Anomaly=') }).Count)|$($oddRun.Log.Contains('copying memory explains'))|$((Read-ReportEngineBuilderLog -Path $oddRun.LogFile).MemoryDumpProcessList)"
+    # The same two unlinked from the list (only in the table, under their
+    # own IDs): marked NotInProcessList
+    Set-TestProcessList -Order ([int[]]@($defaultOrder | Where-Object { $_ -ne 7 -and $_ -ne 8 }))
+    $oddHiddenRun = Invoke-TestEngineRun
+    Reset-TestKernel
+    $oddHiddenNote = "PIDs 5016 (no create time) and 5020 (created after the capture ended) are in neither walk of the kernel's process list, only in its process ID table, yet they have no exit time and were not created while memory was being copied. Copying memory does not explain that, as a process leaves the list only when it ends, and a process hidden from the list (unlinked from it) looks exactly like this. $oddTimeSentence 146 processes were found, 144 of them by all three ways (walking the kernel's process list forwards, walking it backwards, and its process ID table), 2 only in the process ID table (PID 5016; PID 5020)."
+    $oddHiddenRows = @(
+        "Memory-Processes|$captureRowTime|Snapshot|Process in memory: notime.exe (PID: 5016, PPID: 4000)||Threads=1 SessionId=1 FoundBy=ProcessIdTable Anomaly=NotInProcessList",
+        "Memory-Processes|$captureRowTime|Snapshot|Process in memory: future.exe (PID: 5020, PPID: 4000)||Threads=1 SessionId=1 CreateTime=2026-10-12 00:11:01.000 FoundBy=ProcessIdTable Anomaly=NotInProcessList"
+    )
+    Assert-Equal -Name "processes without a create time and created after the capture ended, unlinked from the list (only in the table): both marked NotInProcessList, named first with their times, read back by the findings report" -Expected "|2|True|$oddHiddenNote" -Actual "$(@($oddHiddenRows | Where-Object { $oddHiddenRun.Rows -cnotcontains $_ }) -join ' / ')|$(@($oddHiddenRun.Rows | Where-Object { $_.Contains('Anomaly=') }).Count)|$($oddHiddenRun.Log.Contains("    Processes found: 146; the kernel's process list walked forwards 144, backwards 144, in its process ID table 146, in the debugger engine's own list 146`r`n"))|$((Read-ReportEngineBuilderLog -Path $oddHiddenRun.LogFile).MemoryDumpProcessList)"
+    # IDs a stale entry of the process ID table cannot give, on processes
+    # created during the copy that the list walks find and the table does
+    # not hold: one that is not a multiple of 4 (new.exe) and 0 (churn1.exe)
+    # are marked; 0 on a process the table holds under another ID
+    # (churn2.exe) is capture churn
+    Set-TestProcessList -Order ([int[]]($defaultOrder + @(152, 155)))
+    Set-TestUInt64 -Bytes $script:blocks[152] -Offset $fakeOffsets.UniqueProcessId -Value ([uint64]7101)
+    Set-TestUInt64 -Bytes $script:blocks[155] -Offset $fakeOffsets.UniqueProcessId -Value ([uint64]0)
+    Set-TestUInt64 -Bytes $script:blocks[156] -Offset $fakeOffsets.UniqueProcessId -Value ([uint64]0)
+    Set-TestCidTable -Entries ($defaultCid + @(, @(7600, $churnAddress[156])))
+    try { $idRun = Invoke-TestEngineRun }
+    finally {
+        Reset-TestKernel
+        Set-TestLinks -Index 152 -Flink 0 -Blink 0
+        Set-TestLinks -Index 155 -Flink (Get-TestLinkAddress 155) -Blink (Get-TestLinkAddress 155)
+    }
+    $idNote = "2 processes have a process ID that Windows did not give them (PID 7101 at 0xffffa00000098000, not a multiple of 4 as Windows gives them, created during the copy or shortly before it; PID 0 at 0xffffa0000009b000, an ID only the idle process has, created during the copy or shortly before it). Copying memory does not explain that, and a process whose ID was changed in memory, to hide or disguise it, looks like this. 1 process is capture churn, started while memory was being copied (or at most 120 seconds before it), with a stale process ID table entry (PID 0 at 0xffffa0000009c000, an ID only the idle process has, held in the process ID table under ID 7600). The process ID table and a process's memory are copied at different moments, and a short-lived process that ends in between leaves its ID or its memory to a new process, so copying memory explains this; it is not marked. 149 processes were found, 146 of them by all three ways (walking the kernel's process list forwards, walking it backwards, and its process ID table), 2 not in the process ID table, 1 only in the process ID table (PID 0, created at most 120 seconds before the capture started). The debugger engine's own process list (dx @`$cursession.Processes in WinDbg) has 146 entries."
+    $idRows = @(
+        "Memory-Processes|2026-10-11 00:09:30.000|ProcessCreation|Process in memory: new.exe (PID: 7101, PPID: 4000)||Threads=1 SessionId=1 FoundBy=ListForward,ListBackward Anomaly=ProcessIdChanged",
+        "Memory-Processes|2026-10-11 00:09:20.000|ProcessCreation|Process in memory: churn1.exe (PID: 0, PPID: 4000)||Threads=4 SessionId=1 FoundBy=ListForward,ListBackward Anomaly=ProcessIdChanged",
+        "Memory-Processes|2026-10-11 00:08:59.220|ProcessCreation|Process in memory: churn2.exe (PID: 0, PPID: 4000)||Threads=4 SessionId=1 FoundBy=ProcessIdTable TableId=7600"
+    )
+    Assert-Equal -Name "created during the copy, an ID not a multiple of 4 and 0 without a table entry: marked ProcessIdChanged; 0 held in the table under another ID: capture churn, not marked; the warning, read back by the findings report" -Expected "|2|$idNote" -Actual "$(@($idRows | Where-Object { $idRun.Rows -cnotcontains $_ }) -join ' / ')|$(@($idRun.Rows | Where-Object { $_.Contains('Anomaly=') }).Count)|$((Read-ReportEngineBuilderLog -Path $idRun.LogFile).MemoryDumpProcessList)"
+    # The dump file's last write before the header's time (no capture end):
+    # a process created after the capture started cannot be judged (named,
+    # not marked); those created within the margin before it are churn
+    $savedEnd = $engineDumpInfo.LastWriteUtc
+    $engineDumpInfo.LastWriteUtc = $capture.AddMinutes(-1)
+    Set-TestCidTable -Entries $churnCid
+    try { $noEndRun = Invoke-TestEngineRun }
+    finally { $engineDumpInfo.LastWriteUtc = $savedEnd; Reset-TestKernel }
+    $noEndNote = "1 process has a process ID that does not fit (PID 7400 at 0xffffa0000009b000, held in the process ID table under ID 7500). Whether copying memory explains that cannot be judged without the capture's end time (the dump file's last-write time), as it was created after the capture started, so it is not marked. 2 processes are capture churn, started while memory was being copied (or at most 120 seconds before it), with stale process ID table entries (PID 7404 at 0xffffa0000009c000, held in the process ID table under ID 7600; PID 7412 at 0xffffa0000009e000, held in the process ID table under ID 7800). The process ID table and a process's memory are copied at different moments, and a short-lived process that ends in between leaves its ID or its memory to a new process, so copying memory explains this; they are not marked. 149 processes were found, 146 of them by all three ways (walking the kernel's process list forwards, walking it backwards, and its process ID table), 3 only in the process ID table (PID 7400; PID 7404, created at most 120 seconds before the capture started; PID 7412, created at most 120 seconds before the capture started). The debugger engine's own process list (dx @`$cursession.Processes in WinDbg) has 146 entries."
+    Assert-Equal -Name "no capture end (the dump file's last write before the header's time): no end passed, the process created after the start cannot be judged, the two before it are churn, none marked, read back by the findings report" -Expected "2026-10-11T00:09:00.0000000Z||3|0|False|$noEndNote" -Actual "$($script:workerArguments['CaptureStart'])|$($script:workerArguments['CaptureEnd'])|$(@($noEndRun.Rows | Where-Object { $_.Contains(' TableId=') }).Count)|$(@($noEndRun.Rows | Where-Object { $_.Contains('Anomaly=') }).Count)|$($noEndRun.Log.Contains('does not explain'))|$((Read-ReportEngineBuilderLog -Path $noEndRun.LogFile).MemoryDumpProcessList)"
+    # When a process was created, against the capture (the margin, the
+    # end's slack, no end, an end before the start, no start), and what a
+    # process ID that does not fit gets for each
+    $startTime = $capture.ToFileTimeUtc()
+    $endTime = $acquisitionEnd.ToFileTimeUtc()
+    $second = [long]10000000
+    $whenCases = @(@(0, $startTime, $endTime), @(-5, $startTime, $endTime), @(($startTime - 120 * $second - 1), $startTime, $endTime), @(($startTime - 120 * $second), $startTime, $endTime), @($startTime, $startTime, $endTime),
+        @(($endTime + 2 * $second), $startTime, $endTime), @(($endTime + 2 * $second + 1), $startTime, $endTime), @(($startTime + $second), $startTime, 0), @(($startTime - $second), $startTime, 0), @(($startTime + $second), $startTime, ($startTime - 1)), @($startTime, 0, $endTime))
+    Assert-Equal -Name "Get-DbgEngCreateWhen: no create time, before the 120-second margin, at it, at the start, up to 2 s after the end, past it, no end (after and before the start), an end before the start, no start" -Expected "NoTime|NoTime|Before|Churn|Churn|Churn|Late|NoEnd|Churn|NoEnd|" -Actual ((@($whenCases | ForEach-Object { Get-DbgEngCreateWhen -CreateTime $_[0] -CaptureFileTime $_[1] -CaptureEndFileTime $_[2] })) -join "|")
+    $verdictCases = @(@("Table", 1, ""), @("Table", 1, "Before"), @("Table", 1, "Churn"), @("Table", 1, "NoTime"), @("Table", 1, "Late"), @("Table", 1, "NoEnd"), @("Zero", 1, "Churn"), @("Zero", 0, "Churn"), @("Zero", 0, "NoEnd"), @("Invalid", 1, "Churn"), @("Invalid", 0, ""), @("Invalid", 0, "NoEnd"))
+    Assert-Equal -Name "Get-DbgEngIdChangeVerdict: a stale-entry shape (Table, Zero held under an ID) is churn only when created during the copy, not judged without a start or end; 0 without a table entry and an ID not a multiple of 4 are marked whenever the start is known" -Expected "Unjudged|Marked|Churn|Marked|Marked|Unjudged|Churn|Marked|Marked|Marked|Unjudged|Marked" -Actual ((@($verdictCases | ForEach-Object { Get-DbgEngIdChangeVerdict -Kind $_[0] -TableIdCount $_[1] -When $_[2] })) -join "|")
 
     # The process ID table changed during the copy: an entry that holds a
     # process also held under its own ID (said, TableId=, not marked), and
@@ -2310,6 +2445,14 @@ try {
     $manyMissed = @(1..12 | ForEach-Object { [PSCustomObject]@{ Pid = 8000 + 4 * $_; Why = $(if ($_ -eq 1) { "Exited" } else { "" }) } })
     $manyText = Get-DbgEngScanText -Forward (& $fakeWalk 10 0) -Backward (& $fakeWalk 10 0) -Cid ([PSCustomObject]@{ Entries = @(1..22); Error = ""; UnreadablePages = 0 }) -Methods ([int[]](@(7) * 10 + @(4) * 12)) -Missed $manyMissed
     Assert-Equal -Name "Get-DbgEngScanText: 12 processes only in the process ID table, 10 of them named (one that had exited said so), then how many more" -Expected "22 processes were found, 10 of them by all three ways (walking the kernel's process list forwards, walking it backwards, and its process ID table), 12 only in the process ID table (PID 8004, which had exited; PID 8008; PID 8012; PID 8016; PID 8020; PID 8024; PID 8028; PID 8032; PID 8036; PID 8040; and 2 more)." -Actual $manyText.Note
+    # One process ID that cannot be judged and one process of capture churn:
+    # the wording for one, the one that cannot be judged first
+    $oneChanges = @(
+        [PSCustomObject]@{ Address = [Convert]::ToUInt64("ffffa00000002000", 16); Pid = 8010; Kind = "Invalid"; TableIds = @(); When = "" },
+        [PSCustomObject]@{ Address = [Convert]::ToUInt64("ffffa00000001000", 16); Pid = 8004; Kind = "Table"; TableIds = @(8100); When = "Churn" }
+    )
+    $oneText = Get-DbgEngScanText -Forward (& $fakeWalk 10 0) -Backward (& $fakeWalk 10 0) -Cid ([PSCustomObject]@{ Entries = @(1..11); Error = ""; UnreadablePages = 0 }) -Methods ([int[]](@(7) * 10 + @(4))) -Missed @([PSCustomObject]@{ Pid = 8004; Why = "JustBefore" }) -IdChanges $oneChanges
+    Assert-Equal -Name "Get-DbgEngScanText: one process ID that cannot be judged, then one process of capture churn (created within the margin before the capture started), in the singular; the churn margin is 120 seconds" -Expected "1 process has a process ID that does not fit (PID 8010 at 0xffffa00000002000, not a multiple of 4 as Windows gives them). Whether copying memory explains that cannot be judged without the capture's start time (the time in the dump's header), so it is not marked. 1 process is capture churn, started while memory was being copied (or at most 120 seconds before it), with a stale process ID table entry (PID 8004 at 0xffffa00000001000, held in the process ID table under ID 8100). The process ID table and a process's memory are copied at different moments, and a short-lived process that ends in between leaves its ID or its memory to a new process, so copying memory explains this; it is not marked. 11 processes were found, 10 of them by all three ways (walking the kernel's process list forwards, walking it backwards, and its process ID table), 1 only in the process ID table (PID 8004, created at most 120 seconds before the capture started).|120" -Actual "$($oneText.Note)|$(Get-DbgEngChurnSeconds)"
     $wordCases = @(@(, "a"), @("a", "b"), @("a", "b", "c"), @(1..12 | ForEach-Object { "$_" }))
     Assert-Equal -Name "Join-DbgEngWords: one, two, three, and more than 10 items; with semicolons" -Expected "a|a and b|a, b and c|1, 2, 3, 4, 5, 6, 7, 8, 9, 10 and 2 more|a, x; b|1; 2; 3; 4; 5; 6; 7; 8; 9; 10; and 2 more" -Actual ((@($wordCases | ForEach-Object { Join-DbgEngWords -Items $_ }) + @((Join-DbgEngWords -Items @("a, x", "b") -Semicolons), (Join-DbgEngWords -Items @(1..12 | ForEach-Object { "$_" }) -Semicolons))) -join "|")
     $startCases = @("2026-10-11T05:08:35.9341509Z", "", "not a time", "2026-10-11T05:08:35.9341509+02:00", "1601-01-01T00:00:00.0000000Z")
@@ -2389,8 +2532,8 @@ try {
     $cannedHelper = Join-Path $engineDir "canned helper.ps1"
     $cannedFunction = @'
 function Read-DbgEngDump {
-    param([string]$DumpPath, [string]$EngineFolder, [string[]]$EngineDlls, [string]$SymbolCache, [string]$JobFolder, [string]$CaptureStart)
-    Write-DbgEngLog "  canned: $DumpPath|$EngineFolder|$($EngineDlls -join '+')|$SymbolCache|$JobFolder|$CaptureStart"
+    param([string]$DumpPath, [string]$EngineFolder, [string[]]$EngineDlls, [string]$SymbolCache, [string]$JobFolder, [string]$CaptureStart, [string]$CaptureEnd)
+    Write-DbgEngLog "  canned: $DumpPath|$EngineFolder|$($EngineDlls -join '+')|$SymbolCache|$JobFolder|$CaptureStart|$CaptureEnd"
     Write-DbgEngLog -Warning "  canned warning"
     $result = New-DbgEngResult
     $text = "say ""hi""|there`ttab`r`nnext " + [string][char]0x00FC + [char]0x4E2D + [char]0x20AC + [char]0xD83D + [char]0xDE00 + [char]0xFFFE + " end"
@@ -2427,7 +2570,7 @@ function Read-DbgEngDump {
         "Memory-CommandLine|$captureRowTime|Snapshot|Process command line: long.exe (PID: 4400)|Args=$("y" * 32767)"
     )
     Assert-Equal -Name "the helper as a process: canned entries (non-ASCII, |, quotes, CR/LF, tab, a surrogate pair, U+FFFE, 32,767 characters) come through the pipe whole, as rows" -Expected ($expectedCanned -join "`n") -Actual ($cannedRows -join "`n")
-    $argumentLine = "  canned: $engineDump|C:\stub dir|dbgeng.dll|$symbolRoot|$(Join-Path $script:runScratchDir 'dbgeng')|2026-10-11T00:09:00.0000000Z"
+    $argumentLine = "  canned: $engineDump|C:\stub dir|dbgeng.dll|$symbolRoot|$(Join-Path $script:runScratchDir 'dbgeng')|2026-10-11T00:09:00.0000000Z|2026-10-11T00:11:00.0000000Z"
     Assert-Equal -Name "the helper as a process: its arguments (spaces, [ ], non-ASCII), its log lines relayed (a warning too), the counts logged" -Expected "True|True|True|True|4" -Actual "$($cannedLog.Contains($argumentLine))|$($cannedLog.Contains('WARNING:   canned warning'))|$($cannedLog.Contains('    Processes (windows.pslist rows): 2 entries (1 timed, 1 snapshot); 1 list item(s) could not be read; session ids for 1'))|$($cannedLog.Contains('    Command lines (windows.cmdline rows): 2 entries; none for 2 kernel process(es) without a PEB, 3 not readable (paged out or exited), 4 empty; 1.5 s'))|$($cannedResult.Entries)"
     $script:logFile = Join-Path $workDir "engine-direct.log"
     $state = Start-DbgEngWorker -WorkerPath $cannedHelper -WorkingDirectory $engineDir -TimeoutSeconds 120 -Arguments ([ordered]@{ DumpPath = $engineDump; EngineFolder = "C:\x\"; EngineDlls = "a.dll,b.dll"; SymbolCache = "C:\y"; JobFolder = $engineDir })
@@ -2446,14 +2589,14 @@ function Read-DbgEngDump {
     )
     foreach ($case in $standIns) {
         $script:testHelperPath = Join-Path $engineDir "stand-in $($standIns.IndexOf($case)).ps1"
-        [System.IO.File]::WriteAllText($script:testHelperPath, "param([string]`$DumpPath, [string]`$EngineFolder, [string]`$EngineDlls, [string]`$SymbolCache, [string]`$JobFolder, [string]`$CaptureStart)`r`n$($case.Script)`r`n")
+        [System.IO.File]::WriteAllText($script:testHelperPath, "param([string]`$DumpPath, [string]`$EngineFolder, [string]`$EngineDlls, [string]`$SymbolCache, [string]`$JobFolder, [string]`$CaptureStart, [string]`$CaptureEnd)`r`n$($case.Script)`r`n")
         $script:logFile = Join-Path $workDir ("engine-stand-in-" + [guid]::NewGuid().ToString("N") + ".log")
         $standIn = Invoke-DbgEngMemoryAnalysis -DumpPath $engineDump -DumpInfo $engineDumpInfo
         Assert-Equal -Name "the helper as a process, $($case.Name): the reason$(if ($case.Log) { ', its log line relayed' })" -Expected "$($case.Reason)|0|True" -Actual "$($standIn.Reason)|$($standIn.Entries)|$(-not $case.Log -or (Get-TestLog).Contains($case.Log))"
     }
     $script:testHelperPath = Join-Path $engineDir "stand-in hang.ps1"
     $pidFile = Join-Path $engineDir "hang.pid"
-    [System.IO.File]::WriteAllText($script:testHelperPath, "param([string]`$DumpPath, [string]`$EngineFolder, [string]`$EngineDlls, [string]`$SymbolCache, [string]`$JobFolder, [string]`$CaptureStart)`r`n[System.IO.File]::WriteAllText('$($pidFile.Replace("'", "''"))', `"`$PID`")`r`nStart-Sleep -Seconds 120`r`n")
+    [System.IO.File]::WriteAllText($script:testHelperPath, "param([string]`$DumpPath, [string]`$EngineFolder, [string]`$EngineDlls, [string]`$SymbolCache, [string]`$JobFolder, [string]`$CaptureStart, [string]`$CaptureEnd)`r`n[System.IO.File]::WriteAllText('$($pidFile.Replace("'", "''"))', `"`$PID`")`r`nStart-Sleep -Seconds 120`r`n")
     $script:dbgEngTimeoutSeconds = 4
     $hangTimer = [System.Diagnostics.Stopwatch]::StartNew()
     $hang = Invoke-DbgEngMemoryAnalysis -DumpPath $engineDump -DumpInfo $engineDumpInfo

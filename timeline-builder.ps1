@@ -17731,12 +17731,21 @@ function Invoke-DbgEngMemoryAnalysis {
     $timeout = 900
     if ($script:dbgEngTimeoutSeconds -gt 0) { $timeout = [int]$script:dbgEngTimeoutSeconds }
     $jobFolder = Join-Path (Get-ScratchFolder) "dbgeng"
-    # When the capture started (DumpIt writes it in the dump's header): the
-    # helper judges a process missing from the kernel's process list by it.
-    # A file time is when the capture ended, so it is not passed.
+    # When the capture started (DumpIt writes it in the dump's header) and
+    # ended (the dump file's last write): the helper judges a process
+    # missing from the kernel's process list, or held in its process ID
+    # table under another ID, by them (one created during the copy or
+    # shortly before it is capture churn, not marked). Without the header's
+    # time nothing is marked; a last-write time before it is not an end.
     $captureStart = ""
+    $captureEnd = ""
     if ($DumpInfo.TimeSource -eq "crash dump header" -and $DumpInfo.CaptureTimeUtc) {
-        $captureStart = [datetime]::SpecifyKind([datetime]$DumpInfo.CaptureTimeUtc, [DateTimeKind]::Utc).ToString("o", [System.Globalization.CultureInfo]::InvariantCulture)
+        $startUtc = [datetime]::SpecifyKind([datetime]$DumpInfo.CaptureTimeUtc, [DateTimeKind]::Utc)
+        $captureStart = $startUtc.ToString("o", [System.Globalization.CultureInfo]::InvariantCulture)
+        if ($DumpInfo.LastWriteUtc) {
+            $endUtc = [datetime]::SpecifyKind([datetime]$DumpInfo.LastWriteUtc, [DateTimeKind]::Utc)
+            if ($endUtc -ge $startUtc) { $captureEnd = $endUtc.ToString("o", [System.Globalization.CultureInfo]::InvariantCulture) }
+        }
     }
     $timer = [System.Diagnostics.Stopwatch]::StartNew()
     $state = $null
@@ -17744,7 +17753,7 @@ function Invoke-DbgEngMemoryAnalysis {
         [void][System.IO.Directory]::CreateDirectory($jobFolder)
         $state = Start-DbgEngWorker -WorkerPath $worker -WorkingDirectory $jobFolder -TimeoutSeconds $timeout -Arguments ([ordered]@{
                 DumpPath = $DumpPath; EngineFolder = $engine.Folder; EngineDlls = (@($engine.Dlls) -join ",")
-                SymbolCache = (Join-Path (Get-BuilderToolsFolder) "symbols"); JobFolder = $jobFolder; CaptureStart = $captureStart
+                SymbolCache = (Join-Path (Get-BuilderToolsFolder) "symbols"); JobFolder = $jobFolder; CaptureStart = $captureStart; CaptureEnd = $captureEnd
             })
     }
     catch {
