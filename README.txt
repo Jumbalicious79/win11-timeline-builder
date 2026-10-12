@@ -2204,7 +2204,17 @@ of WinDbg -- instead:
     path, never searched for. The builder runs the engine in a PowerShell
     process of its own (lib\memory\TimelineDbgEng.ps1), so a damaged dump
     that crashes or hangs the engine cannot stop the builder: that process
-    is ended after 15 minutes, and the dump is reported as not analyzed.
+    is ended after 15 minutes. The helper sends the processes and command
+    lines as soon as it has read them, before the other areas run (a
+    checkpoint line, "TBDBG|PCEND|<processes>|<command lines>"): when it
+    crashes or hangs after that (in one of the areas below; a crash of the
+    engine's native code cannot be caught inside the helper), the builder
+    keeps those rows, logs a warning ("The debugger engine helper stopped
+    with exit code 0xC0000005 after it had sent the processes and command
+    lines: they are used, the other memory areas are not read.") and every
+    area is "not read (the helper stopped with exit code ...)" or "not read
+    (the helper did not finish within 15 minutes)". When it stops before
+    that point, the dump is reported as not analyzed.
   - What is read (the same rows as Volatility's plugins, Source
     Memory-Processes and Memory-CommandLine):
       processes, as windows.pslist: PID, parent PID, name (the full file
@@ -2373,11 +2383,13 @@ of WinDbg -- instead:
     (TimelineDbgEng.Reader.ps1: reads through a page cache of at most
     64 MB, structure offsets only from the kernel's symbol file, a
     process's memory regions walked with the copy's inconsistencies
-    counted). The areas run after the command lines, one after the other in
+    counted). The areas run after the command lines (which the helper has
+    already sent to the builder by then, see above), one after the other in
     a fixed order, each with a time limit; then their results are combined
     and only then written. An area that fails, or whose file is missing or
     was blocked, is "not read" and the others go on; the processes and
-    command lines are never affected. The builder makes the rows of the
+    command lines are never affected, not even when the helper process
+    itself dies in an area. The builder makes the rows of the
     areas (lib\memory\TimelineMemoryRows.ps1: Snapshot rows at the capture
     time unless an entry has a valid time of its own, Details as
     "Key=value | Key=value", and every row of a process with
@@ -2387,8 +2399,11 @@ of WinDbg -- instead:
     seconds), and for an area read with gaps that a live copy leaves, an
     information line that the findings report shows as a coverage note:
       Memory dump coverage: <area> -- <what could not be read>
-    The areas, in the order they run (an area whose code is not there says
-    "not read (not built yet)"; a rule summary follows the list):
+    The areas, in the order they run (an area whose file is missing says
+    "not read (lib\memory\<file> is missing)", one whose file an antivirus
+    blocked "not read (lib\memory\<file> could not be loaded [<why>])", and
+    one whose file loaded without its code "not read (not built yet)"; a
+    rule summary follows the list):
       Process users and paths (ProcessDetails; lib\memory\
         TimelineDbgEng.Tokens.ps1 and TimelineDbgEng.ImagePaths.ps1): for
         each process, its token and where its program is. No rows of its
@@ -2553,6 +2568,13 @@ of WinDbg -- instead:
         way only (the kernel, hal and the libraries have no driver object and
         are never flagged), and only when a walk reached the list's end; a
         driver that also removed its driver object is not found this way.
+        Not marked either when an unload record (below) covers the driver
+        object's address with an unload time at or after 120 seconds before
+        the capture started (the process scan's capture churn margin): a
+        driver unloaded while the memory was copied, whose driver object was
+        copied before the unload and the module list after it. The log
+        counts such driver objects ("driver objects of drivers unloaded
+        during the capture") and a coverage note says so.
         The recently unloaded drivers are the kernel's own record of the last
         50 (nt!MmUnloadedDrivers): name, address range and time. The 24H2
         symbols do not describe that record, so its long-standing layout
@@ -2563,9 +2585,9 @@ of WinDbg -- instead:
         PERSIST-DRIVER-USERPATH (Medium) for a module under \Users\,
         \ProgramData\, a Temp folder or another user-writable folder. Measured
         on three 8 GB ARM64 dumps: 193/193/192 modules, 157/157/156 driver
-        objects (9 of them without a module entry), none hidden, every module
-        under C:\Windows\ (DumpIt's driver too), 18/14/10 unloaded drivers;
-        about 1 s.
+        objects (9 of them without a module entry), none hidden, none
+        explained by an unload record, every module under C:\Windows\
+        (DumpIt's driver too), 18/14/10 unloaded drivers; about 1 s.
       Handles (Handles; lib\memory\TimelineDbgEng.Handles.ps1): every
         process's handle table (EPROCESS.ObjectTable, one to three levels of
         4 KB pages) is decoded, each handle's object and type with it --
@@ -2590,7 +2612,12 @@ of WinDbg -- instead:
         Options (the loader keeps that key itself open in every process),
         or the Services key and a service's own key, its path from the key
         control block chain; and a named Mutant (mutex). Each is listed once
-        per process. Anomaly=:
+        per process, and at most 50 File and 50 Mutant entries (25 Key
+        entries) per process and 1,000 File, 2,000 Mutant and 500 Key
+        entries per dump are listed: a process that makes many named objects
+        cannot flood the timeline. The rest are counted ("named mutexes only
+        counted" in the log) and a coverage note says how many in how many
+        processes; on the three real dumps no cap was reached. Anomaly=:
           WriteAccessUnrelated  the holder runs as a user account (S-1-5-21-
                                 or S-1-12-1-...) and the target is not in its
                                 process family: not started by it or its
@@ -2610,6 +2637,25 @@ of WinDbg -- instead:
         handles in 188/182/173 tables, 955/939/887 rows (340/332/309
         process, 3/7/0 thread, 8/8/7 file, 57/53/50 key, 547/539/521
         mutex rows), 2.5-3.8 s.
+        Processes reached only through a handle: every Process handle's
+        object that no way of the process scan found (forward walk, backward
+        walk, process ID table) is read and judged as the scan judges a
+        process missing from the kernel's list, the classic cross view of a
+        process hidden by unlinking it. A process object (its type, a
+        process ID Windows gives, kernel addresses in its list links and
+        token) without an exit time, created more than 120 seconds before
+        the capture started, becomes a Memory-Processes row of its own:
+        "Process in memory: <name> (PID: n, PPID: n)", Details "Threads=
+        SessionId= FoundBy=HandleTable Anomaly=NotInProcessList
+        HeldBy=<PIDs of the processes holding the handles>", a lead of
+        INTEG-PROCESS-HIDDEN; a coverage note says how many. One that has
+        exited (a handle keeps an ended process's object), was created
+        during the copy or in the 120 seconds before it, or cannot be judged
+        (no capture start, no create time, or a process scan that did not
+        read the process ID table, such as the debugger engine's own list)
+        is only counted in the log. On
+        the three real dumps no Process handle reached a process object
+        outside the scan.
       Registry hives (Registry): the registry in memory; Source
         Memory-Registry. On Windows 11 the hives' data is mapped into the
         Registry process, so it is read there (in the process each hive's
@@ -2629,11 +2675,13 @@ of WinDbg -- instead:
             (HKU\<SID>, and .DEFAULT, the system account's): one row per
             value, "Run key value in memory: <name> [<key>]",
             PersistenceChange at the key's last write time (an older value
-            keeps that time), with Details Command= (the data as the
-            collector's run_keys.csv writes it, not expanded), Key=,
-            Time=key last write, OnDisk= (below), and Data=Unreadable when
-            the value is there but its data is not in the dump; User is the
-            hive's SID;
+            keeps that time), with Details "OnDisk=<below> | Key=<key> |
+            Time=key last write [| Data=Unreadable] | Command=<the data as
+            the collector's run_keys.csv writes it, not expanded>"
+            (Data=Unreadable when the value is there but its data is not in
+            the dump): the builder's own fields first and the value's data
+            last, so text in the data (" | OnDisk=Yes", say) never comes
+            before them; User is the hive's SID;
           - SYSTEM\<current control set>\Services: ImagePath, ServiceDll
             (of its Parameters key), Start, Type, ObjectName and
             DisplayName of each service key, with no rows of its own: the
@@ -2653,7 +2701,10 @@ of WinDbg -- instead:
         also look at these rows, except OnDisk=Yes ones (the on-disk row
         with the same command makes that lead), and
         PERSIST-RUNKEY-MEMORY-ONLY (Medium, Persistence) makes a lead of
-        each OnDisk=No value.
+        each OnDisk=No value. The rules read OnDisk= only at the start of
+        Details, where no other source's rows have it: a Run value whose
+        data holds " | OnDisk=Yes" (on disk or in memory) still makes its
+        lead.
         A live copy leaves much of the hives out (35-55% of their blocks
         were in the dumps this was built on): a key is called absent only
         when the subkey lists above it were read in full, else it was "not
@@ -2771,7 +2822,11 @@ of WinDbg -- instead:
         them: by the tag of each pool allocation (TTcb a connection, TcpL a
         listener, UdpA a UDP endpoint), in one read-only pass over the dump
         file itself (lib\memory\TimelineDbgEng.PoolScan.ps1), start to end,
-        16 MB at a time, on a thread of its own while the other areas run:
+        16 MB at a time, on a thread of its own while the other areas run
+        (a match whose pool header gives another allocation size than the
+        object's is counted and dropped right there, so memory filled with
+        these tags cannot take the place of real objects under the pass's
+        cap of 8192 hits per tag):
         about 10 seconds for an 8 GB dump on an internal SSD, longer from a
         USB drive. The pass has the area's time limit, 300 seconds; past it,
         what the part read holds is listed and the area is partly read
@@ -2789,7 +2844,7 @@ of WinDbg -- instead:
         of Windows build N are not known to this builder)". Appended to
         Details, in the same space style:
           FoundBy=PoolScan PoolTag=<TTcb|TcpL|UdpA> Stale=<Yes|No>
-          [RemoteScope=<Public|Private|Loopback|LinkLocal|Other>]
+          [Duplicate=Yes] [RemoteScope=<Public|Private|Loopback|LinkLocal|Other>]
           [OwnerCreated=<the owner's create time>] [Anomaly=OwnerHidden]
           [OwnerPath=<the owner's program path>]
         A scan of memory also finds objects that were freed. Stale=Yes: the
@@ -2802,18 +2857,31 @@ of WinDbg -- instead:
         Other, unspecified, multicast, broadcast and reserved or
         documentation ranges. Anomaly=OwnerHidden: the owner is a process
         row with Anomaly=NotInProcessList, or a process object no way of the
-        process scan found, without an exit time and created before the
-        capture started. A listener's foreign address is 0.0.0.0:0 or ::
-        port 0, a UDP endpoint's *:0 with an empty state. The User column
-        is the owner's account (from the process details area). An entry
-        found twice in memory (an old copy of the same object) gives the
-        same row twice, which the builder's duplicate check combines
-        (Occurrences=N). Counted in the log only: connections in TIME_WAIT
+        process scan found, without an exit time and created more than 120
+        seconds before the capture started (the process scan's capture
+        churn margin: a process that ended and was deleted while memory was
+        copied can leave its object copied before its exit; the log counts
+        owners within the margin). A listener's foreign address is 0.0.0.0:0
+        or :: port 0, a UDP endpoint's *:0 with an empty state. The User
+        column is the owner's account (from the process details area). The
+        owner's name and path (Process=, OwnerPath=) come from memory: a
+        " <Key>=" in them is written " <Key>%3D" (as "|" becomes %7C
+        elsewhere), so a name cannot add a field of its own such as
+        " Stale=Yes". Duplicate=Yes: the pass also finds whole-page copies
+        of pool pages (the dump file's own cache pages, for example), each a
+        snapshot of another moment of the capture; the second and later
+        copies of an object (the same owner, create time and ports at
+        another physical address) are listed with Duplicate=Yes, never
+        flagged, and a coverage note says how many (32/7/4 on the three real
+        dumps). Counted in the log only: connections in TIME_WAIT
         (TcTW; their local address is not read, and the coverage note says
         how many), sockets (AfdE), and objects of other sizes with these
         tags. The log has "The pass over the dump file: 8.0 GB in N s (the
-        whole file), Windows build 26100" and the area's counts. Leads:
+        whole file), Windows build 26100, allocation sizes checked during
+        the pass" and the area's counts. Leads:
           INTEG-NET-OWNER-HIDDEN (High): a connection of a hidden process
+            (never a Stale=Yes or Duplicate=Yes row, nor those of the next
+            two rules)
           EXEC-NET-LISTENER-USERPATH (Medium): a listener or UDP endpoint of
             a program in a user-writable folder (OwnerPath=)
           EXEC-NET-SCRIPTHOST-PUBLIC (Medium, switched off): an ESTABLISHED
@@ -2911,8 +2979,9 @@ of WinDbg -- instead:
     the URL and where to copy the file; when the engine does not accept the
     file it downloaded, or no folder for it can be written, the reason says
     so instead.
-  - Time: 11-13 seconds for an 8 GB dump on an internal disk (measured on
-    three 8 GB ARM64 dumps, in both PowerShell editions): opening the dump
+  - Time: 12-15 seconds for the helper on an 8 GB dump on an internal disk
+    (measured on three 8 GB ARM64 dumps, in both PowerShell editions; peak
+    memory of the helper process 340-410 MB): opening the dump
     and the processes about 3 s, the areas about 9 s one after the other,
     and the pass over the dump file for the network connections (5-8 s
     here; it is disk-bound, so a USB drive takes longer) on a thread of its
@@ -2920,8 +2989,9 @@ of WinDbg -- instead:
     (about 15 seconds). Each area has a time limit (30 s; DLLs and handles
     60 s; the pass over the dump file 300 s): an area that reaches it is
     partly read, with a coverage note, and the others go on. The whole
-    helper is stopped after 15 minutes. Memory: the page cache holds at
-    most 64 MB and the pass reads 16 MB at a time.
+    helper is stopped after 15 minutes (the processes and command lines it
+    sent before the areas are kept, see above). Memory: the page cache
+    holds at most 64 MB and the pass reads 16 MB at a time.
   - The log: "Windows ARM64 dump: analyzing it with Microsoft's debugger
     engine", the engine ("Debugger engine: dbgeng.dll <version> from
     <folder> (part of Windows)"), the symbol file, what each way found
@@ -2947,7 +3017,8 @@ of WinDbg -- instead:
     ("The memory dump is a Windows ARM64 dump, read with the Windows
     debugger engine: these were not read from it, so they are not in this
     report -- <what> (<why>), ..."), and when they were read, network
-    connections (a scan of memory that can include closed connections) and
+    connections (a scan of memory that can include closed connections and
+    second copies of the same object, Stale=Yes and Duplicate=Yes) and
     the registry in memory (partial: a key missing there is no proof it was
     absent) have caveats of their own. For -ReportOnly on a timeline of an
     older builder, whose line says "processes and command lines only;
@@ -4218,8 +4289,10 @@ parsing is skipped, and the timeline CSV can be opened manually.
   cannot open it), canned entries with every kind of character through the
   pipe, arguments with spaces, [ ], non-ASCII and a trailing backslash, a
   crash (exit code 0xC0000005), an error (its message), a hang (ended after
-  the time limit), output without its end, no helper, no engine. Nothing
-  is downloaded; no real dump is opened.
+  the time limit), output without its end, no helper, no engine; a crash
+  and a hang after the helper's checkpoint (its processes and command
+  lines kept as rows, every area "not read" with why, the warning).
+  Nothing is downloaded; no real dump is opened.
 
   tests\Test-MemoryFoundation.ps1 -- the shared layer of the Windows ARM64
   memory areas, on synthetic memory (no dump, no admin): every area file of
@@ -4237,8 +4310,10 @@ parsing is skipped, and the timeline CSV can be opened manually.
   the area dispatcher (the fixed order, "not built yet", a missing file,
   an area that fails before or after its entries, the time limit, the raw
   pass started and disposed, the joins after every area, no areas without
-  the reader); the protocol (P, C, E, AREA, END with three counts) read
-  back by the builder, bad E, AREA and END lines; the builder's process
+  the reader); the protocol (P, C, the checkpoint PCEND with two counts,
+  E, AREA, END with three counts; written in one go or in two parts, the
+  same lines) read back by the builder, bad E, AREA, PCEND and END lines;
+  the builder's process
   merge, User and ExtraDetails on the four Volatility-shaped row kinds,
   the rows of the areas' entries, and the "analyzed with" and coverage texts.
 
@@ -4276,7 +4351,9 @@ parsing is skipped, and the timeline CSV can be opened manually.
   \Driver and \FileSystem, a hidden driver, a driver object whose entry
   moved, one without a module, the walks cut one way and both ways, the
   recently unloaded drivers with times since boot and absolute ones, a slot
-  that fails its checks, a list whose layout does not fit); the handles
+  that fails its checks, a list whose layout does not fit, a hidden driver
+  whose unload record is from the capture's churn margin (not marked) and
+  one unloaded an hour before (marked)); the handles
   area (one- and two-level handle tables, a page not in the dump, every row
   kind and what is left out: rights that cannot change a process, parent
   and child, the System process, thread handles folded into a process row,
@@ -4284,11 +4361,17 @@ parsing is skipped, and the timeline CSV can be opened manually.
   with drive letters and relative names, key paths through hive mount
   points, Image File Execution Options and Services keys, named and unnamed
   mutexes, objects not in the dump, the holder's SID read from its token,
-  the lookup for the joins); the join that adds TargetHasPeCode
-  (TimelineDbgEng.Joins.ps1); missing symbols and the time limit; then the
-  builder's rows (Memory-Drivers, Memory-Handles through the protocol) and
-  the findings rules on them (INTEG-DRIVER-HIDDEN, PERSIST-DRIVER-USERPATH,
-  and the switched-off INTEG-HANDLE-WRITE-ACCESS switched on for the test).
+  the lookup for the joins, the caps of named entries (60 named mutexes in
+  one process, 50 listed, the rest counted and noted), process objects that
+  only handles reach (one hidden, with its holders; one exited, one created
+  30 s before the capture, one with a process ID Windows does not give,
+  one without the fields to judge it; nothing judged without the capture
+  start)); the join that adds TargetHasPeCode (TimelineDbgEng.Joins.ps1);
+  missing symbols and the time limit; then the builder's rows
+  (Memory-Drivers, Memory-Handles through the protocol, and the hidden
+  process as a Memory-Processes row) and the findings rules on them
+  (INTEG-DRIVER-HIDDEN, PERSIST-DRIVER-USERPATH, INTEG-PROCESS-HIDDEN, and
+  the switched-off INTEG-HANDLE-WRITE-ACCESS switched on for the test).
   Its rules' cases are in
   tests\fixtures\report\rules\cases-memory-kernelobjects.csv.
 
@@ -4330,8 +4413,8 @@ parsing is skipped, and the timeline CSV can be opened manually.
   Run values, the Services key offered to the joins, a key not in the dump
   against one that is absent, the time limit, the reasons it is not read,
   and then the rows through the builder's protocol reader, OnDisk= against
-  Persistence-RunKeys and Registry-UserRunKey rows, and the Run key rules on
-  them. Its rules' cases are in
+  Persistence-RunKeys and Registry-UserRunKey rows (first in Details, the
+  value's data last), and the Run key rules on them. Its rules' cases are in
   tests\fixtures\report\rules\cases-memory-registry.csv, and
   tests\fixtures\memory\canned-registry.txt gives tests\Test-ReportBuilder.ps1
   a hive and a Run value.
@@ -4339,17 +4422,21 @@ parsing is skipped, and the timeline CSV can be opened manually.
   tests\Test-MemoryNetwork.ps1 -- the network connections area: the dump
   file's layout (runs, physical addresses, a file cut short, the dumps it
   does not scan), the pass over the dump file on small synthetic full
-  memory dumps written to %TEMP% (each tag at its offset, a copy across
-  the pass's 16 MB reads, a run's end, the cap of 8192 hits per tag, the
-  time limit, passes that cannot start), the Network area on synthetic
-  kernel memory (connections, listeners and UDP endpoints in IPv4 and
-  IPv6; Stale=Yes for a closed entry, an exited owner, owner memory that
-  is not a process or is a later process's; OwnerHidden for a hidden
-  listed owner and for a process object found only through the
-  connection; the self-checks, a Windows build the table does not know,
-  the time limit, the counts and notes), its entries through the protocol
-  into the builder's rows, and those rows through the report engine's
-  Details parser and the network rules. The switched-off
+  memory dumps written to %TEMP% (each tag at its offset, a match of
+  another allocation size counted and not kept, a copy across the pass's
+  16 MB reads, a run's end, the cap of 8192 hits per tag, a flood of
+  matches of another size that does not crowd out a real object, the time
+  limit, passes that cannot start), the Network area on synthetic kernel
+  memory (connections, listeners and UDP endpoints in IPv4 and IPv6;
+  Stale=Yes for a closed entry, an exited owner, owner memory that is not
+  a process or is a later process's; OwnerHidden for a hidden listed owner
+  and for a process object found only through the connection, not for one
+  created within the capture churn margin; Duplicate=Yes for a whole-page
+  copy of a connection; the self-checks, a Windows build the table does
+  not know, the time limit, the counts and notes), its entries through the
+  protocol into the builder's rows, an owner's name and path holding
+  " <Key>=" written " <Key>%3D", and those rows through the report
+  engine's Details parser and the network rules. The switched-off
   EXEC-NET-SCRIPTHOST-PUBLIC is switched on in memory for its cases
   (tests\fixtures\memory\net-rules-switched-off.csv); the other rules'
   cases are in tests\fixtures\report\rules\cases-memory-network.csv.
@@ -4470,11 +4557,24 @@ parsing is skipped, and the timeline CSV can be opened manually.
   found); a log of a builder that could not analyze Windows ARM64 dumps
   says the timeline can be built again for that, and a Windows ARM64 dump
   read with the debugger engine (its "analyzed with the Windows debugger
-  engine" line, also "processes only") gives that note and a caveat that
-  its network connections and services are not in the report, with no
-  "not analyzed" note or caveat; its "Memory dump process list" warning (the
+  engine" line, also "processes only") gives that note and a caveat with
+  no "not analyzed" note or caveat: for an older builder's line ("network
+  connections and services are not read") the caveat that they are not in
+  the report, for this builder's line ("-- read ...; not read <area>
+  (<why>), ...") a caveat built from its "not read" part, the fixed
+  sentences about network connections (closed ones are Stale=Yes, never
+  flagged) and the partial registry in memory, and the plain caveat when
+  nothing was left unread; each "Memory dump coverage" line as a note of
+  its own, not a warning; its "Memory dump process list" warning (the
   ways of finding the processes disagreed) gives a note of its own after
-  that one, with one colon, and no such line no such note.
+  that one, with one colon, and no such line no such note. Option C for
+  the other memory sources: the DLL, handle, console and network rows of
+  the collector's left-out processes (by PID and create time) are left
+  out and counted in the summary, a reused create time or an impostor's
+  rows stay leads, and on an older collection without CollectorProcesses
+  a lead of a process (or its process row) started around the collection
+  is marked as possibly the collector (SuspectRows), one started hours
+  before is not.
   threshold.distinct counts distinct values (records of one file
   once; a row without the value on its own) and lists each value once in
   the evidence first. "evidence": "latest" lists the latest rows after the

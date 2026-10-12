@@ -1,5 +1,5 @@
 # =============================================================
-# Windows ARM64 memory dumps: the one read-only pass over the dump file (network objects; the services fallback)
+# Windows ARM64 memory dumps: the one read-only pass over the dump file (network objects)
 # Part of win11-timeline-builder (work package WP6). lib\memory\TimelineDbgEng.ps1
 # dot-sources this file in the helper's own PowerShell process; it builds on
 # the shared reading layer of TimelineDbgEng.Reader.ps1 (see "The areas" in
@@ -14,9 +14,10 @@
 # memory dump (DumpType 1: the physical memory runs one page after another
 # after the 0x2000-byte header) is scanned; any other kind is "not read".
 # It looks at every 16-byte unit for the tags it was given (a pool tag at
-# _POOL_HEADER.PoolTag, from the kernel's symbols; a user-mode record tag at
-# its own offset) and keeps a copy of the first bytes of each hit, with its
-# physical address. The pass never calls the engine (the engine is used on
+# _POOL_HEADER.PoolTag, from the kernel's symbols), checks the allocation
+# size in that pool header (_POOL_HEADER.BlockSize) and keeps a copy of the
+# first bytes of each hit, with its physical address; a match of another
+# size is only counted. The pass never calls the engine (the engine is used on
 # the main thread only), has a time limit of its own (the Network area's,
 # Get-DbgEngAreas) and stops when it is disposed.
 #
@@ -151,8 +152,10 @@ namespace TimelineDbgEng
             public uint Value;
             public int Offset;
             public int CopyBytes;
+            public int BlockBytes;       // the allocation size a hit must have (0: any)
             public readonly List<PoolHit> Hits = new List<PoolHit>();
             public int Dropped;
+            public int Rejected;
         }
 
         public readonly string DumpPath;
@@ -169,6 +172,9 @@ namespace TimelineDbgEng
         volatile string state = "NotStarted";
         long scanned;
         bool disposed;
+        // The pool header's BlockSize field (SetBlockSizeField): its byte
+        // offset in the header, its first bit and its width; -1 when not set
+        int blockAt = -1, blockPos, blockWidth;
 
         // Why it was not read, or how it ended badly ("" otherwise)
         public string Why = "";
@@ -182,16 +188,35 @@ namespace TimelineDbgEng
 
         // A tag to look for: its 4 ASCII characters at offsetInUnit of a
         // 16-byte unit; copyBytes of each hit are kept, from the unit on
-        public void AddTag(string tag, int offsetInUnit, int copyBytes)
+        public void AddTag(string tag, int offsetInUnit, int copyBytes) { AddTag(tag, offsetInUnit, copyBytes, 0); }
+
+        // ... and only a unit whose pool header gives an allocation of
+        // blockBytes (the header's BlockSize x 16; 0: any) is a hit, once
+        // SetBlockSizeField was called: a match of another size is counted
+        // (RejectedOf), not kept, and does not count toward MaxHitsPerTag,
+        // so memory filled with the tag cannot crowd out the real objects
+        public void AddTag(string tag, int offsetInUnit, int copyBytes, int blockBytes)
         {
             if (state != "NotStarted") throw new InvalidOperationException("the pass has started");
-            if (tag == null || tag.Length != 4 || offsetInUnit < 0 || offsetInUnit > 12 || copyBytes < 16 || copyBytes > 0x4000) throw new ArgumentException("not a tag to look for: " + tag);
+            if (tag == null || tag.Length != 4 || offsetInUnit < 0 || offsetInUnit > 12 || copyBytes < 16 || copyBytes > 0x4000 || blockBytes < 0 || blockBytes % 16 != 0) throw new ArgumentException("not a tag to look for: " + tag);
             TagSpec t = new TagSpec();
             t.Tag = tag;
             t.Value = (uint)tag[0] | ((uint)tag[1] << 8) | ((uint)tag[2] << 16) | ((uint)tag[3] << 24);
             t.Offset = offsetInUnit;
             t.CopyBytes = copyBytes;
+            t.BlockBytes = blockBytes;
             tags.Add(t);
+        }
+
+        // Where the pool header keeps BlockSize: a bitfield of a 64-bit
+        // value at byteOffset of the 16-byte header (the kernel's symbols)
+        public void SetBlockSizeField(int byteOffset, int position, int width)
+        {
+            if (state != "NotStarted") throw new InvalidOperationException("the pass has started");
+            if (byteOffset < 0 || byteOffset > 8 || position < 0 || width <= 0 || position + width > 64) throw new ArgumentException("not a pool header field");
+            blockAt = byteOffset;
+            blockPos = position;
+            blockWidth = width;
         }
 
         // NotStarted, Running, Done (the whole file was read), TimeLimit (it
@@ -339,6 +364,13 @@ namespace TimelineDbgEng
 
         void Record(TagSpec t, byte[] buffer, int i, int got, long position, List<PoolHit> pending)
         {
+            // The allocation's size first (the unit is the pool header)
+            if (t.BlockBytes > 0 && blockAt >= 0)
+            {
+                ulong field = (ulong)BitConverter.ToInt64(buffer, i + blockAt);
+                ulong blocks = blockWidth == 64 ? (field >> blockPos) : ((field >> blockPos) & ((1UL << blockWidth) - 1));
+                if (blocks * 16 != (ulong)t.BlockBytes) { t.Rejected++; return; }
+            }
             if (t.Hits.Count >= MaxHitsPerTag) { t.Dropped++; return; }
             long fileOffset = position + i;
             PoolHit h = new PoolHit();
@@ -382,6 +414,21 @@ namespace TimelineDbgEng
             return (t == null || !Finished) ? 0 : t.Dropped;
         }
 
+        // Matches of a tag whose pool header gave another allocation size
+        // (not kept)
+        public int RejectedOf(string tag)
+        {
+            TagSpec t = Find(tag);
+            return (t == null || !Finished) ? 0 : t.Rejected;
+        }
+
+        // Whether hits of a tag were checked for their allocation size
+        public bool ChecksSize(string tag)
+        {
+            TagSpec t = Find(tag);
+            return t != null && t.BlockBytes > 0 && blockAt >= 0;
+        }
+
         // Stops the pass (it ends at the next 16 MB) and waits for its thread
         public void Dispose()
         {
@@ -398,21 +445,22 @@ namespace TimelineDbgEng
 }
 
 # The tags the pass looks for: Tag, Offset in the 16-byte unit (-1: the
-# pool header's PoolTag, from the kernel's symbols) and Copy (the bytes kept
-# from the unit on). The network objects of tcpip.sys (their layouts:
-# TimelineDbgEng.Network.ps1): TTcb (a TCP connection), TcpL (a TCP
-# listener), UdpA (a UDP endpoint), TcTW (a connection in TIME_WAIT,
-# counted only); AfdE (a socket of afd.sys, counted per process). Sc19: a
-# service record in services.exe's heap, the tag 8 bytes into its 16-byte
-# unit, for the Services area when it cannot find the service list itself.
+# pool header's PoolTag, from the kernel's symbols), Copy (the bytes kept
+# from the unit on) and Block (the allocation size a hit must have, the
+# pool header included; 0: any). The network objects of tcpip.sys (their
+# layouts and sizes: TimelineDbgEng.Network.ps1, NetLayouts): TTcb (a TCP
+# connection), TcpL (a TCP listener), UdpA (a UDP endpoint), TcTW (a
+# connection in TIME_WAIT, counted only); AfdE (a socket of afd.sys,
+# counted per process; its size is not checked). A match of another size
+# is counted, not kept, so it never takes the place of a real object under
+# the pass's cap of hits per tag.
 function Get-DbgEngRawPassTags {
     return @(
-        [PSCustomObject]@{ Tag = "TTcb"; Offset = -1; Copy = 0x400 }
-        [PSCustomObject]@{ Tag = "TcpL"; Offset = -1; Copy = 0x400 }
-        [PSCustomObject]@{ Tag = "UdpA"; Offset = -1; Copy = 0x400 }
-        [PSCustomObject]@{ Tag = "TcTW"; Offset = -1; Copy = 0x100 }
-        [PSCustomObject]@{ Tag = "AfdE"; Offset = -1; Copy = 0x80 }
-        [PSCustomObject]@{ Tag = "Sc19"; Offset = 8; Copy = 0x200 }
+        [PSCustomObject]@{ Tag = "TTcb"; Offset = -1; Copy = 0x400; Block = 0x500 }
+        [PSCustomObject]@{ Tag = "TcpL"; Offset = -1; Copy = 0x400; Block = 0x160 }
+        [PSCustomObject]@{ Tag = "UdpA"; Offset = -1; Copy = 0x400; Block = 0x1A0 }
+        [PSCustomObject]@{ Tag = "TcTW"; Offset = -1; Copy = 0x100; Block = 0xC0 }
+        [PSCustomObject]@{ Tag = "AfdE"; Offset = -1; Copy = 0x80; Block = 0 }
     )
 }
 
@@ -442,9 +490,15 @@ function Start-DbgEngRawPass {
         $pass.SetNotRead("the kernel's symbols do not describe its pool header as expected")
         return
     }
+    # The allocation size is checked during the pass when the symbols give
+    # BlockSize (else the Network area checks it on the hits it reads)
+    if ($layout.Bits.ContainsKey("_POOL_HEADER.BlockSize")) {
+        $bits = $layout.Bits["_POOL_HEADER.BlockSize"]
+        $pass.SetBlockSizeField([int]$layout.Off("_POOL_HEADER.BlockSize"), [int]$bits[0], [int]$bits[1])
+    }
     foreach ($tag in @(Get-DbgEngRawPassTags)) {
         $offset = if ($tag.Offset -lt 0) { $layout.Off("_POOL_HEADER.PoolTag") } else { [int]$tag.Offset }
-        $pass.AddTag([string]$tag.Tag, [int]$offset, [int]$tag.Copy)
+        $pass.AddTag([string]$tag.Tag, [int]$offset, [int]$tag.Copy, [int]$tag.Block)
     }
     $pass.Start()
 }

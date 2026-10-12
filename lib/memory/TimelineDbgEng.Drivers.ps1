@@ -19,7 +19,11 @@
 #                       unlinked from the module list (Anomaly=NotInModuleList).
 #                       Judged one way only (modules without a driver object,
 #                       such as the kernel, hal and libraries, are never
-#                       flagged), and only when a walk reached the list's end.
+#                       flagged), only when a walk reached the list's end,
+#                       and not when an unload record (below) covers its
+#                       address with an unload time at or after the capture
+#                       start less the process scan's churn margin: a driver
+#                       unloaded while memory was copied (counted and noted)
 #   unloaded drivers    nt!MmUnloadedDrivers, the kernel's record of the last
 #                       50 drivers unloaded (name, address range, unload time),
 #                       at the offsets of _UNLOADED_DRIVERS when the symbols
@@ -270,14 +274,21 @@ namespace TimelineDbgEng
                     if (!hidden.DriverObjects.Contains(label)) hidden.DriverObjects.Add(label);
                 }
             }
+            // The recently unloaded drivers first: they explain some driver
+            // objects outside the list
+            List<MemoryEntry> unloadedEntries = ReadUnloaded(area);
             // Judged one way: a driver object's module that is in neither walk,
             // whose code lies in no listed module (a moved or reused entry
-            // whose driver is listed is not hidden), when a walk ended
+            // whose driver is listed is not hidden), when a walk ended, and
+            // that no driver unloaded during the capture (or within its churn
+            // margin before it) explains: the kernel's list and its driver
+            // objects are copied at different moments
             foreach (ulong section in unlistedOrder)
             {
                 KernelModuleRecord m = unlisted[section];
                 if (InListedModule(m.Base)) { StaleSections++; continue; }
                 if (!walkEnded) NotJudged++;
+                else if (UnloadedDuringCapture(m.Base)) UnloadedDuring++;
                 else m.Hidden = true;
                 Modules.Add(m);
             }
@@ -287,6 +298,11 @@ namespace TimelineDbgEng
             foreach (KernelModuleRecord m in Modules) { if (m.Hidden) hiddenCount++; }
             area.Coverage.Count("hidden from the module list", hiddenCount);
             if (StaleSections > 0) area.Coverage.Count("driver objects whose module entry moved", StaleSections);
+            if (UnloadedDuring > 0)
+            {
+                area.Coverage.Count("driver objects of drivers unloaded during the capture", UnloadedDuring);
+                area.Coverage.Note(UnloadedDuring + " driver object(s) outside the kernel's module list belong to drivers unloaded while memory was copied, as their unload records show, and are not marked hidden");
+            }
             if (DriverObjectsUnreadable > 0) area.Coverage.Note(DriverObjectsUnreadable + " driver object(s) were not in the dump");
             if (UnreadableNames > 0) area.Coverage.Note(UnreadableNames + " kernel module name(s) or entries were not in the dump");
 
@@ -305,20 +321,49 @@ namespace TimelineDbgEng
                 if (m.DriverObjects.Count > 0) e.Set("DriverObject", string.Join(",", m.DriverObjects.ToArray()));
                 if (m.Hidden) e.Set("Anomaly", "NotInModuleList");
             }
-            ReadUnloaded(area);
+            if (unloadedEntries != null)
+            {
+                foreach (MemoryEntry e in unloadedEntries) area.Entries.Add(e);
+                area.Coverage.Count("unloaded drivers", UnloadedRead);
+            }
         }
 
+        // An unload record covers this address, with an unload time at or
+        // after the capture start less the churn margin (any time when the
+        // capture start is not known)
+        bool UnloadedDuringCapture(ulong address)
+        {
+            if (address == 0) return false;
+            foreach (UnloadRecord u in unloadRecords)
+            {
+                if (address < u.Start || address >= u.End) continue;
+                if (context.CaptureFileTime <= 0 || u.Time >= context.CaptureFileTime - context.ChurnTicks) return true;
+            }
+            return false;
+        }
+
+        sealed class UnloadRecord
+        {
+            public ulong Start;
+            public ulong End;
+            public long Time;
+        }
+        readonly List<UnloadRecord> unloadRecords = new List<UnloadRecord>();
+        public int UnloadedDuring;
+
         // nt!MmUnloadedDrivers: the last 50 unloaded drivers, oldest first
-        void ReadUnloaded(AreaResult area)
+        // (their entries, or null when the list is not used; the coverage
+        // notes are set here, the count by Run)
+        List<MemoryEntry> ReadUnloaded(AreaResult area)
         {
             ulong arraySymbol = layout.Symbol("nt!MmUnloadedDrivers");
-            if (arraySymbol == 0) { area.Coverage.Note("the list of recently unloaded drivers is not in the kernel's symbols"); return; }
+            if (arraySymbol == 0) { area.Coverage.Note("the list of recently unloaded drivers is not in the kernel's symbols"); return null; }
             ulong array;
-            if (!reader.TryU64(0, arraySymbol, out array)) { area.Coverage.Note("the list of recently unloaded drivers is not in the dump"); return; }
-            if (array == 0) { area.Coverage.Count("unloaded drivers", 0); return; }
+            if (!reader.TryU64(0, arraySymbol, out array)) { area.Coverage.Note("the list of recently unloaded drivers is not in the dump"); return null; }
+            if (array == 0) return new List<MemoryEntry>();
             int size = unloaded[4];
             byte[] all = MemoryReader.IsKernelPointer(array) ? reader.Read(0, array, UnloadedSlots * size) : new byte[0];
-            if (all.Length < size) { area.Coverage.Note("the list of recently unloaded drivers is not in the dump"); return; }
+            if (all.Length < size) { area.Coverage.Note("the list of recently unloaded drivers is not in the dump"); return null; }
             uint last = 0;
             ulong lastSymbol = layout.Symbol("nt!MmLastUnloadedDriver");
             if (lastSymbol != 0) reader.TryU32(0, lastSymbol, out last);
@@ -362,17 +407,22 @@ namespace TimelineDbgEng
                 e.Set("Time", Fmt.IsoTime(time));
                 e.Set("FoundBy", "UnloadedDriverList");
                 found.Add(e);
+                UnloadRecord record = new UnloadRecord();
+                record.Start = start;
+                record.End = end;
+                record.Time = time;
+                unloadRecords.Add(record);
             }
             // A layout that does not fit: most used slots fail the checks
             if (used > 0 && UnloadedRejected * 2 > used)
             {
+                unloadRecords.Clear();
                 area.Coverage.Note("the list of recently unloaded drivers does not have the layout the builder reads, so it was not used");
-                return;
+                return null;
             }
             UnloadedRead = found.Count;
-            foreach (MemoryEntry e in found) area.Entries.Add(e);
-            area.Coverage.Count("unloaded drivers", UnloadedRead);
             if (UnloadedRejected > 0) area.Coverage.Note(UnloadedRejected + " slot(s) of the list of recently unloaded drivers were not readable");
+            return found;
         }
     }
 }

@@ -227,21 +227,20 @@ try {
     $passFile = Join-Path $tempRoot "pass.dmp"
     $marker = New-TestPoolObject -Tag "TTcb" -BlockBytes 0x500 -Raw @{ 0x1F0 = [byte[]](0xAB, 0xCD) }
     $udpAtRunEnd = New-TestPoolObject -Tag "UdpA" -BlockBytes 0x1A0 -Size 0xF0
-    $service = New-Object byte[] 16
-    [Array]::Copy([System.Text.Encoding]::ASCII.GetBytes("Sc19"), 0, $service, 8, 4)
+    $otherSize = New-TestPoolObject -Tag "TTcb" -BlockBytes 0x330 -Size 0x10
     $nearMiss = New-TestPoolObject -Tag "TTcX" -BlockBytes 0x500 -Size 0x10
     New-TestDumpFile -Path $passFile -Runs @(@(0x100, 4), @(0x800, 4)) -Objects @(
-        @(0x1200, $marker), @(0x3F00, $udpAtRunEnd), @(0x4040, $service), @(0x4080, $nearMiss))
+        @(0x1200, $marker), @(0x3F00, $udpAtRunEnd), @(0x4040, $otherSize), @(0x4080, $nearMiss))
     $context = New-TestContext -Memory $memory -DumpPath $passFile
     Start-DbgEngRawPass -Context $context
     $pass = $context.RawPass
     $ended = $pass.Wait(30000)
     $tcb = @($pass.HitsOf("TTcb"))
     $udp = @($pass.HitsOf("UdpA"))
-    $svc = @($pass.HitsOf("Sc19"))
-    Assert-KitEqual -Name "the pass reads the whole file and finds each tag at its offset in the unit (Sc19 at +8; a near miss is no hit)" -Expected "True|Done|0x8000|1|1|1|0|0" -Actual "$ended|$($pass.State)|0x$($pass.ScannedBytes.ToString('x'))|$($tcb.Count)|$($udp.Count)|$($svc.Count)|$(@($pass.HitsOf('TcpL')).Count)|$(@($pass.HitsOf('TTcX')).Count)"
+    Assert-KitEqual -Name "the pass reads the whole file and finds each tag at the pool header's tag (a near miss is no hit; a match of another allocation size is counted, not kept)" -Expected "True|Done|0x8000|1|1|1|0|0|True|False" -Actual "$ended|$($pass.State)|0x$($pass.ScannedBytes.ToString('x'))|$($tcb.Count)|$($udp.Count)|$($pass.RejectedOf('TTcb'))|$(@($pass.HitsOf('TcpL')).Count)|$(@($pass.HitsOf('TTcX')).Count)|$($pass.ChecksSize('TTcb'))|$($pass.ChecksSize('AfdE'))"
+    Assert-KitEqual -Name "the tags of the pass: the network objects with their allocation sizes (no services record tag: nothing reads it)" -Expected "TTcb:1280,TcpL:352,UdpA:416,TcTW:192,AfdE:0" -Actual ((@(Get-DbgEngRawPassTags) | ForEach-Object { "$($_.Tag):$($_.Block)" }) -join ",")
     Assert-KitEqual -Name "a hit's physical address, page offset and copy (0x400 bytes)" -Expected "0x101200|0x200|1024|0xab" -Actual ("0x" + $tcb[0].Physical.ToString("x") + "|0x" + $tcb[0].PageOffset.ToString("x") + "|" + $tcb[0].Bytes.Length + "|0x" + $tcb[0].Bytes[0x200].ToString("x"))
-    Assert-KitEqual -Name "a copy stops at the end of its run of physically adjacent pages" -Expected "0x103f00|256|0x800040" -Actual ("0x" + $udp[0].Physical.ToString("x") + "|" + $udp[0].Bytes.Length + "|0x" + $svc[0].Physical.ToString("x"))
+    Assert-KitEqual -Name "a copy stops at the end of its run of physically adjacent pages" -Expected "0x103f00|256" -Actual ("0x" + $udp[0].Physical.ToString("x") + "|" + $udp[0].Bytes.Length)
     $pass.Dispose()
     Assert-KitEqual -Name "a pass that has ended can be disposed (twice)" -Expected "Done|True" -Actual "$($pass.State)|$(try { $pass.Dispose(); $true } catch { $false })"
 
@@ -268,6 +267,21 @@ try {
     [void]$manyPass.Wait(30000)
     Assert-KitEqual -Name "the hits past the cap of a tag are counted, not kept" -Expected "$([TimelineDbgEng.RawPass]::MaxHitsPerTag)|1" -Actual "$(@($manyPass.HitsOf('AfdE')).Count)|$($manyPass.DroppedOf('AfdE'))"
     $manyPass.Dispose()
+    # Memory filled with a tag at the pool header's place but of another
+    # allocation size cannot crowd out a real object: those matches are
+    # rejected before the cap
+    $floodFile = Join-Path $tempRoot "flood.dmp"
+    $floodCount = [TimelineDbgEng.RawPass]::MaxHitsPerTag + 100
+    $flood = New-Object byte[] (($floodCount + 1) * 16)
+    for ($i = 0; $i -lt $floodCount; $i++) { $flood[$i * 16 + 2] = 0x33; [Array]::Copy([System.Text.Encoding]::ASCII.GetBytes("TTcb"), 0, $flood, $i * 16 + 4, 4) }
+    New-TestDumpFile -Path $floodFile -Runs @(, @(0x100, 48)) -Objects @(@(0, $flood), @(0x2E000, (New-TestPoolObject -Tag "TTcb" -BlockBytes 0x500 -Size 0x30)))
+    $floodPass = New-Object TimelineDbgEng.RawPass -ArgumentList $floodFile, 300.0
+    $floodPass.SetBlockSizeField(2, 0, 8)
+    $floodPass.AddTag("TTcb", 4, 0x40, 0x500)
+    $floodPass.Start()
+    [void]$floodPass.Wait(30000)
+    Assert-KitEqual -Name "a flood of the tag with another allocation size: rejected before the cap, the real object kept" -Expected "1|$floodCount|0|0x2e000" -Actual "$(@($floodPass.HitsOf('TTcb')).Count)|$($floodPass.RejectedOf('TTcb'))|$($floodPass.DroppedOf('TTcb'))|0x$(([long]$floodPass.HitsOf('TTcb')[0].FileOffset - 0x2000).ToString('x'))"
+    $floodPass.Dispose()
 
     # Its time limit, and passes that cannot start
     $limited = New-Object TimelineDbgEng.RawPass -ArgumentList $passFile, 0.0000001
@@ -304,6 +318,10 @@ try {
     Add-TestProcessObject -Memory $memory -Address $u1 -ProcessId 7600 -Created $t0 -Name "fixture-unlist"
     Add-TestProcessObject -Memory $memory -Address $u2 -ProcessId 7604 -Created $t0 -Exited $t0.AddHours(1) -Name "fixture-gone"
     Add-TestProcessObject -Memory $memory -Address $u3 -Type 6 -ProcessId 7608 -Created $t0 -Name "fixture-thread"
+    # Found only through its connection, created 60 s before the capture
+    # (within the process scan's churn margin): not marked
+    $u4 = U "FFFFA00000080000"
+    Add-TestProcessObject -Memory $memory -Address $u4 -ProcessId 7612 -Created $t0.AddHours(3).AddSeconds(-60) -Name "fixture-churn"
     $processes = @(
         @{ Eprocess = $p1; Pid = 4321; Ppid = 4000; CreateTime = $t0; ShortName = "fixture-net.ex"; FullName = "fixture-net.exe"; ImagePath = "C:\Users\Public\Fixture Tools\fixture-net.exe"; UserSid = "S-1-5-21-1-2-3-1001" }
         @{ Eprocess = $p2; Pid = 7300; Ppid = 4000; CreateTime = $t0; ShortName = "fixture-hidden"; Anomaly = "NotInProcessList" }
@@ -324,7 +342,12 @@ try {
     $here = ConvertTo-TestAddress "192.168.56.10"
     $objects = New-Object System.Collections.Generic.List[object]
     # 0: a live connection to a public address
-    $objects.Add(@(0x0100, (& $newTcb (& $tcbFields $v4 (New-TestConnectionAddresses -Memory $memory -Local $here -Remote (ConvertTo-TestAddress "8.8.4.4")) 4 50123 443 $p1 $t0.AddMinutes(10)))))
+    $first = & $newTcb (& $tcbFields $v4 (New-TestConnectionAddresses -Memory $memory -Local $here -Remote (ConvertTo-TestAddress "8.8.4.4")) 4 50123 443 $p1 $t0.AddMinutes(10))
+    $objects.Add(@(0x0100, $first))
+    # 13: owned by a process found only through it, created within the churn
+    # margin; 14: a whole-page copy of 0 at another physical address
+    $objects.Add(@(0x12100, (& $newTcb (& $tcbFields $v4 (New-TestConnectionAddresses -Memory $memory -Local $here -Remote (ConvertTo-TestAddress "8.8.4.4")) 4 50136 443 $u4 $t0.AddHours(3).AddSeconds(-30)))))
+    $objects.Add(@(0x13100, $first))
     # 1: closed
     $objects.Add(@(0x1100, (& $newTcb (& $tcbFields $v4 (New-TestConnectionAddresses -Memory $memory -Local $here -Remote (ConvertTo-TestAddress "8.8.4.4")) 0 50124 443 $p1 $t0.AddMinutes(11)))))
     # 2: owned by a listed process that is hidden from the process list
@@ -367,10 +390,10 @@ try {
     $context.RawPass.Dispose()
     $byOffset = @{}
     foreach ($entry in $area.Entries) { $byOffset[$entry.Get("Offset")] = Get-TestEntryText $entry }
-    Assert-KitEqual -Name "the Network area: read, its entries and its note" -Expected "Read|13|2 connections in TIME_WAIT were found but are not listed, as their local addresses are not read; 1 network object lies across a page boundary and is not read" -Actual "$($area.State)|$($area.Entries.Count)|$($area.Note)"
-    Assert-KitEqual -Name "the area's counts for the log" -Expected ("TCP connections 9, TCP listeners 2, UDP endpoints 2, Stale=Yes 5, OwnerHidden 2, owners found only through the network object 2, owner exited 2, " +
-        "owner memory not a process 1, owner memory of a later process 1, connections in no known state 1, objects without an address family 1, other objects with these tags 1, objects across a page boundary 1, " +
-        "addresses not readable 1, TIME_WAIT connections counted 2, sockets counted 3, sockets of listed processes 2") -Actual $area.Coverage.CountsText
+    Assert-KitEqual -Name "the Network area: read, its entries and its note" -Expected "Read|15|1 network object was found again at another physical address, a copy of the same object from another moment of the capture, and is listed with Duplicate=Yes, never flagged; 2 connections in TIME_WAIT were found but are not listed, as their local addresses are not read; 1 network object lies across a page boundary and is not read" -Actual "$($area.State)|$($area.Entries.Count)|$($area.Note)"
+    Assert-KitEqual -Name "the area's counts for the log (another allocation size counted by the pass, the churn owner, the second copy)" -Expected ("TCP connections 11, TCP listeners 2, UDP endpoints 2, Stale=Yes 5, OwnerHidden 2, other objects with these tags 1, owners found only through the network object 3, owner exited 2, " +
+        "owner memory not a process 1, owner memory of a later process 1, connections in no known state 1, objects without an address family 1, objects across a page boundary 1, " +
+        "addresses not readable 1, owners found only through the network object, created within the capture churn margin 1, Duplicate=Yes 1, TIME_WAIT connections counted 2, sockets counted 3, sockets of listed processes 2") -Actual $area.Coverage.CountsText
     $userPath = "C:\Users\Public\Fixture Tools\fixture-net.exe"
     $expected = [ordered]@{
         "0x80000110" = "Offset=0x80000110;Proto=TCPv4;LocalAddr=192.168.56.10;LocalPort=50123;ForeignAddr=8.8.4.4;ForeignPort=443;State=ESTABLISHED;PID=4321;Owner=fixture-net.exe;Created=$(& $iso $t0.AddMinutes(10));PoolTag=TTcb;Stale=No;RemoteScope=Public;OwnerCreated=2026-05-17 08:00:00.000;OwnerPath=$userPath;OwnerSid=S-1-5-21-1-2-3-1001"
@@ -386,17 +409,20 @@ try {
         "0x8000e110" = "Offset=0x8000e110;Proto=TCPv6;LocalAddr=::1;LocalPort=8080;ForeignAddr=::;ForeignPort=0;State=LISTENING;PID=4321;Owner=fixture-net.exe;Created=$(& $iso $t0.AddMinutes(2));PoolTag=TcpL;Stale=No;OwnerCreated=2026-05-17 08:00:00.000;OwnerPath=$userPath;OwnerSid=S-1-5-21-1-2-3-1001"
         "0x8000f110" = "Offset=0x8000f110;Proto=UDPv4;LocalAddr=127.0.0.1;LocalPort=5353;ForeignAddr=*;ForeignPort=0;State=;PID=4321;Owner=fixture-net.exe;Created=$(& $iso $t0.AddMinutes(3));PoolTag=UdpA;Stale=No;OwnerCreated=2026-05-17 08:00:00.000;OwnerPath=$userPath;OwnerSid=S-1-5-21-1-2-3-1001"
         "0x80010110" = "Offset=0x80010110;Proto=UDPv6;LocalAddr=::;LocalPort=5355;ForeignAddr=*;ForeignPort=0;State=;PID=4321;Owner=fixture-net.exe;Created=$(& $iso $t0.AddMinutes(4));PoolTag=UdpA;Stale=No;OwnerCreated=2026-05-17 08:00:00.000;OwnerPath=$userPath;OwnerSid=S-1-5-21-1-2-3-1001"
+        "0x80012110" = "Offset=0x80012110;Proto=TCPv4;LocalAddr=192.168.56.10;LocalPort=50136;ForeignAddr=8.8.4.4;ForeignPort=443;State=ESTABLISHED;PID=7612;Owner=fixture-churn;Created=$(& $iso $capture.AddSeconds(-30));PoolTag=TTcb;Stale=No;RemoteScope=Public;OwnerCreated=2026-05-17 10:59:00.000"
+        "0x80013110" = "Offset=0x80013110;Proto=TCPv4;LocalAddr=192.168.56.10;LocalPort=50123;ForeignAddr=8.8.4.4;ForeignPort=443;State=ESTABLISHED;PID=4321;Owner=fixture-net.exe;Created=$(& $iso $t0.AddMinutes(10));PoolTag=TTcb;Stale=No;RemoteScope=Public;OwnerCreated=2026-05-17 08:00:00.000;OwnerPath=$userPath;OwnerSid=S-1-5-21-1-2-3-1001;Duplicate=Yes"
     }
     $labels = @("a live connection to a public address", "a closed connection: Stale=Yes", "a hidden listed owner: OwnerHidden", "an owner found only through the connection (IPv6): OwnerHidden",
         "an owner outside the scan that has exited: Stale=Yes", "owner memory that is not a process: Stale=Yes, no PID", "made before its owner started: Stale=Yes, no PID",
-        "a listed owner that has exited: Stale=Yes", "a remote address not in the dump: ?", "a listener on every address", "an IPv6 listener on ::1", "a UDP endpoint on 127.0.0.1", "a UDP endpoint on every IPv6 address")
+        "a listed owner that has exited: Stale=Yes", "a remote address not in the dump: ?", "a listener on every address", "an IPv6 listener on ::1", "a UDP endpoint on 127.0.0.1", "a UDP endpoint on every IPv6 address",
+        "an owner found only through the connection, created within the churn margin: not OwnerHidden", "a whole-page copy of the first connection: Duplicate=Yes")
     $i = 0
     foreach ($offset in $expected.Keys) {
         Assert-KitEqual -Name "entry: $($labels[$i])" -Expected $expected[$offset] -Actual "$($byOffset[$offset])"
         $i++
     }
     $logLines = @(Get-TestProtocolLines | Where-Object { $_.StartsWith("TBDBG|LOG|") } | ForEach-Object { [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($_.Split('|')[3])) })
-    Assert-KitEqual -Name "the log line of the pass" -Expected 1 -Actual @($logLines | Where-Object { $_ -match '^    The pass over the dump file: 0\.0 GB in \d+\.\d s \(the whole file\), Windows build 26100$' }).Count
+    Assert-KitEqual -Name "the log line of the pass" -Expected 1 -Actual @($logLines | Where-Object { $_ -match '^    The pass over the dump file: 0\.0 GB in \d+\.\d s \(the whole file\), Windows build 26100, allocation sizes checked during the pass$' }).Count
 
     # The address scopes
     $scopes = @("8.8.8.8", "10.1.2.3", "172.16.0.1", "172.32.0.1", "192.168.1.1", "100.64.0.1", "127.0.0.1", "169.254.9.9", "0.0.0.0", "224.0.0.251", "255.255.255.255", "192.0.2.1", "198.51.100.1", "203.0.113.1",
@@ -447,7 +473,7 @@ try {
     $acquisitionEnd = $capture.AddMinutes(5)
     $counts = Add-DbgEngNetRows -Entries $netEntries -Source "Memory-Network" -CaptureTimeUtc $capture -AcquisitionEndUtc $acquisitionEnd -DumpPath "C:\dumps\fixture.dmp"
     $rows = @(Get-TestRows -Objects)
-    Assert-KitEqual -Name "Add-DbgEngNetRows: one row per entry, each at its own create time" -Expected "0|13|13|0|13" -Actual "$($state.BadLines)|$($counts.Entries)|$($counts.Timed)|$($counts.Snapshot)|$($rows.Count)"
+    Assert-KitEqual -Name "Add-DbgEngNetRows: one row per entry, each at its own create time" -Expected "0|15|15|0|15" -Actual "$($state.BadLines)|$($counts.Entries)|$($counts.Timed)|$($counts.Snapshot)|$($rows.Count)"
     $row = $rows[0]
     Assert-KitEqual -Name "a connection's row: the Volatility netscan shape with the ARM64 fields appended" -Expected ("Memory-Network|2026-05-17 08:10:00.000|NetworkConnection|Memory network: TCPv4 192.168.56.10:50123 -> 8.8.4.4:443 (ESTABLISHED)|S-1-5-21-1-2-3-1001|" +
         "PID=4321 Process=fixture-net.exe FoundBy=PoolScan PoolTag=TTcb Stale=No RemoteScope=Public OwnerCreated=2026-05-17 08:00:00.000 OwnerPath=$userPath|MemoryDump|C:\dumps\fixture.dmp") -Actual "$($row.Source)|$($row.Timestamp)|$($row.EventType)|$($row.Description)|$($row.User)|$($row.Details)|$($row.Artifact)|$($row.RawPath)"
@@ -463,6 +489,9 @@ try {
         $r = $byDescription[$description]
         Assert-KitEqual -Name "row: $description" -Expected $checks[$description] -Actual "$($r.User)|$($r.Details)"
     }
+    $copies = @($rows | Where-Object { $_.Details -match '(?:^|\s)Duplicate=Yes(?:\s|$)' })
+    Assert-KitEqual -Name "row: the second copy of a connection says Duplicate=Yes after Stale=" -Expected "1|PID=4321 Process=fixture-net.exe FoundBy=PoolScan PoolTag=TTcb Stale=No Duplicate=Yes RemoteScope=Public OwnerCreated=2026-05-17 08:00:00.000 OwnerPath=$userPath" `
+        -Actual "$($copies.Count)|$($copies[0].Details)"
     # A time that is not valid: a Snapshot row at the capture time, the
     # time kept in Details before the ARM64 fields
     $odd = @(
@@ -470,6 +499,7 @@ try {
         [PSCustomObject]@{ Proto = "UDPv4"; LocalAddr = "0.0.0.0"; LocalPort = "3"; ForeignAddr = "*"; ForeignPort = "0"; State = ""; PID = "4"; Owner = "System"; Created = ""; PoolTag = "UdpA"; Stale = "No" }
     )
     $oddCounts = Add-DbgEngNetRows -Entries $odd -Source "Memory-Network" -CaptureTimeUtc $capture -AcquisitionEndUtc $acquisitionEnd -DumpPath "C:\dumps\fixture.dmp"
+    # (an owner's name and path that hold " <Key>=": written " <Key>%3D", see below)
     $oddRows = @(Get-TestRows)
     Assert-KitEqual -Name "entries without a valid time: Snapshot rows at the capture time" -Expected ("0|2|Memory-Network|2026-05-17 11:00:00.000|Snapshot|Memory network: TCPv4 10.0.0.1:1 -> 10.0.0.2:2 (ESTABLISHED)||PID=4 Process=System Created=2099-01-01 00:00:00.000 FoundBy=PoolScan PoolTag=TTcb Stale=No RemoteScope=Private;" +
         "Memory-Network|2026-05-17 11:00:00.000|Snapshot|Memory network: UDPv4 0.0.0.0:3 -> *:0 ()||PID=4 Process=System FoundBy=PoolScan PoolTag=UdpA Stale=No") -Actual "$($oddCounts.Timed)|$($oddCounts.Snapshot)|$($oddRows -join ';')"
@@ -485,7 +515,26 @@ try {
     Assert-KitEqual -Name "the network rules: two switched on, the script-host rule switched off" -Expected "INTEG-NET-OWNER-HIDDEN High True,EXEC-NET-LISTENER-USERPATH Medium True,EXEC-NET-SCRIPTHOST-PUBLIC Medium False" -Actual ($netRules -join ",")
     $reportRows = @($rows | ForEach-Object { [PSCustomObject]@{ Timestamp = $_.Timestamp; Source = $_.Source; EventType = $_.EventType; Description = $_.Description; User = $_.User; Details = $_.Details; Artifact = $_.Artifact; RawPath = $_.RawPath } })
     $found = @(Invoke-ReportRules -Rows $reportRows -Rules $imported | Where-Object { @("INTEG-NET-OWNER-HIDDEN", "EXEC-NET-LISTENER-USERPATH", "EXEC-NET-SCRIPTHOST-PUBLIC") -contains $_.RuleId } | ForEach-Object { "$($_.RuleId) $($_.GroupKey) $(@($_.RowNumbers).Count)" } | Sort-Object)
-    Assert-KitEqual -Name "the area's rows through the rules: the hidden owners' connections, the listeners of the program in a user folder" -Expected "EXEC-NET-LISTENER-USERPATH fixture-net.exe 4,INTEG-NET-OWNER-HIDDEN fixture-hidden 1,INTEG-NET-OWNER-HIDDEN fixture-unlist 1" -Actual ($found -join ",")
+    Assert-KitEqual -Name "the area's rows through the rules: the hidden owners' connections, the listeners of the program in a user folder (not the churn owner's, not the second copy)" -Expected "EXEC-NET-LISTENER-USERPATH fixture-net.exe 4,INTEG-NET-OWNER-HIDDEN fixture-hidden 1,INTEG-NET-OWNER-HIDDEN fixture-unlist 1" -Actual ($found -join ",")
+
+    # An owner whose name and path hold " Stale=Yes", " Duplicate=Yes" and
+    # " OwnerCreated=...": written " <Key>%3D", so the row's own fields are
+    # the ones the parser and the rules read, and the leads stay
+    [void](Get-TestRows)
+    $crafted = @(
+        [PSCustomObject]@{ Proto = "TCPv4"; LocalAddr = "0.0.0.0"; LocalPort = "4444"; ForeignAddr = "0.0.0.0"; ForeignPort = "0"; State = "LISTENING"; PID = "4400"; Owner = "a Stale=Yes OwnerCreated=2026-05-17 08:00:00.000 b.exe"
+            Created = (& $iso $t0.AddMinutes(5)); PoolTag = "TcpL"; Stale = "No"; OwnerCreated = "2026-05-17 08:05:00.000"; OwnerPath = "C:\Users\Public\x Stale=Yes Duplicate=Yes\b.exe" }
+        [PSCustomObject]@{ Proto = "TCPv4"; LocalAddr = "10.0.0.9"; LocalPort = "4445"; ForeignAddr = "10.0.0.1"; ForeignPort = "443"; State = "ESTABLISHED"; PID = "4404"; Owner = "c`tStale=Yes.exe"
+            Created = (& $iso $t0.AddMinutes(6)); PoolTag = "TTcb"; Stale = "No"; RemoteScope = "Private"; OwnerCreated = "2026-05-17 08:06:00.000"; Anomaly = "OwnerHidden" }
+    )
+    [void](Add-DbgEngNetRows -Entries $crafted -Source "Memory-Network" -CaptureTimeUtc $capture -AcquisitionEndUtc $acquisitionEnd -DumpPath "C:\dumps\fixture.dmp")
+    $craftedRows = @(Get-TestRows -Objects)
+    Assert-KitEqual -Name "an owner's name and path holding ' <Key>=': escaped as ' <Key>%3D' in the row" `
+        -Expected "PID=4400 Process=a Stale%3DYes OwnerCreated%3D2026-05-17 08:00:00.000 b.exe FoundBy=PoolScan PoolTag=TcpL Stale=No OwnerCreated=2026-05-17 08:05:00.000 OwnerPath=C:\Users\Public\x Stale%3DYes Duplicate%3DYes\b.exe|No||2026-05-17 08:05:00.000" `
+        -Actual "$($craftedRows[0].Details)|$([TimelineReport.DetailParser]::Get($craftedRows[0].Details, 'Stale'))|$([TimelineReport.DetailParser]::Get($craftedRows[0].Details, 'Duplicate'))|$([TimelineReport.DetailParser]::Get($craftedRows[0].Details, 'OwnerCreated'))"
+    $craftedReport = @($craftedRows | ForEach-Object { [PSCustomObject]@{ Timestamp = $_.Timestamp; Source = $_.Source; EventType = $_.EventType; Description = $_.Description; User = $_.User; Details = $_.Details; Artifact = $_.Artifact; RawPath = $_.RawPath } })
+    $craftedFound = @(Invoke-ReportRules -Rows $craftedReport -Rules $imported | Where-Object { @("INTEG-NET-OWNER-HIDDEN", "EXEC-NET-LISTENER-USERPATH") -contains $_.RuleId } | ForEach-Object { "$($_.RuleId) $(@($_.RowNumbers).Count)" } | Sort-Object)
+    Assert-KitEqual -Name "the escaped rows through the rules: the listener in a user folder and the hidden owner's connection are still leads" -Expected "EXEC-NET-LISTENER-USERPATH 1,INTEG-NET-OWNER-HIDDEN 1" -Actual ($craftedFound -join ",")
 
     # The switched-off rule, switched on in memory, on its cases
     foreach ($rule in $imported.Rules) { if ($rule.Id -eq "EXEC-NET-SCRIPTHOST-PUBLIC") { $rule.Enabled = $true } }

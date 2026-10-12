@@ -336,7 +336,8 @@ $why = $script:DbgEngCompileProblems["Modules"]
     finally { $script:DbgEngFileProblems = @{} }
     Assert-KitEqual -Name "Invoke-DbgEngAreas: without the reader every area is not read, and says why" -Expected "9|9|0" -Actual "$(@($noReader.Areas).Count)|$(@($noReader.Areas | Where-Object { $_.State -eq 'NotRead' -and $_.Note -eq 'lib\memory\TimelineDbgEng.Reader.ps1 is missing' }).Count)|$(@($noReader.Entries).Count)"
 
-    # The protocol: P, C, E, AREA, END with three counts; read back by the builder
+    # The protocol: P, C, the checkpoint PCEND with two counts, E, AREA, END
+    # with three counts; read back by the builder
     $result = New-DbgEngResult
     $result.Processes = @([PSCustomObject]@{ PID = [long]4321; PPID = [long]3000; Threads = [long]3; SessionId = [long]1; Offset = "0x$($procA.ToString('x'))"; ImageFileName = "fixture-stage.e"; CreateTime = "2026-10-11T12:21:33.1234567+00:00"; ExitTime = $null; FoundBy = "ListForward"; TableId = ""; Anomaly = "" })
     $result.CommandLines = @([PSCustomObject]@{ PID = [long]4321; Process = "fixture-stage.e"; Args = "fixture-stage.exe -x" })
@@ -351,21 +352,34 @@ $why = $script:DbgEngCompileProblems["Modules"]
         if ($lineKind -ne "R" -and ($kindRuns.Count -eq 0 -or $kindRuns[$kindRuns.Count - 1] -ne $lineKind)) { $kindRuns.Add($lineKind) }
     }
     $kinds = $kindRuns.ToArray() -join ","
-    Assert-KitEqual -Name "Write-DbgEngWorkerResult: P, C, E (C# and a test's entries), AREA lines, then END with the numbers of P, C and E lines" -Expected "P,C,E,AREA,END|TBDBG|END|1|1|3|9" `
-        -Actual "$kinds|$($lines[-1])|$(@($lines | Where-Object { $_.StartsWith('TBDBG|AREA|') }).Count)"
+    Assert-KitEqual -Name "Write-DbgEngWorkerResult: P, C, the checkpoint (its counts), E (C# and a test's entries), AREA lines, then END with the numbers of P, C and E lines" -Expected "P,C,PCEND,E,AREA,END|TBDBG|PCEND|1|1|TBDBG|END|1|1|3|9|True" `
+        -Actual "$kinds|$(@($lines | Where-Object { $_.StartsWith('TBDBG|PCEND|') }) -join ';')|$($lines[-1])|$(@($lines | Where-Object { $_.StartsWith('TBDBG|AREA|') }).Count)|$($result.Checkpointed)"
+    # Written in two parts (the checkpoint before the areas, as the helper
+    # does): the same lines, the first part once
+    $split = New-DbgEngResult
+    foreach ($name in @("Processes", "CommandLines", "Entries", "Areas")) { $split.$name = $result.$name }
+    [void](Get-TestProtocolLines)
+    Write-DbgEngWorkerCheckpoint $split
+    $firstPart = Get-TestProtocolLines
+    Write-DbgEngWorkerResult $split
+    $secondPart = Get-TestProtocolLines
+    $splitLines = @($firstPart) + @($secondPart)
+    Assert-KitEqual -Name "Write-DbgEngWorkerCheckpoint then Write-DbgEngWorkerResult: the checkpoint ends the first part, the whole is the same as in one go" -Expected "TBDBG|PCEND|1|1|True" `
+        -Actual "$($firstPart[-1])|$(($splitLines -join "`n") -ceq ($lines -join "`n"))"
     $state = New-DbgEngWorkerState
     foreach ($protocolLine in $lines) { Receive-DbgEngWorkerLine -Line $protocolLine -State $state }
     $moduleEntry = $state.Entries["Module"][0]
-    Assert-KitEqual -Name "Receive-DbgEngWorkerLine: the entries by kind with their fields, the areas, END with three counts accepted" `
-        -Expected "True|0|Module,PrivateCode,Proc|4321|2026-10-11 12:21:33.123|yes|9|Partial|it stopped [boom - after one entry]|3" `
-        -Actual "$($state.Ended)|$($state.BadLines)|$(@($state.Entries.Keys | Sort-Object) -join ',')|$($moduleEntry.PID)|$($moduleEntry.ProcessCreated)|$($moduleEntry.Joined)|$($state.Areas.Count)|$($state.Areas[2].State)|$($state.Areas[2].Note)|$($state.EntryCount)"
+    Assert-KitEqual -Name "Receive-DbgEngWorkerLine: the checkpoint and END accepted, the entries by kind with their fields, the areas" `
+        -Expected "True|True|0|Module,PrivateCode,Proc|4321|2026-10-11 12:21:33.123|yes|9|Partial|it stopped [boom - after one entry]|3" `
+        -Actual "$($state.Checkpoint)|$($state.Ended)|$($state.BadLines)|$(@($state.Entries.Keys | Sort-Object) -join ',')|$($moduleEntry.PID)|$($moduleEntry.ProcessCreated)|$($moduleEntry.Joined)|$($state.Areas.Count)|$($state.Areas[2].State)|$($state.Areas[2].Note)|$($state.EntryCount)"
     # A bad line in place of the first line of its kind: a bad END or E line
     # means the run did not end cleanly (the E count no longer fits); a bad
     # AREA line leaves that area unreported
     $badCases = @(
         @("TBDBG|END|1|1", "END with two counts"), @("TBDBG|END|1|1|2", "an E count that does not fit"), @("TBDBG|E|Mod ule|A:QQ==", "a kind that is not a name"),
         @("TBDBG|E|Module|PID", "a field without a colon"), @("TBDBG|E|Module|1x:QQ==", "a key that is not a name"), @("TBDBG|E|Module|A:QQ==|A:QQ==", "a key twice"),
-        @("TBDBG|E|Module|A:@@@", "a value that is not Base64"), @("TBDBG|AREA|Modules|Done|1|0.1|", "an area state that is not one"), @("TBDBG|AREA|Modules|Read|1|0.1", "an area line without its note field")
+        @("TBDBG|E|Module|A:@@@", "a value that is not Base64"), @("TBDBG|AREA|Modules|Done|1|0.1|", "an area state that is not one"), @("TBDBG|AREA|Modules|Read|1|0.1", "an area line without its note field"),
+        @("TBDBG|PCEND|2|1", "a checkpoint whose counts do not fit")
     )
     foreach ($case in $badCases) {
         $badState = New-DbgEngWorkerState
@@ -376,8 +390,8 @@ $why = $script:DbgEngCompileProblems["Modules"]
             Receive-DbgEngWorkerLine -Line $protocolLine -State $badState
         }
         # (A bad E line makes the END line a bad one too: its E count no longer fits)
-        $expected = if ($case[0].StartsWith("TBDBG|AREA|")) { "1|True|8" } elseif ($case[0].StartsWith("TBDBG|E|")) { "2|False|9" } else { "1|False|9" }
-        Assert-KitEqual -Name "Receive-DbgEngWorkerLine: $($case[1]) is a bad line (bad lines|ended cleanly|areas)" -Expected $expected -Actual "$($badState.BadLines)|$($badState.Ended)|$($badState.Areas.Count)"
+        $expected = if ($case[0].StartsWith("TBDBG|AREA|")) { "1|True|8|True" } elseif ($case[0].StartsWith("TBDBG|E|")) { "2|False|9|True" } elseif ($case[0].StartsWith("TBDBG|PCEND|")) { "1|True|9|False" } else { "1|False|9|True" }
+        Assert-KitEqual -Name "Receive-DbgEngWorkerLine: $($case[1]) is a bad line (bad lines|ended cleanly|areas|checkpoint)" -Expected $expected -Actual "$($badState.BadLines)|$($badState.Ended)|$($badState.Areas.Count)|$($badState.Checkpoint)"
     }
 
     # --- The builder's rows ---------------------------------------------------------------

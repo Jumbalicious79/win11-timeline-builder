@@ -30,8 +30,11 @@
 #                     processes (Processes, Find, WithPid), DriveMap, Shared
 #                     (what an area offers the others and the joins, by
 #                     name), Areas (the results so far), DumpPath,
-#                     CaptureFileTime and RawPass (the background pass over
-#                     the dump file, TimelineDbgEng.PoolScan.ps1).
+#                     CaptureFileTime, ChurnTicks and BeforeChurn (the
+#                     process scan's capture churn margin, so an area judges
+#                     an object's age as the scan does) and RawPass (the
+#                     background pass over the dump file,
+#                     TimelineDbgEng.PoolScan.ps1).
 #   AreaResult        what an area gives back: State (Read, Partial, NotRead),
 #                     Entries (MemoryEntry: Kind and Key=value fields), the
 #                     Coverage (counts for the log, notes for the report) and
@@ -747,6 +750,16 @@ namespace TimelineDbgEng
         public readonly Dictionary<string, AreaResult> Areas = new Dictionary<string, AreaResult>(StringComparer.Ordinal);
         public string DumpPath = "";
         public long CaptureFileTime;         // when the capture started (FILETIME), 0 when not known
+        // Capture churn (Get-DbgEngChurnSeconds in TimelineDbgEng.ps1): an
+        // object created within this many 100 ns units before the capture
+        // started can have been changed or removed while memory was copied
+        public long ChurnTicks = 120L * 10000000L;
+        // Created early enough before the capture to be judged (hidden, not
+        // capture churn); false when the capture start or the time is unknown
+        public bool BeforeChurn(long createTime)
+        {
+            return CaptureFileTime > 0 && createTime > 0 && createTime < CaptureFileTime - ChurnTicks;
+        }
         // The background pass over the dump file (TimelineDbgEng.PoolScan.ps1),
         // or null; disposed when the areas are done if it is IDisposable
         public object RawPass;
@@ -1071,6 +1084,8 @@ function New-DbgEngContext {
     $context.ProcessLayout = $ProcessLayout
     $context.DumpPath = $DumpPath
     $context.CaptureFileTime = $CaptureFileTime
+    # The process scan's churn margin, so the areas judge as it does
+    if (Get-Command -Name "Get-DbgEngChurnSeconds" -CommandType Function -ErrorAction SilentlyContinue) { $context.ChurnTicks = [long](Get-DbgEngChurnSeconds) * 10000000L }
     $eprocessSize = $ProcessLayout.Size("_EPROCESS")
     $entries = @($Processes)
     for ($i = 0; $i -lt $entries.Count; $i++) {

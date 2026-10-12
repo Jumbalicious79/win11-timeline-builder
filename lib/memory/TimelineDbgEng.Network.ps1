@@ -25,8 +25,13 @@
 # is no longer that process (not a process object, or a process created
 # after the entry) is Stale=Yes and never flagged. Anomaly=OwnerHidden: the
 # owner is a listed process with Anomaly=NotInProcessList, or a process
-# object found only through the entry (no exit time, created before the
-# capture started).
+# object found only through the entry (no exit time, created more than the
+# process scan's capture churn margin, Get-DbgEngChurnSeconds, before the
+# capture started). The pass also finds whole-page copies of pool pages
+# (the dump file's own cache pages, for example), each from another moment
+# of the capture: a second or later copy of an object (the same owner
+# pointer, create time and ports at another physical address) is
+# Duplicate=Yes and never flagged.
 #
 #   Get-DbgEngNetworkSource   its C# (NetObjectLayout, NetLayouts, NetAddress, NetworkReader)
 #   Invoke-DbgEngNetworkArea -Context <MemoryContext> -Area <AreaResult>
@@ -36,7 +41,8 @@
 #     Owner (the owner's name), Created (ISO 8601), PoolTag, Stale (Yes, No),
 #     RemoteScope (connections: Public, Private, Loopback, LinkLocal, Other),
 #     OwnerCreated (yyyy-MM-dd HH:mm:ss.fff), OwnerPath, OwnerSid, Anomaly
-#     (OwnerHidden); a field without a value is left out
+#     (OwnerHidden), Duplicate (Yes: a later copy of an object already
+#     listed); a field without a value is left out
 # =============================================================
 
 # The C# of this file: namespace blocks only (no using lines; the host's
@@ -417,8 +423,18 @@ namespace TimelineDbgEng
             {
                 PoolHit[] hits = pass.HitsOf(k.Tag);
                 int dropped = pass.DroppedOf(k.Tag);
+                // Matches of another allocation size, left out by the pass
+                // itself (they never count toward its cap)
+                int rejected = pass.RejectedOf(k.Tag);
+                if (rejected > 0) area.Coverage.Count("other objects with these tags", rejected);
                 if (dropped > 0) area.SetPartial(Plural(dropped, "more object", "more objects") + " tagged " + k.Tag + " were not read, past the " + RawPass.MaxHitsPerTag.ToString(CultureInfo.InvariantCulture) + " the pass keeps");
                 List<MemoryEntry> made = new List<MemoryEntry>();
+                // The first copy of each object: a scan of physical memory
+                // also finds whole-page copies of pool pages (the dump file's
+                // own cache pages, for example), each a snapshot of another
+                // moment; a later copy (the same owner pointer, create time
+                // and ports at another physical address) is Duplicate=Yes
+                Dictionary<string, bool> firstCopies = new Dictionary<string, bool>(StringComparer.Ordinal);
                 int recognized = 0, valid = 0, plausible = 0, listedOwners = 0;
                 foreach (PoolHit h in hits)
                 {
@@ -428,15 +444,24 @@ namespace TimelineDbgEng
                     if (h.PageOffset + HeaderBytes + k.Needed > PageBytes) { area.Coverage.Count("objects across a page boundary"); continue; }
                     recognized++;
                     MemoryEntry e = Entry(k, h, ref valid, ref plausible, ref listedOwners, area);
-                    if (e != null) made.Add(e);
+                    if (e == null) continue;
+                    long createdRaw = Bytes.I64(h.Bytes, HeaderBytes + k.Created);
+                    if (createdRaw != 0)
+                    {
+                        string copyKey = Bytes.U64(h.Bytes, HeaderBytes + k.Owner).ToString("x", CultureInfo.InvariantCulture) + "|" + createdRaw.ToString(CultureInfo.InvariantCulture) + "|" +
+                            e.Get("LocalPort") + "|" + e.Get("ForeignPort");
+                        if (firstCopies.ContainsKey(copyKey)) e.Set("Duplicate", "Yes");
+                        else firstCopies[copyKey] = true;
+                    }
+                    made.Add(e);
                 }
-                if (hits.Length == 0) continue;
+                if (hits.Length == 0 && rejected < 16) continue;
                 kindsWithObjects++;
                 // The self-checks of this kind: when enough objects have its
                 // size, most of them must read as such objects; many objects
                 // with the tag and none of the size is another layout too
-                // (each dump had 1 to 6 of other sizes with these tags)
-                bool fails = (hits.Length >= 16 && recognized == 0) ||
+                // (each dump had 1 to 8 of other sizes with these tags)
+                bool fails = (hits.Length + rejected >= 16 && recognized == 0) ||
                     (recognized >= 4 && (valid * 4 < recognized * 3 || plausible * 4 < valid * 3 || listedOwners * 4 < valid));
                 if (fails)
                 {
@@ -450,9 +475,16 @@ namespace TimelineDbgEng
                 {
                     area.Entries.Add(e);
                     area.Coverage.Count(KindLabel(k));
+                    if (e.Get("Duplicate") == "Yes") { area.Coverage.Count("Duplicate=Yes"); continue; }
                     if (e.Get("Stale") == "Yes") area.Coverage.Count("Stale=Yes");
                     if (e.Has("Anomaly")) area.Coverage.Count("OwnerHidden");
                 }
+            }
+            long copies = area.Coverage.Get("Duplicate=Yes");
+            if (copies > 0)
+            {
+                area.Coverage.Note(copies == 1 ? "1 network object was found again at another physical address, a copy of the same object from another moment of the capture, and is listed with Duplicate=Yes, never flagged" :
+                    Plural(copies, "network object", "network objects") + " were found again at other physical addresses, copies of the same objects from other moments of the capture, and are listed with Duplicate=Yes, never flagged");
             }
             if (kindsWithObjects > 0 && failedKinds == kindsWithObjects)
             {
@@ -532,8 +564,17 @@ namespace TimelineDbgEng
             bool hidden = false;
             if (!stale && p != null)
             {
+                // A listed owner: as the process scan judged it. An owner
+                // found only through this object: as the scan judges, created
+                // more than its capture churn margin before the capture
+                // started (a process that ended and was deleted while memory
+                // was copied can leave its EPROCESS copied before its exit)
                 if (owner.Kind == "Listed") hidden = HasToken(p.Anomaly, "NotInProcessList");
-                else hidden = context.CaptureFileTime > 0 && p.CreateTime > 0 && p.CreateTime < context.CaptureFileTime;
+                else
+                {
+                    hidden = context.BeforeChurn(p.CreateTime);
+                    if (!hidden && context.CaptureFileTime > 0 && p.CreateTime > 0) area.Coverage.Count("owners found only through the network object, created within the capture churn margin");
+                }
             }
             if (owner.Kind == "Unlisted" && p != null) area.Coverage.Count("owners found only through the network object");
 
@@ -617,6 +658,7 @@ function Invoke-DbgEngNetworkArea {
         $gigabytes = ([double]$pass.ScannedBytes / 1GB).ToString("0.0", $invariant)
         $state = switch ($pass.State) { "Done" { "the whole file" } "TimeLimit" { "stopped at its time limit" } default { "$($pass.State)".ToLowerInvariant() } }
         $build = if ($network.Build -gt 0) { ", Windows build $($network.Build)" } else { "" }
-        Write-DbgEngLog "    The pass over the dump file: $gigabytes GB in $(([double]$pass.Seconds).ToString('0.0', $invariant)) s ($state)$build"
+        $sizes = if ($pass.ChecksSize("TTcb")) { ", allocation sizes checked during the pass" } else { "" }
+        Write-DbgEngLog "    The pass over the dump file: $gigabytes GB in $(([double]$pass.Seconds).ToString('0.0', $invariant)) s ($state)$build$sizes"
     }
 }

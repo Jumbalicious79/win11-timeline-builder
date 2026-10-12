@@ -746,7 +746,7 @@ function Read-DbgEngDumpReal {
         $cannedNotRead = if ($cannedReadText.Contains("; not read ")) { $cannedReadText.Substring($cannedReadText.IndexOf("; not read ") + 11) } else { "" }
         $armCaveats = @(if ($cannedNotRead) { "The memory dump is a Windows ARM64 dump, read with the Windows debugger engine: these were not read from it, so they are not in this report -- $cannedNotRead." } else { "The memory dump is a Windows ARM64 dump, read with the Windows debugger engine, not with Volatility 3." })
         $cannedReadPart = ($cannedReadText -split '; not read ')[0]
-        if ($cannedReadPart -match '(?:^read |, )network connections(?:,|$)') { $armCaveats += "Network connections in the memory dump come from a scan of memory for connection objects and can include closed ones (Stale=Yes, never flagged)." }
+        if ($cannedReadPart -match '(?:^read |, )network connections(?:,|$)') { $armCaveats += "Network connections in the memory dump come from a scan of memory for connection objects and can include closed ones (Stale=Yes) and second copies of the same object (Duplicate=Yes), neither flagged." }
         if ($cannedReadPart -match '(?:^read |, )registry hives(?:,|$)') { $armCaveats += "The registry in the memory dump is partial: a key or value missing there is not proof that it was absent." }
         $armCaveat = $armCaveats -join " / "
         $armNotesExpected = (@("$analyzedLine.") + @($cannedCoverage | ForEach-Object { "Memory dump coverage: $_." })) -join " / "

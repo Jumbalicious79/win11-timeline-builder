@@ -3939,7 +3939,7 @@ function New-ReportModel {
             }
             else { $caveats.Add("The memory dump is a Windows ARM64 dump, read with the Windows debugger engine, not with Volatility 3.") }
             if ($readPart -match '(?:^|, )network connections(?:,|$)') {
-                $caveats.Add("Network connections in the memory dump come from a scan of memory for connection objects and can include closed ones (Stale=Yes, never flagged).")
+                $caveats.Add("Network connections in the memory dump come from a scan of memory for connection objects and can include closed ones (Stale=Yes) and second copies of the same object (Duplicate=Yes), neither flagged.")
             }
             if ($readPart -match '(?:^|, )registry hives(?:,|$)') {
                 $caveats.Add("The registry in the memory dump is partial: a key or value missing there is not proof that it was absent.")

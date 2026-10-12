@@ -375,6 +375,25 @@ try {
     Assert-KitEqual -Name "drivers: an unloaded-driver list whose layout does not fit is not used (a note says so)" `
         -Expected "0|True" -Actual "$(@($badList.Entries | Where-Object { $_.Get('State') -eq 'Unloaded' }).Count)|$(@($badList.Coverage.Notes) -contains 'the list of recently unloaded drivers does not have the layout the builder reads, so it was not used')"
     for ($i = 0; $i -lt 2; $i++) { $memory.WriteU64(0, (At $unloaded ($i * 0x28 + 0x18)), $slots[$i][2]) }
+    # The hidden driver's range in an unload record (slot 3, the oldest):
+    # unloaded 30 s before the capture started (within the churn margin), it
+    # is a driver unloaded while memory was copied, not marked; unloaded an
+    # hour before, it is still marked
+    $hiddenSlot = At $unloaded (3 * 0x28)
+    Write-TestString $hiddenSlot "fixture-hidden.sys"
+    $memory.WriteU64(0, (At $hiddenSlot 0x10), (K "FFFFF80012000000"))
+    $memory.WriteU64(0, (At $hiddenSlot 0x18), (K "FFFFF80012006000"))
+    $unloadVerdicts = @()
+    foreach ($before in @(30, 3600)) {
+        $memory.WriteU64(0, (At $hiddenSlot 0x20), [uint64]$capture.AddSeconds(-$before).ToFileTimeUtc())
+        $context = New-TestContext -Memory $memory -CaptureFileTime $capture.ToFileTimeUtc()
+        $unloadArea = Invoke-TestArea -Name "Drivers" -Context $context
+        $unloadVerdicts += "$(@($unloadArea.Entries | Where-Object { $_.Get('Anomaly') }).Count)/$($unloadArea.Coverage.Get('driver objects of drivers unloaded during the capture'))/$(@($unloadArea.Entries | Where-Object { $_.Get('State') -eq 'Unloaded' }).Count)"
+        if ($before -eq 30) { $unloadNote = @($unloadArea.Coverage.Notes | Where-Object { $_ -like "*unloaded while memory was copied*" }) -join "" }
+    }
+    Assert-KitEqual -Name "drivers: a driver object outside the list whose driver was unloaded during the capture (an unload record covers it) is not marked hidden, and noted; one unloaded an hour before is" `
+        -Expected "0/1/3|1/0/3|1 driver object(s) outside the kernel's module list belong to drivers unloaded while memory was copied, as their unload records show, and are not marked hidden" -Actual "$($unloadVerdicts -join '|')|$unloadNote"
+    $memory.Write(0, $hiddenSlot, (New-Object byte[] 0x28))
 
     # --- 3. Handles ---
     # The processes: A (a user's, PID 1000) and its child C and grandchild G;
@@ -527,6 +546,72 @@ try {
     $secondPage = $scan.Lookup($eprocess["A"], 0x404)
     Assert-KitEqual -Name "handles: the lookup for the joins (a handle of the first page, of the second page, none)" -Expected "Process|True|Event||True" `
         -Actual "$($first.Type)|$($first.Object -eq $eprocess['B'])|$($secondPage.Type)|$($scan.Lookup($eprocess['A'], 0x408))|$($context.Shared['HandleLookup'] -eq $scan)"
+    Assert-KitEqual -Name "handles: a process object outside the scan without the fields to judge it (no exit time in the layout, no create time) is counted, not listed" -Expected "1|1|0|0" `
+        -Actual "$($handlesArea.Coverage.Get('process objects reached only through a handle'))|$($handlesArea.Coverage.Get('of them not judged'))|$($handlesArea.Coverage.Get('of them hidden from the process scan'))|$(@($handlesArea.Entries | Where-Object { $_.Kind -eq 'HandleProcess' }).Count)"
+
+    # Process objects that only handles reach, judged as the process scan
+    # judges: hidden (no exit time, created an hour before the capture),
+    # exited, created 30 s before the capture (churn), not a process ID
+    # Windows gives; one holder with handles to each (no rights to change
+    # them, so no Process rows), a second holder of the hidden one
+    $judgedLayout = New-TestLayout -Offsets @{ "_EPROCESS.UniqueProcessId" = 0x1d0; "_EPROCESS.InheritedFromUniqueProcessId" = 0x2e0; "_EPROCESS.CreateTime" = 0x1e8; "_EPROCESS.ExitTime" = 0x1f0; "_EPROCESS.ImageFileName" = 0x338 } -Sizes @{ "_EPROCESS" = 0x400 }
+    $outsiders = [ordered]@{
+        Hidden = @{ Pid = 6100; Created = $capture.AddHours(-1); Exited = $null; Name = "fixture-hide" }
+        Exited = @{ Pid = 6104; Created = $capture.AddHours(-1); Exited = $capture.AddMinutes(-5); Name = "fixture-ended" }
+        Churn = @{ Pid = 6108; Created = $capture.AddSeconds(-30); Exited = $null; Name = "fixture-new" }
+        Odd = @{ Pid = 6111; Created = $capture.AddHours(-1); Exited = $null; Name = "fixture-odd" }
+    }
+    $outsideBodies = @{}
+    foreach ($key in $outsiders.Keys) {
+        $o = $outsiders[$key]
+        $body = New-TestObject -Type "Process"
+        $memory.WriteU8(0, $body, 3)
+        $memory.WriteU64(0, (At $body 0x1d0), [uint64]$o.Pid)
+        $memory.WriteU64(0, (At $body 0x2e0), 5900)
+        $memory.WriteU64(0, (At $body 0x1e8), [uint64]$o.Created.ToFileTimeUtc())
+        if ($null -ne $o.Exited) { $memory.WriteU64(0, (At $body 0x1f0), [uint64]([datetime]$o.Exited).ToFileTimeUtc()) }
+        $memory.Write(0, (At $body 0x338), [System.Text.Encoding]::ASCII.GetBytes($o.Name))
+        $outsideBodies[$key] = $body
+    }
+    $holderOne = New-TestObject -Type "Process"
+    $holderTwo = New-TestObject -Type "Process"
+    $holderPages = New-TestHandleTable -Eprocess $holderOne
+    $slot = 1
+    foreach ($key in $outsiders.Keys) { Set-TestHandle -Page $holderPages[0] -Slot $slot -Body $outsideBodies[$key] -Access ([uint32]0x1000); $slot++ }
+    Set-TestHandle -Page $holderPages[0] -Slot $slot -Body $outsideBodies["Hidden"] -Access ([uint32]0x1000)
+    $holderTwoPages = New-TestHandleTable -Eprocess $holderTwo
+    Set-TestHandle -Page $holderTwoPages[0] -Slot 1 -Body $outsideBodies["Hidden"] -Access ([uint32]0x1000)
+    $holders = @(
+        @{ Eprocess = $holderOne; Pid = [long]7000; Ppid = [long]800; ShortName = "fixture-holder.exe"; UserSid = "S-1-5-18"; CreateTime = $t0; FoundBy = "ListForward,ListBackward,ProcessIdTable" },
+        @{ Eprocess = $holderTwo; Pid = [long]7004; Ppid = [long]800; ShortName = "fixture-holder2.exe"; UserSid = "S-1-5-18"; CreateTime = $t0; FoundBy = "ListForward,ListBackward,ProcessIdTable" }
+    )
+    $judgedContext = New-TestContext -Memory $memory -Processes $holders -ProcessLayout $judgedLayout -CaptureFileTime $capture.ToFileTimeUtc()
+    $judgedArea = Invoke-TestArea -Name "Handles" -Context $judgedContext
+    $hiddenFound = @($judgedArea.Entries | Where-Object { $_.Kind -eq "HandleProcess" } | ForEach-Object { Get-TestEntryText $_ })
+    Assert-KitEqual -Name "handles: a process object only handles reach, without an exit time and created an hour before the capture, is a HandleProcess entry (its holders once each); the exited, churn and odd-ID ones only counted" `
+        -Expected ("PID=6100|PPID=5900|ImageFileName=fixture-hide|Offset=0x$($outsideBodies['Hidden'].ToString('x'))|CreateTime=2026-03-02T11:00:00.0000000+00:00|FoundBy=HandleTable|Anomaly=NotInProcessList|HeldBy=7000,7004" +
+            "|4|1|1|1|1|0") `
+        -Actual ("$($hiddenFound -join '/')|$($judgedArea.Coverage.Get('process objects reached only through a handle'))|$($judgedArea.Coverage.Get('of them hidden from the process scan'))|$($judgedArea.Coverage.Get('of them exited'))|" +
+            "$($judgedArea.Coverage.Get('of them created during the capture or within its churn margin'))|$($judgedArea.Coverage.Get('of them not process objects'))|$(@($judgedArea.Entries | Where-Object { $_.Kind -eq 'Handle' }).Count)")
+    Assert-KitEqual -Name "handles: the note of a process reached only through a handle" -Expected "1" `
+        -Actual "$(@($judgedArea.Coverage.Notes | Where-Object { $_ -like '1 process(es) without an exit time, created before the capture, were reached only through a handle*FoundBy=HandleTable' }).Count)"
+    $noStart = Invoke-TestArea -Name "Handles" -Context (New-TestContext -Memory $memory -Processes $holders -ProcessLayout $judgedLayout)
+    Assert-KitEqual -Name "handles: without the capture start nothing is judged hidden" -Expected "0|4" -Actual "$(@($noStart.Entries | Where-Object { $_.Kind -eq 'HandleProcess' }).Count)|$($noStart.Coverage.Get('process objects reached only through a handle'))"
+    $noTable = @($holders | ForEach-Object { $copy = $_.Clone(); $copy["FoundBy"] = "ListForward,ListBackward"; $copy })
+    $noTableArea = Invoke-TestArea -Name "Handles" -Context (New-TestContext -Memory $memory -Processes $noTable -ProcessLayout $judgedLayout -CaptureFileTime $capture.ToFileTimeUtc())
+    Assert-KitEqual -Name "handles: when the process scan did not read the process ID table (or used the engine's own list) nothing is judged hidden" -Expected "0|3" -Actual "$(@($noTableArea.Entries | Where-Object { $_.Kind -eq 'HandleProcess' }).Count)|$($noTableArea.Coverage.Get('of them not judged'))"
+
+    # The caps of named entries: 60 named mutexes in one process, 50 listed
+    $floodHolder = New-TestObject -Type "Process"
+    $floodPages = New-TestHandleTable -Eprocess $floodHolder
+    for ($m = 1; $m -le 60; $m++) { Set-TestHandle -Page $floodPages[0] -Slot $m -Body (New-TestObject -Type "Mutant" -Name ("fixture-flood-{0:d2}" -f $m) -Directory $namedDir) -Access ([uint32]0x1f0001) }
+    $floodContext = New-TestContext -Memory $memory -Processes @(@{ Eprocess = $floodHolder; Pid = [long]7100; Ppid = [long]800; ShortName = "fixture-flood.exe"; UserSid = $user1; CreateTime = $t0 }) -ProcessLayout $processLayout -CaptureFileTime $capture.ToFileTimeUtc()
+    $floodArea = Invoke-TestArea -Name "Handles" -Context $floodContext
+    $floodRows = @($floodArea.Entries | Where-Object { $_.Get("Type") -eq "Mutant" })
+    Assert-KitEqual -Name "handles: at most 50 named mutexes of one process are listed (the first by handle value), the rest counted and noted" `
+        -Expected "50|\BaseNamedObjects\fixture-flood-50|10|10 more named mutexes in 1 process(es) were only counted, as at most 50 per process and 2000 per dump are listed" `
+        -Actual "$($floodRows.Count)|$($floodRows[-1].Get('Target'))|$($floodArea.Coverage.Get('named mutexes only counted'))|$(@($floodArea.Coverage.Notes | Where-Object { $_ -like '*named mutexes*' }) -join '')"
+    Assert-KitEqual -Name "handles: the caps" -Expected "50|25|2000|1000|500" -Actual "$([TimelineDbgEng.HandleTableScan]::MaxNamedPerProcess)|$([TimelineDbgEng.HandleTableScan]::MaxKeysPerProcess)|$([TimelineDbgEng.HandleTableScan]::MaxMutantsPerDump)|$([TimelineDbgEng.HandleTableScan]::MaxFilesPerDump)|$([TimelineDbgEng.HandleTableScan]::MaxKeysPerDump)"
 
     # --- 4. Missing symbols and the time limit ---
     $slowContext = New-TestContext -Memory $memory -Processes $processSpecs.ToArray() -ProcessLayout $processLayout
@@ -602,6 +687,21 @@ try {
     ($rules.Rules | Where-Object { $_.Id -eq "INTEG-HANDLE-WRITE-ACCESS" }).Enabled = $true
     $switchedOn = @(Invoke-ReportRules -Rows $rowsForRules -Rules $rules | Where-Object { $_.RuleId -eq "INTEG-HANDLE-WRITE-ACCESS" } | Sort-Object GroupKey | ForEach-Object { "$($_.GroupKey):$(@($_.RowNumbers).Count)" })
     Assert-KitEqual -Name "INTEG-HANDLE-WRITE-ACCESS switched on: one lead per holder of the WriteAccessUnrelated rows only (not the SYSTEM process, the process family or files)" -Expected "fixture-a.exe:3,fixture-app.exe:1,fixture-b.exe:1" -Actual ($switchedOn -join ",")
+
+    # The process reached only through handles: through the protocol, a
+    # process of the builder's windows.pslist rows (FoundBy=HandleTable,
+    # Anomaly=NotInProcessList, HeldBy=), a lead of INTEG-PROCESS-HIDDEN
+    $hiddenState = New-DbgEngWorkerState
+    foreach ($entry in $judgedArea.Entries) { Receive-DbgEngWorkerLine -Line $entry.ToLine() -State $hiddenState }
+    $hiddenState.Processes.Add([PSCustomObject]@{ PID = [long]7000; PPID = [long]800; ImageFileName = "fixture-holder."; Offset = "0x1"; Threads = [long]1; SessionId = [long]0; CreateTime = "2026-03-02T08:00:00.0000000+00:00"; ExitTime = $null; FoundBy = "ListForward,ListBackward,ProcessIdTable"; TableId = ""; Anomaly = "" })
+    $addedProcesses = Add-DbgEngHandleProcesses -Processes $hiddenState.Processes -Entries $hiddenState.Entries
+    [void](Get-TestRows)
+    [void](Add-MemoryPluginRows -Plugin "windows.pslist" -Source "Memory-Processes" -Entries $hiddenState.Processes.ToArray() -CaptureTimeUtc $capture -AcquisitionEndUtc $capture.AddMinutes(3) -DumpPath "C:\dumps\fixture.dmp")
+    $processRows = @(Get-TestRows -Objects)
+    Assert-KitEqual -Name "rows: the process reached only through handles is a Memory-Processes row of its own" -Expected "1|Memory-Processes|2026-03-02 11:00:00.000|ProcessCreation|Process in memory: fixture-hide (PID: 6100, PPID: 5900)|Threads= SessionId= FoundBy=HandleTable Anomaly=NotInProcessList HeldBy=7000,7004" `
+        -Actual "$addedProcesses|$($processRows[1].Source)|$($processRows[1].Timestamp)|$($processRows[1].EventType)|$($processRows[1].Description)|$($processRows[1].Details)"
+    $hiddenLeads = @(Invoke-ReportRules -Rows ([System.Collections.Generic.List[object]]@($processRows)) -Rules $rules | Where-Object { $_.RuleId -eq "INTEG-PROCESS-HIDDEN" } | ForEach-Object { "$($_.GroupKey):$(@($_.RowNumbers).Count)" })
+    Assert-KitEqual -Name "rules: INTEG-PROCESS-HIDDEN makes the lead of the process reached only through handles" -Expected "fixture-hide:1" -Actual ($hiddenLeads -join ",")
 }
 catch {
     Write-KitResult -Name "test setup or run" -Passed $false -Message "$($_.Exception.Message) (line $($_.InvocationInfo.ScriptLineNumber))`n$($_.ScriptStackTrace)"

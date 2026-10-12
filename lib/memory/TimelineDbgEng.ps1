@@ -26,7 +26,10 @@
 # Output: protocol lines on stdout, "TBDBG|<kind>|..." (log lines, the
 # entries and the counts; text fields in Base64 of UTF-8, so any character
 # of a command line survives the pipe): LOG and R lines, then P (processes),
-# C (command lines), E (the areas' entries, "TBDBG|E|<Kind>|<Key>:<Base64>|
+# C (command lines) and the checkpoint "TBDBG|PCEND|<P>|<C>", written as
+# soon as they are read and before the areas run (a helper that dies or
+# hangs in an area still gives the builder its processes and command
+# lines), then E (the areas' entries, "TBDBG|E|<Kind>|<Key>:<Base64>|
 # ..."), AREA (one per area, "TBDBG|AREA|<Area>|Read|Partial|NotRead|<rows>|
 # <seconds>|<Base64 note>"), ending with "TBDBG|END|<P>|<C>|<E>" when the
 # analysis finished. The builder relays the log lines and adds the rows
@@ -446,6 +449,7 @@ function New-DbgEngResult {
         NoPeb = 0; Unreadable = 0; Empty = 0
         Seconds = 0.0
         Entries = @(); Areas = @()
+        Checkpointed = $false
     }
 }
 
@@ -461,13 +465,16 @@ function ConvertTo-DbgEngEntryLine {
     return $line
 }
 
-# The result as protocol lines: the counts, one line per process ("P":
-# PID, PPID, Threads, SessionId, Offset, then in Base64 ImageFileName,
+# The first part of the result, as soon as the processes and command lines
+# are read and before the areas run: the counts (R), one line per process
+# ("P": PID, PPID, Threads, SessionId, Offset, then in Base64 ImageFileName,
 # CreateTime, ExitTime, FoundBy, TableId, Anomaly) and command line ("C"),
-# one per entry of the areas ("E", after the joins), one per area ("AREA":
-# name, state, rows, seconds, the note in Base64), then END with the three
-# numbers of P, C and E lines (the builder checks them)
-function Write-DbgEngWorkerResult {
+# then the checkpoint "TBDBG|PCEND|<P>|<C>" with the numbers of P and C
+# lines. A helper that dies or hangs in an area (native code: an access
+# violation in the engine is not an exception PowerShell can catch) still
+# gives the builder the processes and command lines. Sets
+# $Result.Checkpointed.
+function Write-DbgEngWorkerCheckpoint {
     param($Result)
     $invariant = [System.Globalization.CultureInfo]::InvariantCulture
     foreach ($name in @("Reason", "PartialReason")) {
@@ -487,6 +494,21 @@ function Write-DbgEngWorkerResult {
     foreach ($entry in @($Result.CommandLines)) {
         Write-DbgEngWorkerLine ("TBDBG|C|" + (& $number $entry.PID) + "|" + (ConvertTo-DbgEngBase64 $entry.Process) + "|" + (ConvertTo-DbgEngBase64 $entry.Args))
     }
+    Write-DbgEngWorkerLine "TBDBG|PCEND|$(@($Result.Processes).Count)|$(@($Result.CommandLines).Count)"
+    $Result | Add-Member -NotePropertyName "Checkpointed" -NotePropertyValue $true -Force
+}
+
+# The result as protocol lines: its first part (Write-DbgEngWorkerCheckpoint)
+# unless it was written already, then one line per entry of the areas ("E",
+# after the joins), one per area ("AREA": name, state, rows, seconds, the
+# note in Base64), then END with the three numbers of P, C and E lines (the
+# builder checks them). A PartialReason set after the checkpoint is sent
+# again.
+function Write-DbgEngWorkerResult {
+    param($Result)
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    if (-not ($Result.PSObject.Properties["Checkpointed"] -and $Result.Checkpointed)) { Write-DbgEngWorkerCheckpoint $Result }
+    elseif ($Result.PartialReason) { Write-DbgEngWorkerLine "TBDBG|R|PartialReason|$(ConvertTo-DbgEngBase64 ([string]$Result.PartialReason))" }
     $entryCount = 0
     foreach ($entry in @($Result.Entries)) {
         if ($null -eq $entry) { continue }
@@ -1831,8 +1853,11 @@ function ConvertFrom-DbgEngCaptureStart {
 # command lines, each in try/catch and timed, with a time cap it checks
 # itself ($Area.TimeUp()); then the joins (Invoke-DbgEngJoins -Context,
 # TimelineDbgEng.Joins.ps1) combine what the areas found, and only then are
-# the entries written. An area whose function is not there yet is "not read
-# (not built yet)".
+# the entries written (the processes and command lines were written before
+# the first area: Write-DbgEngWorkerCheckpoint). An area whose file is
+# missing or did not load is "not read (lib\memory\<file> is missing)" or
+# "not read (lib\memory\<file> could not be loaded [<why>])"; one whose file
+# loaded without its function is "not read (not built yet)".
 
 # The area files, in the order they are loaded: TimelineDbgEng.Reader.ps1
 # (the shared reading layer every area builds on) first
@@ -2080,6 +2105,15 @@ function Read-DbgEngDump {
             $result.PartialReason = "its command lines could not be read [$(Get-DbgEngShortError (Get-DbgEngErrorText $_))]"
         }
 
+        # The processes and command lines go to the builder now, before the
+        # areas (Write-DbgEngWorkerCheckpoint; the helper's run sets
+        # $script:DbgEngCheckpoint), so a helper that dies in an area does
+        # not lose them
+        if ($script:DbgEngCheckpoint) {
+            $result.Seconds = $timer.Elapsed.TotalSeconds
+            Write-DbgEngWorkerCheckpoint $result
+        }
+
         # The areas (process details, DLLs, ...), on the same processes; they
         # never change the processes or command lines above
         try {
@@ -2097,11 +2131,11 @@ function Read-DbgEngDump {
     }
     catch {
         if (@($result.Processes).Count -eq 0) { $result.Reason = "the Windows debugger engine stopped ($(Get-DbgEngShortError (Get-DbgEngErrorText $_)))" }
-        elseif (-not $result.PartialReason) { $result.PartialReason = "its command lines could not be read [$(Get-DbgEngShortError (Get-DbgEngErrorText $_))]" }
+        elseif (-not $result.PartialReason -and -not $result.Checkpointed) { $result.PartialReason = "its command lines could not be read [$(Get-DbgEngShortError (Get-DbgEngErrorText $_))]" }
     }
     finally {
         Close-DbgEngSession $session
-        $result.Seconds = $timer.Elapsed.TotalSeconds
+        if (-not $result.Checkpointed) { $result.Seconds = $timer.Elapsed.TotalSeconds }
     }
     return $result
 }
@@ -2128,6 +2162,7 @@ foreach ($areaFile in @(Get-DbgEngAreaFiles)) {
 if ($JobFolder) {
     $ErrorActionPreference = "Stop"
     $ProgressPreference = "SilentlyContinue"
+    $script:DbgEngCheckpoint = $true
     $workerResult = $null
     try {
         $workerResult = Read-DbgEngDump -DumpPath $DumpPath -EngineFolder $EngineFolder -EngineDlls @("$EngineDlls" -split ',' | Where-Object { $_ }) -SymbolCache $SymbolCache -JobFolder $JobFolder -CaptureStart $CaptureStart -CaptureEnd $CaptureEnd

@@ -2594,6 +2594,30 @@ function Read-DbgEngDump {
         $standIn = Invoke-DbgEngMemoryAnalysis -DumpPath $engineDump -DumpInfo $engineDumpInfo
         Assert-Equal -Name "the helper as a process, $($case.Name): the reason$(if ($case.Log) { ', its log line relayed' })" -Expected "$($case.Reason)|0|True" -Actual "$($standIn.Reason)|$($standIn.Entries)|$(-not $case.Log -or (Get-TestLog).Contains($case.Log))"
     }
+    # The helper stops after its checkpoint (an access violation in an area,
+    # or a hang ended at the time limit): the processes and command lines it
+    # sent are used, every area is "not read" with why
+    $checkpointScript = '$b = { param($t) [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($t)) }; [Console]::Out.WriteLine("TBDBG|R|Reason|"); ' +
+        '[Console]::Out.WriteLine("TBDBG|P|4321|3000|3|1|0xffffa00000001000|" + (& $b "fixture-stage.exe") + "|" + (& $b "2026-10-10T23:59:01.1234567+00:00") + "||" + (& $b "ListForward") + "||"); ' +
+        '[Console]::Out.WriteLine("TBDBG|C|4321|" + (& $b "fixture-stage.exe") + "|" + (& $b "fixture-stage.exe -x")); [Console]::Out.WriteLine("TBDBG|PCEND|1|1"); '
+    $afterCheckpoint = @(
+        @{ Name = "a crash after its checkpoint"; Script = $checkpointScript + '[Environment]::Exit(-1073741819)'; Timeout = 900; Why = "the helper stopped with exit code 0xC0000005"; Warning = "WARNING:   The debugger engine helper stopped with exit code 0xC0000005 after it had sent the processes and command lines" },
+        @{ Name = "a hang after its checkpoint"; Script = $checkpointScript + 'Start-Sleep -Seconds 120'; Timeout = 4; Why = "the helper did not finish within 4 seconds"; Warning = "WARNING:   The debugger engine helper did not finish within 4 seconds after it had sent the processes and command lines" }
+    )
+    foreach ($case in $afterCheckpoint) {
+        $script:testHelperPath = Join-Path $engineDir ("stand-in checkpoint " + [guid]::NewGuid().ToString("N") + ".ps1")
+        [System.IO.File]::WriteAllText($script:testHelperPath, "param([string]`$DumpPath, [string]`$EngineFolder, [string]`$EngineDlls, [string]`$SymbolCache, [string]`$JobFolder, [string]`$CaptureStart, [string]`$CaptureEnd)`r`n$($case.Script)`r`n")
+        $script:logFile = Join-Path $workDir ("engine-checkpoint-" + [guid]::NewGuid().ToString("N") + ".log")
+        $script:timelineEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
+        $script:dbgEngTimeoutSeconds = $case.Timeout
+        try { $stopped = Invoke-DbgEngMemoryAnalysis -DumpPath $engineDump -DumpInfo $engineDumpInfo }
+        finally { $script:dbgEngTimeoutSeconds = 900 }
+        $stoppedRows = @($script:timelineEntries | ForEach-Object { $_.Source }) -join ","
+        $notReadAll = @($stopped.Areas | Where-Object { $_.State -eq "NotRead" -and $_.Note -eq $case.Why }).Count
+        Assert-Equal -Name "the helper as a process, $($case.Name): no reason, its process and command line rows, every area not read with why, the warning" `
+            -Expected "|1|1|0|Memory-Processes,Memory-CommandLine|9|True|True" `
+            -Actual "$($stopped.Reason)|$($stopped.Processes)|$($stopped.CommandLines)|$($stopped.AreaRows)|$stoppedRows|$notReadAll|$($stopped.ReadText.StartsWith(""read processes, command lines; not read process users and paths ($($case.Why)), DLLs ($($case.Why))""))|$((Get-TestLog).Contains($case.Warning))"
+    }
     $script:testHelperPath = Join-Path $engineDir "stand-in hang.ps1"
     $pidFile = Join-Path $engineDir "hang.pid"
     [System.IO.File]::WriteAllText($script:testHelperPath, "param([string]`$DumpPath, [string]`$EngineFolder, [string]`$EngineDlls, [string]`$SymbolCache, [string]`$JobFolder, [string]`$CaptureStart, [string]`$CaptureEnd)`r`n[System.IO.File]::WriteAllText('$($pidFile.Replace("'", "''"))', `"`$PID`")`r`nStart-Sleep -Seconds 120`r`n")

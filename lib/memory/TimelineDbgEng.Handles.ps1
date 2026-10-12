@@ -33,6 +33,19 @@
 #                     ParentKcb, NameBlock); a key whose path cannot be built
 #                     is counted, not listed; once per process and path
 #   Mutant            a named mutex, once per process and name
+# File, Key and Mutant entries: at most 50 per process (25 keys) and 2,000
+# mutexes, 1,000 files and 500 keys per dump; the rest are counted and a
+# coverage note says how many (HandleTableScan.MaxNamedPerProcess and the
+# other caps). A process object that a Process handle reaches but no way of
+# the process scan found (forward walk, backward walk, process ID table) is
+# judged as the scan judges a process missing from the kernel's list: with
+# no exit time and created more than the scan's churn margin before the
+# capture started (and the scan read the process ID table) it is hidden,
+# a HandleProcess entry (PID, PPID,
+# ImageFileName, Offset, CreateTime, FoundBy=HandleTable,
+# Anomaly=NotInProcessList, HeldBy=<holder PIDs>; the builder adds it to the
+# Memory-Processes rows); the others (exited, created during the copy, not
+# judged) are counted.
 # Offers a handle lookup to the joins: $Context.Shared["HandleLookup"]
 # (HandleTableLookup.Lookup(eprocess, handle value)), and the Process and
 # Thread entries with their target's EPROCESS: $Context.Shared["HandleTargets"]
@@ -122,6 +135,15 @@ namespace TimelineDbgEng
         const int MaxRelated = 4;
         const int EntrySize = 16;
         const int EntriesPerPage = 256;
+        // At most this many named entries (File, Key, Mutant: one per name)
+        // per process and per dump; the rest are counted and noted. A process
+        // that makes many named objects cannot flood the timeline (the three
+        // real ARM64 dumps had at most 547 mutex rows in all).
+        public const int MaxNamedPerProcess = 50;
+        public const int MaxKeysPerProcess = 25;
+        public const int MaxMutantsPerDump = 2000;
+        public const int MaxFilesPerDump = 1000;
+        public const int MaxKeysPerDump = 500;
 
         readonly MemoryContext context;
         readonly MemoryReader reader;
@@ -144,6 +166,18 @@ namespace TimelineDbgEng
         public int TablesRead, NoTable, UnreadableTables, UnreadableLeafPages, MaxPerProcess;
         public int ProcessRows, ThreadRows, ThreadRowsFolded, FileRows, KeyRows, MutantRows, UnrelatedUserRows, FamilyRows;
         public int UnnamedFiles, KeyPathsUnreadable, TargetsUnreadable;
+        // Named entries past the caps, per type, and the processes they were in
+        readonly Dictionary<string, int> cappedNamed = new Dictionary<string, int>(StringComparer.Ordinal);
+        readonly Dictionary<string, HashSet<ulong>> cappedProcesses = new Dictionary<string, HashSet<ulong>>(StringComparer.Ordinal);
+        // Process objects reached through a Process handle that no way of the
+        // process scan found (the cross view of a process hidden from the
+        // kernel's lists): per object, its verdict (Hidden, Exited, Churn,
+        // NotJudged, NotProcess); the hidden ones become HandleProcess entries
+        readonly Dictionary<ulong, string> outsideVerdicts = new Dictionary<ulong, string>();
+        readonly Dictionary<ulong, MemoryEntry> hiddenEntries = new Dictionary<ulong, MemoryEntry>();
+        readonly List<MemoryEntry> hiddenList = new List<MemoryEntry>();
+        readonly int linksField;
+        public int OutsideProcesses, OutsideHidden, OutsideExited, OutsideChurn, OutsideNotJudged, OutsideNotProcess;
 
         public HandleTableScan(MemoryContext context, Layout layout, KernelObjectReader objects)
         {
@@ -167,6 +201,7 @@ namespace TimelineDbgEng
             files = layout.HasAll(FileFields);
             keys = layout.HasAll(KeyFields) && layout.Bits.ContainsKey("_CM_NAME_CONTROL_BLOCK.Compressed");
             tokens = layout.HasAll(TokenFields);
+            linksField = layout.Has("_EPROCESS.ActiveProcessLinks") ? layout.Off("_EPROCESS.ActiveProcessLinks") : -1;
         }
 
         // "" when the symbols give what every handle needs, else which are not
@@ -251,6 +286,92 @@ namespace TimelineDbgEng
             }
             outsideScan[eprocess] = p;
             return p;
+        }
+
+        // A process object outside the scan, reached through a Process
+        // handle of holder: judged once (outsideVerdicts). Hidden: a process
+        // object (dispatcher type 3, a process ID Windows gives, kernel
+        // addresses in its list links and token) without an exit time,
+        // created more than the scan's churn margin before the capture
+        // started, as the process scan judges a process missing from the
+        // kernel's list. Exited ones are normal (a handle keeps an ended
+        // process's object), and so is a process created during the copy.
+        void JudgeOutside(ulong eprocess, ProcessInfo holder)
+        {
+            string verdict;
+            if (outsideVerdicts.TryGetValue(eprocess, out verdict))
+            {
+                MemoryEntry known;
+                if (verdict == "Hidden" && hiddenEntries.TryGetValue(eprocess, out known)) AddHolder(known, holder);
+                return;
+            }
+            OutsideProcesses++;
+            ProcessInfo p = ProcessAt(eprocess);
+            Layout pl = context.ProcessLayout;
+            if (p == null || !LooksLikeProcess(p)) { verdict = "NotProcess"; OutsideNotProcess++; }
+            else if (pl == null || !pl.Has("_EPROCESS.ExitTime") || !pl.Has("_EPROCESS.CreateTime") || context.CaptureFileTime <= 0 || p.CreateTime <= 0 || !ProcessIdTableRead()) { verdict = "NotJudged"; OutsideNotJudged++; }
+            else if (p.ExitTime != 0) { verdict = "Exited"; OutsideExited++; }
+            else if (!context.BeforeChurn(p.CreateTime)) { verdict = "Churn"; OutsideChurn++; }
+            else
+            {
+                verdict = "Hidden";
+                OutsideHidden++;
+                MemoryEntry e = new MemoryEntry("HandleProcess");
+                hiddenList.Add(e);
+                e.Set("PID", p.Pid);
+                e.Set("PPID", p.Ppid);
+                e.Set("ImageFileName", p.ShortName);
+                e.SetHex("Offset", p.Eprocess);
+                e.Set("CreateTime", Fmt.IsoTime(p.CreateTime));
+                e.Set("FoundBy", "HandleTable");
+                e.Set("Anomaly", "NotInProcessList");
+                hiddenEntries[eprocess] = e;
+                AddHolder(e, holder);
+            }
+            outsideVerdicts[eprocess] = verdict;
+        }
+
+        // The process scan read the kernel's process ID table (a process of
+        // the scan was found by it): only then does a process object outside
+        // the scan say more than a walk of the list that stopped early, or
+        // the debugger engine's own list that misses the newest processes
+        bool ProcessIdTableRead()
+        {
+            if (cidTableRead < 0)
+            {
+                cidTableRead = 0;
+                foreach (ProcessInfo q in context.Processes)
+                {
+                    foreach (string way in (q.FoundBy ?? "").Split(',')) { if (way.Trim() == "ProcessIdTable") cidTableRead = 1; }
+                    if (cidTableRead == 1) break;
+                }
+            }
+            return cidTableRead == 1;
+        }
+        int cidTableRead = -1;
+
+        // The holders' PIDs of a HandleProcess entry (HeldBy, comma-separated, each once)
+        static void AddHolder(MemoryEntry e, ProcessInfo holder)
+        {
+            string pid = holder.Pid.ToString(CultureInfo.InvariantCulture);
+            string held = e.Get("HeldBy");
+            foreach (string part in held.Split(',')) { if (part == pid) return; }
+            e.Set("HeldBy", held.Length > 0 ? held + "," + pid : pid);
+        }
+
+        // A process object's own fields look like one: a process ID Windows
+        // gives (a multiple of 4 above 0, below 2^32), and kernel addresses in
+        // its process list links and its token when the symbols give them
+        bool LooksLikeProcess(ProcessInfo p)
+        {
+            if (p.Pid <= 0 || p.Pid >= 0x100000000L || (p.Pid & 3) != 0) return false;
+            if (linksField >= 0 && p.Block != null)
+            {
+                if (!Bytes.Has(p.Block, linksField, 16)) return false;
+                if (!MemoryReader.IsKernelAddress(Bytes.U64(p.Block, linksField)) || !MemoryReader.IsKernelAddress(Bytes.U64(p.Block, linksField + 8))) return false;
+            }
+            if (context.ProcessLayout != null && context.ProcessLayout.Has("_EPROCESS.Token") && !MemoryReader.IsKernelPointer(p.Token)) return false;
+            return true;
         }
 
         // The token user's SID of a process: the ProcessDetails area's, else
@@ -586,6 +707,7 @@ namespace TimelineDbgEng
                     {
                         case "Process":
                         case "Thread":
+                            if (type == "Process" && context.Find(r.Object) == null) JudgeOutside(r.Object, holder);
                             if (systemHolder) break;
                             long threadId;
                             ProcessInfo target = ChangingTarget(holder, r, out threadId);
@@ -650,12 +772,30 @@ namespace TimelineDbgEng
                 }
                 if (g.First.Type == "Process") ProcessRows++; else ThreadRows++;
             }
+            Dictionary<string, int> perType = new Dictionary<string, int>(StringComparer.Ordinal);
             foreach (KeyValuePair<HandleTableRecord, string> item in named)
             {
-                MemoryEntry e = NewEntry(area, holder, item.Key.Type, item.Key);
+                string type = item.Key.Type;
+                int inProcess;
+                perType.TryGetValue(type, out inProcess);
+                int rows = type == "File" ? FileRows : (type == "Key" ? KeyRows : MutantRows);
+                int processCap = type == "Key" ? MaxKeysPerProcess : MaxNamedPerProcess;
+                int dumpCap = type == "File" ? MaxFilesPerDump : (type == "Key" ? MaxKeysPerDump : MaxMutantsPerDump);
+                if (inProcess >= processCap || rows >= dumpCap)
+                {
+                    int n;
+                    cappedNamed.TryGetValue(type, out n);
+                    cappedNamed[type] = n + 1;
+                    HashSet<ulong> cappedIn;
+                    if (!cappedProcesses.TryGetValue(type, out cappedIn)) { cappedIn = new HashSet<ulong>(); cappedProcesses[type] = cappedIn; }
+                    cappedIn.Add(holder.Eprocess);
+                    continue;
+                }
+                perType[type] = inProcess + 1;
+                MemoryEntry e = NewEntry(area, holder, type, item.Key);
                 e.Set("Target", item.Value);
-                if (item.Key.Type == "File") FileRows++;
-                else if (item.Key.Type == "Key") KeyRows++;
+                if (type == "File") FileRows++;
+                else if (type == "Key") KeyRows++;
                 else MutantRows++;
             }
         }
@@ -674,6 +814,33 @@ namespace TimelineDbgEng
             area.Coverage.Count("file rows", FileRows);
             area.Coverage.Count("key rows", KeyRows);
             area.Coverage.Count("mutex rows", MutantRows);
+            // Named entries past the caps: counted, and a note per type
+            foreach (string type in new string[] { "Mutant", "File", "Key" })
+            {
+                int capped;
+                if (!cappedNamed.TryGetValue(type, out capped) || capped == 0) continue;
+                int processes = cappedProcesses[type].Count;
+                string what = type == "Mutant" ? "named mutexes" : (type == "File" ? "file handles in user folders" : "persistence key handles");
+                int processCap = type == "Key" ? MaxKeysPerProcess : MaxNamedPerProcess;
+                int dumpCap = type == "File" ? MaxFilesPerDump : (type == "Key" ? MaxKeysPerDump : MaxMutantsPerDump);
+                area.Coverage.Count(what + " only counted", capped);
+                area.Coverage.Note(capped + " more " + what + " in " + processes + " process(es) were only counted, as at most " + processCap + " per process and " + dumpCap + " per dump are listed");
+            }
+            // Process objects reached only through a handle
+            if (OutsideProcesses > 0)
+            {
+                area.Coverage.Count("process objects reached only through a handle", OutsideProcesses);
+                if (OutsideExited > 0) area.Coverage.Count("of them exited", OutsideExited);
+                if (OutsideChurn > 0) area.Coverage.Count("of them created during the capture or within its churn margin", OutsideChurn);
+                if (OutsideNotJudged > 0) area.Coverage.Count("of them not judged", OutsideNotJudged);
+                if (OutsideNotProcess > 0) area.Coverage.Count("of them not process objects", OutsideNotProcess);
+                area.Coverage.Count("of them hidden from the process scan", OutsideHidden);
+            }
+            if (OutsideHidden > 0)
+            {
+                foreach (MemoryEntry e in hiddenList) area.Entries.Add(e);
+                area.Coverage.Note(OutsideHidden + " process(es) without an exit time, created before the capture, were reached only through a handle and found by no way of the process scan, as a process hidden from the kernel's lists is, and are listed with FoundBy=HandleTable");
+            }
             List<KeyValuePair<string, long>> byCount = new List<KeyValuePair<string, long>>(typeCounts);
             byCount.Sort(delegate(KeyValuePair<string, long> a, KeyValuePair<string, long> b) { int c = b.Value.CompareTo(a.Value); return c != 0 ? c : string.CompareOrdinal(a.Key, b.Key); });
             foreach (KeyValuePair<string, long> t in byCount) area.Coverage.Count("type " + t.Key, t.Value);
@@ -699,7 +866,7 @@ namespace TimelineDbgEng
 function Get-DbgEngHandlesLayout {
     param($Context)
     $spec = @{
-        "_EPROCESS"              = @{ ObjectTable = '^Ptr64\b'; UniqueProcessId = '^Ptr64\b'; InheritedFromUniqueProcessId = '^Ptr64\b'; CreateTime = '^union _LARGE_INTEGER\b' }
+        "_EPROCESS"              = @{ ObjectTable = '^Ptr64\b'; UniqueProcessId = '^Ptr64\b'; InheritedFromUniqueProcessId = '^Ptr64\b'; CreateTime = '^union _LARGE_INTEGER\b'; ActiveProcessLinks = '^struct _LIST_ENTRY\b' }
         "_HANDLE_TABLE"          = @{ TableCode = '^Uint8B$' }
         "_HANDLE_TABLE_ENTRY"    = @{ ObjectPointerBits = '^Bitfield\b'; GrantedAccessBits = '^Bitfield\b' }
         "_KTHREAD"               = @{ Process = '^Ptr64\b' }

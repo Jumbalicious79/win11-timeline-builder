@@ -661,11 +661,11 @@ try {
     Assert-KitEqual -Name "SAM's row: listed by name, Root=NotRead, NotRead=CredentialHive, no Readable" `
         -Expected "Registry hive in memory: \REGISTRY\MACHINE\SAM||File=\SystemRoot\System32\Config\SAM | Root=NotRead | FoundBy=HiveListForward,HiveListBackward | NotRead=CredentialHive | Offset=$($hiveFields[5].Offset)" `
         -Actual @($rows | Where-Object { $_.Description -like "*\MACHINE\SAM" } | ForEach-Object { "$($_.Description)|$($_.User)|$($_.Details)" })[0]
-    $onDisk = @($rows | Where-Object { $_.Description -like "Run key value in memory: *" } | ForEach-Object { "$(($_.Description -replace '^Run key value in memory: (.*?) \[.*$', '$1'))=$(($_.Details -replace '^.*OnDisk=(\w+).*$', '$1'))" }) -join ","
+    $onDisk = @($rows | Where-Object { $_.Description -like "Run key value in memory: *" } | ForEach-Object { "$(($_.Description -replace '^Run key value in memory: (.*?) \[.*$', '$1'))=$(($_.Details -replace '^OnDisk=(\w+) \|.*$', '$1'))" }) -join ","
     Assert-KitEqual -Name "OnDisk: Yes (same data in run_keys.csv), No (HKLM read, no such value), Changed (other data), the user's NTUSER.DAT read: No and Yes, Unknown (S-1-5-19 not read)" `
         -Expected "SecurityHealth=Yes,FixtureTray=No,FixtureUpdater=Changed,Fixture$([char]0x00E9)Sync=No,FixtureGone=No,FixtureLong=Yes,(Default)=No,FixtureLocalService=Unknown" -Actual $onDisk
-    Assert-KitEqual -Name "a Run value row: PersistenceChange at the key's last write, the SID, Command first, Data=Unreadable when its data is not in the dump" `
-        -Expected "2026-09-07 08:00:00.000|Memory-Registry|PersistenceChange|Run key value in memory: FixtureGone [$userKey\Run]|S-1-5-21-1-2-3-1001|Command= | Key=$userKey\Run | Time=key last write | OnDisk=No | Data=Unreadable|MemoryDump|C:\dumps\fixture.dmp" `
+    Assert-KitEqual -Name "a Run value row: PersistenceChange at the key's last write, the SID, OnDisk first and the value's data (Command) last, Data=Unreadable when its data is not in the dump" `
+        -Expected "2026-09-07 08:00:00.000|Memory-Registry|PersistenceChange|Run key value in memory: FixtureGone [$userKey\Run]|S-1-5-21-1-2-3-1001|OnDisk=No | Key=$userKey\Run | Time=key last write | Data=Unreadable | Command=|MemoryDump|C:\dumps\fixture.dmp" `
         -Actual @($rowText | Where-Object { $_ -like "*|Run key value in memory: FixtureGone *" })[0]
 
     # The findings report's rules on these rows

@@ -78,6 +78,17 @@ function New-DbgEngRowCounts {
     return [PSCustomObject]@{ Entries = $Timed + $Snapshot; Timed = $Timed; Snapshot = $Snapshot }
 }
 
+# A value read from memory for a space-style Details field (the owner's
+# name and path of a network row): each " <Key>=" in it (whitespace, then
+# a name as the report's DetailParser and rules read a field's) is written
+# " <Key>%3D", so the value cannot add a field of its own. Other text stays
+# as it is (as "|" becomes %7C in other Details).
+function ConvertTo-DbgEngSpaceValue {
+    param([string]$Text)
+    if (-not $Text -or $Text.IndexOf('=') -lt 0) { return $Text }
+    return [regex]::Replace($Text, '(?<=\s)([A-Za-z][A-Za-z0-9.]*(?:\([^()=]*\))?)=', '$1%3D')
+}
+
 # Pipe-style Details ("Key=value | Key=value": the report's DetailParser
 # reads them in pipe mode) from ordered pairs, in their order: a $null value
 # leaves its pair out, "" keeps "Key="
@@ -151,7 +162,9 @@ function Add-DbgEngEntryRows {
     param([System.Collections.IDictionary]$Entries, [datetime]$CaptureTimeUtc, [datetime]$AcquisitionEndUtc, [string]$DumpPath)
     $results = New-Object System.Collections.Generic.List[object]
     if ($null -eq $Entries) { return }
-    $known = @{ Proc = $true }
+    # Proc and HandleProcess entries become Memory-Processes rows (the
+    # builder's own pass; Merge-DbgEngProcessEntries, Add-DbgEngHandleProcesses)
+    $known = @{ Proc = $true; HandleProcess = $true }
     foreach ($kind in @(Get-DbgEngRowKinds)) {
         $known[$kind.Kind] = $true
         $list = @()
@@ -304,6 +317,35 @@ function Set-DbgEngProcessRowFields {
         $commandLine.Process = $same[0].Full
         if ($same[0].User) { $commandLine | Add-Member -NotePropertyName "User" -NotePropertyValue $same[0].User -Force }
     }
+}
+
+# The HandleProcess entries (lib\memory\TimelineDbgEng.Handles.ps1: a process
+# object reached only through a handle, found by no way of the process scan,
+# without an exit time and created before the capture) as processes of the
+# windows.pslist rows: added to -Processes (the worker state's list) with
+# FoundBy=HandleTable and Anomaly=NotInProcessList (the findings report's
+# INTEG-PROCESS-HIDDEN rule reads it) and ExtraDetails "HeldBy=<holder
+# PIDs>". Returns how many were added. -Entries: kind -> entries.
+function Add-DbgEngHandleProcesses {
+    param($Processes, [System.Collections.IDictionary]$Entries)
+    if ($null -eq $Entries -or -not $Entries.Contains("HandleProcess")) { return 0 }
+    $added = 0
+    foreach ($entry in (ConvertTo-DbgEngEntryArray $Entries["HandleProcess"])) {
+        if ($null -eq $entry -or "$($entry.PID)" -notmatch '^\d+$' -or "$($entry.Offset)" -cnotmatch '^0x[0-9a-f]{1,16}$') { continue }
+        $ppid = $null
+        if ("$($entry.PPID)" -match '^-?\d+$') { $ppid = [long]"$($entry.PPID)" }
+        $created = Get-DbgEngEntryField -Entry $entry -Name "CreateTime"
+        $process = [PSCustomObject]@{
+            PID = [long]"$($entry.PID)"; PPID = $ppid; ImageFileName = (Get-DbgEngEntryField -Entry $entry -Name "ImageFileName"); Offset = "$($entry.Offset)"
+            Threads = $null; SessionId = $null; CreateTime = $(if ($created) { $created } else { $null }); ExitTime = $null
+            FoundBy = "HandleTable"; TableId = ""; Anomaly = "NotInProcessList"
+        }
+        $heldBy = Get-DbgEngEntryField -Entry $entry -Name "HeldBy"
+        if ($heldBy) { $process | Add-Member -NotePropertyName "ExtraDetails" -NotePropertyValue "HeldBy=$heldBy" }
+        $Processes.Add($process)
+        $added++
+    }
+    return $added
 }
 
 # Account names the dump's logon sessions hold, registered as fallback
@@ -625,11 +667,15 @@ function Get-DbgEngRunValueOnDisk {
 # Memory-Registry rows of the Run and RunOnce values (RunValue entries):
 # "Run key value in memory: <name> [<key>]", PersistenceChange at the key's
 # last write time (a Snapshot row when that is not valid); Details
-# "Command=<data> | Key=<key> | Time=key last write | OnDisk=Yes|Changed|No|Unknown"
-# (Get-DbgEngRunValueOnDisk, against the Registry-UserRunKey and
-# Persistence-RunKeys rows already in the timeline: Memory is parsed last),
-# then "Data=Unreadable" when the value's data is not in the dump; User: the
-# SID of a user's hive.
+# "OnDisk=Yes|Changed|No|Unknown | Key=<key> | Time=key last write
+# [| Data=Unreadable] | Command=<data>" (OnDisk: Get-DbgEngRunValueOnDisk,
+# against the Registry-UserRunKey and Persistence-RunKeys rows already in
+# the timeline: Memory is parsed last; Data=Unreadable when the value's data
+# is not in the dump). The builder's own fields come first and the value's
+# data last, so text in the data (which may hold " | OnDisk=Yes") never
+# comes before them: the findings report's rules read OnDisk= only at the
+# start of Details, where no other source's rows have it. User: the SID of
+# a user's hive.
 function Add-DbgEngRunValueRows {
     param([object[]]$Entries, [string]$Source, [datetime]$CaptureTimeUtc, [datetime]$AcquisitionEndUtc, [string]$DumpPath)
     $timed = 0
@@ -643,7 +689,7 @@ function Add-DbgEngRunValueRows {
         $data = $null
         if ("$($entry.Data)" -eq "Unreadable") { $data = "Unreadable" }
         $details = Format-DbgEngDetails ([ordered]@{
-                Command = "$($entry.Command)"; Key = "$($entry.Key)"; Time = $timeText; OnDisk = (Get-DbgEngRunValueOnDisk -Entry $entry -OnDisk $onDisk); Data = $data
+                OnDisk = (Get-DbgEngRunValueOnDisk -Entry $entry -OnDisk $onDisk); Key = "$($entry.Key)"; Time = $timeText; Data = $data; Command = "$($entry.Command)"
             })
         $row = Add-DbgEngEntryRow -Source $Source -EventType "PersistenceChange" -Description "Run key value in memory: $($entry.Name) [$($entry.Key)]" -User "$($entry.Sid)" `
             -Details $details -Time "$($entry.LastWrite)" -CaptureTimeUtc $CaptureTimeUtc -AcquisitionEndUtc $AcquisitionEndUtc -DumpPath $DumpPath
@@ -693,25 +739,29 @@ function Add-DbgEngConsoleRows {
 # (<state>)", NetworkConnection at Created when it is valid, else Snapshot;
 # Details "PID=<n> Process=<owner>"), with the ARM64 fields appended in the
 # same space style, those whose values can hold spaces last:
-#   FoundBy=PoolScan PoolTag=<tag> Stale=Yes|No[ RemoteScope=<scope>]
+#   FoundBy=PoolScan PoolTag=<tag> Stale=Yes|No[ Duplicate=Yes][ RemoteScope=<scope>]
 #   [ OwnerCreated=<yyyy-MM-dd HH:mm:ss.fff>][ Anomaly=OwnerHidden][ OwnerPath=<path>]
 # PID= and OwnerCreated= name the owner process (the findings report leaves
-# the collector's own out by them). The User column is the owner's token SID
-# (OwnerSid) when it was read.
+# the collector's own out by them). The owner's name and path come from
+# memory and can hold anything: a " <Key>=" in them is written " <Key>%3D"
+# (ConvertTo-DbgEngSpaceValue), so they never add a field of their own
+# (such as " Stale=Yes" or " OwnerCreated=..." before the real one). The
+# User column is the owner's token SID (OwnerSid) when it was read.
 function Add-DbgEngNetRows {
     param([object[]]$Entries, [string]$Source, [datetime]$CaptureTimeUtc, [datetime]$AcquisitionEndUtc, [string]$DumpPath)
     $netscan = New-Object System.Collections.Generic.List[object]
     foreach ($entry in @($Entries)) {
         if ($null -eq $entry) { continue }
         $extra = "FoundBy=PoolScan"
-        foreach ($key in @("PoolTag", "Stale", "RemoteScope", "OwnerCreated", "Anomaly", "OwnerPath")) {
+        foreach ($key in @("PoolTag", "Stale", "Duplicate", "RemoteScope", "OwnerCreated", "Anomaly", "OwnerPath")) {
             $value = "$($entry.$key)".Trim()
+            if ($key -eq "OwnerPath") { $value = ConvertTo-DbgEngSpaceValue $value }
             if ($value) { $extra += " $key=$value" }
         }
         $netscan.Add([PSCustomObject]@{
                 Proto = [string]$entry.Proto; LocalAddr = [string]$entry.LocalAddr; LocalPort = [string]$entry.LocalPort
                 ForeignAddr = [string]$entry.ForeignAddr; ForeignPort = [string]$entry.ForeignPort; State = [string]$entry.State
-                PID = [string]$entry.PID; Owner = [string]$entry.Owner; Created = [string]$entry.Created
+                PID = [string]$entry.PID; Owner = (ConvertTo-DbgEngSpaceValue ([string]$entry.Owner)); Created = [string]$entry.Created
                 User = [string]$entry.OwnerSid; ExtraDetails = $extra
             })
     }

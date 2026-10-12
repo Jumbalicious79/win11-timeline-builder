@@ -17499,14 +17499,16 @@ function ConvertTo-DbgEngProcessArgument {
 # counts), the pslist and cmdline entries, the areas' entries (Entries:
 # kind -> a list of PSCustomObjects, one property per key; EntryCount: all
 # of them) and what each area read (Areas: Name, State, Rows, Seconds,
-# Note), Ended (its END line came, with the numbers of P, C and E lines it
-# names), BadLines (protocol lines that could not be read), and how its
-# process ended
+# Note), Checkpoint (its PCEND line came, with the numbers of P and C lines
+# it names: the processes and command lines are whole even when the helper
+# stopped later), Ended (its END line came, with the numbers of P, C and E
+# lines it names), BadLines (protocol lines that could not be read), and how
+# its process ended
 function New-DbgEngWorkerState {
     return [PSCustomObject]@{
         Values = @{}; Processes = (New-Object System.Collections.Generic.List[object]); CommandLines = (New-Object System.Collections.Generic.List[object])
         Entries = @{}; EntryCount = 0; Areas = (New-Object System.Collections.Generic.List[object])
-        Ended = $false; BadLines = 0; ExitCode = $null; TimedOut = $false; ErrorText = ""; StartError = ""
+        Checkpoint = $false; Ended = $false; BadLines = 0; ExitCode = $null; TimedOut = $false; ErrorText = ""; StartError = ""
     }
 }
 
@@ -17531,6 +17533,8 @@ function ConvertFrom-DbgEngWorkerNumber {
 # "TBDBG|E|<Kind>|<Key>:<value>|..." an entry of an area (keys: a letter,
 # then letters and digits, each once), "TBDBG|AREA|<area>|<Read, Partial or
 # NotRead>|<rows>|<seconds>|<note>" what an area read,
+# "TBDBG|PCEND|<processes>|<command lines>" the checkpoint after the
+# processes and command lines (before the areas run),
 # "TBDBG|END|<processes>|<command lines>|<entries>" the end. Other lines
 # (PowerShell's own output) are ignored.
 function Receive-DbgEngWorkerLine {
@@ -17582,6 +17586,10 @@ function Receive-DbgEngWorkerLine {
                         Name = $fields[1]; State = $fields[2]; Rows = [long](ConvertFrom-DbgEngWorkerNumber $fields[3])
                         Seconds = [double]::Parse($fields[4], [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture); Note = (ConvertFrom-DbgEngBase64 $fields[5])
                     })
+            }
+            "PCEND" {
+                if ($fields.Count -eq 3 -and $fields[1] -eq "$($State.Processes.Count)" -and $fields[2] -eq "$($State.CommandLines.Count)") { $State.Checkpoint = $true }
+                else { $State.BadLines++ }
             }
             "END" {
                 if ($fields.Count -eq 4 -and $fields[1] -eq "$($State.Processes.Count)" -and $fields[2] -eq "$($State.CommandLines.Count)" -and $fields[3] -eq "$($State.EntryCount)") { $State.Ended = $true }
@@ -17765,18 +17773,34 @@ function Invoke-DbgEngMemoryAnalysis {
         $result.Reason = "the debugger engine helper could not be started ($($state.StartError))"
         return $result
     }
-    if ($state.TimedOut) {
-        $limit = "$timeout seconds"
-        if ($timeout -ge 120) { $limit = "$([int][Math]::Ceiling($timeout / 60)) minutes" }
-        $result.Reason = "the Windows debugger engine did not finish within $limit"
-        return $result
-    }
-    if (-not $state.Ended) {
+    $limit = "$timeout seconds"
+    if ($timeout -ge 120) { $limit = "$([int][Math]::Ceiling($timeout / 60)) minutes" }
+    $stoppedWhy = ""
+    $detail = ""
+    if ($state.TimedOut) { $stoppedWhy = "did not finish within $limit" }
+    elseif (-not $state.Ended) {
         $detail = "exit code $(Format-DbgEngExitCode $state.ExitCode)"
         $errorLine = Get-DbgEngWorkerErrorLine $state.ErrorText
         if ($errorLine) { $detail += " - $errorLine" }
-        $result.Reason = "the Windows debugger engine stopped ($detail)"
-        return $result
+        $stoppedWhy = "stopped with $detail"
+    }
+    if ($stoppedWhy) {
+        # Stopped in an area, after its checkpoint: the processes and
+        # command lines are whole and are used; nothing of the areas is
+        # (their entries come only after all of them)
+        if (-not ($state.Checkpoint -and -not $state.Values["Reason"] -and $state.Processes.Count -gt 0)) {
+            if ($state.TimedOut) { $result.Reason = "the Windows debugger engine did not finish within $limit" }
+            else { $result.Reason = "the Windows debugger engine stopped ($detail)" }
+            return $result
+        }
+        Log-Warning "  The debugger engine helper $stoppedWhy after it had sent the processes and command lines: they are used, the other memory areas are not read."
+        $state.Entries = @{}
+        $state.EntryCount = 0
+        $state.Areas = New-Object System.Collections.Generic.List[object]
+        $areaWhy = if ($state.TimedOut) { "the helper did not finish within $limit" } else { "the helper stopped with exit code $(Format-DbgEngExitCode $state.ExitCode)" }
+        foreach ($label in @(Get-DbgEngAreaLabels)) {
+            $state.Areas.Add([PSCustomObject]@{ Name = $label.Name; State = "NotRead"; Rows = [long]0; Seconds = [double]0; Note = $areaWhy })
+        }
     }
     $values = $state.Values
     if ($values["Reason"]) {
@@ -17797,6 +17821,13 @@ function Invoke-DbgEngMemoryAnalysis {
     }
     try { Set-DbgEngProcessRowFields -Processes $state.Processes.ToArray() -CommandLines $state.CommandLines.ToArray() }
     catch { Log-Warning "  The process details could not be added to the process rows: $(Get-DbgEngShortError (Get-DbgEngErrorText $_))" }
+    # Process objects reached only through a handle and found by no way of
+    # the process scan (HandleProcess entries): process rows of their own
+    try {
+        $handleProcesses = Add-DbgEngHandleProcesses -Processes $state.Processes -Entries $state.Entries
+        if ($handleProcesses -gt 0) { Log "    Processes reached only through a handle, missing from the kernel's process list and process ID table: $handleProcesses (process rows with FoundBy=HandleTable Anomaly=NotInProcessList)" }
+    }
+    catch { Log-Warning "  The processes found through handles could not be added to the process rows: $(Get-DbgEngShortError (Get-DbgEngErrorText $_))" }
     $counts = Add-MemoryPluginRows -Plugin "windows.pslist" -Source "Memory-Processes" -Entries $state.Processes.ToArray() `
         -CaptureTimeUtc $DumpInfo.CaptureTimeUtc -AcquisitionEndUtc $DumpInfo.LastWriteUtc -DumpPath $DumpPath
     $badNote = ""
