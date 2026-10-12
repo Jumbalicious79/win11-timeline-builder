@@ -4,8 +4,8 @@ dumps), for the tests that do not read a dump: tests\Test-ReportBuilder.ps1
 and rows), and any test through Read-TestCannedEntries (tests\MemoryTestKit.ps1).
 
 One file per entry kind, canned-<kind>.txt (or per area when it has several
-kinds, as canned-registry.txt: Hive and RunValue), ASCII, CRLF. Each work
-package adds and edits only its own files. A line is one of:
+kinds, as canned-registry.txt: Hive and RunValue), ASCII, CRLF. A line is
+one of:
   # <comment>
   #AREA<TAB><area><TAB><Read|Partial|NotRead><TAB><note>
       the AREA line of that area (Name as in Get-DbgEngAreas: ProcessDetails,
@@ -18,7 +18,7 @@ package adds and edits only its own files. A line is one of:
       TAB in it).
 The values are synthetic (fixture-*.exe and the like), never from a real dump.
 
-net-rules-switched-off.csv (WP6): the cases of a network rule that ships
+net-rules-switched-off.csv: the cases of a network rule that ships
 switched off (EXEC-NET-SCRIPTHOST-PUBLIC), in the format of
 tests\fixtures\report\rules\cases*.csv; tests\Test-MemoryNetwork.ps1 runs
 them with the rule switched on in memory (tests\Test-ReportRules.ps1 does

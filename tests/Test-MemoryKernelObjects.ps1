@@ -74,14 +74,14 @@ function Add-TestType([string]$Name, [int]$Index) {
 # An object's header: its type (index XOR cookie XOR the header's second
 # byte) and, with -Name, its name header (in -Directory)
 function Set-TestObject([uint64]$Body, [string]$Type, [string]$Name = $null, [uint64]$Directory = 0, [int]$RawIndex = -1) {
-    $header = At $Body -0x30
+    $header = At $Body (-0x30)
     $index = if ($RawIndex -ge 0) { $RawIndex } else { $script:typeIndex[$Type] }
     $encoded = $index -bxor $script:cookie -bxor [int](($header -shr 8) -band 0xFF)
     $script:memory.WriteU8(0, (At $header 0x18), [byte]$encoded)
     $mask = 0
     if ($null -ne $Name) {
         $mask = 2
-        $info = At $header -0x20
+        $info = At $header (-0x20)
         $script:memory.WriteU64(0, $info, $Directory)
         Write-TestString (At $info 8) $Name
     }
@@ -137,7 +137,7 @@ function New-TestDriver([string]$Name, [uint64]$Directory, [string]$DriverName, 
 # ObjectPointerBits (bit 20, 44 bits, the address shifted right by 4) and
 # the access in GrantedAccessBits
 function Set-TestHandle([uint64]$Page, [int]$Slot, [uint64]$Body, [uint32]$Access) {
-    $header = At $Body -0x30
+    $header = At $Body (-0x30)
     $bits = ($header -shr 4) -band (K "00000FFFFFFFFFFF")
     $script:memory.WriteU64(0, (At $Page ($Slot * 16)), (($bits -shl 20) -bor 1))
     $script:memory.WriteU64(0, (At $Page ($Slot * 16 + 8)), [uint64]$Access)
@@ -301,11 +301,11 @@ try {
     $entryK = New-TestModule -Base (K "FFFFF80010000000") -Size 0x800000 -FullName "\SystemRoot\system32\ntoskrnl.exe" -Name "ntoskrnl.exe"
     $entryH = New-TestModule -Base (K "FFFFF80012000000") -Size 0x6000 -FullName "\SystemRoot\System32\drivers\fixture-hidden.sys" -Name "fixture-hidden.sys"
     $entryS = New-TestModule -Base (K "FFFFF80011004000") -Size 0x1000 -FullName "\SystemRoot\System32\drivers\fixture-moved.sys" -Name "fixture-moved.sys"
-    Set-TestLinks $head $entryA $entryK
-    Set-TestLinks $entryA $entryB $head
-    Set-TestLinks $entryB $entryK $entryA
-    Set-TestLinks $entryK $head $entryB
-    Set-TestLinks $entryH $entryH $entryH
+    Set-TestLinks -Entry $head -Forward $entryA -Back $entryK
+    Set-TestLinks -Entry $entryA -Forward $entryB -Back $head
+    Set-TestLinks -Entry $entryB -Forward $entryK -Back $entryA
+    Set-TestLinks -Entry $entryK -Forward $head -Back $entryB
+    Set-TestLinks -Entry $entryH -Forward $entryH -Back $entryH
     $drivers = @(
         (New-TestDriver -Name "fixture-a" -Directory $driverDir -DriverName "\Driver\fixture-a" -Section $entryA -Start (K "FFFFF80011000000") -Size 0x10000),
         (New-TestDriver -Name "fixture-hidden" -Directory $driverDir -DriverName "\Driver\fixture-hidden" -Section $entryH -Start (K "FFFFF80012000000") -Size 0x6000),
@@ -352,7 +352,7 @@ try {
         -Expected "Read|kernel modules 3, driver objects 5, driver objects without a module entry 1, hidden from the module list 1, driver objects whose module entry moved 1, unloaded drivers 2|1 slot(s) of the list of recently unloaded drivers were not readable" `
         -Actual "$($driversArea.State)|$($driversArea.Coverage.CountsText)|$($driversArea.Note)"
     # The backward walk alone reaches the head: hidden drivers are still judged
-    Set-TestLinks $entryA (K "FFFFE00000100000") $head
+    Set-TestLinks -Entry $entryA -Forward (K "FFFFE00000100000") -Back $head
     $context = New-TestContext -Memory $memory -CaptureFileTime $capture.ToFileTimeUtc()
     $oneWay = Invoke-TestArea -Name "Drivers" -Context $context
     $scan = $context.Shared["DriverScan"]
@@ -360,14 +360,14 @@ try {
         -Expected "False|True|3|1|Read|the kernel's module list was inconsistent in places, as when memory is copied while Windows runs" `
         -Actual "$($scan.ForwardWalk.Complete)|$($scan.BackwardWalk.Complete)|$(@($oneWay.Entries | Where-Object { $_.Get('FoundBy').StartsWith('ModuleList') }).Count)|$(@($oneWay.Entries | Where-Object { $_.Get('Anomaly') }).Count)|$($oneWay.State)|$(($oneWay.Coverage.Notes | Select-Object -First 1))"
     # Neither walk ends: nothing is judged hidden
-    Set-TestLinks $head (K "FFFFE00000100000") (K "FFFFE00000200000")
+    Set-TestLinks -Entry $head -Forward (K "FFFFE00000100000") -Back (K "FFFFE00000200000")
     $context = New-TestContext -Memory $memory -CaptureFileTime $capture.ToFileTimeUtc()
     $noWalk = Invoke-TestArea -Name "Drivers" -Context $context
     Assert-KitEqual -Name "drivers: both walks cut -- partly read, the driver objects' modules listed without Anomaly" `
         -Expected "Partial|4|0|4|the kernel's module list could not be walked to its end either way (forwards it stopped at an entry that is not in the dump), so drivers hidden from it were not judged" `
         -Actual "$($noWalk.State)|$(@($noWalk.Entries | Where-Object { $_.Get('State') -eq 'Loaded' }).Count)|$(@($noWalk.Entries | Where-Object { $_.Get('Anomaly') }).Count)|$($context.Shared['DriverScan'].NotJudged)|$(($noWalk.Coverage.Notes | Select-Object -First 1))"
-    Set-TestLinks $head $entryA $entryK
-    Set-TestLinks $entryA $entryB $head
+    Set-TestLinks -Entry $head -Forward $entryA -Back $entryK
+    Set-TestLinks -Entry $entryA -Forward $entryB -Back $head
     # An unloaded-driver list whose slots all fail their checks: not used
     for ($i = 0; $i -lt 2; $i++) { $memory.WriteU64(0, (At $unloaded ($i * 0x28 + 0x18)), 0) }
     $context = New-TestContext -Memory $memory -CaptureFileTime $capture.ToFileTimeUtc()
@@ -457,7 +457,7 @@ try {
     $kParameters = New-TestKcb -Name "Parameters" -Hive $systemHive -Parent $kService
     $kBroken = New-TestKcb -Name "" -Hive $systemHive -Parent $kService -NoName
     $unnamedMutex = New-TestObject -Type "Mutant"
-    $event = New-TestObject -Type "Event"
+    $eventObject = New-TestObject -Type "Event"
     $undecoded = New-TestBody
     Set-TestObject -Body $undecoded -Type "" -RawIndex 0x77
     $notInDump = K "FFFFE0000D000100"
@@ -475,7 +475,7 @@ try {
         @(22, $notInDump, [uint32]0x1f0003)
     )
     foreach ($h in $aHandles) { Set-TestHandle -Page $pagesA[0] -Slot $h[0] -Body $h[1] -Access $h[2] }
-    Set-TestHandle -Page $pagesA[1] -Slot 1 -Body $event -Access ([uint32]0x1f0003)
+    Set-TestHandle -Page $pagesA[1] -Slot 1 -Body $eventObject -Access ([uint32]0x1f0003)
     $pagesB = New-TestHandleTable -Eprocess $eprocess["B"]
     Set-TestHandle -Page $pagesB[0] -Slot 1 -Body $eprocess["A"] -Access $all
     $pagesS = New-TestHandleTable -Eprocess $eprocess["S"]
@@ -518,7 +518,7 @@ try {
     Assert-KitEqual -Name "handles: the entries (rights that change an unrelated process, files in user folders, persistence keys, named mutexes) and what is left out" -Expected ($expectedHandles -join "`n") -Actual ($handleTexts -join "`n")
     $scan = $context.Shared["HandleLookup"]
     Assert-KitEqual -Name "handles: counts for the log (handles, tables, folded thread rows, the anomaly and the process family, objects not read, an exited process)" `
-        -Expected "28|7|1|5|3|1|1|1|1|1|1|1" `
+        -Expected "29|14|1|5|4|1|1|1|1|1|1|1" `
         -Actual "$($handlesArea.Coverage.Get('handles'))|$($handlesArea.Coverage.Get('handle tables read'))|$($handlesArea.Coverage.Get('thread rows folded into process rows'))|$($handlesArea.Coverage.Get('rows of a user account changing an unrelated process'))|$($handlesArea.Coverage.Get(""rows of a user account in the target's process family""))|$($handlesArea.Coverage.Get('handles whose object could not be read') - 1)|$($handlesArea.Coverage.Get('file handles without a readable name'))|$($handlesArea.Coverage.Get('key handles whose path could not be built'))|$($handlesArea.Coverage.Get('exited processes without a handle table'))|$($handlesArea.Coverage.Get('type Event'))|$($handlesArea.Coverage.Get('type Thread') - 1)|$($handlesArea.Coverage.Get('thread rows'))"
     Assert-KitEqual -Name "handles: read, with the note of what a live copy left unreadable" `
         -Expected "Read|1 page(s) of handle entries were not in the dump, the objects of 2 handle(s) could not be read, 1 registry key handle(s) without a readable path were left out, as when memory is copied while Windows runs" `
@@ -536,7 +536,7 @@ try {
     $noEntry.Remove("_HANDLE_TABLE_ENTRY")
     Set-TestEngineCommands -Dt $noEntry -Symbols $symbols
     $missing = Invoke-TestArea -Name "Handles" -Context (New-TestContext -Memory $memory -Processes $processSpecs.ToArray())
-    Assert-KitEqual -Name "handles: not read when the symbols lack the handle table entry" -Expected "NotRead|the kernel's symbols do not give _HANDLE_TABLE_ENTRY|0" -Actual "$($missing.State)|$($missing.Note)|$($missing.Entries.Count)"
+    Assert-KitEqual -Name "handles: not read when the symbols lack the handle table entry" -Expected "NotRead|the kernel's symbols do not give _HANDLE_TABLE_ENTRY.ObjectPointerBits, _HANDLE_TABLE_ENTRY.GrantedAccessBits|0" -Actual "$($missing.State)|$($missing.Note)|$($missing.Entries.Count)"
     $noCookie = $symbols.Clone()
     $noCookie.Remove("nt!ObHeaderCookie")
     Set-TestEngineCommands -Dt $dt -Symbols $noCookie
@@ -557,6 +557,7 @@ try {
     Assert-KitEqual -Name "rows: the builder reads every Driver and Handle line" -Expected "0|6|16" -Actual "$($state.BadLines)|$((ConvertTo-DbgEngEntryArray $state.Entries['Driver']).Count)|$((ConvertTo-DbgEngEntryArray $state.Entries['Handle']).Count)"
     [void](Get-TestRows)
     $driverCounts = Add-DbgEngDriverRows -Entries (ConvertTo-DbgEngEntryArray $state.Entries["Driver"]) -Source "Memory-Drivers" -CaptureTimeUtc $capture -AcquisitionEndUtc $capture.AddMinutes(3) -DumpPath "C:\dumps\fixture.dmp"
+    $driverRowObjects = @(Get-TestRows -Objects -Keep)
     $driverRows = @(Get-TestRows)
     Assert-KitEqual -Name "rows: Memory-Drivers (Snapshot rows of the loaded modules, DriverUnload at the unload times)" -Expected "6|2|4" -Actual "$($driverCounts.Entries)|$($driverCounts.Timed)|$($driverCounts.Snapshot)"
     Assert-KitEqual -Name "rows: a loaded module, the hidden one and an unloaded one" `
@@ -577,9 +578,23 @@ try {
             "Memory-Handles|2026-03-02 12:00:00.000|Snapshot|Handle in memory: Key \REGISTRY\MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run (PID: 1000, Process: fixture-a.exe)|$user1|PID=1000 | ProcessCreated=$(& $created 'A') | Type=Key | Handle=0x34 | Access=0x20019 | Target=\REGISTRY\MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run") -join "`n") `
         -Actual (@($handleRows[0], $handleRows[1], $handleRows[6]) -join "`n")
 
+    # --- The join (TimelineDbgEng.Joins.ps1): a target with a program header in its private memory ---
+    $peCode = [System.Collections.Generic.HashSet[uint64]]::new()
+    [void]$peCode.Add($eprocess["B"])
+    $context.Shared["PeCodeProcesses"] = $peCode
+    [void](Get-TestProtocolLines)
+    Invoke-DbgEngJoins -Context $context
+    Invoke-DbgEngJoins -Context $context
+    $joined = @($handlesArea.Entries | Where-Object { $_.Get('Anomaly') -match 'TargetHasPeCode' } | ForEach-Object { "$($_.Get('Pid'))>$($_.Get('TargetPid')):$($_.Get('Anomaly'))" })
+    $joinLines = Get-TestProtocolLines
+    $joinLog = @($joinLines | Where-Object { $_.StartsWith('TBDBG|LOG|') } | ForEach-Object { [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($_.Split('|')[3])) } | Select-Object -Last 1)
+    Assert-KitEqual -Name "joins: the handle entries whose target has a program header in its private memory get TargetHasPeCode once (an anomaly they had is kept), the count in the log; nothing to join without the private memory area" `
+        -Expected "1000>2000:WriteAccessUnrelated,TargetHasPeCode,600>2000:TargetHasPeCode|    Joins: handle entries whose target has a program header in its executable private memory 2|-1" `
+        -Actual "$($joined -join ',')|$($joinLog -join '')|$([TimelineDbgEng.MemoryJoins]::MarkPeCodeTargets((New-TestContext -Memory $memory)))"
+
     # --- 6. The findings rules on these rows ---
     $rowsForRules = New-Object System.Collections.Generic.List[object]
-    foreach ($row in @($driverRows) + @(Get-TestRows -Objects)) { $rowsForRules.Add($row) }
+    foreach ($row in @($driverRowObjects) + @(Get-TestRows -Objects)) { $rowsForRules.Add($row) }
     . (Join-Path (Split-Path $BuilderPath -Parent) "lib\report\TimelineReport.Engine.ps1")
     $rules = Import-ReportRules -Path (Join-Path (Split-Path $BuilderPath -Parent) "lib\report\report-rules.json")
     $shipped = @(Invoke-ReportRules -Rows $rowsForRules -Rules $rules | Where-Object { $_.RuleId -in @("INTEG-DRIVER-HIDDEN", "PERSIST-DRIVER-USERPATH", "INTEG-HANDLE-WRITE-ACCESS") } | ForEach-Object { "$($_.RuleId):$($_.GroupKey):$(@($_.RowNumbers).Count)" })

@@ -326,7 +326,7 @@ $why = $script:DbgEngCompileProblems["Modules"]
     $summary = @($run.Areas | ForEach-Object { "$($_.Name)=$($_.State)/$($_.Rows)/$($_.Note)" })
     Assert-KitEqual -Name "Invoke-DbgEngAreas: the areas in their fixed order; stubs not built yet; a missing file names it; a failure after entries is Partial (entries kept), before them NotRead" `
         -Expected ("ProcessDetails=NotRead/0/not built yet|Modules=Read/1/1 process's loader list could not be read|PrivateCode=Partial/1/it stopped [boom - after one entry]|" +
-            "Drivers=NotRead/0/it stopped [boom [before any entry]]|Handles=NotRead/0/not built yet|Registry=NotRead/0/not built yet|Console=NotRead/0/lib\memory\TimelineDbgEng.Console.ps1 is missing|Services=NotRead/0/not built yet|Network=NotRead/0/the pass over the dump file was not started") `
+            "Drivers=NotRead/0/it stopped [boom [before any entry]]|Handles=NotRead/0/not built yet|Registry=NotRead/0/not built yet|Console=NotRead/0/lib\memory\TimelineDbgEng.Console.ps1 is missing|Services=NotRead/0/not built yet|Network=NotRead/0/not built yet") `
         -Actual ($summary -join "|")
     $runFields = @($run.Entries | ForEach-Object { $f = Get-TestEntryFields $_; "$($f['Kind']):$($f['PID']):$($f['ProcessCreated']):$($f['Joined'])" })
     Assert-KitEqual -Name "Invoke-DbgEngAreas: the context's processes from the scan's blocks, the raw pass started first and disposed at the end, the joins after every area, the entries in area order" `
@@ -430,7 +430,7 @@ $why = $script:DbgEngCompileProblems["Modules"]
     $partialText = Get-DbgEngReadText -Areas @($state.Areas | Where-Object { $_.Name -ne "Services" }) -PartialReason "its command lines could not be read [the command did not finish within 300 s]"
     Assert-KitEqual -Name "Get-DbgEngReadText: what was read in the report's order, what was not with its reason (no colon, no parentheses inside), an area the helper did not report" `
         -Expected ("read processes, command lines, DLLs, executable private memory; not read process users and paths (not built yet), kernel drivers (it stopped [boom [before any entry]]), handles (not built yet), " +
-            "registry hives (not built yet), console history (lib\memory\TimelineDbgEng.Console.ps1 is missing), network connections (the pass over the dump file was not started), services (not built yet)|" +
+            "registry hives (not built yet), console history (lib\memory\TimelineDbgEng.Console.ps1 is missing), network connections (not built yet), services (not built yet)|" +
             "read processes, DLLs, executable private memory; not read command lines (could not be read [the command did not finish within 300 s]), process users and paths (not built yet)") `
         -Actual "$readText|$(($partialText -split '; not read ')[0]); not read $((($partialText -split '; not read ')[1] -split ', ')[0..1] -join ', ')"
     Assert-KitEqual -Name "Get-DbgEngReadText: an area the helper did not report says so" -Expected "True" -Actual "$($partialText.EndsWith('services (not reported by the debugger engine helper)'))"

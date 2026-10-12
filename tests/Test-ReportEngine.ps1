@@ -1301,6 +1301,16 @@ try {
     $oldOwnedRows = @($ownedRows) + @((New-TestOwnedRow -Source "Memory-Modules" -Description "Module in memory: fixture-old.dll (PID: 5000, Process: explorer.exe)" -Details "PID=5000 | ProcessCreated=2026-05-15 08:00:00.000 | Path=C:\Users\Public\fixture-old.dll"))
     $oldLeads = @(Invoke-ReportRules -Rows $oldOwnedRows -Rules $moduleRules -CollectionInfo $oldCollection)
     Assert-Equal (@($oldLeads | ForEach-Object { "$($_.GroupKey):$([bool]$_.CollectorSuspect)" } | Sort-Object) -join ",") "fixture-a.dll:True,fixture-b.dll:True,fixture-c.dll:True,fixture-old.dll:False" -Message "collector, other memory sources, an older collection: a DLL lead of a process started around the collection is marked as possibly the collector (by ProcessCreated=), one started hours before is not"
+    # The Memory-Processes rows themselves (a Windows ARM64 dump's process rows
+    # carry the token's user and privileges, so a rule can flag the
+    # collector's own process row): in an older collection, a lead on the row
+    # of a process started around the collection is marked as possibly the
+    # collector; one started hours before, or a Snapshot row, is not
+    $procRulesPath = Join-Path $workDir "proc-rules.json"
+    New-TestTextFile $procRulesPath '{ "schemaVersion": 1, "rules": [ { "id": "ANYPROCROW", "title": "Process {{group}}", "category": "Access", "severity": "Info", "why": "w", "groupBy": "capture", "match": { "source": "^Memory-Processes$", "description": "^Process in memory: (?<key>[^ ]+) " } } ] }'
+    $procRows = @($colRows) + @((New-TestProc -Time "2026-05-15 08:00:00.000" -Name "explorer.exe" -ProcId 5000 -Ppid 4000))
+    $procLeads = @(Invoke-ReportRules -Rows $procRows -Rules (Import-ReportRules -Path $procRulesPath) -CollectionInfo $oldCollection)
+    Assert-Equal (@($procLeads | Where-Object { @("DumpIt.exe", "explorer.exe", "evil.exe") -contains $_.GroupKey } | ForEach-Object { "$($_.GroupKey):$([bool]$_.CollectorSuspect)" } | Sort-Object) -join ",") "DumpIt.exe:True,evil.exe:False,explorer.exe:False" -Message "collector, process rows, an older collection: a lead on the process row of a process started around the collection is marked as possibly the collector; one started hours before, or a Snapshot row, is not"
 
     # =========================================================
     # The builder's line for a Windows ARM64 dump read with the Windows

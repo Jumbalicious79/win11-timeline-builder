@@ -249,7 +249,9 @@ tools\symbols\, where later runs find it.
   #15). A dump from a Windows ARM64 computer is offered too: Volatility 3
   cannot read ARM64 memory, so the builder reads it with Microsoft's
   debugger engine (part of Windows) -- the processes and their command
-  lines, not network connections or services. The first ARM64 dump of
+  lines, users and full paths, DLLs, kernel drivers, handles, executable
+  private memory, registry hives, console history, network connections
+  and services (see "ARM64 memory dumps"). The first ARM64 dump of
   each Windows kernel version needs internet access once, for the kernel's
   symbol file (about 10 MB, kept in tools\symbols\; see "Windows kernel
   symbols"). When the manifest lists a dump the builder cannot find or use, it
@@ -259,7 +261,7 @@ tools\symbols\, where later runs find it.
   answered 2 at the prompt, no vol.exe, no kernel symbol file for an ARM64
   dump, not found -- is named in the findings report's Evidence coverage
   notes, with the reason, and in its "What this report can't tell you"
-  box; so is what an ARM64 dump does not give.
+  box; so is any part of an ARM64 dump that could not be read.
 
 ### PowerShell (Admin)
 
@@ -709,8 +711,9 @@ gets it):
   - Defender DetectionHistory and quarantine entries: the times stored in
     the files
   - Memory dump (Volatility 3, or the Windows debugger engine for a Windows
-    ARM64 dump): process creation and connection times kept
-    in memory; rows without one get the capture time (the SystemTime in the
+    ARM64 dump): process creation and connection times kept in memory, and
+    for a Windows ARM64 dump also DLL load times, driver unload times and a
+    Run key's last-write time; rows without one get the capture time (the SystemTime in the
     header of a 64-bit crash dump, else the dump file's last-write time; see
     "Snapshot rows" and parser #15)
 
@@ -725,7 +728,9 @@ gets it):
   time as their Timestamp. The memory dump is read the same way: services
   and process command lines found in memory, and processes or connections
   without a valid time of their own, are Snapshot rows at the time the
-  memory was captured (parser #15). A few context rows are Snapshot rows at
+  memory was captured (parser #15); so are a Windows ARM64 dump's kernel
+  modules, handles, executable private memory, registry hives, console
+  commands and DLLs without a load time. A few context rows are Snapshot rows at
   a time of their own: a security product reported ON to Security Center
   (event time), the Outlook attachment folder and the triage collector's
   own Defender exclusion (registry key last-write time). Snapshot rows are
@@ -917,10 +922,13 @@ once more.
      no 4104 script blocks, no Sysmon, the USN journal's span, ...),
      collector errors and warnings (or that the collector's log is
      missing), notes (among them a memory dump of the collection that was
-     not analyzed, and why, or what was read from a Windows ARM64 dump and,
+     not analyzed, and why, or what was read from a Windows ARM64 dump, per
+     area what a live copy left unreadable ("Memory dump coverage") and,
      when the ways of finding its processes disagreed, how many each found),
-     and the Integrity leads (among them a process in a Windows ARM64 dump
-     that looks hidden from Windows' process list)
+     and the Integrity leads (among them, in a Windows ARM64 dump, a process
+     that looks hidden from Windows' process list, a renamed process, a
+     driver hidden from the kernel's module list, a program image in
+     executable private memory and DLLs mapped but not in the loader's lists)
   3  Antivirus verdicts       4  Access       5  Persistence
   6  Execution                7  Initial access       8  File system
      (and "Other leads" when a rule uses another category)
@@ -964,9 +972,9 @@ once more.
                            the severity (that row is among the evidence);
                            rows set aside by the allowlist; "Captured in
                            the memory dump" when every row of the lead
-                           comes from the memory dump (Memory-Processes,
-                           Memory-Network, Memory-CommandLine,
-                           Memory-Services): it keeps its severity and is a
+                           comes from the memory dump (any Memory-*
+                           Source, see "Leads seen only in the memory
+                           dump"): it keeps its severity and is a
                            lead like any other; "Every row is from during
                            the collection" (maybe the collector itself: its
                            first event time is at or after the collection
@@ -1010,11 +1018,13 @@ once more.
 
 ### Leads seen only in the memory dump
 
-  A lead whose rows all come from the memory dump -- the Memory-Processes,
-  Memory-Network, Memory-CommandLine and Memory-Services rows the Memory
-  parser reads with Volatility 3 (or the Windows debugger engine, for a
-  Windows ARM64 dump), whatever their event type -- says
-  exactly that: "Captured in the memory dump". Its rows are the state when
+  A lead whose rows all come from the memory dump -- every Memory-* Source:
+  the Memory-Processes, Memory-Network, Memory-CommandLine and
+  Memory-Services rows the Memory parser reads with Volatility 3 or the
+  Windows debugger engine, and for a Windows ARM64 dump also
+  Memory-Modules, Memory-PrivateCode, Memory-Drivers, Memory-Handles,
+  Memory-Registry and Memory-ConsoleHistory, whatever their event type --
+  says exactly that: "Captured in the memory dump". Its rows are the state when
   the dump was taken (stamped with the dump's capture time) unless the dump
   records a time of its own, such as a process's creation time. The note
   is the same everywhere:
@@ -1102,6 +1112,18 @@ once more.
   time does not match -- a memory-only lead on that process (the .bat run
   from Downloads) keeps the "possibly the collector" card note.
 
+  The other rows a Windows ARM64 dump gives a process -- its DLLs
+  (Memory-Modules), the handles it holds (Memory-Handles), its executable
+  private memory (Memory-PrivateCode) and, for a console host, the console
+  commands it keeps (Memory-ConsoleHistory) -- carry PID= and
+  ProcessCreated= (the process's create time): they are left out with a
+  left-out process only when that time is its own, to the millisecond, so
+  a later process that reused the PID keeps its rows. Kernel drivers
+  (Memory-Drivers) and registry hives and Run values (Memory-Registry)
+  belong to no process and are never left out. The summary ("Collector's
+  own processes in the memory dump: N (not flagged), with M row(s) of
+  theirs from other memory sources") counts these rows apart.
+
   Memory service rows (Memory-Services) of these processes are always kept
   and checked, and so are Volatility's network rows (Memory-Network of an
   x64 dump): a stale socket can belong to an earlier process that reused
@@ -1126,7 +1148,12 @@ once more.
   in the memory dump" note, and a memory-only lead seen only during the
   collection is flagged on its card as possibly the collector ("check that
   it is not the triage collector, its launcher or the memory capture tool"),
-  since this collection cannot tell them apart. The same holds for a current
+  since this collection cannot tell them apart. "During the collection" is
+  judged by the create time of the process a row belongs to (at or after a
+  minute before the collection start): a process row's own time, the
+  process row of a command line, or the ProcessCreated= (OwnerCreated=) of
+  a Windows ARM64 dump's DLL, handle, private memory, console or network
+  row. The same holds for a current
   collection whose recorded processes were not recognized in the dump. The
   note in Evidence coverage gives the reason the IDs are not known:
   collection_info.json was not available, could not be read (the builder
@@ -2120,7 +2147,9 @@ Requires vol.exe in tools\volatility3\ (see tools\volatility3\README.txt)
 for an x64 or x86 dump. Volatility 3 analyzes Intel x86/x64 Windows memory
 only: a Windows ARM64 dump (detected from the dump header) is read with
 Microsoft's debugger engine instead -- its processes and command lines, the
-same rows as below (see "ARM64 memory dumps"). A dump of the collection
+same rows as below, and more (users, DLLs, drivers, handles, the registry
+in memory, console history, network connections and services; see "ARM64
+memory dumps"). A dump of the collection
 that is found or listed but not analyzed (answered 2 at the prompt, no
 vol.exe, an ARM64 dump the debugger engine could not read, not found) gets
 a log line "Memory dump not analyzed: <dump> (<size>) -- <reason>[; <what
@@ -2154,7 +2183,9 @@ acquisition ended). The log shows it as "Dump time: <UTC> (crash dump
 header)" or "(dump file last-write time)", and per plugin "windows.pslist:
 N entries (T timed, S snapshot)". The Source column distinguishes memory
 rows (Memory-Processes, Memory-Network, Memory-CommandLine,
-Memory-Services).
+Memory-Services; for a Windows ARM64 dump also Memory-Modules,
+Memory-PrivateCode, Memory-Drivers, Memory-Handles, Memory-Registry and
+Memory-ConsoleHistory).
 
 ### ARM64 memory dumps (Windows debugger engine)
 Volatility 3 cannot read Windows ARM64 memory (it has no ARM64 support for
@@ -2290,8 +2321,8 @@ of WinDbg -- instead:
     seconds), and for an area read with gaps that a live copy leaves, an
     information line that the findings report shows as a coverage note:
       Memory dump coverage: <area> -- <what could not be read>
-    The areas, in the order they run (each is described here when it is
-    built; until then the log says "not read (not built yet)"):
+    The areas, in the order they run (an area whose code is not there says
+    "not read (not built yet)"; a rule summary follows the list):
       Process users and paths (ProcessDetails; lib\memory\
         TimelineDbgEng.Tokens.ps1 and TimelineDbgEng.ImagePaths.ps1): for
         each process, its token and where its program is. No rows of its
@@ -2434,11 +2465,85 @@ of WinDbg -- instead:
         on three 8 GB ARM64 dumps: 19-21 regions in 3-4 processes, none with
         a program header, well under 0.1 s (it reuses the DLLs area's walk of
         the memory regions).
-      Kernel drivers (Drivers): loaded kernel modules, drivers hidden from
-        the module list, recently unloaded drivers; Source Memory-Drivers.
-        Not built yet.
-      Handles (Handles): a subset of the handles of each process; Source
-        Memory-Handles. Not built yet.
+      Kernel drivers (Drivers; lib\memory\TimelineDbgEng.Drivers.ps1, with
+        the kernel object decoding of TimelineDbgEng.Objects.ps1): the
+        kernel's module list (nt!PsLoadedModuleList) walked forwards and
+        backwards like the process list, and every driver object of the
+        object directories \Driver and \FileSystem (an object's type is
+        decoded from its header with the kernel's per-boot cookie, its name
+        from its name header; all offsets from the kernel's symbol file).
+        Source Memory-Drivers, no User (a kernel module belongs to no
+        process):
+          Kernel module in memory: <file name>  (Snapshot)
+            Path=<its path, \SystemRoot\, \??\ and the volume's device name
+            as a drive letter> | Base=0x.. | Size=0x.. |
+            FoundBy=ModuleList[,DriverObject] [| DriverObject=\Driver\<n>
+            or \FileSystem\<n>, those that use it] [| Anomaly=NotInModuleList]
+          Kernel module unloaded: <file name>  (DriverUnload at its unload
+            time) Base=0x.. | Size=0x.. | FoundBy=UnloadedDriverList
+        Anomaly=NotInModuleList: a driver object whose module entry is in
+        neither walk of the list and whose code lies in no listed module --
+        a driver unlinked from the list, as kernel rootkits do. Judged one
+        way only (the kernel, hal and the libraries have no driver object and
+        are never flagged), and only when a walk reached the list's end; a
+        driver that also removed its driver object is not found this way.
+        The recently unloaded drivers are the kernel's own record of the last
+        50 (nt!MmUnloadedDrivers): name, address range and time. The 24H2
+        symbols do not describe that record, so its long-standing layout
+        (name, start, end, time; 0x28 bytes) is used, every slot is checked,
+        and the whole list is dropped when most slots fail; on Windows 11
+        24H2 its time is the time since boot, added to nt!KeBootTime.
+        Rules: INTEG-DRIVER-HIDDEN (High) on NotInModuleList and
+        PERSIST-DRIVER-USERPATH (Medium) for a module under \Users\,
+        \ProgramData\, a Temp folder or another user-writable folder. Measured
+        on three 8 GB ARM64 dumps: 193/193/192 modules, 157/157/156 driver
+        objects (9 of them without a module entry), none hidden, every module
+        under C:\Windows\ (DumpIt's driver too), 18/14/10 unloaded drivers;
+        about 1 s.
+      Handles (Handles; lib\memory\TimelineDbgEng.Handles.ps1): every
+        process's handle table (EPROCESS.ObjectTable, one to three levels of
+        4 KB pages) is decoded, each handle's object and type with it --
+        about 74,000-81,000 handles per dump, counted per type in the log --
+        but only a subset becomes rows, at most about 1,000 per dump. Source
+        Memory-Handles, Snapshot rows, User the holder's token SID:
+          Handle in memory: <Type> <target> (PID: n, Process: <holder>)
+          PID=<holder> | ProcessCreated=<its create time> |
+          Type=Process|Thread|File|Key|Mutant | Handle=0x.. | Access=0x<mask>
+          | Target=<process, file path, key path or name> [| TargetPID=n |
+          TargetProcess=<name> | TargetCreated=..] [| TargetTID=n]
+          [| Handles=<n of them>] [| Anomaly=..]
+        The subset: a Process handle with rights to change another process
+        (memory operation and write, thread creation, or all access) or a
+        Thread handle with set-context, where the holder is neither the
+        target's parent nor its child and is not the System process (one
+        row per holder, target and type, with their rights together; a
+        thread handle is folded into the row of a process handle to the same
+        process); a File in a user-writable folder (Downloads, Users\Public,
+        PerfLogs, the Recycle Bin, a Temp folder) or a Startup folder; a Key
+        under Run, RunOnce, Winlogon, a key under Image File Execution
+        Options (the loader keeps that key itself open in every process),
+        or the Services key and a service's own key, its path from the key
+        control block chain; and a named Mutant (mutex). Each is listed once
+        per process. Anomaly=:
+          WriteAccessUnrelated  the holder runs as a user account (S-1-5-21-
+                                or S-1-12-1-...) and the target is not in its
+                                process family: not started by it or its
+                                children (any depth), not of its console when
+                                it is a console host, not another process of
+                                the same program, user and parent
+          TargetHasPeCode       the target has executable private memory that
+                                starts with a program header (the joins, with
+                                the executable private memory area)
+        Rule: INTEG-HANDLE-WRITE-ACCESS (Medium, Integrity) on
+        WriteAccessUnrelated -- switched off: on the three real ARM64
+        collections it had 2, 3 and 0 rows the collector does not explain
+        (thread handles with all access held by installed applications to
+        another application's thread). The rows keep the Anomaly for the
+        analyst, and the rule can be switched on in a copy of the rules
+        file. Measured on three 8 GB ARM64 dumps: 80,724/76,115/73,818
+        handles in 188/182/173 tables, 955/939/887 rows (340/332/309
+        process, 3/7/0 thread, 8/8/7 file, 57/53/50 key, 547/539/521
+        mutex rows), 2.5-3.8 s.
       Registry hives (Registry): the registry in memory; Source
         Memory-Registry. On Windows 11 the hives' data is mapped into the
         Registry process, so it is read there (in the process each hive's
@@ -2587,8 +2692,9 @@ of WinDbg -- instead:
         Volatility's x64 rows); PERSIST-SERVICE-REMOTEACCESS (Medium) also
         reads the name, display name and binary of these rows;
         INTEG-SERVICE-NO-REGISTRY-KEY (Medium, Integrity: Anomaly=
-        NoRegistryKey) is switched off until it has been measured with the
-        registry in memory.
+        NoRegistryKey), switched on after it was measured with the registry
+        in memory joined (615 of 615 services joined with their key, none
+        missing, on each of the three real ARM64 collections).
       Network connections (Network): TCP connections, listeners and UDP
         endpoints, as Volatility's windows.netscan gives them on x64 dumps;
         Source Memory-Network, the same rows ("Memory network: <proto>
@@ -2654,6 +2760,83 @@ of WinDbg -- instead:
         in the memory dump"). Nothing is downloaded: tcpip.pdb (public
         symbols only) would tell live connections from freed ones exactly,
         and is not used.
+  - How the areas are combined: they run in a fixed order, and a later
+    area uses what an earlier one found. Every row of a process gets the
+    process's token user (the User column) and full name from the process
+    users and paths area, which runs first; the Services area joins each
+    service with its key of the registry in memory (RegistryBinary=,
+    ServiceDll=, Account=, NoRegistryKey); the Network area judges each
+    connection's owner against the processes (Stale=, OwnerHidden,
+    OwnerPath=); the Console area takes a history's client process from the
+    console host's own record of it. After every area, the joins
+    (lib\memory\TimelineDbgEng.Joins.ps1) add TargetHasPeCode to a handle
+    row whose target has a program image in its executable private memory,
+    with a "Joins: ..." count line in the log.
+  - The findings rules of the areas (lib\report\report-rules.json; each
+    described with its area above). A new Medium or High rule was switched
+    on only when the builder, run on three real ARM64 collections (8 GB
+    dumps of Windows 11 24H2, two of them with the collector's own process
+    IDs recorded), gave it no hit that the collector does not explain; Info
+    rules show noisy signals for the analyst. Hits per collection, newest
+    first (12-21 / 00-08 / 10-47; "off" rules measured switched on):
+      ACCESS-SYSTEM-CHILD-OF-USER       High    on   0/0/0
+      INTEG-PROCESS-NAME-CHANGED        High    on   0/0/0
+      INTEG-PROCESS-PEB-MISMATCH        Medium  on   0/0/0
+      ACCESS-DEBUG-PRIV-USER            Info    on   2/1/2 leads (elevated
+                                                     programs; on 10-47 the
+                                                     collector's own, marked as
+                                                     possibly the collector)
+      INTEG-PRIVATE-CODE-PE             High    on   0/0/0
+      INTEG-PRIVATE-CODE                Info    on   2/2/1 leads
+      EXEC-MODULE-USERPATH              Medium  on   0/0/0
+      INTEG-MODULE-UNLINKED-USERPATH    Medium  on   0/0/0
+      INTEG-MODULE-UNLINKED             Info    on   0/0/0
+      INTEG-MODULE-NAME-MISMATCH        Info    on   2/2/0 leads
+      INTEG-DRIVER-HIDDEN               High    on   0/0/0
+      PERSIST-DRIVER-USERPATH           Medium  on   0/0/0
+      INTEG-HANDLE-WRITE-ACCESS         Medium  off  2/3/0 (thread handles
+                                                     between installed apps)
+      PERSIST-RUNKEY-MEMORY-ONLY        Medium  on   0/0/0
+      INTEG-NET-OWNER-HIDDEN            High    on   0/0/0
+      EXEC-NET-LISTENER-USERPATH        Medium  on   0/0/0
+      EXEC-NET-SCRIPTHOST-PUBLIC        Medium  off  1/0/1 (one PowerShell
+                                                     with a public connection)
+      PERSIST-SERVICE-MEMORY-SUSPICIOUS Medium  on   0/0/0
+      INTEG-SERVICE-NO-REGISTRY-KEY     Medium  on   0/0/0
+    Existing rules that also read these rows: EXEC-STAGING (a process's
+    ImagePath=), the command-content rules (console history, see Console),
+    PERSIST-RUNKEY-SUSPICIOUS and PERSIST-RUNKEY-STAGING (Run values in
+    memory), PERSIST-SERVICE-REMOTEACCESS (services in memory) and
+    INTEG-PROCESS-HIDDEN (processes). A switched-off rule is switched on
+    with "enabled": true in a copy of the rules file (-ReportRules).
+  - What a Windows ARM64 dump still does not give (each is a deliberate
+    limit, said here so that its absence is not read as a finding):
+      - connections in TIME_WAIT and sockets: counted, not listed; and a
+        closed connection is told from a live one by its state and owner
+        only (Stale=Yes), not exactly (that would need tcpip.pdb, a download
+        this builder does not make)
+      - handles: only the subset described under Handles becomes rows; the
+        others are counted per type in the log
+      - the registry in memory: only the hives, the Run, RunOnce and
+        Policies\Explorer\Run values and the Services key are read, and only
+        what is in the dump (35-55% of the hives' pages on the real dumps);
+        SAM and SECURITY are listed by name and never read
+      - console windows: the commands a console host keeps, not the text
+        on the screen (that would need conhost.pdb); PowerShell's own
+        history is read from disk (PowerShellHistory)
+      - a 32-bit DLL known only to a WoW64 process's 32-bit loader list has
+        no load time (a Snapshot row)
+      - a driver that unlinked itself from the module list and also removed
+        its driver object is not found
+      - the network objects, service records and console history have no
+        symbol file: their layouts are known for Windows 11 builds 26100 to
+        26299 (network), build 26100 and later (services) and the open-source
+        console code (console history); a dump whose objects fail the
+        layout's self-checks gives "not read (...)" for that area, never
+        rows from a wrong layout
+      - Windows x64 and x86 dumps are read with Volatility 3, unchanged:
+        processes, network connections, command lines and services, not
+        these areas
   - Kernel symbols: the engine needs the symbol file of the dump's exact
     Windows kernel. The builder reads its name and ID from the kernel image
     in the dump and takes the file from tools\symbols\, or downloads it once
@@ -2662,8 +2845,17 @@ of WinDbg -- instead:
     the URL and where to copy the file; when the engine does not accept the
     file it downloaded, or no folder for it can be written, the reason says
     so instead.
-  - Time: about 3 seconds for an 8 GB dump, plus the download the first
-    time (about 15 seconds) and starting the engine.
+  - Time: 11-13 seconds for an 8 GB dump on an internal disk (measured on
+    three 8 GB ARM64 dumps, in both PowerShell editions): opening the dump
+    and the processes about 3 s, the areas about 9 s one after the other,
+    and the pass over the dump file for the network connections (5-8 s
+    here; it is disk-bound, so a USB drive takes longer) on a thread of its
+    own beside them. Plus the kernel symbol file's download the first time
+    (about 15 seconds). Each area has a time limit (30 s; DLLs and handles
+    60 s; the pass over the dump file 300 s): an area that reaches it is
+    partly read, with a coverage note, and the others go on. The whole
+    helper is stopped after 15 minutes. Memory: the page cache holds at
+    most 64 MB and the pass reads 16 MB at a time.
   - The log: "Windows ARM64 dump: analyzing it with Microsoft's debugger
     engine", the engine ("Debugger engine: dbgeng.dll <version> from
     <folder> (part of Windows)"), the symbol file, what each way found
@@ -2672,8 +2864,14 @@ of WinDbg -- instead:
     ("Processes (windows.pslist rows): N entries (T timed, S snapshot);
     session ids for K" and "Command lines (windows.cmdline rows): M
     entries; none for A kernel process(es) without a PEB, U not readable
-    (paged out or exited), E empty"), a line per area, then the line the
-    findings report reads, with what was read and what not:
+    (paged out or exited), E empty"), each area's counts (for example
+    "Handles: handles 80724, handle tables read 188, ..."), the joins
+    ("Joins: handle entries whose target has a program header in its
+    executable private memory 0"), the rows of each Source ("Memory-Modules
+    rows (Module entries): 462 of 462 entries (381 timed, 81 snapshot)"), a
+    line per area ("DLLs: read, 462 entries, 3.4 s"), "Debugger engine
+    analysis took N s", then the line the findings report reads, with what
+    was read and what not:
       Memory dump analyzed with the Windows debugger engine: <dump> (<size>)
         -- read processes, command lines, DLLs, ...; not read handles
         (<why>), ...
@@ -2718,8 +2916,8 @@ of WinDbg -- instead:
       the Windows debugger engine stopped (<error>, or an exit code such as
         0xC0000005), or did not finish within 15 minutes
   - More with WinDbg: the log ends with a command for the dump with the
-    builder's symbol cache, for handles, drivers and other kernel objects
-    the builder does not read:
+    builder's symbol cache, to look further than the builder reads ("To
+    look further than the builder reads, open the dump in WinDbg; ..."):
       kdARM64.exe -z "D:\Cases\TriageCollection_2026-10-11_00-08_memory_dump.dmp" -y "srv*C:\Tools\win11-timeline-builder\tools\symbols*https://msdl.microsoft.com/download/symbols"
     then, at its kd> prompt: !process 0 0 (processes), lm (modules), !handle
     (handles), dx @$cursession.Processes, and q to quit. In a dump copied
@@ -3246,10 +3444,12 @@ selects it.
     does not keep the file's dates (most copies do) gives the time of the
     copy instead.
 
-  - Windows ARM64 memory dumps -- Read with Microsoft's debugger engine,
-    they give the processes and their command lines only: no network
-    connections and no services (see "ARM64 memory dumps" under parser
-    #15). The first ARM64 dump of each Windows kernel version needs
+  - Windows ARM64 memory dumps -- Read with Microsoft's debugger engine:
+    the processes and their command lines, users and paths, DLLs, kernel
+    drivers, a subset of the handles, executable private memory, the
+    registry in memory (partly: what the dump holds), console history,
+    network connections and services, with the limits listed under
+    "ARM64 memory dumps" (parser #15). The first ARM64 dump of each Windows kernel version needs
     internet access once, for the kernel's symbol file (or a copy of it
     placed in tools\symbols\ by hand; the log says where); without it the
     dump is reported as not analyzed. A command line that is paged out of
@@ -3510,9 +3710,11 @@ parsing is skipped, and the timeline CSV can be opened manually.
   deleted after each plugin.
 
 ### Microsoft debugger engine (ARM64 memory dumps)
-  Purpose:    Reads Windows ARM64 memory dumps (processes and command lines),
-              which Volatility 3 cannot read (parser #15, "ARM64 memory
-              dumps")
+  Purpose:    Reads Windows ARM64 memory dumps (processes, command lines
+              and the other areas: users, DLLs, drivers, handles, private
+              memory, registry, console history, network connections,
+              services), which Volatility 3 cannot read (parser #15,
+              "ARM64 memory dumps")
   Author:     Microsoft (the engine of WinDbg)
   Needed:     Nothing to install: dbgeng.dll, dbghelp.dll and dbgmodel.dll
               are part of Windows (C:\Windows\System32), and the builder uses
@@ -3978,11 +4180,36 @@ parsing is skipped, and the timeline CSV can be opened manually.
   tests\Test-MemoryTokens.ps1, Test-MemoryModules.ps1,
   Test-MemoryKernelObjects.ps1, Test-MemoryRegistry.ps1,
   Test-MemoryConsole.ps1, Test-MemoryNetwork.ps1, Test-MemoryServices.ps1
-  -- one per memory area work package, on synthetic memory through
-  tests\MemoryTestKit.ps1 (no dump in CI). While an area is not built yet,
-  its test checks only that the area reports "not read (not built yet)" and
-  that its rows functions add no rows.
-  Test-MemoryConsole.ps1 builds console hosts in a sparse memory map as
+  -- one per memory area, on synthetic memory through
+  tests\MemoryTestKit.ps1 (no dump in CI), each described here.
+
+  tests\Test-MemoryKernelObjects.ps1 -- the kernel drivers and handles
+  areas and their shared object decoding, on a synthetic kernel with the
+  layouts of Windows 11 24H2 ARM64 as canned "dt -v" output: object headers
+  (the type index mixed with the header cookie and the header's address,
+  names, an empty name, full names), the object directory and its symbolic
+  links (\SystemRoot, \??\C:, \Device\BootDevice) as drive-letter paths;
+  the drivers area (the module list both ways, the driver objects of
+  \Driver and \FileSystem, a hidden driver, a driver object whose entry
+  moved, one without a module, the walks cut one way and both ways, the
+  recently unloaded drivers with times since boot and absolute ones, a slot
+  that fails its checks, a list whose layout does not fit); the handles
+  area (one- and two-level handle tables, a page not in the dump, every row
+  kind and what is left out: rights that cannot change a process, parent
+  and child, the System process, thread handles folded into a process row,
+  the process family of the anomaly, a target outside the scan, file names
+  with drive letters and relative names, key paths through hive mount
+  points, Image File Execution Options and Services keys, named and unnamed
+  mutexes, objects not in the dump, the holder's SID read from its token,
+  the lookup for the joins); the join that adds TargetHasPeCode
+  (TimelineDbgEng.Joins.ps1); missing symbols and the time limit; then the
+  builder's rows (Memory-Drivers, Memory-Handles through the protocol) and
+  the findings rules on them (INTEG-DRIVER-HIDDEN, PERSIST-DRIVER-USERPATH,
+  and the switched-off INTEG-HANDLE-WRITE-ACCESS switched on for the test).
+  Its rules' cases are in
+  tests\fixtures\report\rules\cases-memory-kernelobjects.csv.
+
+  tests\Test-MemoryConsole.ps1 -- the console history area: it builds console hosts in a sparse memory map as
   Microsoft's console code lays them out (a PE section table, the list of
   histories in the writable data, history nodes, strings in place and
   behind pointers, the record of an attached client) and checks: the
@@ -3999,7 +4226,7 @@ parsing is skipped, and the timeline CSV can be opened manually.
   rules taking Memory-ConsoleHistory rows in report-rules.json.
 
   tests\Test-MemoryModules.ps1 -- the DLLs and executable private memory
-  areas (work package WP2) on synthetic memory: canned "dt -v" output, six
+  areas on synthetic memory: canned "dt -v" output, six
   processes (a 64-bit one with DLLs in and out of its loader list, a
   protected one, a WoW64 one with a 32-bit list, one whose list is cut
   short, an exited one, one without a PEB), VAD trees with image mappings
@@ -4057,7 +4284,7 @@ parsing is skipped, and the timeline CSV can be opened manually.
   the dump; records of another layout (not read, or the registry alone);
   no services.exe, its memory not in the dump, the time limit, two
   services.exe; the rules PERSIST-SERVICE-MEMORY-SUSPICIOUS and
-  INTEG-SERVICE-NO-REGISTRY-KEY (switched on for the test) on the rows and
+  INTEG-SERVICE-NO-REGISTRY-KEY on the rows and
   on tests\fixtures\report\rules\cases-memory-services.csv.
 
   tests\MemoryTestKit.ps1 -- what these tests share (dot-sourced): it loads
@@ -4433,8 +4660,9 @@ parsing is skipped, and the timeline CSV can be opened manually.
 
   dbgeng.dll,          Microsoft's debugger engine (with dbghelp.dll and
   dbghelp.dll,         dbgmodel.dll in C:\Windows\System32) reads Windows
-  dbgmodel.dll         ARM64 memory dumps: the processes and their command
-                       lines (parser #15). Loaded by full path in a
+  dbgmodel.dll         ARM64 memory dumps: the processes, their command
+                       lines and the other areas (parser #15, "ARM64
+                       memory dumps"). Loaded by full path in a
                        PowerShell process of its own
                        (lib\memory\TimelineDbgEng.ps1).
 
@@ -4487,6 +4715,18 @@ parsing is skipped, and the timeline CSV can be opened manually.
   Tools for Windows    Windows) reads Windows ARM64 memory dumps, with the
                        kernel symbols of Microsoft's public symbol server.
                        https://learn.microsoft.com/windows-hardware/drivers/debugger/
+
+  Windows Terminal     Microsoft's open-source console code (src\host\history.h,
+                       src\server\ProcessHandle.h) gives the layout of the
+                       console's command history read from Windows ARM64 dumps.
+                       https://github.com/microsoft/terminal
+
+  MemProcFS            Ulf Frisk's published offsets of the network objects
+                       and the service control manager's records for Windows
+                       11 build 26100 are used as facts (checked on real
+                       dumps; no code is copied) to read them from Windows
+                       ARM64 dumps.
+                       https://github.com/ufrisk/MemProcFS
 
   log2timeline/plaso   The timeline-building concept and CSV output format are
                        inspired by the plaso/log2timeline project, the gold

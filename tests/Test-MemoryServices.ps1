@@ -25,9 +25,8 @@
 #     from the memory regions when the PEB is not in the dump, records that
 #     are not this layout (not read, or the registry alone), no services.exe,
 #     its memory not in the dump, the time limit, the order of candidates
-#   - the rules: PERSIST-SERVICE-MEMORY-SUSPICIOUS on the rows, and
-#     INTEG-SERVICE-NO-REGISTRY-KEY (switched off until work package WP8)
-#     switched on for this test on the rows and on
+#   - the rules: PERSIST-SERVICE-MEMORY-SUSPICIOUS and
+#     INTEG-SERVICE-NO-REGISTRY-KEY (both switched on) on the rows and on
 #     tests\fixtures\report\rules\cases-memory-services.csv
 # Exit code 0 = pass, 1 = fail. Windows PowerShell 5.1 and PowerShell 7.
 #
@@ -451,8 +450,8 @@ try {
     $rules = Import-ReportRules -Path (Join-Path (Split-Path $BuilderPath -Parent) "lib\report\report-rules.json")
     $suspicious = @($rules.Rules | Where-Object { $_.Id -eq "PERSIST-SERVICE-MEMORY-SUSPICIOUS" })[0]
     $noKey = @($rules.Rules | Where-Object { $_.Id -eq "INTEG-SERVICE-NO-REGISTRY-KEY" })[0]
-    Assert-KitEqual -Name "the rules file: PERSIST-SERVICE-MEMORY-SUSPICIOUS switched on (Medium), INTEG-SERVICE-NO-REGISTRY-KEY switched off until WP8 (Medium)" `
-        -Expected "True|Medium|False|Medium" -Actual "$($suspicious.Enabled)|$($suspicious.Severity)|$($noKey.Enabled)|$($noKey.Severity)"
+    Assert-KitEqual -Name "the rules file: PERSIST-SERVICE-MEMORY-SUSPICIOUS and INTEG-SERVICE-NO-REGISTRY-KEY switched on (Medium; the latter after the join was measured on the merged build)" `
+        -Expected "True|Medium|True|Medium" -Actual "$($suspicious.Enabled)|$($suspicious.Severity)|$($noKey.Enabled)|$($noKey.Severity)"
     $noKey.Enabled = $true
     try {
         # The joined rows of the synthetic dump, as the timeline has them

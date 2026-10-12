@@ -17876,7 +17876,7 @@ function Parse-Memory {
             Log-Warning "  Memory analysis skipped: $($engineResult.Reason)."
             Write-MemoryDumpNotAnalyzed -What $dumpText -Why $engineResult.Reason
         }
-        Log "  For more (handles, drivers and other kernel objects), open the dump in WinDbg; its command-line debugger, with the builder's symbol cache: $(Get-DbgEngWinDbgCommand -DumpPath $dumpPath)"
+        Log "  To look further than the builder reads, open the dump in WinDbg; its command-line debugger, with the builder's symbol cache: $(Get-DbgEngWinDbgCommand -DumpPath $dumpPath)"
         Log "  Memory parsing complete."
         Log ""
         return
@@ -19185,9 +19185,10 @@ if ($Sources -notcontains "Memory") {
                 Write-Host "  A Windows ARM64 dump: Volatility 3 cannot read it, so the builder uses" -ForegroundColor Green
                 Write-Host "  Microsoft's debugger engine $engineWhere." -ForegroundColor Green
                 Write-Host ""
-                Write-Host "  Memory analysis adds the processes (parent, start time, session," -ForegroundColor White
-                Write-Host "  threads) and their command lines from the RAM dump. Network" -ForegroundColor White
-                Write-Host "  connections and services are not read from ARM64 dumps." -ForegroundColor White
+                Write-Host "  Memory analysis adds the processes (user, program path, parent, start" -ForegroundColor White
+                Write-Host "  time), their command lines and DLLs, kernel drivers, handles," -ForegroundColor White
+                Write-Host "  executable private memory, the registry in memory, console history," -ForegroundColor White
+                Write-Host "  network connections and services from the RAM dump." -ForegroundColor White
                 Write-Host "  Takes under a minute. The first time for each Windows kernel version" -ForegroundColor DarkGray
                 Write-Host "  (most Windows updates bring a new one) it downloads the kernel's" -ForegroundColor DarkGray
                 Write-Host "  symbol file (about 10 MB) from Microsoft's symbol server into" -ForegroundColor DarkGray

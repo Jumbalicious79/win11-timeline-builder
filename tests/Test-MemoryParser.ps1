@@ -950,7 +950,7 @@ try {
             $readBack = Read-ReportEngineBuilderLog -Path $script:logFile
             $expectedEngineLine = ""
             if ($case.Complete) { $expectedEngineLine = $case.Line.Substring("  Memory dump analyzed with the Windows debugger engine: ".Length) }
-            $winDbgLine = "  For more (handles, drivers and other kernel objects), open the dump in WinDbg; its command-line debugger, with the builder's symbol cache: $(Get-DbgEngWinDbgCommand -DumpPath $armDump)"
+            $winDbgLine = "  To look further than the builder reads, open the dump in WinDbg; its command-line debugger, with the builder's symbol cache: $(Get-DbgEngWinDbgCommand -DumpPath $armDump)"
             Assert-Equal -Name "Parse-Memory, an ARM64 dump ($($case.Name)): the dump time, the debugger engine (not Volatility 3) on the dump, the line for the report, read back, and the WinDbg command" -Expected "True|True|True|1|$armDump|0|True|True|True|$expectedEngineLine|$($case.NotAnalyzed)|True" `
                 -Actual "$($log.Contains("Found memory dump: $armDump (0 GB, ARM64)"))|$($log.Contains("Dump time: $captureText UTC (crash dump header)"))|$($log.Contains("  Windows ARM64 dump: analyzing it with Microsoft's debugger engine (Volatility 3 cannot read ARM64 memory)"))|$($script:engineCalls)|$($script:engineDump)|$($script:volCalls)|$($log.Contains($case.Line))|$(-not $case.Complete -or $log.Contains($case.Complete))|$($log.Contains($winDbgLine))|$($readBack.MemoryDumpEngine)|$($readBack.MemoryDumpNotAnalyzed)|$($log.Contains('Memory parsing complete.'))"
             # The coverage line of an area read in part: an information line
@@ -1031,9 +1031,10 @@ try {
     # what not, the time and the one-time symbol download
     $engineLines = @(
         "  A Windows ARM64 dump: Volatility 3 cannot read it, so the builder uses",
-        "  Memory analysis adds the processes (parent, start time, session,",
-        "  threads) and their command lines from the RAM dump. Network",
-        "  connections and services are not read from ARM64 dumps.",
+        "  Memory analysis adds the processes (user, program path, parent, start",
+        "  time), their command lines and DLLs, kernel drivers, handles,",
+        "  executable private memory, the registry in memory, console history,",
+        "  network connections and services from the RAM dump.",
         "  Takes under a minute. The first time for each Windows kernel version",
         "  (most Windows updates bring a new one) it downloads the kernel's",
         "  symbol file (about 10 MB) from Microsoft's symbol server into",

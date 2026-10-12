@@ -34,7 +34,9 @@
 #                     is counted, not listed; once per process and path
 #   Mutant            a named mutex, once per process and name
 # Offers a handle lookup to the joins: $Context.Shared["HandleLookup"]
-# (HandleTableLookup.Lookup(eprocess, handle value)).
+# (HandleTableLookup.Lookup(eprocess, handle value)), and the Process and
+# Thread entries with their target's EPROCESS: $Context.Shared["HandleTargets"]
+# (TimelineDbgEng.Joins.ps1 adds Anomaly TargetHasPeCode from them).
 # =============================================================
 
 # The C# of this file: namespace blocks only (no using lines; the host's
@@ -134,6 +136,9 @@ namespace TimelineDbgEng
         readonly Dictionary<ulong, string> sids = new Dictionary<ulong, string>();
         readonly Dictionary<string, long> typeCounts = new Dictionary<string, long>(StringComparer.Ordinal);
         public readonly HandleTableLookup Lookup = new HandleTableLookup();
+        // The Process and Thread entries with their target's EPROCESS, for
+        // the joins (TimelineDbgEng.Joins.ps1)
+        public readonly List<KeyValuePair<MemoryEntry, ulong>> Targets = new List<KeyValuePair<MemoryEntry, ulong>>();
 
         public long Handles, UndecodedHandles, UnreadableHeaders;
         public int TablesRead, NoTable, UnreadableTables, UnreadableLeafPages, MaxPerProcess;
@@ -519,6 +524,9 @@ namespace TimelineDbgEng
 
         public void Run(AreaResult area)
         {
+            // Offered to the joins (set here, in C#: no PowerShell wrapper)
+            context.Shared["HandleLookup"] = Lookup;
+            context.Shared["HandleTargets"] = Targets;
             foreach (ProcessInfo holder in context.Processes)
             {
                 if (area.TimeUp()) break;
@@ -634,6 +642,7 @@ namespace TimelineDbgEng
                 e.Set("TargetCreated", g.Target.CreatedText);
                 if (g.ThreadId >= 0) e.Set("TargetTid", g.ThreadId);
                 if (g.Count > 1) e.Set("Handles", g.Count);
+                Targets.Add(new KeyValuePair<MemoryEntry, ulong>(e, g.Target.Eprocess));
                 if (userHolder)
                 {
                     if (Family(holder, g.Target, holderSid)) FamilyRows++;
@@ -716,6 +725,5 @@ function Invoke-DbgEngHandlesArea {
     $scan = New-Object TimelineDbgEng.HandleTableScan -ArgumentList $Context, $layout, $objects
     if ($scan.MissingFields) { $Area.SetNotRead("the kernel's symbols do not give $($scan.MissingFields)"); return }
     if ($scan.PartlyMissing) { $Area.SetPartial("the kernel's symbols do not describe the $($scan.PartlyMissing), so those handles were only counted") }
-    $Context.Shared["HandleLookup"] = $scan.Lookup
     $scan.Run($Area)
 }

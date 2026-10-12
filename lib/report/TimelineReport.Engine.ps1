@@ -1737,7 +1737,8 @@ namespace TimelineReport
 
         // Memory-CommandLine rows whose process (by PID, from its pslist
         // ProcessCreation row) started at or after the collection start minus
-        // a minute. In a collection that did not record the collector's own
+        // a minute, and such Memory-Processes ProcessCreation rows
+        // themselves. In a collection that did not record the collector's own
         // process IDs, a memory-only lead on such a row may be the collector
         // itself (it started when the collection did), so it is flagged on
         // its card. A process that started well before the collection (an
@@ -1772,7 +1773,10 @@ namespace TimelineReport
                 if (only != null && !only.Contains(ownerPid)) continue;
                 if (ownerTicks >= threshold) suspect[i] = true;
             }
-            if (commandSource < 0) return suspect;
+            // The Memory-Processes ProcessCreation rows: their own time is the
+            // process's create time (the same test; a Windows ARM64 dump's
+            // process rows carry the token's user and privileges, so a lead
+            // can be on the collector's own process row)
             Dictionary<int, long> createByPid = new Dictionary<int, long>();
             if (processSource >= 0 && creationType >= 0)
             {
@@ -1786,8 +1790,10 @@ namespace TimelineReport
                     int pid = ParseInt(m.Groups["pid"].Value);
                     long existing;
                     if (!createByPid.TryGetValue(pid, out existing) || tk < existing) createByPid[pid] = tk;
+                    if ((only == null || only.Contains(pid)) && tk >= threshold) suspect[i] = true;
                 }
             }
+            if (commandSource < 0) return suspect;
             for (int i = 0; i < t.Count; i++)
             {
                 if (t.SourceId[i] != commandSource) continue;

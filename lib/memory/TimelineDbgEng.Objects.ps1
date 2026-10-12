@@ -218,7 +218,7 @@ namespace TimelineDbgEng
 
         // The object's full name in the namespace ("\Device\HarddiskVolume3"),
         // through the directories of its name header; null when it has no
-        // name or a part is not in the dump. Kept per object.
+        // name (or an empty one) or a part is not in the dump. Kept per object.
         public string FullName(ulong body)
         {
             string cached;
@@ -232,8 +232,10 @@ namespace TimelineDbgEng
                 byte[] h = Header(header);
                 ulong info = NameInfo(header, h);
                 if (info == 0) break;
+                // An empty name is no name (an unnamed object, or a
+                // directory part that is not in the dump)
                 string name = reader.UnicodeString(0, info + (ulong)nameField);
-                if (name == null) break;
+                if (string.IsNullOrEmpty(name)) break;
                 ulong directory;
                 if (!reader.TryU64(0, info + (ulong)nameDirectoryField, out directory)) break;
                 parts.Insert(0, name);
